@@ -1753,20 +1753,62 @@ on pressButtonFast(buttonRef)
     end try
 end pressButtonFast
 
+on buttonEnabled(buttonRef)
+    tell application "System Events"
+        try
+            return enabled of buttonRef as boolean
+        end try
+    end tell
+    return true
+end buttonEnabled
+
+on buttonText(buttonRef)
+    set labelText to ""
+    tell application "System Events"
+        try
+            set labelText to labelText & " " & (name of buttonRef as string)
+        end try
+        try
+            set labelText to labelText & " " & (value of buttonRef as string)
+        end try
+        try
+            set labelText to labelText & " " & ((value of attribute "AXTitle" of buttonRef) as string)
+        end try
+    end tell
+    return labelText
+end buttonText
+
+on buttonLooksSubmit(buttonTextValue)
+    ignoring case
+        if buttonTextValue contains "Continue" then return true
+        if buttonTextValue contains "Next" then return true
+        if buttonTextValue contains "Connect" then return true
+        if buttonTextValue contains "Sign in" then return true
+        if buttonTextValue contains "Sign In" then return true
+        if buttonTextValue contains "Log in" then return true
+        if buttonTextValue contains "Login" then return true
+        if buttonTextValue contains "Log on" then return true
+        if buttonTextValue contains "Submit" then return true
+        if buttonTextValue contains "OK" then return true
+        if buttonTextValue contains "Ok" then return true
+        if buttonTextValue contains "Done" then return true
+        if buttonTextValue contains "Войти" then return true
+        if buttonTextValue contains "Подключиться" then return true
+        if buttonTextValue contains "Продолжить" then return true
+        if buttonTextValue contains "Далее" then return true
+    end ignoring
+    return false
+end buttonLooksSubmit
+
 on clickPreferredSubmit(containerRef)
     tell application "System Events"
-        set preferredNames to {"Sign in", "Sign In", "Log in", "Login", "Log on", "Log On", "Connect", "Continue", "Next", "Submit", "OK", "Ok", "Done", "Войти", "Подключиться", "Продолжить", "Далее"}
-        repeat with preferredName in preferredNames
-            try
-                repeat with b in every button of containerRef
-                    try
-                        if (name of b as string) is (preferredName as string) then
-                            if my pressButtonFast(b) then return true
-                        end if
-                    end try
-                end repeat
-            end try
-        end repeat
+        try
+            repeat with b in every button of containerRef
+                if my buttonEnabled(b) and my buttonLooksSubmit(my buttonText(b)) then
+                    if my pressButtonFast(b) then return true
+                end if
+            end repeat
+        end try
     end tell
     return false
 end clickPreferredSubmit
