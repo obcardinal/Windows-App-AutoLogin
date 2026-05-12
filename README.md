@@ -1,5 +1,7 @@
 # Windows App AutoLogin
 
+![Accounts screen](docs/images/accounts-screen.webp)
+
 Windows App AutoLogin is a small macOS menu-bar utility that fills Microsoft Windows App / Microsoft Remote Desktop credential prompts only when the visible prompt clearly belongs to one saved account.
 
 It is designed for the narrow case where Windows App shows a password prompt with a visible email address. The app verifies the running Microsoft client, reads the visible email, matches exactly one enabled account, loads only that account's password, fills the password field, and submits the prompt.
