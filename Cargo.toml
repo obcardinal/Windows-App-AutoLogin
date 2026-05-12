@@ -46,10 +46,9 @@ chrono = "0.4"
 zeroize = "1.8"
 
 [features]
-default = ["logs-ui"]
+default = []
 diagnostics-ui = []
-logs-ui = []
-dev-tools = ["diagnostics-ui", "logs-ui"]
+dev-tools = ["diagnostics-ui"]
 
 [profile.release]
 opt-level = 3

@@ -61,6 +61,7 @@ impl AutoLoginApp {
         worker_event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
         config: AppConfig,
         settings_window_mode: bool,
+        initial_tab: Tab,
     ) -> Self {
         let worker_status = WorkerStatus::Idle;
         let settings_draft = config.settings.clone();
@@ -68,7 +69,7 @@ impl AutoLoginApp {
 
         let mut app = Self {
             config,
-            selected_tab: Tab::Accounts,
+            selected_tab: initial_tab,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             worker_status,
             worker_tx,
@@ -114,10 +115,6 @@ impl AutoLoginApp {
                 10.0f64,
             ));
         }
-        if app.settings_window_mode {
-            app.selected_tab = Tab::Settings;
-        }
-
         app
     }
 
@@ -227,6 +224,11 @@ impl AutoLoginApp {
     fn process_tray_commands(&mut self, ctx: &egui::Context) {
         while let Ok(cmd) = self.tray_rx.try_recv() {
             match cmd {
+                TrayCommand::OpenAccounts => {
+                    self.selected_tab = Tab::Accounts;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                }
                 TrayCommand::OpenSettings => {
                     self.selected_tab = Tab::Settings;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -447,8 +449,6 @@ impl eframe::App for AutoLoginApp {
                     for (tab, label) in [
                         (Tab::Accounts, "Accounts"),
                         (Tab::Settings, "Settings"),
-                        #[cfg(feature = "logs-ui")]
-                        (Tab::Logs, "Logs"),
                         #[cfg(feature = "diagnostics-ui")]
                         (Tab::Diagnose, "Diagnose"),
                     ] {
@@ -521,10 +521,6 @@ impl eframe::App for AutoLoginApp {
                 match self.selected_tab {
                     Tab::Accounts => crate::ui::accounts::show(ui, self),
                     Tab::Settings => crate::ui::settings::show(ui, self),
-                    #[cfg(feature = "logs-ui")]
-                    Tab::Logs => crate::ui::logs::show(ui, self),
-                    #[cfg(not(feature = "logs-ui"))]
-                    Tab::Logs => crate::ui::accounts::show(ui, self),
                     #[cfg(feature = "diagnostics-ui")]
                     Tab::Diagnose => crate::ui::diagnose::show(ui, self),
                 }

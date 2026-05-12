@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         return debug_fill::run_from_args(&args);
     }
     if args.iter().any(|arg| arg == "--full-ui") {
-        return run_full_ui();
+        return run_full_ui(initial_full_ui_tab(&args));
     }
 
     run_lightweight_supervisor()
@@ -80,7 +80,7 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_full_ui() -> anyhow::Result<()> {
+fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let config = storage::load_config();
     let (worker_tx, _worker_rx) = tokio_channel::<background::WorkerCommand>(32);
     let (_worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
@@ -101,7 +101,14 @@ fn run_full_ui() -> anyhow::Result<()> {
         native_options,
         Box::new(|cc| {
             ui::theme::apply(&cc.egui_ctx);
-            let app = app::AutoLoginApp::new(worker_tx, tray_rx, worker_event_rx, config, true);
+            let app = app::AutoLoginApp::new(
+                worker_tx,
+                tray_rx,
+                worker_event_rx,
+                config,
+                true,
+                initial_tab,
+            );
             Ok(Box::new(app))
         }),
     );
@@ -173,6 +180,7 @@ impl LightweightSupervisor {
     fn process_tray_commands(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(command) = self.tray_rx.try_recv() {
             match command {
+                tray::TrayCommand::OpenAccounts => self.open_accounts_window(),
                 tray::TrayCommand::OpenSettings => self.open_settings_window(),
                 tray::TrayCommand::ToggleMonitor => self.toggle_monitor(),
                 tray::TrayCommand::RequestAccessibilityAccess => {
@@ -249,12 +257,20 @@ impl LightweightSupervisor {
         }
     }
 
+    fn open_accounts_window(&mut self) {
+        self.open_full_ui_window(models::Tab::Accounts);
+    }
+
     fn open_settings_window(&mut self) {
+        self.open_full_ui_window(models::Tab::Settings);
+    }
+
+    fn open_full_ui_window(&mut self, initial_tab: models::Tab) {
         if self.settings_child.is_some() {
             return;
         }
 
-        match spawn_settings_window() {
+        match spawn_full_ui_window(initial_tab) {
             Ok(child) => {
                 self.settings_child = Some(child);
             }
@@ -338,7 +354,30 @@ impl ApplicationHandler for LightweightSupervisor {
     }
 }
 
-fn spawn_settings_window() -> anyhow::Result<Child> {
+fn initial_full_ui_tab(args: &[String]) -> models::Tab {
+    for arg in args {
+        match arg.as_str() {
+            "--initial-tab=accounts" | "--accounts" => return models::Tab::Accounts,
+            "--initial-tab=settings" | "--settings" => return models::Tab::Settings,
+            #[cfg(feature = "diagnostics-ui")]
+            "--initial-tab=diagnose" | "--diagnose" => return models::Tab::Diagnose,
+            _ => {}
+        }
+    }
+
+    models::Tab::Settings
+}
+
+fn initial_tab_arg(initial_tab: models::Tab) -> &'static str {
+    match initial_tab {
+        models::Tab::Accounts => "--initial-tab=accounts",
+        models::Tab::Settings => "--initial-tab=settings",
+        #[cfg(feature = "diagnostics-ui")]
+        models::Tab::Diagnose => "--initial-tab=diagnose",
+    }
+}
+
+fn spawn_full_ui_window(initial_tab: models::Tab) -> anyhow::Result<Child> {
     let status = autologin::accessibility_status();
     if !status.app_bundle_path.is_empty() {
         return Ok(Command::new("/usr/bin/open")
@@ -347,11 +386,13 @@ fn spawn_settings_window() -> anyhow::Result<Child> {
             .arg(status.app_bundle_path)
             .arg("--args")
             .arg("--full-ui")
+            .arg(initial_tab_arg(initial_tab))
             .spawn()?);
     }
 
     Ok(Command::new(std::env::current_exe()?)
         .arg("--full-ui")
+        .arg(initial_tab_arg(initial_tab))
         .spawn()?)
 }
 

@@ -18,7 +18,7 @@ This project is not affiliated with Microsoft.
 - Auto-clicks reconnect controls when they are safely detected.
 - Auto-fills password prompts only after a visible email matches exactly one enabled account.
 - Handles both native secure fields and Windows App password fields exposed as password-like `AXTextField` controls.
-- Keeps recent logs bounded and redacted.
+- Keeps internal diagnostic logs bounded and redacted.
 - Provides a standalone sanitized macOS UI diagnostic tool for development.
 
 ## Safety Model
@@ -106,7 +106,7 @@ macOS grants Accessibility and Keychain access to a specific app identity/path. 
 ## First Run
 
 1. Build and open the app bundle.
-2. Use the menu-bar icon and choose **Open Settings**.
+2. Use the menu-bar icon and choose **Open Accounts**.
 3. If Accessibility is missing, click **Request Accessibility Access** or **Open Accessibility Settings**.
 4. Enable Windows App AutoLogin in:
 
@@ -126,6 +126,7 @@ When the matching Windows App credential prompt is visible and Windows App is fr
 
 The default launch mode is a lightweight supervisor with no always-on egui window. The menu contains:
 
+- **Open Accounts**
 - **Open Settings**
 - **Start Monitor** / **Stop Monitor**
 - **Request Accessibility Access**
@@ -143,7 +144,6 @@ The settings window includes:
 
 - **Accounts**: add, edit, pause, enable, or delete saved accounts.
 - **Settings**: adjust polling, reconnect delay, target app name, Open at Login, and storage mode.
-- **Logs**: a bounded, redacted in-window log buffer for settings and development UI events.
 - **Diagnose**: only when built with development diagnostics features.
 
 Existing accounts can be edited without re-entering a password. Leave the password field blank to keep the saved password.
@@ -262,7 +262,7 @@ The one-shot command is intended for development and troubleshooting. Accessibil
 Default features:
 
 ```text
-logs-ui
+none
 ```
 
 Optional features:

@@ -6,6 +6,7 @@ use tray_icon::{
 
 #[derive(Debug, Clone)]
 pub(crate) enum TrayCommand {
+    OpenAccounts,
     OpenSettings,
     ToggleMonitor,
     RequestAccessibilityAccess,
@@ -53,6 +54,7 @@ impl AppTray {
 
 pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let menu = Menu::new();
+    let accounts_i = MenuItem::new("Open Accounts", true, None);
     let settings_i = MenuItem::new("Open Settings", true, None);
     let toggle_i = MenuItem::new("Start Monitor", true, None);
     let request_accessibility_i = MenuItem::new("Request Accessibility Access", true, None);
@@ -63,6 +65,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let separator = PredefinedMenuItem::separator();
     let quit_i = MenuItem::new("Quit", true, None);
 
+    menu.append(&accounts_i)?;
     menu.append(&settings_i)?;
     menu.append(&toggle_i)?;
     menu.append(&separator)?;
@@ -84,12 +87,14 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         .with_icon_as_template(false)
         .build()?;
 
+    let accounts_id = accounts_i.id().clone();
     let settings_id = settings_i.id().clone();
     let toggle_id = toggle_i.id().clone();
     let request_accessibility_id = request_accessibility_i.id().clone();
     let open_accessibility_id = open_accessibility_i.id().clone();
     let quit_id = quit_i.id().clone();
 
+    let tx_accounts = tx.clone();
     let tx_settings = tx.clone();
     let tx_toggle = tx.clone();
     let tx_request_accessibility = tx.clone();
@@ -100,7 +105,9 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         let menu_channel = MenuEvent::receiver();
         loop {
             if let Ok(event) = menu_channel.recv() {
-                if event.id == settings_id {
+                if event.id == accounts_id {
+                    let _ = tx_accounts.send(TrayCommand::OpenAccounts);
+                } else if event.id == settings_id {
                     let _ = tx_settings.send(TrayCommand::OpenSettings);
                 } else if event.id == toggle_id {
                     let _ = tx_toggle.send(TrayCommand::ToggleMonitor);

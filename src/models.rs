@@ -139,7 +139,6 @@ fn secure_file_permissions(_path: &Path) -> anyhow::Result<()> {
 pub enum Tab {
     Accounts,
     Settings,
-    Logs,
     #[cfg(feature = "diagnostics-ui")]
     Diagnose,
 }
@@ -150,6 +149,7 @@ pub enum WorkerStatus {
     Running,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -181,9 +181,9 @@ mod tests {
 
     #[cfg(not(feature = "diagnostics-ui"))]
     #[test]
-    fn production_tabs_do_not_include_runtime_status_tab() {
-        let tabs = [Tab::Accounts, Tab::Settings, Tab::Logs];
+    fn production_tabs_include_only_accounts_and_settings() {
+        let tabs = [Tab::Accounts, Tab::Settings];
 
-        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs.len(), 2);
     }
 }
