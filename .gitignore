@@ -1,0 +1,39 @@
+# Rust build output
+/target/
+
+# Packaged macOS app output
+/dist/
+
+# Codex/local assistant state
+/.codex/
+
+# macOS metadata
+.DS_Store
+._*
+__MACOSX/
+
+# Local runtime/config/secrets
+/config.json
+/passwords.json
+/fallback.key
+/*.key
+/*.pem
+/*.p12
+/*.mobileprovision
+*.log
+*.local
+
+# Temporary files and archives
+*.tmp
+*.temp
+*.bak
+*.orig
+*.tar
+*.tar.gz
+*.zip
+
+# Editor/project-local state
+.vscode/
+.idea/
+*.swp
+*.swo

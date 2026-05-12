@@ -1,0 +1,662 @@
+use crate::autologin::{
+    accessibility_status, open_accessibility_settings, request_accessibility_access_prompt,
+    AccessibilityStatus,
+};
+use crate::background::{WorkerCommand, WorkerEvent};
+use crate::debug_fill::FillAttemptReport;
+use crate::models::{
+    Account, AccountId, AppConfig, AppSettings, LogEntry, LogLevel, Tab, WorkerStatus,
+};
+use crate::tray::TrayCommand;
+use crate::ui::theme;
+use eframe::egui;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Sender as TokioSender;
+use zeroize::Zeroizing;
+
+const MAX_LOG_ENTRIES: usize = 200;
+
+pub(crate) struct AutoLoginApp {
+    pub(crate) config: AppConfig,
+    pub(crate) selected_tab: Tab,
+    pub(crate) logs: VecDeque<LogEntry>,
+    pub(crate) worker_status: WorkerStatus,
+    pub(crate) worker_tx: TokioSender<WorkerCommand>,
+    pub(crate) tray_rx: std::sync::mpsc::Receiver<TrayCommand>,
+    pub(crate) worker_event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
+
+    pub(crate) editing_account: Option<Account>,
+    pub(crate) confirm_delete_account: Option<AccountId>,
+    pub(crate) settings_draft: AppSettings,
+    pub(crate) temp_password: Zeroizing<String>,
+    pub(crate) show_password: bool,
+    pub(crate) status_message: Option<(String, f64)>,
+    pub(crate) last_fill_report: Option<FillAttemptReport>,
+    quit_requested: bool,
+
+    #[cfg(feature = "diagnostics-ui")]
+    pub(crate) diagnose_running: bool,
+    #[cfg(feature = "diagnostics-ui")]
+    pub(crate) diagnose_result: String,
+    #[cfg(feature = "diagnostics-ui")]
+    pub(crate) diagnose_rx: Option<std::sync::mpsc::Receiver<String>>,
+    #[cfg(feature = "diagnostics-ui")]
+    pub(crate) runtime_status_running: bool,
+    #[cfg(feature = "diagnostics-ui")]
+    pub(crate) runtime_status_report: Option<FillAttemptReport>,
+    #[cfg(feature = "diagnostics-ui")]
+    pub(crate) runtime_status_rx: Option<std::sync::mpsc::Receiver<FillAttemptReport>>,
+    settings_window_mode: bool,
+
+    pub(crate) accessibility_status: AccessibilityStatus,
+    accessibility_last_poll: Instant,
+    accessibility_last_missing_log: Option<Instant>,
+}
+
+impl AutoLoginApp {
+    pub(crate) fn new(
+        worker_tx: TokioSender<WorkerCommand>,
+        tray_rx: std::sync::mpsc::Receiver<TrayCommand>,
+        worker_event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
+        config: AppConfig,
+        settings_window_mode: bool,
+    ) -> Self {
+        let worker_status = WorkerStatus::Idle;
+        let settings_draft = config.settings.clone();
+        let accessibility_status = accessibility_status();
+
+        let mut app = Self {
+            config,
+            selected_tab: Tab::Accounts,
+            logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
+            worker_status,
+            worker_tx,
+            tray_rx,
+            worker_event_rx,
+            editing_account: None,
+            confirm_delete_account: None,
+            settings_draft,
+            temp_password: Zeroizing::new(String::new()),
+            show_password: false,
+            status_message: None,
+            last_fill_report: None,
+            quit_requested: false,
+            #[cfg(feature = "diagnostics-ui")]
+            diagnose_running: false,
+            #[cfg(feature = "diagnostics-ui")]
+            diagnose_result: String::new(),
+            #[cfg(feature = "diagnostics-ui")]
+            diagnose_rx: None,
+            #[cfg(feature = "diagnostics-ui")]
+            runtime_status_running: false,
+            #[cfg(feature = "diagnostics-ui")]
+            runtime_status_report: None,
+            #[cfg(feature = "diagnostics-ui")]
+            runtime_status_rx: None,
+            settings_window_mode,
+            accessibility_status,
+            accessibility_last_poll: Instant::now(),
+            accessibility_last_missing_log: None,
+        };
+
+        app.log_accessibility_event(
+            "accessibility_check_result",
+            if app.accessibility_status.trusted {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+        );
+        if !app.accessibility_status.trusted {
+            app.status_message = Some((
+                "Accessibility permission is required for this exact app".to_string(),
+                10.0f64,
+            ));
+        }
+        if app.settings_window_mode {
+            app.selected_tab = Tab::Settings;
+        }
+
+        app
+    }
+
+    fn add_log(&mut self, entry: LogEntry) {
+        push_bounded_log(&mut self.logs, entry);
+    }
+
+    pub(crate) fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some((msg.into(), 3.0));
+    }
+
+    pub(crate) fn send_worker_command(&mut self, cmd: WorkerCommand) {
+        if self.settings_window_mode {
+            return;
+        }
+        if let Err(e) = self.worker_tx.try_send(cmd) {
+            self.set_status(format!("Monitor command failed: {}", e));
+        }
+    }
+
+    pub(crate) fn accessibility_ready(&self) -> bool {
+        self.accessibility_status.trusted
+    }
+
+    fn log_accessibility_event(&mut self, event: &str, level: LogLevel) {
+        let status = &self.accessibility_status;
+        self.add_log(LogEntry {
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            level,
+            message: format!(
+                "{event} ax_trusted_for_current_process={} current_process_path={} app_bundle_path={}",
+                status.trusted, status.current_process_path, status.app_bundle_path
+            ),
+        });
+    }
+
+    fn block_for_accessibility(&mut self, action: &str) {
+        self.log_accessibility_event("accessibility_still_missing", LogLevel::Warn);
+        self.status_message = Some((
+            format!("Accessibility permission is required before {action}"),
+            6.0,
+        ));
+        self.selected_tab = Tab::Accounts;
+    }
+
+    pub(crate) fn request_accessibility_access(&mut self) {
+        self.log_accessibility_event("accessibility_prompt_requested", LogLevel::Info);
+        let trusted = request_accessibility_access_prompt();
+        self.accessibility_status = accessibility_status();
+        if trusted || self.accessibility_status.trusted {
+            self.handle_accessibility_granted();
+        } else {
+            self.log_accessibility_event("accessibility_still_missing", LogLevel::Warn);
+            self.status_message = Some((
+                "macOS did not grant Accessibility yet. Enable this exact app in System Settings."
+                    .to_string(),
+                8.0,
+            ));
+        }
+    }
+
+    pub(crate) fn open_accessibility_settings(&mut self) {
+        self.log_accessibility_event("accessibility_settings_opened", LogLevel::Info);
+        if let Err(e) = open_accessibility_settings() {
+            self.set_status(format!("Could not open Accessibility settings: {e}"));
+        }
+    }
+
+    fn handle_accessibility_granted(&mut self) {
+        self.accessibility_status = accessibility_status();
+        self.log_accessibility_event("accessibility_granted", LogLevel::Info);
+        self.status_message = Some(("Accessibility permission granted".to_string(), 5.0));
+        if self.worker_status == WorkerStatus::Idle {
+            self.send_worker_command(WorkerCommand::Start);
+        }
+    }
+
+    fn poll_accessibility_onboarding(&mut self, ctx: &egui::Context) {
+        if self.accessibility_status.trusted {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+        if self.accessibility_last_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.accessibility_last_poll = Instant::now();
+
+        let previous = self.accessibility_status.trusted;
+        self.accessibility_status = accessibility_status();
+        if !previous && self.accessibility_status.trusted {
+            self.handle_accessibility_granted();
+            return;
+        }
+
+        if self.worker_status == WorkerStatus::Running {
+            self.send_worker_command(WorkerCommand::Stop);
+        }
+        let should_log = self
+            .accessibility_last_missing_log
+            .is_none_or(|logged| logged.elapsed() >= Duration::from_secs(30));
+        if should_log {
+            self.log_accessibility_event("accessibility_still_missing", LogLevel::Warn);
+            self.accessibility_last_missing_log = Some(Instant::now());
+        }
+    }
+
+    fn process_tray_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.tray_rx.try_recv() {
+            match cmd {
+                TrayCommand::OpenSettings => {
+                    self.selected_tab = Tab::Settings;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                }
+                TrayCommand::ToggleMonitor => match self.worker_status {
+                    WorkerStatus::Running => {
+                        self.send_worker_command(WorkerCommand::Stop);
+                    }
+                    WorkerStatus::Idle => {
+                        if self.accessibility_ready() {
+                            self.send_worker_command(WorkerCommand::Start);
+                        } else {
+                            self.block_for_accessibility("starting the monitor");
+                        }
+                    }
+                },
+                TrayCommand::RequestAccessibilityAccess => {
+                    self.request_accessibility_access();
+                }
+                TrayCommand::OpenAccessibilitySettings => {
+                    self.open_accessibility_settings();
+                }
+                TrayCommand::Exit => {
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn process_worker_events(&mut self) {
+        while let Ok(event) = self.worker_event_rx.try_recv() {
+            match event {
+                WorkerEvent::StatusChanged(status) => {
+                    self.worker_status = status;
+                }
+                WorkerEvent::Log(entry) => {
+                    self.add_log(entry);
+                }
+                WorkerEvent::FillAttemptReport(report) => {
+                    self.last_fill_report = Some(report);
+                }
+            }
+        }
+    }
+}
+
+fn redact_sensitive_log_text(message: &str) -> String {
+    redact_secret_assignments(&redact_email_addresses(message))
+}
+
+fn redact_email_addresses(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::new();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        if chars[idx] == '@' {
+            let mut start = idx;
+            while start > 0 && is_email_char(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut end = idx + 1;
+            while end < chars.len() && is_email_char(chars[end]) {
+                end += 1;
+            }
+
+            let candidate: String = chars[start..end].iter().collect();
+            if looks_like_email(&candidate) {
+                let keep_chars = out.chars().count().saturating_sub(idx - start);
+                out = out.chars().take(keep_chars).collect();
+                out.push_str("[email]");
+                idx = end;
+                continue;
+            }
+        }
+
+        out.push(chars[idx]);
+        idx += 1;
+    }
+
+    out
+}
+
+fn redact_secret_assignments(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::new();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        if let Some((prefix, value_end)) = secret_assignment_at(&chars, idx) {
+            out.push_str(&prefix);
+            out.push_str("[redacted]");
+            idx = value_end;
+            continue;
+        }
+
+        out.push(chars[idx]);
+        idx += 1;
+    }
+
+    out
+}
+
+fn secret_assignment_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    if idx > 0 && (chars[idx - 1].is_ascii_alphanumeric() || chars[idx - 1] == '_') {
+        return None;
+    }
+
+    let key_len = secret_key_len_at(chars, idx)?;
+    let mut cursor = idx + key_len;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= chars.len() || !matches!(chars[cursor], '=' | ':') {
+        return None;
+    }
+    cursor += 1;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= chars.len() || value_delimiter(chars[cursor]) {
+        return None;
+    }
+
+    let value_start = cursor;
+    if chars[cursor] == '"' || chars[cursor] == char::from(39) {
+        let quote = chars[cursor];
+        cursor += 1;
+        while cursor < chars.len() {
+            let current = chars[cursor];
+            cursor += 1;
+            if current == quote {
+                break;
+            }
+        }
+    } else {
+        while cursor < chars.len() && !value_delimiter(chars[cursor]) {
+            cursor += 1;
+        }
+    }
+
+    Some((chars[idx..value_start].iter().collect(), cursor))
+}
+
+fn secret_key_len_at(chars: &[char], idx: usize) -> Option<usize> {
+    ["password", "passcode", "token", "secret"]
+        .iter()
+        .find_map(|key| {
+            let key_chars = key.chars().collect::<Vec<_>>();
+            if idx + key_chars.len() > chars.len() {
+                return None;
+            }
+            let matches = key_chars
+                .iter()
+                .enumerate()
+                .all(|(offset, expected)| chars[idx + offset].to_ascii_lowercase() == *expected);
+            matches.then_some(key_chars.len())
+        })
+}
+
+fn value_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | ';')
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let mut parts = value.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+}
+
+fn is_email_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-' | '@')
+}
+
+impl eframe::App for AutoLoginApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_accessibility_onboarding(ctx);
+        self.process_tray_commands(ctx);
+        self.process_worker_events();
+        #[cfg(feature = "diagnostics-ui")]
+        crate::ui::diagnose::poll_diagnosis(self);
+        #[cfg(feature = "diagnostics-ui")]
+        crate::ui::diagnose::poll_runtime_status(self);
+        if !self.settings_window_mode
+            && !self.quit_requested
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        if let Some((_, ref mut remaining)) = self.status_message {
+            *remaining -= ctx.input(|i| i.stable_dt) as f64;
+            if *remaining <= 0.0 {
+                self.status_message = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+
+        egui::Panel::top("top_panel")
+            .frame(theme::top_bar_frame())
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (tab, label) in [
+                        (Tab::Accounts, "Accounts"),
+                        (Tab::Settings, "Settings"),
+                        #[cfg(feature = "logs-ui")]
+                        (Tab::Logs, "Logs"),
+                        #[cfg(feature = "diagnostics-ui")]
+                        (Tab::Diagnose, "Diagnose"),
+                    ] {
+                        let selected = self.selected_tab == tab;
+                        if ui
+                            .add(
+                                egui::Button::selectable(
+                                    selected,
+                                    egui::RichText::new(label).strong(),
+                                )
+                                .corner_radius(egui::CornerRadius::same(8)),
+                            )
+                            .clicked()
+                        {
+                            self.selected_tab = tab;
+                        }
+                    }
+
+                    if !self.settings_window_mode {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match self.worker_status {
+                                WorkerStatus::Running => {
+                                    if ui
+                                        .add_sized([82.0, 30.0], theme::secondary_button("Stop"))
+                                        .clicked()
+                                    {
+                                        self.send_worker_command(WorkerCommand::Stop);
+                                    }
+                                }
+                                WorkerStatus::Idle => {
+                                    if ui
+                                        .add_enabled(
+                                            self.accessibility_ready(),
+                                            theme::primary_button("Start"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.send_worker_command(WorkerCommand::Start);
+                                    }
+                                }
+                            }
+                            let (color, fill, label) = theme::worker_status(self.worker_status);
+                            theme::pill(ui, label, color, fill);
+                        });
+                    }
+                });
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 18.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if let Some((msg, _)) = &self.status_message {
+                            ui.label(
+                                egui::RichText::new(msg.as_str())
+                                    .small()
+                                    .color(theme::message_color(msg)),
+                            );
+                        }
+                    },
+                );
+            });
+
+        egui::CentralPanel::default()
+            .frame(theme::content_frame())
+            .show_inside(ui, |ui| {
+                if !self.accessibility_ready() {
+                    show_accessibility_onboarding(ui, self);
+                    return;
+                }
+                match self.selected_tab {
+                    Tab::Accounts => crate::ui::accounts::show(ui, self),
+                    Tab::Settings => crate::ui::settings::show(ui, self),
+                    #[cfg(feature = "logs-ui")]
+                    Tab::Logs => crate::ui::logs::show(ui, self),
+                    #[cfg(not(feature = "logs-ui"))]
+                    Tab::Logs => crate::ui::accounts::show(ui, self),
+                    #[cfg(feature = "diagnostics-ui")]
+                    Tab::Diagnose => crate::ui::diagnose::show(ui, self),
+                }
+            });
+    }
+}
+
+fn push_bounded_log(logs: &mut VecDeque<LogEntry>, mut entry: LogEntry) {
+    entry.message = redact_sensitive_log_text(&entry.message);
+    logs.push_back(entry);
+    while logs.len() > MAX_LOG_ENTRIES {
+        logs.pop_front();
+    }
+}
+
+fn show_accessibility_onboarding(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
+    theme::page_header(
+        ui,
+        "Accessibility permission is required",
+        "Windows App AutoLogin can only detect and fill the visible credential prompt after macOS allows this exact app to use Accessibility.",
+        |ui| {
+            if ui
+                .add(theme::primary_button("Request Accessibility Access"))
+                .clicked()
+            {
+                app.request_accessibility_access();
+            }
+            if ui
+                .add(theme::secondary_button("Open Accessibility Settings"))
+                .clicked()
+            {
+                app.open_accessibility_settings();
+            }
+        },
+    );
+
+    theme::glass_frame().show(ui, |ui| {
+        ui.label(theme::muted(
+            "System Settings -> Privacy & Security -> Accessibility",
+        ));
+        ui.label(theme::muted(
+            "Enable Windows App AutoLogin for the path shown above, then return here. The app checks again every second.",
+        ));
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{push_bounded_log, redact_sensitive_log_text, MAX_LOG_ENTRIES};
+    use crate::models::{LogEntry, LogLevel};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn log_redaction_removes_email_addresses_and_secret_assignments() {
+        let redacted = redact_sensitive_log_text(
+            "failed for user@example.com password=super-secret token: abc123; secret = value",
+        );
+
+        assert!(redacted.contains("[email]"));
+        assert!(redacted.contains("password=[redacted]"));
+        assert!(redacted.contains("token: [redacted];"));
+        assert!(redacted.contains("secret = [redacted]"));
+        assert!(!redacted.contains("user@example.com"));
+        assert!(!redacted.contains("super-secret"));
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains(" value"));
+    }
+
+    #[test]
+    fn log_redaction_does_not_rewrite_plain_password_words() {
+        let redacted = redact_sensitive_log_text("password was not loaded for prompt");
+
+        assert_eq!(redacted, "password was not loaded for prompt");
+    }
+
+    #[test]
+    fn log_redaction_handles_quoted_and_uppercase_secret_assignments() {
+        let redacted = redact_sensitive_log_text(
+            "PASSWORD=\"secret with spaces\" PASSCODE: 123456 token='abc def'",
+        );
+
+        assert!(redacted.contains("PASSWORD=[redacted]"));
+        assert!(redacted.contains("PASSCODE: [redacted]"));
+        assert!(redacted.contains("token=[redacted]"));
+        assert!(!redacted.contains("secret with spaces"));
+        assert!(!redacted.contains("123456"));
+        assert!(!redacted.contains("abc def"));
+    }
+
+    #[test]
+    fn log_buffer_caps_entries_and_keeps_recent_events() {
+        let mut logs = VecDeque::new();
+        for idx in 0..(MAX_LOG_ENTRIES + 7) {
+            push_bounded_log(
+                &mut logs,
+                LogEntry {
+                    timestamp: format!("{idx:02}"),
+                    level: LogLevel::Info,
+                    message: format!("event {idx}"),
+                },
+            );
+        }
+
+        assert_eq!(logs.len(), MAX_LOG_ENTRIES);
+        assert_eq!(
+            logs.front().map(|entry| entry.message.as_str()),
+            Some("event 7")
+        );
+        let expected_last = format!("event {}", MAX_LOG_ENTRIES + 6);
+        assert_eq!(
+            logs.back().map(|entry| entry.message.as_str()),
+            Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn log_buffer_redacts_before_retaining_message() {
+        let mut logs = VecDeque::new();
+        push_bounded_log(
+            &mut logs,
+            LogEntry {
+                timestamp: "00:00".to_string(),
+                level: LogLevel::Warn,
+                message: "user@example.com password=super-secret token=abc".to_string(),
+            },
+        );
+
+        let message = &logs[0].message;
+        assert!(message.contains("[email]"));
+        assert!(message.contains("password=[redacted]"));
+        assert!(message.contains("token=[redacted]"));
+        assert!(!message.contains("user@example.com"));
+        assert!(!message.contains("super-secret"));
+    }
+}

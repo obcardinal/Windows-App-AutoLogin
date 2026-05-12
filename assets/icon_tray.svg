@@ -1,0 +1,19 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="circle-clip">
+      <circle cx="64" cy="64" r="55"/>
+    </clipPath>
+  </defs>
+
+  <path
+    fill="#202020"
+    fill-rule="evenodd"
+    d="M64 5a59 59 0 1 0 0 118 59 59 0 0 0 0-118Zm0 8a51 51 0 1 1 0 102 51 51 0 0 1 0-102Z"/>
+
+  <g clip-path="url(#circle-clip)" fill="#202020">
+    <rect x="-11" y="14" width="67" height="42" rx="4"/>
+    <rect x="72" y="14" width="67" height="42" rx="4"/>
+    <rect x="-11" y="72" width="67" height="42" rx="4"/>
+    <rect x="72" y="72" width="67" height="42" rx="4"/>
+  </g>
+</svg>

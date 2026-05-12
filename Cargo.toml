@@ -1,0 +1,58 @@
+[package]
+name = "windows-app-autologin"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.93"
+description = "GUI application that monitors Windows App RDP client and auto-reconnects with secure password storage"
+license = "MIT"
+autobins = false
+
+[lib]
+name = "windows_app_autologin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "windows-app-autologin"
+path = "src/main.rs"
+
+[[bin]]
+name = "diagnose-macos-ui"
+path = "src/bin/diagnose-macos-ui.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+keyring = { version = "3.6", features = ["apple-native"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+whoami = "1"
+auto-launch = "0.6"
+libc = "0.2"
+
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = "0.24"
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+uuid = { version = "1.11", features = ["v4"] }
+dirs = "6.0"
+chrono = "0.4"
+zeroize = "1.8"
+
+[features]
+default = ["logs-ui"]
+diagnostics-ui = []
+logs-ui = []
+dev-tools = ["diagnostics-ui", "logs-ui"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
