@@ -640,16 +640,20 @@ tell application "System Events"
         if my processMatches(procRef, expectedName, expectedProcessNumber) then
             set procNumberText to (unix id of procRef) as string
             try
-                set w to front window of procRef
-                set wName to name of w as string
-                repeat with s in every sheet of w
-                    set resultText to my detectPromptContainer(s, procNumberText, wName)
-                    if resultText is not "" then return resultText
+                repeat with candidateWindow in my activePromptWindows(procRef)
+                    try
+                        set w to contents of candidateWindow
+                        set wName to name of w as string
+                        repeat with s in every sheet of w
+                            set resultText to my detectPromptContainer(s, procNumberText, wName)
+                            if resultText is not "" then return resultText
+                        end repeat
+                        if my isProbableSessionTitle(wName) then
+                            set resultText to my detectPromptContainer(w, procNumberText, wName)
+                            if resultText is not "" then return resultText
+                        end if
+                    end try
                 end repeat
-                if my isProbableSessionTitle(wName) then
-                    set resultText to my detectPromptContainer(w, procNumberText, wName)
-                    if resultText is not "" then return resultText
-                end if
             end try
         end if
     end repeat
@@ -702,16 +706,20 @@ tell application "System Events"
     repeat with procRef in every application process whose name is expectedName
         if my processMatches(procRef, expectedName, expectedProcessNumber) then
             try
-                set w to front window of procRef
-                set wName to name of w as string
-                if my windowTitleMatches(wName, expectedTitle) then
-                    repeat with s in every sheet of w
-                        set resultText to my fillContainer(s, usernameValue, passwordValue, expectedName, expectedProcessNumber, requestedMethod)
-                        if resultText is not "" then return resultText
-                    end repeat
-                    set resultText to my fillContainer(w, usernameValue, passwordValue, expectedName, expectedProcessNumber, requestedMethod)
-                    if resultText is not "" then return resultText
-                end if
+                repeat with candidateWindow in my activePromptWindows(procRef)
+                    try
+                        set w to contents of candidateWindow
+                        set wName to name of w as string
+                        if wName is "" or my windowTitleMatches(wName, expectedTitle) then
+                            repeat with s in every sheet of w
+                                set resultText to my fillContainer(s, usernameValue, passwordValue, expectedName, expectedProcessNumber, requestedMethod)
+                                if resultText is not "" then return resultText
+                            end repeat
+                            set resultText to my fillContainer(w, usernameValue, passwordValue, expectedName, expectedProcessNumber, requestedMethod)
+                            if resultText is not "" then return resultText
+                        end if
+                    end try
+                end repeat
             end try
         end if
     end repeat
@@ -748,16 +756,20 @@ tell application "System Events"
     repeat with procRef in every application process whose name is expectedName
         if my processMatches(procRef, expectedName, expectedProcessNumber) then
             try
-                set w to front window of procRef
-                set wName to name of w as string
-                if my windowTitleMatches(wName, expectedTitle) then
-                    repeat with s in every sheet of w
-                        set resultText to my submitContainer(s, usernameValue, expectedName, expectedProcessNumber)
-                        if resultText is not "" then return resultText
-                    end repeat
-                    set resultText to my submitContainer(w, usernameValue, expectedName, expectedProcessNumber)
-                    if resultText is not "" then return resultText
-                end if
+                repeat with candidateWindow in my activePromptWindows(procRef)
+                    try
+                        set w to contents of candidateWindow
+                        set wName to name of w as string
+                        if wName is "" or my windowTitleMatches(wName, expectedTitle) then
+                            repeat with s in every sheet of w
+                                set resultText to my submitContainer(s, usernameValue, expectedName, expectedProcessNumber)
+                                if resultText is not "" then return resultText
+                            end repeat
+                            set resultText to my submitContainer(w, usernameValue, expectedName, expectedProcessNumber)
+                            if resultText is not "" then return resultText
+                        end if
+                    end try
+                end repeat
             end try
         end if
     end repeat
@@ -1255,6 +1267,38 @@ on windowTitleMatches(wName, expectedTitle)
     end ignoring
     return false
 end windowTitleMatches
+
+on activePromptWindows(procRef)
+    set candidateWindows to {}
+    set candidateWindow to missing value
+    try
+        with timeout of 0.25 seconds
+            tell application "System Events"
+                set candidateWindow to value of attribute "AXFocusedWindow" of procRef
+            end tell
+        end timeout
+        if candidateWindow is not missing value then set end of candidateWindows to candidateWindow
+    end try
+    set candidateWindow to missing value
+    try
+        with timeout of 0.25 seconds
+            tell application "System Events"
+                set candidateWindow to value of attribute "AXMainWindow" of procRef
+            end tell
+        end timeout
+        if candidateWindow is not missing value then set end of candidateWindows to candidateWindow
+    end try
+    set candidateWindow to missing value
+    try
+        with timeout of 0.25 seconds
+            tell application "System Events"
+                set candidateWindow to front window of procRef
+            end tell
+        end timeout
+        if candidateWindow is not missing value then set end of candidateWindows to candidateWindow
+    end try
+    return candidateWindows
+end activePromptWindows
 
 on elementRoleText(elem)
     tell application "System Events"
