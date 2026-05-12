@@ -8,9 +8,6 @@ use tracing::debug;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MonitorStatus {
     Connected,
-    ReconnectAvailable {
-        button_text: String,
-    },
     ProcessNotFound,
     LoginWindowDetected {
         process_id: i32,
@@ -51,7 +48,6 @@ struct WindowInspection {
     process_found: Option<bool>,
     titles: Vec<WindowTitle>,
     forms: Vec<FormInspection>,
-    button_texts: Vec<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -88,11 +84,6 @@ fn check_status_macos(config: &Config) -> MonitorStatus {
         "macOS trusted app window count: {}",
         app_window_titles.len()
     );
-
-    let reconnect_keywords = reconnect_keywords();
-    if let Some(button_text) = reconnect_button_text(&inspection.button_texts) {
-        return MonitorStatus::ReconnectAvailable { button_text };
-    }
 
     let login_title_keywords = [
         "Sign in",
@@ -136,16 +127,6 @@ fn check_status_macos(config: &Config) -> MonitorStatus {
         };
     }
 
-    for title in app_window_titles {
-        for keyword in &reconnect_keywords {
-            if contains_keyword(&title.title, keyword) {
-                return MonitorStatus::ReconnectAvailable {
-                    button_text: title.title.clone(),
-                };
-            }
-        }
-    }
-
     let has_session = app_window_titles
         .iter()
         .any(|title| is_probable_session_window_title(&title.title));
@@ -176,9 +157,6 @@ fn is_probable_session_window_title(title: &str) -> bool {
         "connection lost",
         "disconnected",
         "unable to connect",
-        "reconnect",
-        "retry",
-        "try again",
         "sign in",
         "authentication",
         "credentials",
@@ -219,23 +197,6 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
         }
     }
     false
-}
-
-#[cfg(target_os = "macos")]
-fn reconnect_keywords() -> [&'static str; 4] {
-    ["Reconnect", "Retry", "Try again", "Повторное подключение"]
-}
-
-#[cfg(target_os = "macos")]
-fn reconnect_button_text(button_texts: &[String]) -> Option<String> {
-    for button_text in button_texts {
-        for keyword in reconnect_keywords() {
-            if contains_keyword(button_text, keyword) {
-                return Some(button_text.clone());
-            }
-        }
-    }
-    None
 }
 
 #[cfg(target_os = "macos")]
@@ -283,60 +244,6 @@ on processMatches(procRef, expectedName, trustedPIDs)
         end try
     end tell
 end processMatches
-
-on reconnectButtonNameMatches(buttonName)
-    ignoring case
-        if buttonName contains "Reconnect" then return true
-        if buttonName contains "Retry" then return true
-        if buttonName contains "Try Again" then return true
-        if buttonName contains "Try again" then return true
-        if buttonName contains "Повтор" then return true
-    end ignoring
-    return false
-end reconnectButtonNameMatches
-
-on disconnectContextMatches(containerRef, baseText)
-    set contextText to baseText
-    tell application "System Events"
-        tell containerRef
-            try
-                repeat with t in (every static text)
-                    try
-                        set contextText to contextText & " " & (name of t as string)
-                    end try
-                    try
-                        set contextText to contextText & " " & (value of t as string)
-                    end try
-                end repeat
-            end try
-        end tell
-    end tell
-    ignoring case
-        if contextText contains "Disconnected" then return true
-        if contextText contains "Connection lost" then return true
-        if contextText contains "Unable to connect" then return true
-        if contextText contains "Reconnect" then return true
-        if contextText contains "Retry" then return true
-        if contextText contains "Отключ" then return true
-        if contextText contains "Повтор" then return true
-    end ignoring
-    return false
-end disconnectContextMatches
-
-on appendReconnectButtons(buttonList, currentOutput)
-    set outputText to currentOutput
-    tell application "System Events"
-        repeat with b in buttonList
-            try
-                set buttonName to name of b as string
-                if my reconnectButtonNameMatches(buttonName) then
-                    set outputText to outputText & "BUTTON:" & buttonName & linefeed
-                end if
-            end try
-        end repeat
-    end tell
-    return outputText
-end appendReconnectButtons
 
 on appendFormText(containerRef, currentOutput)
     set outputText to currentOutput
@@ -553,9 +460,6 @@ tell application "System Events"
                 set output to output & "TITLE:" & procPID & tab & wName & linefeed
                 try
                     repeat with s in (every sheet of w)
-                        if my disconnectContextMatches(s, wName) then
-                            set output to my appendReconnectButtons(every button of s, output)
-                        end if
                         set sheetButtonCount to my countPromptButtons(s)
                         set sheetButtonCount to sheetButtonCount + my countPromptButtons(w)
                         if my countPasswordFields(s) >= 1 and sheetButtonCount >= 1 then
@@ -565,9 +469,6 @@ tell application "System Events"
                     end repeat
                 end try
                 try
-                    if my disconnectContextMatches(w, wName) then
-                        set output to my appendReconnectButtons(every button of w, output)
-                    end if
                     if my countPasswordFields(w) >= 1 and my countPromptButtons(w) >= 1 then
                         set output to output & "FORM:" & procPID & tab & wName & linefeed
                         {}
@@ -613,11 +514,6 @@ end tell
                 inspection.titles.push(WindowTitle { process_id, title });
             }
             current_form_index = None;
-        } else if let Some(button_text) = line.strip_prefix("BUTTON:") {
-            let button_text = button_text.trim().trim_matches('"');
-            if !button_text.is_empty() {
-                inspection.button_texts.push(button_text.to_string());
-            }
         } else if let Some(form_text) = line.strip_prefix("FORM_TEXT:") {
             if let Some(form_index) = current_form_index {
                 if inspection.forms[form_index].prompt_email.is_none() {
@@ -761,45 +657,12 @@ fn classify_osascript_stderr(stderr: &[u8]) -> &'static str {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{
-        contains_keyword, extract_email_like, is_probable_session_window_title,
-        reconnect_button_text,
-    };
+    use super::{contains_keyword, extract_email_like, is_probable_session_window_title};
 
     #[test]
     fn contains_keyword_handles_non_ascii_boundaries() {
-        assert!(contains_keyword(
-            "Доступно Повторное подключение",
-            "Повторное подключение"
-        ));
-        assert!(!contains_keyword(
-            "ПредПовторное подключение",
-            "Повторное подключение"
-        ));
-    }
-
-    #[test]
-    fn reconnect_dialog_keywords_remain_detectable() {
-        assert!(contains_keyword("Reconnect", "Reconnect"));
-        assert!(contains_keyword("Try again", "Try again"));
-        assert!(contains_keyword(
-            "Доступно Повторное подключение",
-            "Повторное подключение"
-        ));
-    }
-
-    #[test]
-    fn reconnect_button_text_is_preferred_before_login_heuristics() {
-        let buttons = vec![
-            "Cancel".to_string(),
-            "Reconnect".to_string(),
-            "Enter password".to_string(),
-        ];
-
-        assert_eq!(
-            reconnect_button_text(&buttons).as_deref(),
-            Some("Reconnect")
-        );
+        assert!(contains_keyword("Введите Пароль для продолжения", "Пароль"));
+        assert!(!contains_keyword("ПредПароль", "Пароль"));
     }
 
     #[test]

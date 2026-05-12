@@ -8,7 +8,6 @@ mod debug_fill;
 mod macos_identity;
 mod models;
 mod monitor;
-mod reconnect;
 mod single_instance;
 mod storage;
 mod tray;

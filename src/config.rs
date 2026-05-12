@@ -1,7 +1,5 @@
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub reconnect_delay_secs: u64,
-
     pub macos_app_name: String,
 }
 

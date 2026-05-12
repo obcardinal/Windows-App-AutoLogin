@@ -38,7 +38,6 @@ impl Account {
 #[serde(default)]
 pub struct AppSettings {
     pub poll_interval_secs: u64,
-    pub reconnect_delay_secs: u64,
     pub auto_start: bool,
     pub start_minimized: bool,
     pub use_keyring: bool,
@@ -49,7 +48,6 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             poll_interval_secs: 1,
-            reconnect_delay_secs: 2,
             auto_start: false,
             start_minimized: false,
             use_keyring: true,
@@ -161,7 +159,6 @@ pub struct LogEntry {
 pub enum LogLevel {
     Info,
     Warn,
-    Error,
 }
 
 impl std::fmt::Display for LogLevel {
@@ -169,7 +166,6 @@ impl std::fmt::Display for LogLevel {
         match self {
             LogLevel::Info => write!(f, "INFO"),
             LogLevel::Warn => write!(f, "WARN"),
-            LogLevel::Error => write!(f, "ERROR"),
         }
     }
 }

@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::debug_fill::{self, FillAttemptReport, FillMethod};
 use crate::models::{Account, AppSettings, LogEntry, LogLevel, WorkerStatus};
 use crate::monitor::{AppMonitor, MonitorStatus};
-use crate::reconnect::ReconnectHandler;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +26,6 @@ pub(crate) enum WorkerEvent {
     FillAttemptReport(FillAttemptReport),
 }
 
-const RECOVERY_COOLDOWN: Duration = Duration::from_secs(8);
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
 const AUTOMATION_SLEEP: Duration = Duration::from_millis(250);
 const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -68,7 +66,6 @@ fn log_event(level: LogLevel, message: impl Into<String>) -> WorkerEvent {
 fn safe_status_name(status: &MonitorStatus) -> &'static str {
     match status {
         MonitorStatus::Connected => "connected",
-        MonitorStatus::ReconnectAvailable { .. } => "reconnect_available",
         MonitorStatus::ProcessNotFound => "process_not_found",
         MonitorStatus::LoginWindowDetected { .. } => "login_window_detected",
         MonitorStatus::Unknown => "unknown",
@@ -77,7 +74,6 @@ fn safe_status_name(status: &MonitorStatus) -> &'static str {
 
 fn runtime_config(settings: &AppSettings) -> Arc<Config> {
     Arc::new(Config {
-        reconnect_delay_secs: settings.reconnect_delay_secs,
         macos_app_name: settings.macos_app_name.clone(),
     })
 }
@@ -223,9 +219,7 @@ fn stable_status_backoff_max(status: &MonitorStatus) -> Option<Duration> {
     match status {
         MonitorStatus::Connected => Some(CONNECTED_POLL_BACKOFF_MAX),
         MonitorStatus::Unknown => Some(UNKNOWN_POLL_BACKOFF_MAX),
-        MonitorStatus::ReconnectAvailable { .. }
-        | MonitorStatus::ProcessNotFound
-        | MonitorStatus::LoginWindowDetected { .. } => None,
+        MonitorStatus::ProcessNotFound | MonitorStatus::LoginWindowDetected { .. } => None,
     }
 }
 
@@ -372,121 +366,6 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
     true
 }
 
-fn spawn_recovery_attempt(
-    config: Arc<Config>,
-    event_tx: Sender<WorkerEvent>,
-    generation: Arc<AtomicU64>,
-    recovery_in_progress: Arc<AtomicBool>,
-    automation_in_progress: Arc<AtomicBool>,
-    close_dialogs: bool,
-    reason: String,
-) -> bool {
-    let Some(recovery_guard) = FlagGuard::acquire(&recovery_in_progress) else {
-        debug!("Recovery already in progress");
-        return false;
-    };
-    let Some(automation_guard) = FlagGuard::acquire(&automation_in_progress) else {
-        debug!("Recovery skipped; UI automation is busy");
-        return false;
-    };
-    let expected_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
-
-    std::thread::spawn(move || {
-        let recovery_guard = recovery_guard;
-        let automation_guard = automation_guard;
-        info!("Recovery attempt started: {}", reason);
-        let reconnect = ReconnectHandler::new(config);
-        let guard_generation = generation.clone();
-        let guard = move || {
-            if guard_generation.load(Ordering::SeqCst) == expected_generation {
-                Ok(())
-            } else {
-                anyhow::bail!("Recovery cancelled because monitor state changed")
-            }
-        };
-        let result = if close_dialogs {
-            reconnect.reconnect_guarded(guard)
-        } else {
-            reconnect.restart_guarded(guard)
-        };
-
-        drop(automation_guard);
-        drop(recovery_guard);
-
-        match result {
-            Ok(()) => {
-                let _ =
-                    event_tx.try_send(log_event(LogLevel::Info, "Windows App recovery completed"));
-            }
-            Err(e) => {
-                warn!("Recovery attempt failed: {}", e);
-                let _ = event_tx.try_send(log_event(
-                    LogLevel::Error,
-                    format!("Windows App recovery failed: {}", e),
-                ));
-            }
-        }
-    });
-    true
-}
-
-fn spawn_reconnect_click_attempt(
-    config: Arc<Config>,
-    event_tx: Sender<WorkerEvent>,
-    generation: Arc<AtomicU64>,
-    recovery_in_progress: Arc<AtomicBool>,
-    automation_in_progress: Arc<AtomicBool>,
-    _button_text: String,
-) -> bool {
-    let Some(recovery_guard) = FlagGuard::acquire(&recovery_in_progress) else {
-        debug!("Reconnect/recovery action already in progress");
-        return false;
-    };
-    let Some(automation_guard) = FlagGuard::acquire(&automation_in_progress) else {
-        debug!("Reconnect skipped; UI automation is busy");
-        return false;
-    };
-    let expected_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
-
-    std::thread::spawn(move || {
-        let recovery_guard = recovery_guard;
-        let automation_guard = automation_guard;
-        let reconnect = ReconnectHandler::new(config);
-        let guard_generation = generation.clone();
-        let guard = move || {
-            if guard_generation.load(Ordering::SeqCst) == expected_generation {
-                Ok(())
-            } else {
-                anyhow::bail!("Reconnect action cancelled because monitor state changed")
-            }
-        };
-
-        let result = (|| -> anyhow::Result<()> {
-            guard()?;
-            reconnect.click_reconnect_button()?;
-            guard()?;
-            Ok(())
-        })();
-
-        drop(automation_guard);
-        drop(recovery_guard);
-
-        match result {
-            Ok(()) => {
-                let _ = event_tx.try_send(log_event(LogLevel::Info, "Reconnect handled"));
-            }
-            Err(e) => {
-                warn!("Reconnect handling failed: {}", e);
-                let _ = event_tx.try_send(log_event(
-                    LogLevel::Error,
-                    format!("Reconnect handling failed: {}", e),
-                ));
-            }
-        }
-    });
-    true
-}
-
 pub(crate) fn spawn(
     mut cmd_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
@@ -499,10 +378,8 @@ pub(crate) fn spawn(
         let mut running = false;
         let recent_prompt_attempts =
             Arc::new(Mutex::new(HashMap::<LoginPromptKey, Instant>::new()));
-        let recovery_in_progress = Arc::new(AtomicBool::new(false));
         let automation_in_progress = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
-        let mut last_recovery_attempt: Option<Instant> = None;
         let mut last_auto_fill_attempt: Option<Instant> = None;
         let mut poll_cadence = PollCadence::default();
 
@@ -607,8 +484,7 @@ pub(crate) fn spawn(
                 }
             }
 
-            let config = runtime_config(&settings);
-            let monitor = AppMonitor::new(config.clone());
+            let monitor = AppMonitor::new(runtime_config(&settings));
             let tick_start = Instant::now();
             let status = monitor.check_status();
             let next_poll_delay = poll_cadence.next_delay(&settings, &status);
@@ -663,50 +539,6 @@ pub(crate) fn spawn(
                 MonitorStatus::ProcessNotFound => {
                     if let Ok(mut prompts) = recent_prompt_attempts.lock() {
                         prompts.clear();
-                    }
-                    let cooldown_ok = last_recovery_attempt
-                        .map(|attempt| attempt.elapsed() >= RECOVERY_COOLDOWN)
-                        .unwrap_or(true);
-                    if cooldown_ok {
-                        let started = spawn_recovery_attempt(
-                            config.clone(),
-                            event_tx.clone(),
-                            generation.clone(),
-                            recovery_in_progress.clone(),
-                            automation_in_progress.clone(),
-                            false,
-                            "Windows App is not running".to_string(),
-                        );
-                        if started {
-                            last_recovery_attempt = Some(Instant::now());
-                            let _ = event_tx
-                                .send(log_event(LogLevel::Warn, "Windows App is not running"))
-                                .await;
-                        }
-                    }
-                }
-                MonitorStatus::ReconnectAvailable { button_text } => {
-                    if let Ok(mut prompts) = recent_prompt_attempts.lock() {
-                        prompts.clear();
-                    }
-                    let cooldown_ok = last_recovery_attempt
-                        .map(|attempt| attempt.elapsed() >= RECOVERY_COOLDOWN)
-                        .unwrap_or(true);
-                    if cooldown_ok {
-                        let started = spawn_reconnect_click_attempt(
-                            config.clone(),
-                            event_tx.clone(),
-                            generation.clone(),
-                            recovery_in_progress.clone(),
-                            automation_in_progress.clone(),
-                            button_text.clone(),
-                        );
-                        if started {
-                            last_recovery_attempt = Some(Instant::now());
-                            let _ = event_tx
-                                .send(log_event(LogLevel::Warn, "Reconnect available"))
-                                .await;
-                        }
                     }
                 }
                 MonitorStatus::LoginWindowDetected {

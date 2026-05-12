@@ -3,7 +3,7 @@ name = "windows-app-autologin"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.93"
-description = "GUI application that monitors Windows App RDP client and auto-reconnects with secure password storage"
+description = "GUI application that monitors Windows App RDP client and fills matching credential prompts with secure password storage"
 license = "MIT"
 autobins = false
 

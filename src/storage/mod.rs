@@ -20,7 +20,6 @@ pub(crate) fn keychain_service_name() -> &'static str {
 struct LegacyConfig {
     process_names: Vec<String>,
     poll_interval_secs: u64,
-    reconnect_delay_secs: u64,
     credentials: Option<LegacyCredentialsConfig>,
     macos_app_name: Option<String>,
 }
@@ -33,7 +32,6 @@ impl Default for LegacyConfig {
                 "Microsoft Remote Desktop".to_string(),
             ],
             poll_interval_secs: 1,
-            reconnect_delay_secs: 2,
             credentials: None,
             macos_app_name: None,
         }
@@ -190,7 +188,6 @@ fn load_config_file(path: &Path) -> anyhow::Result<AppConfig> {
 fn migrate_legacy_config(legacy: LegacyConfig) -> AppConfig {
     let mut config = AppConfig::default();
     config.settings.poll_interval_secs = legacy.poll_interval_secs;
-    config.settings.reconnect_delay_secs = legacy.reconnect_delay_secs;
     config.settings.macos_app_name = legacy
         .macos_app_name
         .as_deref()

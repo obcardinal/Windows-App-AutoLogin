@@ -14,8 +14,7 @@ This project is not affiliated with Microsoft.
 - Opens the full settings window only on demand.
 - Stores account metadata in a local config file.
 - Stores passwords in macOS Keychain by default.
-- Detects Windows App / Microsoft Remote Desktop reconnect and credential prompts.
-- Auto-clicks reconnect controls when they are safely detected.
+- Detects Windows App / Microsoft Remote Desktop credential prompts.
 - Auto-fills password prompts only after a visible email matches exactly one enabled account.
 - Handles both native secure fields and Windows App password fields exposed as password-like `AXTextField` controls.
 - Keeps internal diagnostic logs bounded and redacted.
@@ -143,7 +142,7 @@ The heavier settings UI is launched only when needed. Closing the settings windo
 The settings window includes:
 
 - **Accounts**: add, edit, pause, enable, or delete saved accounts.
-- **Settings**: adjust polling, reconnect delay, target app name, Open at Login, and storage mode.
+- **Settings**: adjust polling, target app name, Open at Login, and storage mode.
 - **Diagnose**: only when built with development diagnostics features.
 
 Existing accounts can be edited without re-entering a password. Leave the password field blank to keep the saved password.
@@ -171,7 +170,6 @@ Example:
   "accounts": [],
   "settings": {
     "poll_interval_secs": 1,
-    "reconnect_delay_secs": 2,
     "auto_start": false,
     "start_minimized": false,
     "use_keyring": true,
@@ -225,12 +223,6 @@ At a high level:
 13. Post-check whether the app reached an authenticated/normal state, still shows the prompt, or ended in an unknown state.
 
 Windows App may expose its password box as `AXTextField` rather than `AXSecureTextField`. The app treats password-like `AXTextField` controls as password fields only inside a verified credential prompt context.
-
-## Reconnect Handling
-
-The monitor also looks for reconnect controls in trusted Windows App windows. If a reconnect button is safely detected, the app attempts to click it through macOS Accessibility automation.
-
-Reconnect handling uses the same target-app trust boundary as credential filling.
 
 ## Diagnostics
 

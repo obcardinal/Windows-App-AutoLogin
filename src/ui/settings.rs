@@ -54,16 +54,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                                     .suffix(" sec"),
                                 );
                                 ui.end_row();
-
-                                ui.label("Reconnect delay");
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut app.settings_draft.reconnect_delay_secs,
-                                        0..=30,
-                                    )
-                                    .suffix(" sec"),
-                                );
-                                ui.end_row();
                             });
                     });
 
