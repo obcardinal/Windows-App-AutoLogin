@@ -477,11 +477,37 @@ fn fill_current_prompt_once_macos(
         return log.fail(field_value(&fill_output, "failure_reason").unwrap_or("fill_failed"));
     }
 
-    log.set("submit_duration_ms", "0");
+    let submit_start = Instant::now();
+    let submit_output = match run_submit_script(
+        &app_name,
+        prompt.process_id,
+        &prompt.window_title,
+        &prompt_email,
+    ) {
+        Ok(output) => output,
+        Err(e) => {
+            log.set(
+                "submit_duration_ms",
+                submit_start.elapsed().as_millis().to_string(),
+            );
+            let post_state = post_check_state(settings, target.pid, Duration::from_millis(1200));
+            log.set("post_check_state", post_state);
+            return if post_state == "authenticated" {
+                log.finish(None)
+            } else {
+                log.fail(format!("submit_script_failed_{e}"))
+            };
+        }
+    };
+    log.set(
+        "submit_duration_ms",
+        submit_start.elapsed().as_millis().to_string(),
+    );
+    apply_script_fields(&mut log, &submit_output);
 
-    if field_value(&fill_output, "submit_attempted") != Some("true") {
+    if field_value(&submit_output, "submit_attempted") != Some("true") {
         return log
-            .fail(field_value(&fill_output, "failure_reason").unwrap_or("submit_not_attempted"));
+            .fail(field_value(&submit_output, "failure_reason").unwrap_or("submit_not_attempted"));
     }
 
     let post_state = post_check_state(settings, target.pid, Duration::from_millis(1200));
@@ -489,8 +515,8 @@ fn fill_current_prompt_once_macos(
     if post_state == "authenticated" {
         return log.finish(None);
     }
-    if field_value(&fill_output, "submit_status") != Some("ok") {
-        return log.fail(field_value(&fill_output, "failure_reason").unwrap_or("submit_failed"));
+    if field_value(&submit_output, "submit_status") != Some("ok") {
+        return log.fail(field_value(&submit_output, "failure_reason").unwrap_or("submit_failed"));
     }
     match post_state {
         "authenticated" => log.finish(None),
@@ -705,7 +731,6 @@ end tell"#,
 }
 
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 fn run_submit_script(
     app_name: &str,
     prompt_pid: i32,
@@ -722,19 +747,18 @@ tell application "System Events"
     if not my targetIsFrontmost(expectedName, expectedProcessNumber) then return my submitFailureOutput("target_not_frontmost_before_submit")
     repeat with procRef in every application process whose name is expectedName
         if my processMatches(procRef, expectedName, expectedProcessNumber) then
-            repeat with w in every window of procRef
-                try
-                    set wName to name of w as string
-                    if my windowTitleMatches(wName, expectedTitle) then
-                        repeat with s in every sheet of w
-                            set resultText to my submitContainer(s, usernameValue, expectedName, expectedProcessNumber)
-                            if resultText is not "" then return resultText
-                        end repeat
-                        set resultText to my submitContainer(w, usernameValue, expectedName, expectedProcessNumber)
+            try
+                set w to front window of procRef
+                set wName to name of w as string
+                if my windowTitleMatches(wName, expectedTitle) then
+                    repeat with s in every sheet of w
+                        set resultText to my submitContainer(s, usernameValue, expectedName, expectedProcessNumber)
                         if resultText is not "" then return resultText
-                    end if
-                end try
-            end repeat
+                    end repeat
+                    set resultText to my submitContainer(w, usernameValue, expectedName, expectedProcessNumber)
+                    if resultText is not "" then return resultText
+                end if
+            end try
         end if
     end repeat
     return my submitFailureOutput("verified_prompt_not_found_before_submit")
@@ -1625,9 +1649,11 @@ end firstCredentialPasswordField
 on fieldFocusState(passwordField)
     set sawFocusSignal to false
     try
-        tell application "System Events"
-            set focusedValue to focused of passwordField
-        end tell
+        with timeout of 0.2 seconds
+            tell application "System Events"
+                set focusedValue to focused of passwordField
+            end tell
+        end timeout
         if focusedValue then
             set sawFocusSignal to true
         else
@@ -1635,9 +1661,11 @@ on fieldFocusState(passwordField)
         end if
     end try
     try
-        tell application "System Events"
-            set axFocusedValue to value of attribute "AXFocused" of passwordField
-        end tell
+        with timeout of 0.2 seconds
+            tell application "System Events"
+                set axFocusedValue to value of attribute "AXFocused" of passwordField
+            end tell
+        end timeout
         if axFocusedValue then
             set sawFocusSignal to true
         else
@@ -1650,14 +1678,18 @@ end fieldFocusState
 
 on focusPasswordField(passwordField)
     try
-        tell application "System Events"
-            set focused of passwordField to true
-        end tell
+        with timeout of 0.2 seconds
+            tell application "System Events"
+                set focused of passwordField to true
+            end tell
+        end timeout
     end try
     try
-        tell application "System Events"
-            click passwordField
-        end tell
+        with timeout of 0.2 seconds
+            tell application "System Events"
+                click passwordField
+            end tell
+        end timeout
     end try
     delay 0.05
     return my fieldFocusState(passwordField)
@@ -1689,7 +1721,7 @@ on fillContainer(containerRef, usernameValue, passwordValue, expectedName, expec
             end tell
             set out to out & my kv("password_field_focused", my fieldFocusState(passwordField))
             set out to out & my kv("fill_status", "ok")
-            return out & my submitContainer(containerRef, usernameValue, expectedName, expectedProcessNumber)
+            return out
         on error
             set out to out & my kv("fill_status", "failed")
             set out to out & my kv("failure_reason", "direct_ax_set_value_failed")
@@ -1732,7 +1764,7 @@ on fillContainer(containerRef, usernameValue, passwordValue, expectedName, expec
         end tell
         delay 0.04
         set out to out & my kv("fill_status", "ok")
-        return out & my submitContainer(containerRef, usernameValue, expectedName, expectedProcessNumber)
+        return out
     on error
         set out to out & my kv("fill_status", "failed")
         set out to out & my kv("failure_reason", "keyboard_fill_failed")
@@ -1756,7 +1788,9 @@ end pressButtonFast
 on buttonEnabled(buttonRef)
     tell application "System Events"
         try
-            return enabled of buttonRef as boolean
+            with timeout of 0.2 seconds
+                return enabled of buttonRef as boolean
+            end timeout
         end try
     end tell
     return true
@@ -1766,13 +1800,21 @@ on buttonText(buttonRef)
     set labelText to ""
     tell application "System Events"
         try
-            set labelText to labelText & " " & (name of buttonRef as string)
+            with timeout of 0.2 seconds
+                set labelText to labelText & " " & (name of buttonRef as string)
+            end timeout
         end try
+        if my buttonLooksSubmit(labelText) then return labelText
         try
-            set labelText to labelText & " " & (value of buttonRef as string)
+            with timeout of 0.2 seconds
+                set labelText to labelText & " " & (value of buttonRef as string)
+            end timeout
         end try
+        if my buttonLooksSubmit(labelText) then return labelText
         try
-            set labelText to labelText & " " & ((value of attribute "AXTitle" of buttonRef) as string)
+            with timeout of 0.2 seconds
+                set labelText to labelText & " " & ((value of attribute "AXTitle" of buttonRef) as string)
+            end timeout
         end try
     end tell
     return labelText
@@ -1814,8 +1856,6 @@ on clickPreferredSubmit(containerRef)
 end clickPreferredSubmit
 
 on submitContainer(containerRef, usernameValue, expectedName, expectedProcessNumber)
-    if my countDirectButtons(containerRef) < 1 then return ""
-    if my countDirectPasswordFields(containerRef) < 1 then return ""
     set promptText to my collectPromptTextDirect(containerRef, "")
     if not my promptMatchesAccount(promptText, usernameValue) then return ""
     set passwordField to my firstDirectCredentialPasswordField(containerRef)
@@ -1823,8 +1863,41 @@ on submitContainer(containerRef, usernameValue, expectedName, expectedProcessNum
 
     set out to ""
     set out to out & my kv("submit_attempted", "true")
+
+    if my fieldFocusState(passwordField) is not "true" then
+        set refocusState to my focusPasswordField(passwordField)
+    end if
+
+    set out to out & my kv("enter_fallback_attempted", "true")
+    set enterResult to "focus_not_verified"
+    if my fieldFocusState(passwordField) is "true" then
+        try
+            with timeout of 0.4 seconds
+                tell application "System Events"
+                    key code 36
+                end tell
+            end timeout
+            delay 0.05
+            set out to out & my kv("submit_method", "enter")
+            set out to out & my kv("axpress_attempted", "false")
+            set out to out & my kv("axpress_result", "not_needed")
+            set out to out & my kv("enter_fallback_result", "sent")
+            set out to out & my kv("submit_status", "ok")
+            return out
+        on error
+            set enterResult to "failed"
+        end try
+    end if
+    set out to out & my kv("enter_fallback_result", enterResult)
+
     set out to out & my kv("axpress_attempted", "true")
-    if my clickPreferredSubmit(containerRef) then
+    set axPressed to false
+    try
+        with timeout of 1.0 seconds
+            set axPressed to my clickPreferredSubmit(containerRef)
+        end timeout
+    end try
+    if axPressed then
         set out to out & my kv("submit_method", "axpress")
         set out to out & my kv("axpress_result", "success")
         set out to out & my kv("enter_fallback_attempted", "false")
@@ -1834,26 +1907,8 @@ on submitContainer(containerRef, usernameValue, expectedName, expectedProcessNum
     end if
     set out to out & my kv("axpress_result", "failed")
 
-    if my fieldFocusState(passwordField) is not "true" then
-        set refocusState to my focusPasswordField(passwordField)
-    end if
-
-    set out to out & my kv("enter_fallback_attempted", "true")
-    if my fieldFocusState(passwordField) is "true" then
-        try
-            tell application "System Events"
-                key code 36
-            end tell
-            delay 0.05
-            set out to out & my kv("submit_method", "enter")
-            set out to out & my kv("enter_fallback_result", "sent")
-            set out to out & my kv("submit_status", "ok")
-            return out
-        end try
-    end if
-
     set out to out & my kv("submit_method", "none")
-    set out to out & my kv("enter_fallback_result", "focus_not_verified")
+    set out to out & my kv("enter_fallback_result", enterResult)
     set out to out & my kv("submit_status", "failed")
     set out to out & my kv("failure_reason", "submit_control_not_pressed")
     return out
