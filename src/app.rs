@@ -16,6 +16,7 @@ use tokio::sync::mpsc::Sender as TokioSender;
 use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
+const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 pub(crate) struct AutoLoginApp {
     pub(crate) config: AppConfig,
@@ -467,8 +468,10 @@ impl eframe::App for AutoLoginApp {
                         }
                     }
 
-                    if !self.settings_window_mode {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(theme::small_muted(APP_VERSION_LABEL));
+
+                        if !self.settings_window_mode {
                             match self.worker_status {
                                 WorkerStatus::Running => {
                                     if ui
@@ -492,8 +495,8 @@ impl eframe::App for AutoLoginApp {
                             }
                             let (color, fill, label) = theme::worker_status(self.worker_status);
                             theme::pill(ui, label, color, fill);
-                        });
-                    }
+                        }
+                    });
                 });
 
                 ui.allocate_ui_with_layout(
