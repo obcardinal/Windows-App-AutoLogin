@@ -3,9 +3,11 @@ use std::{fs, path::Path};
 fn main() {
     let icon = Path::new("assets/icon.png");
     let tray_icon = Path::new("assets/icon_tray.png");
+    let inter_font = Path::new("assets/fonts/InterVariable.ttf");
 
     println!("cargo:rerun-if-changed={}", icon.display());
     println!("cargo:rerun-if-changed={}", tray_icon.display());
+    println!("cargo:rerun-if-changed={}", inter_font.display());
 
     let fingerprint = [icon, tray_icon]
         .into_iter()

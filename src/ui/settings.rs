@@ -6,11 +6,10 @@ use eframe::egui;
 const FOOTER_GAP: f32 = 8.0;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
-    theme::page_header(
+    theme::simple_page_header(
         ui,
         "Settings",
         "Tune monitoring, login behavior, and macOS integration.",
-        |_| {},
     );
 
     let mut save_clicked = false;

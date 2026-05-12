@@ -1,5 +1,6 @@
 use crate::models::WorkerStatus;
 use eframe::egui;
+use std::sync::Arc;
 
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 132, 194);
 pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(226, 241, 252);
@@ -7,11 +8,13 @@ pub const SUCCESS: egui::Color32 = egui::Color32::from_rgb(31, 128, 79);
 pub const SUCCESS_SOFT: egui::Color32 = egui::Color32::from_rgb(222, 243, 231);
 pub const DANGER: egui::Color32 = egui::Color32::from_rgb(190, 55, 55);
 pub const DANGER_SOFT: egui::Color32 = egui::Color32::from_rgb(251, 226, 226);
-pub const MUTED: egui::Color32 = egui::Color32::from_rgb(92, 99, 106);
+pub const MUTED: egui::Color32 = egui::Color32::from_rgb(62, 70, 78);
 pub const MUTED_SOFT: egui::Color32 = egui::Color32::from_rgb(238, 241, 244);
-pub const TEXT: egui::Color32 = egui::Color32::from_rgb(36, 42, 48);
+pub const TEXT: egui::Color32 = egui::Color32::from_rgb(22, 28, 34);
 pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(248, 250, 252);
 pub const STROKE: egui::Color32 = egui::Color32::from_rgb(214, 222, 230);
+
+const INTER_FONT_NAME: &str = "inter";
 
 fn glass() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 212)
@@ -26,6 +29,8 @@ fn top_bar() -> egui::Color32 {
 }
 
 pub fn apply(ctx: &egui::Context) {
+    apply_fonts(ctx);
+
     let mut style = egui::Style::default();
     let mut visuals = egui::Visuals::light();
 
@@ -35,6 +40,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.selection.bg_fill = ACCENT_SOFT;
     visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, STROKE);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::TRANSPARENT);
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(7);
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(7);
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(7);
@@ -45,21 +51,67 @@ pub fn apply(ctx: &egui::Context) {
     visuals.override_text_color = Some(TEXT);
 
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(24.0, 4.0);
     style.spacing.window_margin = egui::Margin::same(12);
     style.spacing.interact_size = egui::vec2(48.0, 28.0);
     style.spacing.text_edit_width = 240.0;
     style.spacing.slider_width = 190.0;
     style.spacing.combo_width = 190.0;
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::new(12.5, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(15.75, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::new(15.75, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(21.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::new(15.75, egui::FontFamily::Monospace),
+    );
 
     ctx.set_global_style(style);
+}
+
+fn apply_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let inter = egui::FontData::from_static(include_bytes!("../../assets/fonts/InterVariable.ttf"))
+        .tweak(egui::FontTweak {
+            hinting_override: Some(true),
+            coords: egui::epaint::text::VariationCoords::new([(b"wght", 500.0)]),
+            ..Default::default()
+        });
+
+    fonts
+        .font_data
+        .insert(INTER_FONT_NAME.to_owned(), Arc::new(inter));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, INTER_FONT_NAME.to_owned());
+
+    ctx.set_fonts(fonts);
 }
 
 pub fn top_bar_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(top_bar())
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 10,
+            bottom: 8,
+        })
         .stroke(egui::Stroke::new(1.0, STROKE))
 }
 
@@ -74,7 +126,7 @@ pub fn glass_frame() -> egui::Frame {
         .fill(glass())
         .stroke(egui::Stroke::new(1.0, STROKE))
         .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .inner_margin(egui::Margin::symmetric(16, 14))
 }
 
 pub fn compact_frame() -> egui::Frame {
@@ -82,7 +134,7 @@ pub fn compact_frame() -> egui::Frame {
         .fill(glass_dense())
         .stroke(egui::Stroke::new(1.0, STROKE))
         .corner_radius(egui::CornerRadius::same(7))
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .inner_margin(egui::Margin::symmetric(12, 10))
 }
 
 pub fn page_header(
@@ -96,8 +148,9 @@ pub fn page_header(
         if available_width < 620.0 {
             ui.vertical(|ui| {
                 ui.heading(title);
+                ui.add_space(4.0);
                 ui.add(egui::Label::new(muted(subtitle)).wrap());
-                ui.add_space(6.0);
+                ui.add_space(10.0);
                 ui.horizontal_wrapped(actions);
             });
         } else {
@@ -109,6 +162,7 @@ pub fn page_header(
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         ui.heading(title);
+                        ui.add_space(4.0);
                         ui.add(egui::Label::new(muted(subtitle)).wrap());
                     },
                 );
@@ -116,15 +170,54 @@ pub fn page_header(
             });
         }
     });
-    ui.add_space(8.0);
+    ui.add_space(12.0);
+}
+
+pub fn simple_page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    egui::Frame::new()
+        .fill(glass())
+        .stroke(egui::Stroke::new(1.0, STROKE))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin {
+            left: 16,
+            right: 16,
+            top: 13,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            ui.heading(title);
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(muted(subtitle)).wrap());
+        });
+    ui.add_space(10.0);
 }
 
 pub fn muted(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text).color(MUTED)
+    egui::RichText::new(text)
+        .color(MUTED)
+        .line_height(Some(22.0))
+}
+
+pub fn version_label(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text)
+        .color(MUTED)
+        .size(13.5)
+        .line_height(Some(18.0))
+}
+
+pub fn status_text(text: impl Into<String>) -> egui::RichText {
+    let text = text.into();
+    let color = message_color(&text);
+    egui::RichText::new(text)
+        .color(color)
+        .line_height(Some(22.0))
 }
 
 pub fn small_muted(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text).small().color(MUTED)
+    egui::RichText::new(text)
+        .small()
+        .color(MUTED)
+        .line_height(Some(18.0))
 }
 
 pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {

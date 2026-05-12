@@ -17,6 +17,8 @@ use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
 const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const ACCESSIBILITY_REQUEST_BUTTON_SIZE: [f32; 2] = [278.0, 34.0];
+const ACCESSIBILITY_SETTINGS_BUTTON_SIZE: [f32; 2] = [248.0, 34.0];
 
 pub(crate) struct AutoLoginApp {
     pub(crate) config: AppConfig,
@@ -432,6 +434,7 @@ impl eframe::App for AutoLoginApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let accessibility_ready = self.accessibility_ready();
 
         if let Some((_, ref mut remaining)) = self.status_message {
             *remaining -= ctx.input(|i| i.stable_dt) as f64;
@@ -446,32 +449,34 @@ impl eframe::App for AutoLoginApp {
             .frame(theme::top_bar_frame())
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    for (tab, label) in [
-                        (Tab::Accounts, "Accounts"),
-                        (Tab::Settings, "Settings"),
-                        #[cfg(feature = "diagnostics-ui")]
-                        (Tab::Diagnose, "Diagnose"),
-                    ] {
-                        let selected = self.selected_tab == tab;
-                        if ui
-                            .add(
-                                egui::Button::selectable(
-                                    selected,
-                                    egui::RichText::new(label).strong(),
+                    if accessibility_ready {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for (tab, label) in [
+                            (Tab::Accounts, "Accounts"),
+                            (Tab::Settings, "Settings"),
+                            #[cfg(feature = "diagnostics-ui")]
+                            (Tab::Diagnose, "Diagnose"),
+                        ] {
+                            let selected = self.selected_tab == tab;
+                            if ui
+                                .add(
+                                    egui::Button::selectable(
+                                        selected,
+                                        egui::RichText::new(label).strong(),
+                                    )
+                                    .corner_radius(egui::CornerRadius::same(8)),
                                 )
-                                .corner_radius(egui::CornerRadius::same(8)),
-                            )
-                            .clicked()
-                        {
-                            self.selected_tab = tab;
+                                .clicked()
+                            {
+                                self.selected_tab = tab;
+                            }
                         }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::small_muted(APP_VERSION_LABEL));
+                        ui.label(theme::version_label(APP_VERSION_LABEL));
 
-                        if !self.settings_window_mode {
+                        if accessibility_ready && !self.settings_window_mode {
                             match self.worker_status {
                                 WorkerStatus::Running => {
                                     if ui
@@ -499,25 +504,18 @@ impl eframe::App for AutoLoginApp {
                     });
                 });
 
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 18.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        if let Some((msg, _)) = &self.status_message {
-                            ui.label(
-                                egui::RichText::new(msg.as_str())
-                                    .small()
-                                    .color(theme::message_color(msg)),
-                            );
-                        }
-                    },
-                );
+                if accessibility_ready {
+                    if let Some((msg, _)) = &self.status_message {
+                        ui.add_space(7.0);
+                        ui.label(theme::status_text(msg.as_str()));
+                    }
+                }
             });
 
         egui::CentralPanel::default()
             .frame(theme::content_frame())
             .show_inside(ui, |ui| {
-                if !self.accessibility_ready() {
+                if !accessibility_ready {
                     show_accessibility_onboarding(ui, self);
                     return;
                 }
@@ -540,30 +538,41 @@ fn push_bounded_log(logs: &mut VecDeque<LogEntry>, mut entry: LogEntry) {
 }
 
 fn show_accessibility_onboarding(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
-    theme::page_header(
-        ui,
-        "Accessibility permission is required",
-        "Windows App AutoLogin can only detect and fill the visible credential prompt after macOS allows this exact app to use Accessibility.",
-        |ui| {
+    theme::glass_frame().show(ui, |ui| {
+        ui.heading("Accessibility permission is required");
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(theme::muted(
+            "Windows App AutoLogin can only detect and fill the visible credential prompt after macOS allows this exact app to use Accessibility.",
+        )).wrap());
+        ui.add_space(14.0);
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .add(theme::primary_button("Request Accessibility Access"))
+                .add_sized(
+                    ACCESSIBILITY_REQUEST_BUTTON_SIZE,
+                    theme::primary_button("Request Accessibility Access"),
+                )
                 .clicked()
             {
                 app.request_accessibility_access();
             }
             if ui
-                .add(theme::secondary_button("Open Accessibility Settings"))
+                .add_sized(
+                    ACCESSIBILITY_SETTINGS_BUTTON_SIZE,
+                    theme::secondary_button("Open Accessibility Settings"),
+                )
                 .clicked()
             {
                 app.open_accessibility_settings();
             }
-        },
-    );
+        });
+    });
+    ui.add_space(12.0);
 
     theme::glass_frame().show(ui, |ui| {
         ui.label(theme::muted(
             "System Settings -> Privacy & Security -> Accessibility",
         ));
+        ui.add_space(8.0);
         ui.label(theme::muted(
             "Enable Windows App AutoLogin for the path shown above, then return here. The app checks again every second.",
         ));
