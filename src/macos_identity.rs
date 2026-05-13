@@ -148,7 +148,7 @@ pub(crate) fn applescript_string_literal(value: &str) -> String {
 #[cfg(target_os = "macos")]
 fn trusted_identity(app_name: &str) -> Option<TrustedIdentity> {
     match app_name.trim() {
-        "Windows App" | "Microsoft Remote Desktop" => Some(TrustedIdentity {
+        "Windows App" => Some(TrustedIdentity {
             bundle_id: MICROSOFT_REMOTE_DESKTOP_BUNDLE_ID,
             team_id: MICROSOFT_TEAM_ID,
         }),
@@ -160,9 +160,6 @@ fn trusted_identity(app_name: &str) -> Option<TrustedIdentity> {
 fn trusted_bundle_candidates(app_name: &str) -> Vec<PathBuf> {
     match app_name.trim() {
         "Windows App" => vec![PathBuf::from("/Applications/Windows App.app")],
-        "Microsoft Remote Desktop" => {
-            vec![PathBuf::from("/Applications/Microsoft Remote Desktop.app")]
-        }
         _ => Vec::new(),
     }
 }
@@ -439,6 +436,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported app identity for secure automation: Lookalike App"
+        );
+    }
+
+    #[test]
+    fn microsoft_remote_desktop_identity_is_rejected() {
+        let error = trusted_process_ids_from_identities(
+            "Microsoft Remote Desktop",
+            &[],
+            |_path, _identity| Ok(true),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported app identity for secure automation: Microsoft Remote Desktop"
         );
     }
 

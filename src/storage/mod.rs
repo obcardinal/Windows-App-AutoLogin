@@ -1,4 +1,4 @@
-use crate::models::{Account, AccountId, AppConfig};
+use crate::models::{Account, AccountId, AppConfig, FIXED_POLL_INTERVAL_SECS};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -33,22 +33,15 @@ fn native_secure_storage_name() -> &'static str {
 #[derive(Debug, serde::Deserialize)]
 #[serde(default)]
 struct LegacyConfig {
-    process_names: Vec<String>,
     poll_interval_secs: u64,
     credentials: Option<LegacyCredentialsConfig>,
-    macos_app_name: Option<String>,
 }
 
 impl Default for LegacyConfig {
     fn default() -> Self {
         Self {
-            process_names: vec![
-                "Windows App".to_string(),
-                "Microsoft Remote Desktop".to_string(),
-            ],
             poll_interval_secs: 1,
             credentials: None,
-            macos_app_name: None,
         }
     }
 }
@@ -170,13 +163,13 @@ pub(crate) fn load_config() -> AppConfig {
         }
     };
     match load_config_file(&path) {
-        Ok(config) => config,
+        Ok(config) => normalize_config(config),
         Err(e) => {
             warn!(path = %path.display(), error = %e, "Failed to load config; using defaults");
             if let Err(backup_error) = backup_invalid_file(&path) {
                 warn!(path = %path.display(), error = %backup_error, "Failed to back up invalid config before using defaults");
             }
-            AppConfig::default()
+            normalize_config(AppConfig::default())
         }
     }
 }
@@ -193,24 +186,17 @@ fn load_config_file(path: &Path) -> anyhow::Result<AppConfig> {
     let content = std::fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&content)?;
     if value.get("accounts").is_some() || value.get("settings").is_some() {
-        return Ok(serde_json::from_value(value)?);
+        return Ok(normalize_config(serde_json::from_value(value)?));
     }
 
     let legacy: LegacyConfig = serde_json::from_value(value)?;
-    Ok(migrate_legacy_config(legacy))
+    Ok(normalize_config(migrate_legacy_config(legacy)))
 }
 
 fn migrate_legacy_config(legacy: LegacyConfig) -> AppConfig {
     let mut config = AppConfig::default();
-    config.settings.poll_interval_secs = legacy.poll_interval_secs;
-    config.settings.macos_app_name = legacy
-        .macos_app_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| legacy.process_names.first().cloned())
-        .unwrap_or_else(|| "Windows App".to_string());
+    let _ = legacy.poll_interval_secs;
+    config.settings.poll_interval_secs = FIXED_POLL_INTERVAL_SECS;
 
     if let Some(credentials) = legacy.credentials {
         let username = credentials.username.trim().to_string();
@@ -234,7 +220,12 @@ fn migrate_legacy_config(legacy: LegacyConfig) -> AppConfig {
 
 pub(crate) fn save_config(config: &AppConfig) -> anyhow::Result<()> {
     ensure_config_dir()?;
-    config.save(config_file()?)
+    normalize_config(config.clone()).save(config_file()?)
+}
+
+fn normalize_config(mut config: AppConfig) -> AppConfig {
+    config.settings.poll_interval_secs = FIXED_POLL_INTERVAL_SECS;
+    config
 }
 
 fn backup_invalid_file(path: &Path) -> anyhow::Result<()> {
@@ -825,23 +816,35 @@ mod tests {
         migrate_legacy_config, password_entry_for_account, redact_password_load_error,
         storage_error_kind, LegacyConfig, LegacyCredentialsConfig, PasswordFile,
     };
-    use crate::models::{Account, AppConfig};
+    use crate::models::{Account, AppConfig, FIXED_POLL_INTERVAL_SECS};
     use std::collections::HashMap;
 
     #[test]
-    fn legacy_migration_uses_first_process_name_when_app_name_is_missing() {
+    fn legacy_migration_uses_fixed_poll_interval() {
         let legacy = LegacyConfig {
-            process_names: vec!["Microsoft Remote Desktop".to_string()],
-            macos_app_name: None,
+            poll_interval_secs: 30,
             ..LegacyConfig::default()
         };
 
         let config = migrate_legacy_config(legacy);
 
-        assert_eq!(
-            config.settings.macos_app_name,
-            "Microsoft Remote Desktop".to_string()
-        );
+        assert_eq!(config.settings.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn legacy_migration_ignores_removed_target_app_fields() {
+        let legacy: LegacyConfig = serde_json::from_value(serde_json::json!({
+            "process_names": ["Microsoft Remote Desktop"],
+            "macos_app_name": "Microsoft Remote Desktop"
+        }))
+        .unwrap();
+
+        let config = migrate_legacy_config(legacy);
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!json.contains("macos_app_name"));
+        assert!(!json.contains("Microsoft Remote Desktop"));
+        assert!(!json.contains("Windows App"));
     }
 
     #[test]

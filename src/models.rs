@@ -3,6 +3,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 pub type AccountId = String;
+pub const FIXED_POLL_INTERVAL_SECS: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Account {
@@ -37,21 +38,20 @@ impl Account {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppSettings {
+    #[serde(default = "fixed_poll_interval_secs", skip_serializing)]
     pub poll_interval_secs: u64,
     pub auto_start: bool,
     pub start_minimized: bool,
     pub use_keyring: bool,
-    pub macos_app_name: String,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            poll_interval_secs: 1,
+            poll_interval_secs: FIXED_POLL_INTERVAL_SECS,
             auto_start: false,
             start_minimized: false,
             use_keyring: true,
-            macos_app_name: "Windows App".to_string(),
         }
     }
 }
@@ -66,6 +66,10 @@ fn is_true(value: &bool) -> bool {
 
 fn default_account_enabled() -> bool {
     true
+}
+
+fn fixed_poll_interval_secs() -> u64 {
+    FIXED_POLL_INTERVAL_SECS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -172,6 +176,8 @@ impl std::fmt::Display for LogLevel {
 
 #[cfg(test)]
 mod tests {
+    use super::{AppConfig, AppSettings};
+
     #[cfg(not(feature = "diagnostics-ui"))]
     use super::Tab;
 
@@ -181,5 +187,24 @@ mod tests {
         let tabs = [Tab::Accounts, Tab::Settings];
 
         assert_eq!(tabs.len(), 2);
+    }
+
+    #[test]
+    fn app_settings_do_not_serialize_fixed_poll_interval() {
+        let settings = AppSettings {
+            poll_interval_secs: 60,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+
+        assert!(!json.contains("poll_interval_secs"));
+    }
+
+    #[test]
+    fn app_config_does_not_serialize_target_app_name_setting() {
+        let json = serde_json::to_string(&AppConfig::default()).unwrap();
+
+        assert!(!json.contains("macos_app_name"));
+        assert!(!json.contains("Windows App"));
     }
 }

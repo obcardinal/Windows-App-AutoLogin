@@ -73,9 +73,9 @@ fn safe_status_name(status: &MonitorStatus) -> &'static str {
     }
 }
 
-fn runtime_config(settings: &AppSettings) -> Arc<Config> {
+fn runtime_config(_settings: &AppSettings) -> Arc<Config> {
     Arc::new(Config {
-        macos_app_name: settings.macos_app_name.clone(),
+        macos_app_name: crate::config::TARGET_APP_NAME.to_string(),
     })
 }
 
@@ -195,8 +195,8 @@ struct PollCadence {
 }
 
 impl PollCadence {
-    fn next_delay(&mut self, settings: &AppSettings, status: &MonitorStatus) -> Duration {
-        let base_delay = Duration::from_secs(settings.poll_interval_secs.max(1));
+    fn next_delay(&mut self, _settings: &AppSettings, status: &MonitorStatus) -> Duration {
+        let base_delay = fixed_poll_interval();
         let Some(max_delay) = stable_status_backoff_max(status) else {
             self.last_stable_status = None;
             self.stable_status_count = 0;
@@ -215,6 +215,10 @@ impl PollCadence {
         let delay = base_delay.saturating_mul(multiplier.unwrap_or(8));
         delay.min(max_delay)
     }
+}
+
+fn fixed_poll_interval() -> Duration {
+    Duration::from_secs(crate::models::FIXED_POLL_INTERVAL_SECS)
 }
 
 fn stable_status_backoff_max(status: &MonitorStatus) -> Option<Duration> {
@@ -442,7 +446,7 @@ pub(crate) fn spawn(
 
             if !has_enabled_account {
                 if !wait_or_handle_command(
-                    Duration::from_secs(settings.poll_interval_secs.max(1)),
+                    fixed_poll_interval(),
                     &mut cmd_rx,
                     &event_tx,
                     &mut running,
@@ -637,7 +641,7 @@ mod tests {
     #[test]
     fn poll_cadence_backs_off_only_for_stable_statuses() {
         let settings = AppSettings {
-            poll_interval_secs: 1,
+            poll_interval_secs: 60,
             ..AppSettings::default()
         };
         let mut cadence = PollCadence::default();
@@ -900,7 +904,7 @@ mod tests {
         let mut accounts = vec![account("account-1", "user@example.com", true)];
         let expected_generation = generation.load(Ordering::SeqCst);
         let mut new_settings = settings.clone();
-        new_settings.poll_interval_secs = settings.poll_interval_secs + 1;
+        new_settings.start_minimized = !settings.start_minimized;
 
         handle_command(
             WorkerCommand::UpdateSettings(new_settings),

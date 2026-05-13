@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn check_status_macos_uses_one_detailed_inspection() {
         let config = Config {
-            macos_app_name: "Windows App".to_string(),
+            macos_app_name: crate::config::TARGET_APP_NAME.to_string(),
         };
         let mut calls = Vec::new();
 
@@ -304,7 +304,10 @@ mod tests {
             )
         });
 
-        assert_eq!(calls, vec![("Windows App".to_string(), true)]);
+        assert_eq!(
+            calls,
+            vec![(crate::config::TARGET_APP_NAME.to_string(), true)]
+        );
         assert_eq!(
             status,
             MonitorStatus::LoginWindowDetected {

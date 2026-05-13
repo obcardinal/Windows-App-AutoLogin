@@ -1,10 +1,8 @@
 {
   "accounts": [],
   "settings": {
-    "poll_interval_secs": 1,
     "auto_start": false,
     "start_minimized": false,
-    "use_keyring": true,
-    "macos_app_name": "Windows App"
+    "use_keyring": true
   }
 }

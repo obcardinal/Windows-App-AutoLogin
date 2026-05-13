@@ -1,15 +1,11 @@
-use crate::models::WorkerStatus;
 use eframe::egui;
 use std::sync::Arc;
 
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 132, 194);
 pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(226, 241, 252);
-pub const SUCCESS: egui::Color32 = egui::Color32::from_rgb(31, 128, 79);
-pub const SUCCESS_SOFT: egui::Color32 = egui::Color32::from_rgb(222, 243, 231);
 pub const DANGER: egui::Color32 = egui::Color32::from_rgb(190, 55, 55);
 pub const DANGER_SOFT: egui::Color32 = egui::Color32::from_rgb(251, 226, 226);
 pub const MUTED: egui::Color32 = egui::Color32::from_rgb(62, 70, 78);
-pub const MUTED_SOFT: egui::Color32 = egui::Color32::from_rgb(238, 241, 244);
 pub const TEXT: egui::Color32 = egui::Color32::from_rgb(22, 28, 34);
 pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(248, 250, 252);
 pub const STROKE: egui::Color32 = egui::Color32::from_rgb(214, 222, 230);
@@ -30,6 +26,7 @@ fn top_bar() -> egui::Color32 {
 
 pub fn apply(ctx: &egui::Context) {
     apply_fonts(ctx);
+    egui_extras::install_image_loaders(ctx);
 
     let mut style = egui::Style::default();
     let mut visuals = egui::Visuals::light();
@@ -173,6 +170,15 @@ pub fn page_header(
     ui.add_space(12.0);
 }
 
+pub fn page_header_plain(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    glass_frame().show(ui, |ui| {
+        ui.heading(title);
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(muted(subtitle)).wrap());
+    });
+    ui.add_space(12.0);
+}
+
 pub fn muted(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text)
         .color(MUTED)
@@ -192,13 +198,6 @@ pub fn status_text(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text)
         .color(color)
         .line_height(Some(22.0))
-}
-
-pub fn small_muted(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text)
-        .small()
-        .color(MUTED)
-        .line_height(Some(18.0))
 }
 
 pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
@@ -233,53 +232,6 @@ pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
         ))
         .corner_radius(egui::CornerRadius::same(7))
         .min_size(egui::vec2(0.0, 28.0))
-}
-
-pub fn pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, fill: egui::Color32) {
-    draw_pill(ui, text, color, fill, 18.0, 10.0);
-}
-
-pub fn compact_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, fill: egui::Color32) {
-    draw_pill(ui, text, color, fill, 18.0, 9.0);
-}
-
-fn draw_pill(
-    ui: &mut egui::Ui,
-    text: &str,
-    color: egui::Color32,
-    fill: egui::Color32,
-    height: f32,
-    horizontal_padding: f32,
-) {
-    let font_id = egui::TextStyle::Small.resolve(ui.style());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font_id.clone(), color);
-    let width = galley.size().x + horizontal_padding * 2.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let radius = egui::CornerRadius::same((height / 2.0) as u8);
-
-    ui.painter().rect_filled(rect, radius, fill);
-    ui.painter().rect_stroke(
-        rect,
-        radius,
-        egui::Stroke::new(1.0, color.linear_multiply(0.42)),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        font_id,
-        color,
-    );
-}
-
-pub fn worker_status(status: WorkerStatus) -> (egui::Color32, egui::Color32, &'static str) {
-    match status {
-        WorkerStatus::Idle => (MUTED, MUTED_SOFT, "Idle"),
-        WorkerStatus::Running => (SUCCESS, SUCCESS_SOFT, "Running"),
-    }
 }
 
 pub fn message_color(msg: &str) -> egui::Color32 {

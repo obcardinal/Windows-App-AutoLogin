@@ -279,7 +279,7 @@ fn start_diagnosis(app: &mut AutoLoginApp) {
 
     let (tx, rx) = std::sync::mpsc::channel();
     app.diagnose_rx = Some(rx);
-    let app_name = app.config.settings.macos_app_name.clone();
+    let app_name = crate::config::TARGET_APP_NAME.to_string();
 
     std::thread::spawn(move || {
         let output = match windows_app_autologin::diagnose::run_for_app(&app_name) {

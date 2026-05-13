@@ -31,10 +31,10 @@ pub(crate) struct AutoLogin {
 }
 
 impl AutoLogin {
-    pub(crate) fn new(target_app_name: impl Into<String>) -> Self {
+    pub(crate) fn new(_target_app_name: impl Into<String>) -> Self {
         Self {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            target_app_name: target_app_name.into(),
+            target_app_name: crate::config::TARGET_APP_NAME.to_string(),
         }
     }
 

@@ -513,6 +513,8 @@ impl eframe::App for AutoLoginApp {
                 ui.horizontal(|ui| {
                     if accessibility_ready {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        let previous_button_padding = ui.spacing().button_padding;
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
                         for (tab, label) in [
                             (Tab::Accounts, "Accounts"),
                             (Tab::Settings, "Settings"),
@@ -526,17 +528,25 @@ impl eframe::App for AutoLoginApp {
                                         selected,
                                         egui::RichText::new(label).strong(),
                                     )
-                                    .corner_radius(egui::CornerRadius::same(8)),
+                                    .corner_radius(egui::CornerRadius::same(8))
+                                    .min_size(egui::vec2(0.0, 30.0)),
                                 )
                                 .clicked()
                             {
                                 self.selected_tab = tab;
                             }
                         }
+                        ui.spacing_mut().button_padding = previous_button_padding;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::version_label(APP_VERSION_LABEL));
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(68.0, 30.0),
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                            |ui| {
+                                ui.label(theme::version_label(APP_VERSION_LABEL));
+                            },
+                        );
 
                         if accessibility_ready {
                             match self.worker_status {
@@ -563,8 +573,6 @@ impl eframe::App for AutoLoginApp {
                                     }
                                 }
                             }
-                            let (color, fill, label) = theme::worker_status(self.worker_status);
-                            theme::pill(ui, label, color, fill);
                         }
                     });
                 });

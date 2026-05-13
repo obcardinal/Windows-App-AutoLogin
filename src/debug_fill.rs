@@ -342,10 +342,10 @@ fn fill_current_prompt_once_macos(
         return log.fail(format!("attempt_cancelled_{e}"));
     }
 
-    let app_name = settings.macos_app_name.clone();
+    let app_name = crate::config::TARGET_APP_NAME;
 
     let (prompt, prompt_email, selected_account) =
-        match select_prompt_and_account(&mut log, &app_name, accounts, verified_prompt, guard) {
+        match select_prompt_and_account(&mut log, app_name, accounts, verified_prompt, guard) {
             Ok(selection) => selection,
             Err(reason) => return log.fail(reason),
         };
@@ -664,8 +664,8 @@ fn fill_current_prompt_once_windows(
         return log.fail(format!("attempt_cancelled_{e}"));
     }
 
-    let app_name = settings.macos_app_name.clone();
-    let mut inspection = match crate::windows_ui::inspect(&app_name) {
+    let app_name = crate::config::TARGET_APP_NAME;
+    let mut inspection = match crate::windows_ui::inspect(app_name) {
         Ok(inspection) => inspection,
         Err(e) => return log.fail(format!("windows_uia_inspection_failed_{e}")),
     };
@@ -918,8 +918,8 @@ fn runtime_status_report_macos(settings: &AppSettings, accounts: &[Account]) -> 
         return log.fail("accessibility_not_trusted_for_current_process");
     }
 
-    let app_name = settings.macos_app_name.clone();
-    let trusted_infos = match macos_identity::trusted_process_infos(&app_name) {
+    let app_name = crate::config::TARGET_APP_NAME;
+    let trusted_infos = match macos_identity::trusted_process_infos(app_name) {
         Ok(infos) => infos,
         Err(_) => return log.fail("windows_app_trust_check_failed"),
     };
@@ -1001,8 +1001,8 @@ fn runtime_status_report_windows(
     log.set("ax_trusted_for_current_process", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
 
-    let app_name = settings.macos_app_name.clone();
-    let inspection = match crate::windows_ui::inspect(&app_name) {
+    let app_name = crate::config::TARGET_APP_NAME;
+    let inspection = match crate::windows_ui::inspect(app_name) {
         Ok(inspection) => inspection,
         Err(e) => return log.fail(format!("windows_uia_inspection_failed_{e}")),
     };
@@ -1169,13 +1169,13 @@ mod macos_context_tests {
 }
 #[cfg(target_os = "macos")]
 fn post_check_state(
-    settings: &AppSettings,
+    _settings: &AppSettings,
     prompt_pid: i32,
     expected_email: &str,
     timeout: Duration,
 ) -> &'static str {
     crate::macos_ax::post_check_state(
-        &settings.macos_app_name,
+        crate::config::TARGET_APP_NAME,
         prompt_pid,
         expected_email,
         timeout,

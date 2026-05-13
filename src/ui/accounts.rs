@@ -5,17 +5,23 @@ use crate::ui::theme;
 use eframe::egui;
 use zeroize::Zeroizing;
 
-const STATE_COLUMN_WIDTH: f32 = 116.0;
+const STATE_COLUMN_WIDTH: f32 = 88.0;
 const TABLE_SPACING: f32 = 8.0;
-const EDIT_BUTTON_WIDTH: f32 = 82.0;
-const DELETE_BUTTON_WIDTH: f32 = 96.0;
+const EDIT_BUTTON_WIDTH: f32 = 40.0;
+const DELETE_BUTTON_WIDTH: f32 = 40.0;
 const ROW_BUTTON_HEIGHT: f32 = 30.0;
 const ACTIONS_COLUMN_WIDTH: f32 = EDIT_BUTTON_WIDTH + TABLE_SPACING + DELETE_BUTTON_WIDTH;
 const ACCOUNT_ROW_HEIGHT: f32 = 34.0;
 const ACCOUNT_EDITOR_WIDTH: f32 = 388.0;
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 300.0;
-const ACCOUNT_EDITOR_PASSWORD_WIDTH: f32 = 206.0;
-const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 86.0;
+const ACCOUNT_EDITOR_PASSWORD_WIDTH: f32 = 254.0;
+const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
+const ACTION_ICON_SIZE: f32 = 17.0;
+const PASSWORD_ICON_SIZE: f32 = 18.0;
+const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
+const EYE_OFF_ICON: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
+const PENCIL_ICON: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
+const TRASH_ICON: &[u8] = include_bytes!("../../assets/icons/trash.svg");
 
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let mut toggle_enabled_idx = None;
@@ -161,13 +167,13 @@ struct AccountColumns {
 }
 
 fn show_accounts_header(ui: &mut egui::Ui) {
-    show_table_row(ui, 20.0, |ui, cells| {
+    show_table_row(ui, 22.0, |ui, cells| {
         show_cell(
             ui,
             cells.email,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(theme::small_muted("Email"));
+                ui.label(table_header_text("Email"));
             },
         );
         show_cell(
@@ -175,7 +181,7 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             cells.state,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(theme::small_muted("State"));
+                ui.label(table_header_text("Enabled"));
             },
         );
         show_cell(
@@ -183,10 +189,17 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             cells.actions,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(theme::small_muted("Actions"));
+                ui.label(table_header_text("Actions"));
             },
         );
     });
+}
+
+fn table_header_text(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text)
+        .size(14.0)
+        .color(theme::MUTED)
+        .line_height(Some(19.0))
 }
 
 fn show_account_row(
@@ -229,12 +242,6 @@ fn show_account_row(
                 {
                     *toggle_enabled_idx = Some(idx);
                 }
-                let (state, state_color, state_fill) = if account.enabled {
-                    ("Enabled", theme::SUCCESS, theme::SUCCESS_SOFT)
-                } else {
-                    ("Paused", theme::MUTED, theme::MUTED_SOFT)
-                };
-                theme::compact_pill(ui, state, state_color, state_fill);
             },
         );
 
@@ -243,14 +250,16 @@ fn show_account_row(
             cells.actions,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                let edit_button = theme::secondary_button("Edit")
-                    .min_size(egui::vec2(EDIT_BUTTON_WIDTH, ROW_BUTTON_HEIGHT));
-                if ui.add_enabled(actions_enabled, edit_button).clicked() {
+                if account_action_button(ui, AccountActionIcon::Edit, actions_enabled)
+                    .on_hover_text("Edit account")
+                    .clicked()
+                {
                     *edit_account = Some(account.clone());
                 }
-                let delete_button = theme::danger_button("Delete")
-                    .min_size(egui::vec2(DELETE_BUTTON_WIDTH, ROW_BUTTON_HEIGHT));
-                if ui.add_enabled(actions_enabled, delete_button).clicked() {
+                if account_action_button(ui, AccountActionIcon::Delete, actions_enabled)
+                    .on_hover_text("Delete account")
+                    .clicked()
+                {
                     *confirm_delete_account = Some(account.id.clone());
                 }
             },
@@ -431,12 +440,13 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                                 })
                                 .password(!app.show_password);
                             ui.add_sized([ACCOUNT_EDITOR_PASSWORD_WIDTH, 24.0], password_edit);
-                            let label = if app.show_password { "Hide" } else { "Show" };
-                            if ui
-                                .add_sized(
-                                    [ACCOUNT_EDITOR_TOGGLE_WIDTH, 28.0],
-                                    theme::secondary_button(label),
-                                )
+                            let tooltip = if app.show_password {
+                                "Hide password"
+                            } else {
+                                "Show password"
+                            };
+                            if password_visibility_button(ui, app.show_password)
+                                .on_hover_text(tooltip)
                                 .clicked()
                             {
                                 app.show_password = !app.show_password;
@@ -447,10 +457,6 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if is_existing && account.has_saved_password {
-                        theme::pill(ui, "Password saved", theme::SUCCESS, theme::SUCCESS_SOFT);
-                    }
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_sized([104.0, 28.0], theme::secondary_button("Cancel"))
@@ -487,6 +493,84 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     if was_editing && app.editing_account.is_none() {
         clear_temp_password(app);
     }
+}
+
+#[derive(Clone, Copy)]
+enum AccountActionIcon {
+    Edit,
+    Delete,
+}
+
+fn account_action_button(
+    ui: &mut egui::Ui,
+    icon: AccountActionIcon,
+    enabled: bool,
+) -> egui::Response {
+    let (width, bytes_uri, icon_bytes, fill, stroke, icon_color) = match icon {
+        AccountActionIcon::Edit => (
+            EDIT_BUTTON_WIDTH,
+            "bytes://icons/pencil.svg",
+            PENCIL_ICON,
+            egui::Color32::from_rgb(246, 249, 252),
+            egui::Stroke::new(1.0, theme::STROKE),
+            theme::TEXT,
+        ),
+        AccountActionIcon::Delete => (
+            DELETE_BUTTON_WIDTH,
+            "bytes://icons/trash.svg",
+            TRASH_ICON,
+            theme::DANGER_SOFT,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(235, 177, 177)),
+            theme::DANGER,
+        ),
+    };
+    let icon_color = if enabled {
+        icon_color
+    } else {
+        theme::MUTED.linear_multiply(0.55)
+    };
+    let button = egui::Button::image(svg_icon(
+        bytes_uri,
+        icon_bytes,
+        ACTION_ICON_SIZE,
+        icon_color,
+    ))
+    .fill(if enabled {
+        fill
+    } else {
+        egui::Color32::from_rgb(241, 245, 249)
+    })
+    .stroke(stroke)
+    .corner_radius(egui::CornerRadius::same(7))
+    .min_size(egui::vec2(width, ROW_BUTTON_HEIGHT));
+
+    ui.add_enabled(enabled, button)
+}
+
+fn password_visibility_button(ui: &mut egui::Ui, password_visible: bool) -> egui::Response {
+    let (uri, bytes) = if password_visible {
+        ("bytes://icons/eye-off.svg", EYE_OFF_ICON)
+    } else {
+        ("bytes://icons/eye.svg", EYE_ICON)
+    };
+    let button = egui::Button::image(svg_icon(uri, bytes, PASSWORD_ICON_SIZE, theme::TEXT))
+        .fill(egui::Color32::from_rgb(246, 249, 252))
+        .stroke(egui::Stroke::new(1.0, theme::STROKE))
+        .corner_radius(egui::CornerRadius::same(7))
+        .min_size(egui::vec2(ACCOUNT_EDITOR_TOGGLE_WIDTH, 28.0));
+
+    ui.add(button)
+}
+
+fn svg_icon(
+    uri: &'static str,
+    bytes: &'static [u8],
+    size: f32,
+    tint: egui::Color32,
+) -> egui::Image<'static> {
+    egui::Image::from_bytes(uri, bytes)
+        .fit_to_exact_size(egui::vec2(size, size))
+        .tint(tint)
 }
 
 fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: bool) -> bool {
@@ -547,12 +631,12 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
                 return false;
             }
         }
-        app.set_status("Password saved");
+        app.set_status("Account saved");
         if let Err(e) = app
             .worker_tx
             .try_send(crate::background::WorkerCommand::RefreshPasswords)
         {
-            app.set_status(format!("Password saved, but monitor update failed: {}", e));
+            app.set_status(format!("Account saved, but monitor update failed: {}", e));
         }
         return true;
     }

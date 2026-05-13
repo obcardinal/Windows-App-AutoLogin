@@ -49,7 +49,7 @@ impl DiagnosticReport {
 
         if self.target_processes.is_empty() {
             out.push_str("⚠️  No target processes found.\n");
-            out.push_str("   Make sure Windows App / Microsoft Remote Desktop is running.\n\n");
+            out.push_str("   Make sure Windows App is running.\n\n");
         } else {
             for proc in &self.target_processes {
                 out.push_str(&format!(

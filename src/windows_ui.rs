@@ -121,6 +121,7 @@ pub(crate) fn verify_prompt_without_password(
     credentials: &CredentialsConfig,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    ensure_fixed_target_app(target_app_name)?;
     guard()?;
     let prompt = detect_matching_prompt(
         target_app_name,
@@ -140,6 +141,7 @@ pub(crate) fn perform_login_with_password_guarded(
     password: Zeroizing<String>,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<crate::autologin::AutoLoginResult> {
+    ensure_fixed_target_app(target_app_name)?;
     guard()?;
     let Some(prompt) = detect_matching_prompt(
         target_app_name,
@@ -168,6 +170,7 @@ pub(crate) fn perform_login_with_password_guarded(
 }
 
 pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection> {
+    ensure_fixed_target_app(target_app_name)?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
     let allow_system_credential_dialogs = is_builtin_target_name(target_app_name);
     let trusted_target = allow_system_credential_dialogs
@@ -466,6 +469,10 @@ pub(crate) fn post_check_state(
     expected_email: &str,
     timeout: Duration,
 ) -> &'static str {
+    if ensure_fixed_target_app(target_app_name).is_err() {
+        return "present";
+    }
+
     let started = Instant::now();
     loop {
         match inspect(target_app_name) {
@@ -1220,11 +1227,6 @@ fn target_aliases(target_app_name: &str) -> Vec<String> {
             "rdclientwinstore".to_string(),
             "mstsc".to_string(),
         ]),
-        "microsoftremotedesktop" | "remotedesktop" | "remotedesktopconnection" => aliases.extend([
-            "msrdc".to_string(),
-            "msrdcw".to_string(),
-            "mstsc".to_string(),
-        ]),
         _ => {}
     }
 
@@ -1236,8 +1238,18 @@ fn target_aliases(target_app_name: &str) -> Vec<String> {
 fn is_builtin_target_name(target_app_name: &str) -> bool {
     matches!(
         normalized_identifier(target_app_name).as_str(),
-        "windowsapp" | "microsoftremotedesktop" | "remotedesktop" | "remotedesktopconnection"
+        "windowsapp"
     )
+}
+
+fn ensure_fixed_target_app(target_app_name: &str) -> anyhow::Result<()> {
+    if normalized_identifier(target_app_name)
+        == normalized_identifier(crate::config::TARGET_APP_NAME)
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("Only Windows App is supported")
+    }
 }
 
 fn trusted_microsoft_rdp_path_hint(path: &str) -> bool {
@@ -1524,11 +1536,18 @@ const SUBMIT_LABELS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_keyword, credential_dialog_title_like, extract_email_like,
-        is_preferred_submit_label, is_probable_session_window_title, login_title_like,
-        normalized_identifier, system_credential_dialog_matches, target_aliases,
+        contains_keyword, credential_dialog_title_like, ensure_fixed_target_app,
+        extract_email_like, is_preferred_submit_label, is_probable_session_window_title,
+        login_title_like, normalized_identifier, system_credential_dialog_matches, target_aliases,
         text_contains_password_cue, WindowsTarget,
     };
+
+    #[test]
+    fn lower_level_windows_target_is_fixed_to_windows_app() {
+        assert!(ensure_fixed_target_app("Windows App").is_ok());
+        assert!(ensure_fixed_target_app("Microsoft Remote Desktop").is_err());
+        assert!(ensure_fixed_target_app("Custom App").is_err());
+    }
 
     #[test]
     fn windows_target_aliases_include_known_rdp_clients() {
