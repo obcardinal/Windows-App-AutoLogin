@@ -3,10 +3,15 @@ use crate::macos_identity;
 use crate::models::{Account, AppSettings};
 use crate::storage;
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "macos")]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
+#[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
@@ -15,6 +20,31 @@ struct PromptInfo {
     window_title: String,
     email: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct VerifiedPromptContext {
+    pub(crate) account_id: String,
+    pub(crate) process_id: i32,
+    pub(crate) window_title: String,
+    pub(crate) prompt_email: String,
+    pub(crate) detected_at: Instant,
+}
+
+impl VerifiedPromptContext {
+    #[cfg(target_os = "macos")]
+    fn age(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.detected_at)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_fresh(&self) -> bool {
+        self.age() <= VERIFIED_PROMPT_CONTEXT_MAX_AGE
+    }
+}
+
+#[cfg(target_os = "macos")]
+const VERIFIED_PROMPT_CONTEXT_MAX_AGE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillMethod {
@@ -38,10 +68,19 @@ impl FillMethod {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn as_applescript(self) -> &'static str {
         match self {
             Self::Keyboard => "keyboard",
             Self::DirectAxSetValue => "direct_ax_set_value",
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn as_windows_strategy(self) -> crate::windows_ui::WindowsFillStrategy {
+        match self {
+            Self::Keyboard => crate::windows_ui::WindowsFillStrategy::Keyboard,
+            Self::DirectAxSetValue => crate::windows_ui::WindowsFillStrategy::DirectSetValue,
         }
     }
 }
@@ -118,6 +157,8 @@ impl DebugLog {
             ("windows_app_bundle_id", String::new()),
             ("windows_app_team_id", String::new()),
             ("windows_app_frontmost", "false".to_string()),
+            ("prompt_context_source", "live_scan".to_string()),
+            ("prompt_context_age_ms", "0".to_string()),
             ("prompt_detected", "false".to_string()),
             ("detected_email_redacted", String::new()),
             ("account_match_count", "0".to_string()),
@@ -204,19 +245,19 @@ fn log_value(log: &DebugLog, key: &str) -> Option<String> {
 }
 
 pub(crate) fn run_from_args(args: &[String]) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        run_macos(args)
+        run_platform(args)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = args;
-        anyhow::bail!("debug-fill-once is only supported on macOS")
+        anyhow::bail!("debug-fill-once is only supported on macOS and Windows")
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos(args: &[String]) -> anyhow::Result<()> {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn run_platform(args: &[String]) -> anyhow::Result<()> {
     let method = FillMethod::parse(args)?;
     let config = storage::load_config();
     let report = fill_current_prompt_once(&config.settings, &config.accounts, method);
@@ -244,12 +285,16 @@ pub(crate) fn runtime_status_report(
     {
         runtime_status_report_macos(settings, accounts)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        runtime_status_report_windows(settings, accounts)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = settings;
         let _ = accounts;
         DebugLog::new(format!("status-{}", make_attempt_id()))
-            .fail("runtime status is only supported on macOS")
+            .fail("runtime status is only supported on macOS and Windows")
     }
 }
 
@@ -259,16 +304,33 @@ pub(crate) fn fill_current_prompt_once_guarded(
     method: FillMethod,
     guard: impl Fn() -> anyhow::Result<()>,
 ) -> FillAttemptReport {
+    fill_current_prompt_once_guarded_with_context(settings, accounts, method, None, guard)
+}
+
+pub(crate) fn fill_current_prompt_once_guarded_with_context(
+    settings: &AppSettings,
+    accounts: &[Account],
+    method: FillMethod,
+    verified_prompt: Option<VerifiedPromptContext>,
+    guard: impl Fn() -> anyhow::Result<()>,
+) -> FillAttemptReport {
     #[cfg(target_os = "macos")]
     {
-        fill_current_prompt_once_macos(settings, accounts, method, &guard)
+        fill_current_prompt_once_macos(settings, accounts, method, verified_prompt.as_ref(), &guard)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = verified_prompt;
+        fill_current_prompt_once_windows(settings, accounts, method, &guard)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = settings;
         let _ = accounts;
         let _ = method;
-        DebugLog::new(make_attempt_id()).fail("debug-fill-once is only supported on macOS")
+        let _ = verified_prompt;
+        DebugLog::new(make_attempt_id())
+            .fail("debug-fill-once is only supported on macOS and Windows")
     }
 }
 
@@ -277,6 +339,7 @@ fn fill_current_prompt_once_macos(
     settings: &AppSettings,
     accounts: &[Account],
     method: FillMethod,
+    verified_prompt: Option<&VerifiedPromptContext>,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> FillAttemptReport {
     let mut log = DebugLog::new(make_attempt_id());
@@ -294,62 +357,11 @@ fn fill_current_prompt_once_macos(
 
     let app_name = settings.macos_app_name.clone();
 
-    let trusted_infos = match macos_identity::trusted_process_infos(&app_name) {
-        Ok(infos) => infos,
-        Err(_) => return log.fail("windows_app_trust_check_failed"),
-    };
-    let Some(target) = trusted_infos.first() else {
-        return log.fail("trusted_windows_app_not_running");
-    };
-
-    apply_windows_app_fields(&mut log, target);
-
-    let frontmost_ok = match ensure_frontmost(&app_name, target.pid) {
-        Ok(frontmost) => frontmost,
-        Err(e) => return log.fail(format!("frontmost_check_failed_{e}")),
-    };
-    if !frontmost_ok {
-        log.set("windows_app_frontmost", "false");
-        return log.fail("windows_app_not_frontmost");
-    }
-    log.set("windows_app_frontmost", "true");
-
-    let prompt = match detect_visible_prompt(&app_name, target.pid) {
-        Ok(prompt) => prompt,
-        Err(e) => return log.fail(format!("prompt_detection_script_failed_{e}")),
-    };
-    let Some(prompt) = prompt else {
-        return log.fail("visible_credential_prompt_not_detected");
-    };
-    log.set("prompt_detected", "true");
-
-    if prompt.process_id != target.pid {
-        return log.fail("prompt_pid_does_not_match_trusted_target");
-    }
-
-    let Some(prompt_email) = prompt.email.filter(|email| !email.trim().is_empty()) else {
-        return log.fail("visible_prompt_email_missing");
-    };
-    log.set("detected_email_redacted", redacted_email(&prompt_email));
-    if let Err(e) = guard() {
-        return log.fail(format!("attempt_cancelled_{e}"));
-    }
-
-    let account_lookup_start = Instant::now();
-    let matches = matching_accounts(accounts, &prompt_email);
-    log.set(
-        "account_id_lookup_ms",
-        account_lookup_start.elapsed().as_millis().to_string(),
-    );
-    log.set("account_match_count", matches.len().to_string());
-    let [selected_account] = matches.as_slice() else {
-        return if matches.is_empty() {
-            log.fail("visible_prompt_email_matches_no_enabled_account")
-        } else {
-            log.fail("visible_prompt_email_matches_multiple_enabled_accounts")
+    let (prompt, prompt_email, selected_account) =
+        match select_prompt_and_account(&mut log, &app_name, accounts, verified_prompt, guard) {
+            Ok(selection) => selection,
+            Err(reason) => return log.fail(reason),
         };
-    };
-    log.set("selected_account_id", selected_account.id.clone());
 
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
@@ -490,7 +502,8 @@ fn fill_current_prompt_once_macos(
                 "submit_duration_ms",
                 submit_start.elapsed().as_millis().to_string(),
             );
-            let post_state = post_check_state(settings, target.pid, Duration::from_millis(1200));
+            let post_state =
+                post_check_state(settings, prompt.process_id, Duration::from_millis(1200));
             log.set("post_check_state", post_state);
             return if post_state == "authenticated" {
                 log.finish(None)
@@ -510,7 +523,7 @@ fn fill_current_prompt_once_macos(
             .fail(field_value(&submit_output, "failure_reason").unwrap_or("submit_not_attempted"));
     }
 
-    let post_state = post_check_state(settings, target.pid, Duration::from_millis(1200));
+    let post_state = post_check_state(settings, prompt.process_id, Duration::from_millis(1200));
     log.set("post_check_state", post_state);
     if post_state == "authenticated" {
         return log.finish(None);
@@ -522,6 +535,376 @@ fn fill_current_prompt_once_macos(
         "authenticated" => log.finish(None),
         "still_prompt" => log.fail("credential_prompt_still_visible_after_submit"),
         "prompt_gone_unknown" => log.fail("post_submit_prompt_gone_unknown"),
+        "failed" => log.fail("windows_app_not_running_after_submit"),
+        _ => log.fail("post_submit_state_unknown"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn select_prompt_and_account<'a>(
+    log: &mut DebugLog,
+    app_name: &str,
+    accounts: &'a [Account],
+    verified_prompt: Option<&VerifiedPromptContext>,
+    guard: &dyn Fn() -> anyhow::Result<()>,
+) -> Result<(PromptInfo, String, &'a Account), String> {
+    if let Some(context) = verified_prompt {
+        let context_age = context.age();
+        log.set("prompt_context_age_ms", context_age.as_millis().to_string());
+        if context.is_fresh() {
+            log.set("prompt_context_source", "monitor_snapshot");
+            log.set("windows_app_pid", context.process_id.to_string());
+            log.set("prompt_detected", "true");
+
+            let prompt_email = context.prompt_email.trim().to_string();
+            if prompt_email.is_empty() {
+                return Err("visible_prompt_email_missing".to_string());
+            }
+            log.set("detected_email_redacted", redacted_email(&prompt_email));
+
+            guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
+
+            let account_lookup_start = Instant::now();
+            let matches = matching_accounts(accounts, &prompt_email);
+            log.set(
+                "account_id_lookup_ms",
+                account_lookup_start.elapsed().as_millis().to_string(),
+            );
+            log.set("account_match_count", matches.len().to_string());
+            let [selected_account] = matches.as_slice() else {
+                return if matches.is_empty() {
+                    Err("visible_prompt_email_matches_no_enabled_account".to_string())
+                } else {
+                    Err("visible_prompt_email_matches_multiple_enabled_accounts".to_string())
+                };
+            };
+            if selected_account.id != context.account_id {
+                return Err("monitor_prompt_context_account_changed".to_string());
+            }
+            log.set("selected_account_id", selected_account.id.clone());
+
+            return Ok((
+                PromptInfo {
+                    process_id: context.process_id,
+                    window_title: context.window_title.clone(),
+                    email: Some(prompt_email.clone()),
+                },
+                prompt_email,
+                *selected_account,
+            ));
+        }
+
+        log.set("prompt_context_source", "live_scan_after_stale_context");
+    }
+
+    let trusted_infos = macos_identity::trusted_process_infos(app_name)
+        .map_err(|_| "windows_app_trust_check_failed".to_string())?;
+    let Some(target) = trusted_infos.first() else {
+        return Err("trusted_windows_app_not_running".to_string());
+    };
+
+    apply_windows_app_fields(log, target);
+
+    let frontmost_ok = ensure_frontmost(app_name, target.pid)
+        .map_err(|e| format!("frontmost_check_failed_{e}"))?;
+    if !frontmost_ok {
+        log.set("windows_app_frontmost", "false");
+        return Err("windows_app_not_frontmost".to_string());
+    }
+    log.set("windows_app_frontmost", "true");
+
+    let prompt = detect_visible_prompt(app_name, target.pid)
+        .map_err(|e| format!("prompt_detection_script_failed_{e}"))?;
+    let Some(prompt) = prompt else {
+        return Err("visible_credential_prompt_not_detected".to_string());
+    };
+    log.set("prompt_detected", "true");
+
+    if prompt.process_id != target.pid {
+        return Err("prompt_pid_does_not_match_trusted_target".to_string());
+    }
+
+    let Some(prompt_email) = prompt
+        .email
+        .clone()
+        .filter(|email| !email.trim().is_empty())
+    else {
+        return Err("visible_prompt_email_missing".to_string());
+    };
+    log.set("detected_email_redacted", redacted_email(&prompt_email));
+    guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
+
+    let account_lookup_start = Instant::now();
+    let matches = matching_accounts(accounts, &prompt_email);
+    log.set(
+        "account_id_lookup_ms",
+        account_lookup_start.elapsed().as_millis().to_string(),
+    );
+    log.set("account_match_count", matches.len().to_string());
+    let [selected_account] = matches.as_slice() else {
+        return if matches.is_empty() {
+            Err("visible_prompt_email_matches_no_enabled_account".to_string())
+        } else {
+            Err("visible_prompt_email_matches_multiple_enabled_accounts".to_string())
+        };
+    };
+    log.set("selected_account_id", selected_account.id.clone());
+
+    Ok((prompt, prompt_email, *selected_account))
+}
+
+#[cfg(target_os = "windows")]
+fn fill_current_prompt_once_windows(
+    settings: &AppSettings,
+    accounts: &[Account],
+    method: FillMethod,
+    guard: &dyn Fn() -> anyhow::Result<()>,
+) -> FillAttemptReport {
+    let mut log = DebugLog::new(make_attempt_id());
+
+    apply_current_process_fields(&mut log);
+    log.set("ax_trusted_for_current_process", "true");
+
+    if let Err(e) = guard() {
+        return log.fail(format!("attempt_cancelled_{e}"));
+    }
+
+    let app_name = settings.macos_app_name.clone();
+    let mut inspection = match crate::windows_ui::inspect(&app_name) {
+        Ok(inspection) => inspection,
+        Err(e) => return log.fail(format!("windows_uia_inspection_failed_{e}")),
+    };
+
+    let target = inspection.target.clone().or_else(|| {
+        inspection
+            .prompt
+            .as_ref()
+            .map(|prompt| prompt.target.clone())
+    });
+    let Some(target) = target else {
+        return log.fail("trusted_windows_app_not_running");
+    };
+    apply_windows_target_fields(&mut log, &target);
+
+    let Some(mut prompt) = inspection.prompt else {
+        return log.fail("visible_credential_prompt_not_detected");
+    };
+    if !prompt.target.frontmost {
+        if let Err(e) = crate::windows_ui::activate_window(prompt.target.window_handle) {
+            return log.fail(format!("credential_prompt_activation_failed_{e}"));
+        }
+        inspection = match crate::windows_ui::inspect(&app_name) {
+            Ok(inspection) => inspection,
+            Err(e) => return log.fail(format!("windows_uia_reinspection_failed_{e}")),
+        };
+        let Some(next_prompt) = inspection.prompt else {
+            return log.fail("visible_credential_prompt_not_detected_after_activation");
+        };
+        prompt = next_prompt;
+    }
+    log.set("windows_app_frontmost", prompt.target.frontmost.to_string());
+    if !prompt.target.frontmost {
+        return log.fail("windows_app_not_frontmost");
+    }
+
+    log.set("prompt_detected", "true");
+    log.set("password_field_detected", "true");
+    log.set("password_field_role", prompt.password_field_role.clone());
+    log.set(
+        "password_field_description_redacted",
+        prompt.password_field_description.clone(),
+    );
+
+    let account_lookup_start = Instant::now();
+    let (matches, prompt_email) = match windows_prompt_account_matches(accounts, &prompt) {
+        Ok((matches, prompt_email)) => {
+            log.set("detected_email_redacted", redacted_email(&prompt_email));
+            (matches, prompt_email)
+        }
+        Err(reason) => return log.fail(reason),
+    };
+    if let Err(e) = guard() {
+        return log.fail(format!("attempt_cancelled_{e}"));
+    }
+
+    log.set(
+        "account_id_lookup_ms",
+        account_lookup_start.elapsed().as_millis().to_string(),
+    );
+    log.set("account_match_count", matches.len().to_string());
+    let [selected_account] = matches.as_slice() else {
+        return if matches.is_empty() {
+            log.fail("visible_prompt_email_matches_no_enabled_account")
+        } else {
+            log.fail("visible_prompt_email_matches_multiple_enabled_accounts")
+        };
+    };
+    log.set("selected_account_id", selected_account.id.clone());
+    let expected_email = prompt_email.as_str();
+
+    log.set("password_load_attempted", "true");
+    log.set("keychain_service_name", storage::keychain_service_name());
+    log.set("keychain_account_key", selected_account.id.clone());
+    log.set(
+        "keychain_process_path",
+        log_value(&log, "current_process_path").unwrap_or_default(),
+    );
+
+    let password =
+        match storage::load_password_with_timing(&selected_account.id, settings.use_keyring) {
+            Ok(result) => {
+                log.set(
+                    "storage_lookup_start_ms",
+                    result.timing.storage_lookup_start_ms.to_string(),
+                );
+                log.set(
+                    "keychain_query_start",
+                    result.timing.keychain_query_start_ms.to_string(),
+                );
+                log.set(
+                    "keychain_query_ms",
+                    result.timing.keychain_query_ms.to_string(),
+                );
+                log.set(
+                    "keychain_prompt_suspected",
+                    result.timing.keychain_prompt_suspected.to_string(),
+                );
+                log.set(
+                    "fallback_lookup_ms",
+                    result.timing.fallback_lookup_ms.to_string(),
+                );
+                log.set(
+                    "zeroizing_wrap_ms",
+                    result.timing.zeroizing_wrap_ms.to_string(),
+                );
+                log.set(
+                    "total_password_load_ms",
+                    result.timing.total_password_load_ms.to_string(),
+                );
+                log.set(
+                    "password_load_ms",
+                    result.timing.total_password_load_ms.to_string(),
+                );
+                result.password
+            }
+            Err(e) => {
+                log.set(
+                    "storage_lookup_start_ms",
+                    e.timing.storage_lookup_start_ms.to_string(),
+                );
+                log.set(
+                    "keychain_query_start",
+                    e.timing.keychain_query_start_ms.to_string(),
+                );
+                log.set("keychain_query_ms", e.timing.keychain_query_ms.to_string());
+                log.set(
+                    "keychain_prompt_suspected",
+                    e.timing.keychain_prompt_suspected.to_string(),
+                );
+                log.set(
+                    "fallback_lookup_ms",
+                    e.timing.fallback_lookup_ms.to_string(),
+                );
+                log.set("zeroizing_wrap_ms", e.timing.zeroizing_wrap_ms.to_string());
+                log.set(
+                    "total_password_load_ms",
+                    e.timing.total_password_load_ms.to_string(),
+                );
+                log.set(
+                    "password_load_ms",
+                    e.timing.total_password_load_ms.to_string(),
+                );
+                log.set("keychain_error_redacted", e.kind);
+                return log.fail("password_load_failed_for_selected_account");
+            }
+        };
+    if let Err(e) = guard() {
+        return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
+    }
+
+    let fill_start = Instant::now();
+    let fill_result = match crate::windows_ui::fill_password(
+        &app_name,
+        &prompt,
+        password.as_str(),
+        method.as_windows_strategy(),
+        guard,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            log.set(
+                "fill_duration_ms",
+                fill_start.elapsed().as_millis().to_string(),
+            );
+            return log.fail(format!("fill_script_failed_{e}"));
+        }
+    };
+    log.set(
+        "fill_duration_ms",
+        fill_start.elapsed().as_millis().to_string(),
+    );
+    log.set("fill_method", fill_result.fill_method);
+    log.set("fill_attempted", "true");
+    log.set("fill_status", fill_result.fill_status);
+    log.set(
+        "password_field_focused",
+        fill_result.password_field_focused.to_string(),
+    );
+
+    let submit_start = Instant::now();
+    let submit_result = match crate::windows_ui::submit_prompt(&app_name, &prompt, guard) {
+        Ok(result) => result,
+        Err(e) => {
+            log.set(
+                "submit_duration_ms",
+                submit_start.elapsed().as_millis().to_string(),
+            );
+            let post_state = crate::windows_ui::post_check_state(
+                &app_name,
+                target.process_id,
+                expected_email,
+                Duration::from_millis(1200),
+            );
+            log.set("post_check_state", post_state);
+            return if post_state == "authenticated" {
+                log.finish(None)
+            } else {
+                log.fail(format!("submit_script_failed_{e}"))
+            };
+        }
+    };
+    log.set(
+        "submit_duration_ms",
+        submit_start.elapsed().as_millis().to_string(),
+    );
+    log.set("submit_method", submit_result.submit_method);
+    log.set("submit_attempted", "true");
+    log.set("submit_status", submit_result.submit_status);
+    log.set(
+        "axpress_attempted",
+        submit_result.axpress_attempted.to_string(),
+    );
+    log.set("axpress_result", submit_result.axpress_result);
+    log.set(
+        "enter_fallback_attempted",
+        submit_result.enter_fallback_attempted.to_string(),
+    );
+    log.set("enter_fallback_result", submit_result.enter_fallback_result);
+
+    let post_state = crate::windows_ui::post_check_state(
+        &app_name,
+        target.process_id,
+        expected_email,
+        Duration::from_millis(1200),
+    );
+    log.set("post_check_state", post_state);
+    match post_state {
+        "authenticated" => log.finish(None),
+        "prompt_gone_unknown" => {
+            log.set("post_check_state", "submitted_prompt_closed");
+            log.finish(None)
+        }
+        "still_prompt" => log.fail("credential_prompt_still_visible_after_submit"),
         "failed" => log.fail("windows_app_not_running_after_submit"),
         _ => log.fail("post_submit_state_unknown"),
     }
@@ -571,12 +954,11 @@ fn runtime_status_report_macos(settings: &AppSettings, accounts: &[Account]) -> 
         return log.fail("prompt_pid_does_not_match_trusted_target");
     }
 
+    let account_lookup_start = Instant::now();
     let Some(prompt_email) = prompt.email.filter(|email| !email.trim().is_empty()) else {
         return log.fail("visible_prompt_email_missing");
     };
     log.set("detected_email_redacted", redacted_email(&prompt_email));
-
-    let account_lookup_start = Instant::now();
     let matches = matching_accounts(accounts, &prompt_email);
     log.set(
         "account_id_lookup_ms",
@@ -613,7 +995,76 @@ fn runtime_status_report_macos(settings: &AppSettings, accounts: &[Account]) -> 
     log.finish(None)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "windows", feature = "diagnostics-ui"))]
+fn runtime_status_report_windows(
+    settings: &AppSettings,
+    accounts: &[Account],
+) -> FillAttemptReport {
+    let mut log = DebugLog::new(format!("status-{}", make_attempt_id()));
+
+    apply_current_process_fields(&mut log);
+    log.set("ax_trusted_for_current_process", "true");
+    log.set("keychain_service_name", storage::keychain_service_name());
+
+    let app_name = settings.macos_app_name.clone();
+    let inspection = match crate::windows_ui::inspect(&app_name) {
+        Ok(inspection) => inspection,
+        Err(e) => return log.fail(format!("windows_uia_inspection_failed_{e}")),
+    };
+
+    let target = inspection.target.clone().or_else(|| {
+        inspection
+            .prompt
+            .as_ref()
+            .map(|prompt| prompt.target.clone())
+    });
+    let Some(target) = target else {
+        return log.fail("trusted_windows_app_not_running");
+    };
+    apply_windows_target_fields(&mut log, &target);
+
+    let Some(prompt) = inspection.prompt else {
+        return log.finish(None);
+    };
+    log.set("prompt_detected", "true");
+    log.set("password_field_detected", "true");
+    log.set("password_field_role", prompt.password_field_role.clone());
+    log.set(
+        "password_field_description_redacted",
+        prompt.password_field_description.clone(),
+    );
+
+    let account_lookup_start = Instant::now();
+    let matches = match windows_prompt_account_matches(accounts, &prompt) {
+        Ok((matches, prompt_email)) => {
+            log.set("detected_email_redacted", redacted_email(&prompt_email));
+            matches
+        }
+        Err(reason) => return log.fail(reason),
+    };
+    log.set(
+        "account_id_lookup_ms",
+        account_lookup_start.elapsed().as_millis().to_string(),
+    );
+    log.set("account_match_count", matches.len().to_string());
+    let [selected_account] = matches.as_slice() else {
+        return if matches.is_empty() {
+            log.fail("visible_prompt_email_matches_no_enabled_account")
+        } else {
+            log.fail("visible_prompt_email_matches_multiple_enabled_accounts")
+        };
+    };
+
+    log.set("selected_account_id", selected_account.id.clone());
+    log.set("keychain_account_key", selected_account.id.clone());
+    log.set(
+        "keychain_process_path",
+        log_value(&log, "current_process_path").unwrap_or_default(),
+    );
+    log.finish(None)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn matching_accounts<'a>(accounts: &'a [Account], prompt_email: &str) -> Vec<&'a Account> {
     accounts
         .iter()
@@ -626,6 +1077,100 @@ fn matching_accounts<'a>(accounts: &'a [Account], prompt_email: &str) -> Vec<&'a
         })
         .take(2)
         .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_prompt_account_matches<'a>(
+    accounts: &'a [Account],
+    prompt: &crate::windows_ui::WindowsPrompt,
+) -> Result<(Vec<&'a Account>, String), &'static str> {
+    windows_prompt_account_matches_for_context(accounts, prompt.email.as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_prompt_account_matches_for_context<'a>(
+    accounts: &'a [Account],
+    prompt_email: Option<&str>,
+) -> Result<(Vec<&'a Account>, String), &'static str> {
+    if let Some(prompt_email) = prompt_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    {
+        return Ok((
+            matching_accounts(accounts, prompt_email),
+            prompt_email.to_string(),
+        ));
+    }
+
+    Err("visible_prompt_email_missing")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::windows_prompt_account_matches_for_context;
+    use crate::models::Account;
+
+    fn account(id: &str, username: &str, enabled: bool) -> Account {
+        Account {
+            id: id.to_string(),
+            username: username.to_string(),
+            has_saved_password: true,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn windows_prompt_without_email_is_rejected_even_with_single_account() {
+        let accounts = vec![account("a", "user@example.com", true)];
+
+        assert_eq!(
+            windows_prompt_account_matches_for_context(&accounts, None),
+            Err("visible_prompt_email_missing")
+        );
+    }
+
+    #[test]
+    fn visible_email_still_matches_exact_enabled_account() {
+        let accounts = vec![
+            account("a", "user@example.com", true),
+            account("b", "other@example.com", true),
+            account("c", "disabled@example.com", false),
+        ];
+
+        let (matches, prompt_email) =
+            windows_prompt_account_matches_for_context(&accounts, Some(" USER@example.com "))
+                .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id.as_str(), "a");
+        assert_eq!(prompt_email, "USER@example.com");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_context_tests {
+    use super::VerifiedPromptContext;
+    use std::time::{Duration, Instant};
+
+    fn context(detected_at: Instant) -> VerifiedPromptContext {
+        VerifiedPromptContext {
+            account_id: "account-1".to_string(),
+            process_id: 42,
+            window_title: "Sign in".to_string(),
+            prompt_email: "user@example.com".to_string(),
+            detected_at,
+        }
+    }
+
+    #[test]
+    fn fresh_monitor_prompt_context_is_accepted() {
+        assert!(context(Instant::now() - Duration::from_millis(500)).is_fresh());
+    }
+
+    #[test]
+    fn stale_monitor_prompt_context_falls_back_to_live_scan() {
+        assert!(!context(Instant::now() - Duration::from_secs(3)).is_fresh());
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1056,12 +1601,39 @@ fn apply_current_process_fields(log: &mut DebugLog) -> PathBuf {
     current_exe
 }
 
+#[cfg(target_os = "windows")]
+fn apply_current_process_fields(log: &mut DebugLog) -> PathBuf {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<unknown>"));
+    log.set("current_process_path", current_exe.display().to_string());
+    log.set("executable_path", current_exe.display().to_string());
+    log.set(
+        "current_launch_kind",
+        if current_exe.parent().is_some_and(|parent| {
+            parent.ends_with("target\\debug") || parent.ends_with("target\\release")
+        }) {
+            "cargo_or_raw_binary"
+        } else {
+            "installed_exe"
+        },
+    );
+    current_exe
+}
+
 #[cfg(target_os = "macos")]
 fn apply_windows_app_fields(log: &mut DebugLog, target: &macos_identity::TrustedProcessInfo) {
     log.set("windows_app_pid", target.pid.to_string());
     log.set("windows_app_path", target.bundle_path.display().to_string());
     log.set("windows_app_bundle_id", target.bundle_id.clone());
     log.set("windows_app_team_id", target.team_id);
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_target_fields(log: &mut DebugLog, target: &crate::windows_ui::WindowsTarget) {
+    log.set("windows_app_pid", target.process_id.to_string());
+    log.set("windows_app_path", target.process_path.clone());
+    log.set("windows_app_bundle_id", String::new());
+    log.set("windows_app_team_id", String::new());
+    log.set("windows_app_frontmost", target.frontmost.to_string());
 }
 
 #[cfg(target_os = "macos")]
@@ -1818,11 +2390,12 @@ end fillContainer
 
 on pressButtonFast(buttonRef)
     try
-        with timeout of 0.75 seconds
+        with timeout of 0.35 seconds
             tell application "System Events"
                 perform action "AXPress" of buttonRef
             end tell
         end timeout
+        delay 0.02
         return true
     on error
         return false
@@ -1840,57 +2413,34 @@ on buttonEnabled(buttonRef)
     return true
 end buttonEnabled
 
-on buttonText(buttonRef)
-    set labelText to ""
+on buttonLooksSubmit(buttonRef)
     tell application "System Events"
         try
-            with timeout of 0.2 seconds
-                set labelText to labelText & " " & (name of buttonRef as string)
-            end timeout
+            if my buttonTextIsContinue(name of buttonRef as string) then return true
         end try
-        if my buttonLooksSubmit(labelText) then return labelText
         try
-            with timeout of 0.2 seconds
-                set labelText to labelText & " " & (value of buttonRef as string)
-            end timeout
+            if my buttonTextIsContinue(value of buttonRef as string) then return true
         end try
-        if my buttonLooksSubmit(labelText) then return labelText
         try
-            with timeout of 0.2 seconds
-                set labelText to labelText & " " & ((value of attribute "AXTitle" of buttonRef) as string)
-            end timeout
+            if my buttonTextIsContinue(value of attribute "AXTitle" of buttonRef as string) then return true
         end try
     end tell
-    return labelText
-end buttonText
-
-on buttonLooksSubmit(buttonTextValue)
-    ignoring case
-        if buttonTextValue contains "Continue" then return true
-        if buttonTextValue contains "Next" then return true
-        if buttonTextValue contains "Connect" then return true
-        if buttonTextValue contains "Sign in" then return true
-        if buttonTextValue contains "Sign In" then return true
-        if buttonTextValue contains "Log in" then return true
-        if buttonTextValue contains "Login" then return true
-        if buttonTextValue contains "Log on" then return true
-        if buttonTextValue contains "Submit" then return true
-        if buttonTextValue contains "OK" then return true
-        if buttonTextValue contains "Ok" then return true
-        if buttonTextValue contains "Done" then return true
-        if buttonTextValue contains "Войти" then return true
-        if buttonTextValue contains "Подключиться" then return true
-        if buttonTextValue contains "Продолжить" then return true
-        if buttonTextValue contains "Далее" then return true
-    end ignoring
     return false
 end buttonLooksSubmit
+
+on buttonTextIsContinue(buttonTextValue)
+    ignoring case
+        if buttonTextValue is "Continue" then return true
+    end ignoring
+    if buttonTextValue is "Продолжить" then return true
+    return false
+end buttonTextIsContinue
 
 on clickPreferredSubmit(containerRef)
     tell application "System Events"
         try
             repeat with b in every button of containerRef
-                if my buttonEnabled(b) and my buttonLooksSubmit(my buttonText(b)) then
+                if my buttonEnabled(b) and my buttonLooksSubmit(b) then
                     if my pressButtonFast(b) then return true
                 end if
             end repeat
@@ -1907,6 +2457,23 @@ on submitContainer(containerRef, usernameValue, expectedName, expectedProcessNum
 
     set out to ""
     set out to out & my kv("submit_attempted", "true")
+
+    set out to out & my kv("axpress_attempted", "true")
+    set axPressed to false
+    try
+        with timeout of 0.6 seconds
+            set axPressed to my clickPreferredSubmit(containerRef)
+        end timeout
+    end try
+    if axPressed then
+        set out to out & my kv("submit_method", "axpress")
+        set out to out & my kv("axpress_result", "success")
+        set out to out & my kv("enter_fallback_attempted", "false")
+        set out to out & my kv("enter_fallback_result", "not_needed")
+        set out to out & my kv("submit_status", "ok")
+        return out
+    end if
+    set out to out & my kv("axpress_result", "failed")
 
     if my fieldFocusState(passwordField) is not "true" then
         set refocusState to my focusPasswordField(passwordField)
@@ -1933,23 +2500,6 @@ on submitContainer(containerRef, usernameValue, expectedName, expectedProcessNum
         end try
     end if
     set out to out & my kv("enter_fallback_result", enterResult)
-
-    set out to out & my kv("axpress_attempted", "true")
-    set axPressed to false
-    try
-        with timeout of 1.0 seconds
-            set axPressed to my clickPreferredSubmit(containerRef)
-        end timeout
-    end try
-    if axPressed then
-        set out to out & my kv("submit_method", "axpress")
-        set out to out & my kv("axpress_result", "success")
-        set out to out & my kv("enter_fallback_attempted", "false")
-        set out to out & my kv("enter_fallback_result", "not_needed")
-        set out to out & my kv("submit_status", "ok")
-        return out
-    end if
-    set out to out & my kv("axpress_result", "failed")
 
     set out to out & my kv("submit_method", "none")
     set out to out & my kv("enter_fallback_result", enterResult)

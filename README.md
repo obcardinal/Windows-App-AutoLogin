@@ -2,7 +2,7 @@
 
 ![Accounts screen](docs/images/accounts-screen.webp)
 
-Windows App AutoLogin is a small macOS menu-bar utility that fills Microsoft Windows App / Microsoft Remote Desktop credential prompts only when the visible prompt clearly belongs to one saved account.
+Windows App AutoLogin is a small desktop tray/menu-bar utility for macOS and Windows that fills Microsoft Windows App / Microsoft Remote Desktop credential prompts only when the visible prompt clearly belongs to one saved account.
 
 It is designed for the narrow case where Windows App shows a password prompt with a visible email address. The app verifies the running Microsoft client, reads the visible email, matches exactly one enabled account, loads only that account's password, fills the password field, and submits the prompt.
 
@@ -10,13 +10,13 @@ This project is not affiliated with Microsoft.
 
 ## What It Does
 
-- Runs as a lightweight menu-bar app by default.
+- Runs as a lightweight tray/menu-bar app by default.
 - Opens the full settings window only on demand.
 - Stores account metadata in a local config file.
-- Stores passwords in macOS Keychain by default.
+- Stores passwords in the system secure store by default: macOS Keychain on macOS, Windows Credential Manager on Windows.
 - Detects Windows App / Microsoft Remote Desktop credential prompts.
 - Auto-fills password prompts only after a visible email matches exactly one enabled account.
-- Handles both native secure fields and Windows App password fields exposed as password-like `AXTextField` controls.
+- Handles native secure/password fields and password-like text fields only inside a verified credential prompt.
 - Keeps internal diagnostic logs bounded and redacted.
 - Provides a standalone sanitized macOS UI diagnostic tool for development.
 
@@ -26,9 +26,9 @@ The app is intentionally conservative. It should do nothing unless the current s
 
 Before loading a password, it requires:
 
-1. Accessibility permission for the exact running process.
-2. A trusted Windows App / Microsoft Remote Desktop process.
-3. The expected Microsoft bundle identity and code signature.
+1. Platform automation access for the exact running app: macOS Accessibility, or the current Windows desktop UI Automation session.
+2. A trusted Windows App / Microsoft Remote Desktop process/window.
+3. The expected Microsoft app/process identity.
 4. The target app to be frontmost.
 5. A visible credential prompt.
 6. A visible email address in that prompt.
@@ -53,24 +53,26 @@ The runtime trust check currently supports:
 - `Windows App`
 - `Microsoft Remote Desktop`
 
-The trusted Microsoft app identity is:
+On Windows, the native implementation uses Windows UI Automation and supports the known Microsoft RDP client process names used by Windows App, Microsoft Remote Desktop, and Remote Desktop Connection, including `WindowsApp`, `msrdc`, `msrdcw`, and `mstsc`.
+
+On macOS, the trusted Microsoft app identity is:
 
 - Bundle ID: `com.microsoft.rdc.macos`
 - Microsoft Team ID: `UBF8T346G9`
 
-The app expects the Microsoft client bundle to be installed in `/Applications`, for example:
+On macOS, the app expects the Microsoft client bundle to be installed in `/Applications`, for example:
 
 - `/Applications/Windows App.app`
 - `/Applications/Microsoft Remote Desktop.app`
 
-Other app names, copied bundles, unsigned bundles, or modified bundles are rejected.
+Other app names, copied bundles, unsigned bundles, modified bundles, or unexpected Windows process/path identities are rejected.
 
 ## Requirements
 
-- macOS 11 or newer.
+- macOS 11 or newer, or Windows 10/11.
 - Rust matching the version in `Cargo.toml` (`rust-version = "1.93"`).
-- Windows App or Microsoft Remote Desktop installed in `/Applications`.
-- macOS Accessibility permission for the exact app or binary you launch.
+- Windows App or Microsoft Remote Desktop installed on the same desktop session.
+- macOS Accessibility permission for the exact app or binary you launch on macOS.
 - For bundle creation: `sips`, `iconutil`, and optionally `codesign`.
 
 ## Build
@@ -79,6 +81,12 @@ Build the release binary:
 
 ```bash
 cargo build --release
+```
+
+Build-check the Windows implementation from another host when the target is installed:
+
+```bash
+cargo check --target x86_64-pc-windows-gnu --all-targets --all-features
 ```
 
 Build and launch the macOS app bundle:
@@ -182,18 +190,18 @@ Password records are keyed by account ID. Manually editing account IDs can disco
 
 ## Password Storage
 
-By default, passwords are stored in macOS Keychain:
+By default, passwords are stored in the system secure store:
 
 - Service: `WindowsAppAutoLogin`
 - Account: the saved account UUID
 
-If **Use macOS Keychain** is disabled, passwords are stored in an encrypted local fallback file:
+If **Use system secure storage** is disabled, passwords are stored in an encrypted local fallback file:
 
 ```text
 passwords.json
 ```
 
-That fallback uses AES-256-GCM. Its encryption key is still stored in Keychain under:
+That fallback uses AES-256-GCM. Its encryption key is still stored in the system secure store under:
 
 - Service: `WindowsAppAutoLoginFallbackKey`
 - Account: `fallback-encryption-key`
@@ -310,7 +318,7 @@ The script does not perform Developer ID signing or notarization. For distributi
 
 The app bundle sets `LSUIElement=true`, so it behaves like a menu-bar utility rather than a Dock-first application.
 
-Open at Login should be enabled only from a stable app location such as `/Applications`. The app intentionally refuses autostart from transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`.
+On macOS, Open at Login should be enabled only from a stable app location such as `/Applications`; the app intentionally refuses autostart from transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`. On Windows, the portable `dist/WindowsAppAutoLogin-windows-x86_64` build can register itself for Startup, while `target/` and temporary folders are still rejected.
 
 ## Troubleshooting
 
@@ -360,10 +368,8 @@ cargo run --quiet --bin diagnose-macos-ui
 
 ## Limitations
 
-- macOS only.
-- Requires Accessibility permission.
 - Supports only the configured Microsoft Windows App / Microsoft Remote Desktop identities.
-- UI detection depends on macOS Accessibility data exposed by Windows App.
+- UI detection depends on macOS Accessibility data on macOS and Windows UI Automation data on Windows.
 - Prompts with hidden emails, unusual localization, MFA-only flows, SSO web views, or nonstandard controls may not be fillable.
 - The app intentionally prefers doing nothing over guessing.
 

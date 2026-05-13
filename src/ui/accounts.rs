@@ -28,7 +28,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     theme::page_header(
         ui,
         "Accounts",
-        &format!("{account_count} saved account(s) monitored through Windows App on macOS."),
+        &format!("{account_count} saved account(s) monitored through Windows App."),
         |ui| {
             if ui
                 .add_enabled(

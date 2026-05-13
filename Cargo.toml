@@ -26,7 +26,7 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sy
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
-keyring = { version = "3.6", features = ["apple-native"] }
+keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
 aes-gcm = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
@@ -44,6 +44,17 @@ uuid = { version = "1.11", features = ["v4"] }
 dirs = "6.0"
 chrono = "0.4"
 zeroize = "1.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+uiautomation = { version = "0.25", features = ["process"] }
+windows-registry = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = []

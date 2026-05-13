@@ -15,6 +15,21 @@ pub(crate) fn keychain_service_name() -> &'static str {
     SERVICE_NAME
 }
 
+fn native_secure_storage_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macOS Keychain"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Windows Credential Manager"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "system credential store"
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(default)]
 struct LegacyConfig {
@@ -358,26 +373,42 @@ fn legacy_encryption_key() -> [u8; 32] {
 fn fallback_encryption_key() -> anyhow::Result<[u8; 32]> {
     ensure_config_dir()?;
 
-    let entry = keyring::Entry::new(FALLBACK_KEY_SERVICE_NAME, FALLBACK_KEY_ACCOUNT)
-        .map_err(|e| anyhow::anyhow!("macOS Keychain is unavailable for fallback key: {e}"))?;
+    let entry =
+        keyring::Entry::new(FALLBACK_KEY_SERVICE_NAME, FALLBACK_KEY_ACCOUNT).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is unavailable for fallback key: {e}",
+                native_secure_storage_name()
+            )
+        })?;
     match entry.get_password() {
         Ok(encoded) => return decode_fallback_encryption_key(encoded.trim()),
         Err(keyring::Error::NoEntry) => {}
-        Err(e) => anyhow::bail!("macOS Keychain refused to load fallback key: {e}"),
+        Err(e) => anyhow::bail!(
+            "{} refused to load fallback key: {e}",
+            native_secure_storage_name()
+        ),
     }
 
     if let Some(legacy_key) = load_legacy_fallback_key_from_file()? {
         entry
             .set_password(&STANDARD.encode(legacy_key))
-            .map_err(|e| anyhow::anyhow!("macOS Keychain refused to migrate fallback key: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{} refused to migrate fallback key: {e}",
+                    native_secure_storage_name()
+                )
+            })?;
         return Ok(legacy_key);
     }
 
     let mut key = [0u8; 32];
     rand::thread_rng().fill(&mut key);
-    entry
-        .set_password(&STANDARD.encode(key))
-        .map_err(|e| anyhow::anyhow!("macOS Keychain refused to save fallback key: {e}"))?;
+    entry.set_password(&STANDARD.encode(key)).map_err(|e| {
+        anyhow::anyhow!(
+            "{} refused to save fallback key: {e}",
+            native_secure_storage_name()
+        )
+    })?;
     Ok(key)
 }
 
@@ -565,7 +596,7 @@ fn save_password(account_id: &AccountId, password: &str, use_keyring: bool) -> a
     debug!(account_id = %account_id, use_keyring, "save_password called");
     if use_keyring {
         let entry = keyring::Entry::new(SERVICE_NAME, account_id)
-            .map_err(|e| anyhow::anyhow!("macOS Keychain is unavailable: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", native_secure_storage_name()))?;
         match entry.set_password(password) {
             Ok(()) => {
                 if let Err(e) = delete_from_file(account_id) {
@@ -581,7 +612,10 @@ fn save_password(account_id: &AccountId, password: &str, use_keyring: bool) -> a
                 info!(account_id = %account_id, "Password saved to secure storage successfully");
                 return Ok(());
             }
-            Err(e) => anyhow::bail!("macOS Keychain refused to save the password: {e}"),
+            Err(e) => anyhow::bail!(
+                "{} refused to save the password: {e}",
+                native_secure_storage_name()
+            ),
         }
     } else {
         warn!(
@@ -727,7 +761,11 @@ fn storage_error_kind(error: &anyhow::Error) -> &'static str {
         || message.contains("invalid fallback key")
     {
         "decrypt_failed"
-    } else if message.contains("Keychain") || message.contains("keyring") {
+    } else if message.contains("Keychain")
+        || message.contains("Credential Manager")
+        || message.contains("credential")
+        || message.contains("keyring")
+    {
         "secure_storage_unavailable"
     } else {
         "storage_error"

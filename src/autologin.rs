@@ -26,15 +26,15 @@ impl AutoLoginResult {
 }
 
 pub(crate) struct AutoLogin {
-    #[cfg(target_os = "macos")]
-    macos_app_name: String,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    target_app_name: String,
 }
 
 impl AutoLogin {
-    pub(crate) fn new(_macos_app_name: impl Into<String>) -> Self {
+    pub(crate) fn new(target_app_name: impl Into<String>) -> Self {
         Self {
-            #[cfg(target_os = "macos")]
-            macos_app_name: _macos_app_name.into(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            target_app_name: target_app_name.into(),
         }
     }
 
@@ -48,7 +48,7 @@ impl AutoLogin {
         {
             info!("perform_login: taking macOS path with guarded password");
             let result = perform_login_macos_with_password(
-                &self.macos_app_name,
+                &self.target_app_name,
                 credentials,
                 password,
                 &guard,
@@ -58,13 +58,26 @@ impl AutoLogin {
             }
             result
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            let result = crate::windows_ui::perform_login_with_password_guarded(
+                &self.target_app_name,
+                credentials,
+                password,
+                &guard,
+            );
+            if let Err(ref e) = result {
+                warn!("perform_login (Windows) failed: {}", e);
+            }
+            result
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = credentials;
             let _ = password;
             let _ = guard;
             warn!("perform_login: unsupported platform");
-            anyhow::bail!("AutoLogin is only supported on macOS")
+            anyhow::bail!("AutoLogin is only supported on macOS and Windows")
         }
     }
 
@@ -77,18 +90,26 @@ impl AutoLogin {
         {
             guard()?;
             ensure_matching_prompt_email(
-                &self.macos_app_name,
+                &self.target_app_name,
                 &credentials.username,
                 credentials.prompt_window_title.as_deref(),
                 credentials.prompt_process_id,
             )?;
             guard()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows_ui::verify_prompt_without_password(
+                &self.target_app_name,
+                credentials,
+                &guard,
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = credentials;
             let _ = guard;
-            anyhow::bail!("AutoLogin is only supported on macOS")
+            anyhow::bail!("AutoLogin is only supported on macOS and Windows")
         }
     }
 }
@@ -1222,10 +1243,10 @@ fn try_applescript_login(
         r#"on pressButtonFast(buttonRef)
     tell application "System Events"
         try
-            with timeout of 0.75 seconds
+            with timeout of 0.35 seconds
                 perform action "AXPress" of buttonRef
             end timeout
-            delay 0.05
+            delay 0.02
             return true
         on error
             return false
@@ -1234,31 +1255,54 @@ fn try_applescript_login(
 end pressButtonFast
 
 on clickPreferredSubmit(containerRef, expectedName, trustedPIDs)
+    if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
+    return my clickContinueSubmit(containerRef, expectedName, trustedPIDs)
+end clickPreferredSubmit
+
+on clickContinueSubmit(containerRef, expectedName, trustedPIDs)
     tell application "System Events"
-        if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
-        set preferredNames to {{"Sign in", "Sign In", "Log in", "Login", "Log on", "Log On", "Connect", "Continue", "Next", "Submit", "OK", "Ok", "Done", "Войти", "Подключиться", "Продолжить", "Далее"}}
-        repeat with preferredName in preferredNames
-            try
-                repeat with b in (every button of containerRef)
-                    try
-                        set buttonName to name of b as string
-                        if buttonName is (preferredName as string) then
-                            if my pressButtonFast(b) then return true
-                        end if
-                    end try
-                end repeat
-            end try
-        end repeat
+        try
+            repeat with b in (every button of containerRef)
+                if my buttonLooksContinue(b) then
+                    if my targetIsFrontmost(expectedName, trustedPIDs) then
+                        if my pressButtonFast(b) then return true
+                    end if
+                end if
+            end repeat
+        end try
 
         try
             repeat with elem in (every UI element of containerRef)
-                if my clickPreferredSubmit(elem, expectedName, trustedPIDs) then return true
+                if my clickContinueSubmit(elem, expectedName, trustedPIDs) then return true
             end repeat
         end try
 
         return false
     end tell
-end clickPreferredSubmit
+end clickContinueSubmit
+
+on buttonLooksContinue(buttonRef)
+    tell application "System Events"
+        try
+            if my buttonTextIsContinue(name of buttonRef as string) then return true
+        end try
+        try
+            if my buttonTextIsContinue(value of buttonRef as string) then return true
+        end try
+        try
+            if my buttonTextIsContinue(value of attribute "AXTitle" of buttonRef as string) then return true
+        end try
+    end tell
+    return false
+end buttonLooksContinue
+
+on buttonTextIsContinue(buttonTextValue)
+    ignoring case
+        if buttonTextValue is "Continue" then return true
+    end ignoring
+    if buttonTextValue is "Продолжить" then return true
+    return false
+end buttonTextIsContinue
 
 on pressDefaultSubmit(containerRef, expectedName, trustedPIDs, allowPasswordLike)
     tell application "System Events"

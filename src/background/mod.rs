@@ -28,6 +28,7 @@ pub(crate) enum WorkerEvent {
 
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
 const AUTOMATION_SLEEP: Duration = Duration::from_millis(250);
+const PROMPT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const UNKNOWN_POLL_BACKOFF_MAX: Duration = Duration::from_secs(3);
 const MAX_RECENT_PROMPT_ATTEMPTS: usize = 32;
@@ -99,6 +100,7 @@ struct CurrentPromptAttempt {
     automation_in_progress: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     expected_generation: u64,
+    prompt_context: Option<debug_fill::VerifiedPromptContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -331,14 +333,16 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
             event_tx,
             generation,
             expected_generation,
+            prompt_context,
             ..
         } = job;
         let _automation_guard = automation_guard;
         let guard_generation = generation.clone();
-        let report = debug_fill::fill_current_prompt_once_guarded(
+        let report = debug_fill::fill_current_prompt_once_guarded_with_context(
             &settings,
             &accounts,
             FillMethod::Keyboard,
+            prompt_context,
             || {
                 ensure_generation_current(
                     &guard_generation,
@@ -380,7 +384,8 @@ pub(crate) fn spawn(
             Arc::new(Mutex::new(HashMap::<LoginPromptKey, Instant>::new()));
         let automation_in_progress = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
-        let mut last_auto_fill_attempt: Option<Instant> = None;
+        #[cfg(target_os = "macos")]
+        let mut last_macos_prompt_probe: Option<Instant> = None;
         let mut poll_cadence = PollCadence::default();
 
         loop {
@@ -452,42 +457,11 @@ pub(crate) fn spawn(
                 continue;
             }
 
-            let auto_probe_due = last_auto_fill_attempt
-                .map(|attempt| attempt.elapsed() >= Duration::from_secs(1))
-                .unwrap_or(true);
-            if auto_probe_due {
-                let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
-                    trigger: FillTrigger::Automatic,
-                    settings: settings.clone(),
-                    accounts: accounts.clone(),
-                    event_tx: event_tx.clone(),
-                    automation_in_progress: automation_in_progress.clone(),
-                    generation: generation.clone(),
-                    expected_generation: current_generation,
-                });
-                if started {
-                    last_auto_fill_attempt = Some(Instant::now());
-                    if !wait_or_handle_command(
-                        AUTOMATION_SLEEP,
-                        &mut cmd_rx,
-                        &event_tx,
-                        &mut running,
-                        &mut settings,
-                        &mut accounts,
-                        &generation,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    continue;
-                }
-            }
-
             let monitor = AppMonitor::new(runtime_config(&settings));
             let tick_start = Instant::now();
             let status = monitor.check_status();
-            let next_poll_delay = poll_cadence.next_delay(&settings, &status);
+            let status_poll_delay = poll_cadence.next_delay(&settings, &status);
+            let next_poll_delay = status_poll_delay.min(PROMPT_STATUS_POLL_INTERVAL);
             trace!(
                 worker_tick_ms = tick_start.elapsed().as_millis(),
                 worker_state = if running { "running" } else { "idle" },
@@ -497,7 +471,7 @@ pub(crate) fn spawn(
                 suppression_active = false,
                 suppression_reason = "",
                 suppression_until_ms = 0_u64,
-                backoff_ms = next_poll_delay.as_millis(),
+                backoff_ms = status_poll_delay.as_millis(),
                 next_attempt_in_ms = if matches!(
                     status,
                     MonitorStatus::LoginWindowDetected { .. } | MonitorStatus::Unknown
@@ -511,31 +485,18 @@ pub(crate) fn spawn(
                 safe_status_name(&status)
             );
 
+            #[cfg(target_os = "macos")]
+            let status_allows_macos_probe = matches!(status, MonitorStatus::Unknown);
+            #[cfg(target_os = "macos")]
+            let mut prompt_attempt_started = false;
+
             match status {
                 MonitorStatus::Connected => {
                     if let Ok(mut prompts) = recent_prompt_attempts.lock() {
                         prompts.clear();
                     }
                 }
-                MonitorStatus::Unknown => {
-                    let prompt_retry_ok = last_auto_fill_attempt
-                        .map(|attempt| attempt.elapsed() >= Duration::from_secs(1))
-                        .unwrap_or(true);
-                    if prompt_retry_ok {
-                        let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
-                            trigger: FillTrigger::Automatic,
-                            settings: settings.clone(),
-                            accounts: accounts.clone(),
-                            event_tx: event_tx.clone(),
-                            automation_in_progress: automation_in_progress.clone(),
-                            generation: generation.clone(),
-                            expected_generation: current_generation,
-                        });
-                        if started {
-                            last_auto_fill_attempt = Some(Instant::now());
-                        }
-                    }
-                }
+                MonitorStatus::Unknown => {}
                 MonitorStatus::ProcessNotFound => {
                     if let Ok(mut prompts) = recent_prompt_attempts.lock() {
                         prompts.clear();
@@ -547,11 +508,12 @@ pub(crate) fn spawn(
                     prompt_email,
                 } => match account_for_visible_prompt_email(&accounts, prompt_email.as_deref()) {
                     PromptAccountDecision::Allow(account) => {
+                        let prompt_email = prompt_email.unwrap_or_default();
                         let prompt_key = LoginPromptKey {
                             account_id: account.id.clone(),
                             process_id,
                             window_title: window_title.clone(),
-                            prompt_email: prompt_email.unwrap_or_default(),
+                            prompt_email: prompt_email.clone(),
                         };
                         if let Ok(mut prompts) = recent_prompt_attempts.lock() {
                             let now = Instant::now();
@@ -562,6 +524,13 @@ pub(crate) fn spawn(
                                 PROMPT_ATTEMPT_RETENTION,
                             );
                         }
+                        let prompt_context = debug_fill::VerifiedPromptContext {
+                            account_id: account.id.clone(),
+                            process_id,
+                            window_title: window_title.clone(),
+                            prompt_email,
+                            detected_at: Instant::now(),
+                        };
                         let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
                             trigger: FillTrigger::Automatic,
                             settings: settings.clone(),
@@ -570,9 +539,14 @@ pub(crate) fn spawn(
                             automation_in_progress: automation_in_progress.clone(),
                             generation: generation.clone(),
                             expected_generation: current_generation,
+                            prompt_context: Some(prompt_context),
                         });
                         if started {
-                            last_auto_fill_attempt = Some(Instant::now());
+                            #[cfg(target_os = "macos")]
+                            {
+                                prompt_attempt_started = true;
+                                last_macos_prompt_probe = Some(Instant::now());
+                            }
                             let _ = event_tx
                                 .try_send(log_event(LogLevel::Info, "Login window detected"));
                         }
@@ -591,6 +565,42 @@ pub(crate) fn spawn(
                             );
                     }
                 },
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let prompt_probe_due = last_macos_prompt_probe
+                    .map(|attempt| attempt.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if !prompt_attempt_started && status_allows_macos_probe && prompt_probe_due {
+                    let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
+                        trigger: FillTrigger::Automatic,
+                        settings: settings.clone(),
+                        accounts: accounts.clone(),
+                        event_tx: event_tx.clone(),
+                        automation_in_progress: automation_in_progress.clone(),
+                        generation: generation.clone(),
+                        expected_generation: current_generation,
+                        prompt_context: None,
+                    });
+                    if started {
+                        last_macos_prompt_probe = Some(Instant::now());
+                        if !wait_or_handle_command(
+                            AUTOMATION_SLEEP,
+                            &mut cmd_rx,
+                            &event_tx,
+                            &mut running,
+                            &mut settings,
+                            &mut accounts,
+                            &generation,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
             }
 
             if !wait_or_handle_command(
@@ -616,6 +626,7 @@ mod tests {
         account_for_visible_prompt_email, ensure_generation_current, handle_command,
         prompt_retry_is_suppressed, LoginPromptKey, MonitorStatus, PollCadence,
         PromptAccountDecision, WorkerCommand, WorkerEvent, MAX_RECENT_PROMPT_ATTEMPTS,
+        PROMPT_STATUS_POLL_INTERVAL,
     };
     use crate::models::{Account, AppSettings};
     use std::collections::HashMap;
@@ -669,6 +680,65 @@ mod tests {
         assert_eq!(
             cadence.next_delay(&settings, &MonitorStatus::Unknown),
             Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn prompt_status_poll_wakes_up_after_one_second_even_with_status_backoff() {
+        let settings = AppSettings {
+            poll_interval_secs: 1,
+            ..AppSettings::default()
+        };
+        let mut cadence = PollCadence::default();
+
+        assert_eq!(
+            cadence.next_delay(&settings, &MonitorStatus::Connected),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            cadence.next_delay(&settings, &MonitorStatus::Connected),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            cadence.next_delay(&settings, &MonitorStatus::Connected),
+            Duration::from_secs(4)
+        );
+
+        assert_eq!(
+            Duration::from_secs(4).min(PROMPT_STATUS_POLL_INTERVAL),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn credential_prompt_poll_cadence_stays_one_second_after_stable_backoff() {
+        let settings = AppSettings {
+            poll_interval_secs: 1,
+            ..AppSettings::default()
+        };
+        let mut cadence = PollCadence::default();
+
+        for _ in 0..4 {
+            let _ = cadence.next_delay(&settings, &MonitorStatus::Connected);
+        }
+
+        let prompt = MonitorStatus::LoginWindowDetected {
+            process_id: 42,
+            window_title: "Windows Security".to_string(),
+            prompt_email: Some("user@example.com".to_string()),
+        };
+
+        assert_eq!(
+            cadence.next_delay(&settings, &prompt),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            cadence.next_delay(&settings, &prompt),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            cadence.next_delay(&settings, &prompt),
+            Duration::from_secs(1)
         );
     }
 

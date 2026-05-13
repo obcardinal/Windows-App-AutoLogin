@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app;
 #[allow(dead_code)]
 mod autologin;
@@ -12,6 +17,8 @@ mod single_instance;
 mod storage;
 mod tray;
 mod ui;
+#[cfg(target_os = "windows")]
+mod windows_ui;
 
 use eframe::egui;
 use std::process::{Child, Command};
@@ -49,6 +56,12 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     let _single_instance = match single_instance::SingleInstanceGuard::acquire() {
         Ok(guard) => guard,
         Err(e) => {
+            #[cfg(target_os = "windows")]
+            if let Err(activation_error) = single_instance::request_activation() {
+                tracing::warn!(
+                    "Could not request existing instance activation: {activation_error}"
+                );
+            }
             eprintln!("{e}");
             return Ok(());
         }
@@ -80,7 +93,7 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
 }
 
 fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
-    let config = storage::load_config();
+    let config = load_startup_config();
     let (worker_tx, _worker_rx) = tokio_channel::<background::WorkerCommand>(32);
     let (_worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
     let (_tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
@@ -136,7 +149,10 @@ struct LightweightSupervisor {
     worker_status: models::WorkerStatus,
     accessibility_trusted: bool,
     last_accessibility_check: Instant,
+    monitor_command_watcher: single_instance::MonitorCommandWatcher,
     settings_child: Option<Child>,
+    #[cfg(target_os = "windows")]
+    activation_watcher: single_instance::ActivationWatcher,
 }
 
 impl LightweightSupervisor {
@@ -157,7 +173,10 @@ impl LightweightSupervisor {
             worker_status: models::WorkerStatus::Idle,
             accessibility_trusted: autologin::accessibility_is_trusted(),
             last_accessibility_check: Instant::now(),
+            monitor_command_watcher: single_instance::MonitorCommandWatcher::new(),
             settings_child: None,
+            #[cfg(target_os = "windows")]
+            activation_watcher: single_instance::ActivationWatcher::new(),
         }
     }
 
@@ -201,6 +220,21 @@ impl LightweightSupervisor {
         }
     }
 
+    fn process_monitor_commands(&mut self) {
+        let Some(command) = self.monitor_command_watcher.consume_command() else {
+            return;
+        };
+
+        match command {
+            single_instance::MonitorControlCommand::Start => self.start_monitor_if_ready(),
+            single_instance::MonitorControlCommand::Stop => {
+                if self.worker_status == models::WorkerStatus::Running {
+                    let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+                }
+            }
+        }
+    }
+
     fn process_worker_events(&mut self) {
         while let Ok(event) = self.worker_event_rx.try_recv() {
             match event {
@@ -215,6 +249,13 @@ impl LightweightSupervisor {
                 }
                 background::WorkerEvent::Log(_) => {}
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn process_activation_requests(&mut self) {
+        if self.activation_watcher.consume_activation_request() {
+            self.open_settings_window();
         }
     }
 
@@ -244,7 +285,7 @@ impl LightweightSupervisor {
                 if self.accessibility_trusted {
                     let _ = self.worker_tx.try_send(background::WorkerCommand::Start);
                 } else {
-                    tracing::warn!("Accessibility permission is required before starting monitor");
+                    tracing::warn!("Automation permission is required before starting monitor");
                 }
             }
         }
@@ -317,12 +358,17 @@ impl LightweightSupervisor {
     }
 
     fn update_tray_status(&self) {
+        let running = self.worker_status == models::WorkerStatus::Running;
+        if let Err(e) = single_instance::write_monitor_status(running) {
+            tracing::warn!("Could not write monitor status: {e}");
+        }
+
         let Some(tray) = &self.tray else {
             return;
         };
         tray.set_accessibility_trusted(self.accessibility_trusted);
         tray.set_keychain_enabled(self.config.settings.use_keyring);
-        tray.set_monitor_running(self.worker_status == models::WorkerStatus::Running);
+        tray.set_monitor_running(running);
     }
 }
 
@@ -346,6 +392,9 @@ impl ApplicationHandler for LightweightSupervisor {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_tray();
         self.process_tray_commands(event_loop);
+        self.process_monitor_commands();
+        #[cfg(target_os = "windows")]
+        self.process_activation_requests();
         self.process_worker_events();
         self.poll_accessibility();
         self.poll_settings_window();

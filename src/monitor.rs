@@ -31,7 +31,11 @@ impl AppMonitor {
         {
             check_status_macos(&self.config)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows_ui::check_status(&self.config)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             tracing::trace!("Monitor stub on unsupported platform");
             MonitorStatus::Unknown

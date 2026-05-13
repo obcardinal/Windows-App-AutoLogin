@@ -173,25 +173,6 @@ pub fn page_header(
     ui.add_space(12.0);
 }
 
-pub fn simple_page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    egui::Frame::new()
-        .fill(glass())
-        .stroke(egui::Stroke::new(1.0, STROKE))
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin {
-            left: 16,
-            right: 16,
-            top: 13,
-            bottom: 10,
-        })
-        .show(ui, |ui| {
-            ui.heading(title);
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(muted(subtitle)).wrap());
-        });
-    ui.add_space(10.0);
-}
-
 pub fn muted(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text)
         .color(MUTED)

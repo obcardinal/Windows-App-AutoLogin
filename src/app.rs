@@ -7,6 +7,7 @@ use crate::debug_fill::FillAttemptReport;
 use crate::models::{
     Account, AccountId, AppConfig, AppSettings, LogEntry, LogLevel, Tab, WorkerStatus,
 };
+use crate::single_instance::{self, MonitorControlCommand};
 use crate::tray::TrayCommand;
 use crate::ui::theme;
 use eframe::egui;
@@ -55,6 +56,7 @@ pub(crate) struct AutoLoginApp {
     pub(crate) accessibility_status: AccessibilityStatus,
     accessibility_last_poll: Instant,
     accessibility_last_missing_log: Option<Instant>,
+    monitor_status_last_poll: Instant,
 }
 
 impl AutoLoginApp {
@@ -66,7 +68,11 @@ impl AutoLoginApp {
         settings_window_mode: bool,
         initial_tab: Tab,
     ) -> Self {
-        let worker_status = WorkerStatus::Idle;
+        let worker_status = if settings_window_mode {
+            bridged_monitor_status().unwrap_or(WorkerStatus::Idle)
+        } else {
+            WorkerStatus::Idle
+        };
         let settings_draft = config.settings.clone();
         let accessibility_status = accessibility_status();
 
@@ -102,6 +108,7 @@ impl AutoLoginApp {
             accessibility_status,
             accessibility_last_poll: Instant::now(),
             accessibility_last_missing_log: None,
+            monitor_status_last_poll: Instant::now(),
         };
 
         app.log_accessibility_event(
@@ -135,6 +142,35 @@ impl AutoLoginApp {
         }
         if let Err(e) = self.worker_tx.try_send(cmd) {
             self.set_status(format!("Monitor command failed: {}", e));
+        }
+    }
+
+    fn send_monitor_control_command(&mut self, command: MonitorControlCommand) {
+        if self.settings_window_mode {
+            if let Err(e) = single_instance::request_monitor_command(command) {
+                self.set_status(format!("Monitor command failed: {e}"));
+            }
+            return;
+        }
+
+        match command {
+            MonitorControlCommand::Start => self.send_worker_command(WorkerCommand::Start),
+            MonitorControlCommand::Stop => self.send_worker_command(WorkerCommand::Stop),
+        }
+    }
+
+    fn toggle_monitor_from_ui(&mut self) {
+        match self.worker_status {
+            WorkerStatus::Running => {
+                self.send_monitor_control_command(MonitorControlCommand::Stop);
+            }
+            WorkerStatus::Idle => {
+                if self.accessibility_ready() {
+                    self.send_monitor_control_command(MonitorControlCommand::Start);
+                } else {
+                    self.block_for_accessibility("starting the monitor");
+                }
+            }
         }
     }
 
@@ -278,6 +314,21 @@ impl AutoLoginApp {
             }
         }
     }
+
+    fn poll_bridged_monitor_status(&mut self, ctx: &egui::Context) {
+        if !self.settings_window_mode {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+        if self.monitor_status_last_poll.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.monitor_status_last_poll = Instant::now();
+
+        if let Some(status) = bridged_monitor_status() {
+            self.worker_status = status;
+        }
+    }
 }
 
 fn redact_sensitive_log_text(message: &str) -> String {
@@ -413,11 +464,22 @@ fn is_email_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-' | '@')
 }
 
+fn bridged_monitor_status() -> Option<WorkerStatus> {
+    single_instance::read_monitor_status().map(|running| {
+        if running {
+            WorkerStatus::Running
+        } else {
+            WorkerStatus::Idle
+        }
+    })
+}
+
 impl eframe::App for AutoLoginApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_accessibility_onboarding(ctx);
         self.process_tray_commands(ctx);
         self.process_worker_events();
+        self.poll_bridged_monitor_status(ctx);
         #[cfg(feature = "diagnostics-ui")]
         crate::ui::diagnose::poll_diagnosis(self);
         #[cfg(feature = "diagnostics-ui")]
@@ -476,25 +538,28 @@ impl eframe::App for AutoLoginApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(theme::version_label(APP_VERSION_LABEL));
 
-                        if accessibility_ready && !self.settings_window_mode {
+                        if accessibility_ready {
                             match self.worker_status {
                                 WorkerStatus::Running => {
                                     if ui
-                                        .add_sized([82.0, 30.0], theme::secondary_button("Stop"))
+                                        .add_sized(
+                                            [140.0, 30.0],
+                                            theme::secondary_button("Stop Monitor"),
+                                        )
                                         .clicked()
                                     {
-                                        self.send_worker_command(WorkerCommand::Stop);
+                                        self.toggle_monitor_from_ui();
                                     }
                                 }
                                 WorkerStatus::Idle => {
                                     if ui
-                                        .add_enabled(
-                                            self.accessibility_ready(),
-                                            theme::primary_button("Start"),
+                                        .add_sized(
+                                            [140.0, 30.0],
+                                            theme::primary_button("Start Monitor"),
                                         )
                                         .clicked()
                                     {
-                                        self.send_worker_command(WorkerCommand::Start);
+                                        self.toggle_monitor_from_ui();
                                     }
                                 }
                             }

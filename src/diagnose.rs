@@ -175,6 +175,7 @@ fn run_macos(app_name: &str) -> anyhow::Result<DiagnosticReport> {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn redacted_stderr(stderr: &str) -> &'static str {
     if stderr.is_empty() {
         "no stderr"
