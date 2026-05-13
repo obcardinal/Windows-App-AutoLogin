@@ -17,6 +17,7 @@ TARGET_EXECUTABLE="$ROOT_DIR/target/release/$BINARY_NAME"
 DEFAULT_CACHE_ROOT="${HOME:-/tmp}/Library/Caches"
 LOCK_ROOT="${XDG_CACHE_HOME:-$DEFAULT_CACHE_ROOT}/WindowsAppAutoLogin"
 LOCK_DIR="$LOCK_ROOT/WindowsAppAutoLogin.lock"
+FULL_UI_LOCK_DIR="$LOCK_ROOT/WindowsAppAutoLogin.full-ui.lock"
 CARGO_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
 BUILD_VERSION="${CARGO_VERSION}.$(date +%Y%m%d%H%M%S)"
 
@@ -81,6 +82,7 @@ for pid in $(app_pids); do
   kill -9 "$pid" 2>/dev/null || true
 done
 rm -rf "$LOCK_DIR"
+rm -rf "$FULL_UI_LOCK_DIR"
 
 cd "$ROOT_DIR"
 if [ "$DEV_UI" = true ]; then

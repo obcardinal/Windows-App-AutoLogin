@@ -3,7 +3,7 @@ use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::{Command, Stdio};
+use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "macos")]
@@ -15,6 +15,8 @@ const MICROSOFT_REMOTE_DESKTOP_BUNDLE_ID: &str = "com.microsoft.rdc.macos";
 const MICROSOFT_TEAM_ID: &str = "UBF8T346G9";
 #[cfg(target_os = "macos")]
 const SIGNATURE_CACHE_TTL: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const PROC_ALL_PIDS: u32 = 1;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +136,7 @@ pub(crate) fn applescript_pid_list_literal(pids: &[i32]) -> String {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub(crate) fn applescript_string_literal(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
@@ -178,49 +181,90 @@ fn bundle_path_is_trusted_location(path: &Path, app_name: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn enumerate_processes(app_name: &str) -> anyhow::Result<Vec<ProcessIdentity>> {
-    let app_name = applescript_string_literal(app_name);
-    let script = format!(
-        r#"tell application "System Events"
-    set output to ""
-    set expectedName to {}
-    repeat with procRef in every application process whose name is expectedName
-        try
-            set procPID to unix id of procRef as string
-            set procBundle to bundle identifier of procRef as string
-            set procPath to POSIX path of (file of procRef)
-            set output to output & procPID & tab & procBundle & tab & procPath & linefeed
-        end try
-    end repeat
-    return output
-end tell"#,
-        app_name
-    );
+    let Some(identity) = trusted_identity(app_name) else {
+        anyhow::bail!("unsupported app identity for secure automation: {app_name}");
+    };
 
-    let output = run_osascript(&script)?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to enumerate target app processes: {}",
-            redacted_stderr(&output.stderr)
-        );
+    let trusted_candidates = trusted_bundle_candidates(app_name)
+        .into_iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    if trusted_candidates.is_empty() {
+        return Ok(Vec::new());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_process_identity_line)
+    Ok(native_process_ids()
+        .into_iter()
+        .filter_map(|pid| {
+            let executable_path = process_executable_path(pid)?;
+            let bundle_path = containing_app_bundle(&executable_path)?;
+            let canonical_bundle = bundle_path.canonicalize().ok()?;
+            trusted_candidates
+                .iter()
+                .any(|candidate| *candidate == canonical_bundle)
+                .then(|| ProcessIdentity {
+                    pid,
+                    bundle_id: identity.bundle_id.to_string(),
+                    bundle_path: canonical_bundle,
+                })
+        })
         .collect())
 }
 
 #[cfg(target_os = "macos")]
-fn parse_process_identity_line(line: &str) -> Option<ProcessIdentity> {
-    let mut parts = line.splitn(3, '\t');
-    let pid = parts.next()?.trim().parse::<i32>().ok()?;
-    let bundle_id = parts.next()?.trim().to_string();
-    let bundle_path = PathBuf::from(parts.next()?.trim());
-    Some(ProcessIdentity {
-        pid,
-        bundle_id,
-        bundle_path,
-    })
+fn native_process_ids() -> Vec<i32> {
+    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+
+    let mut pids = vec![0 as libc::pid_t; bytes as usize / std::mem::size_of::<libc::pid_t>() + 64];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+        )
+    };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+
+    pids.truncate(bytes as usize / std::mem::size_of::<libc::pid_t>());
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid as i32)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable_path(pid: i32) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast(),
+            buffer.len().try_into().ok()?,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(len as usize);
+    let path = String::from_utf8_lossy(&buffer[..end]).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(target_os = "macos")]
+fn containing_app_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|candidate| candidate.extension().is_some_and(|ext| ext == "app"))
+        .map(Path::to_path_buf)
 }
 
 #[cfg(target_os = "macos")]
@@ -334,27 +378,6 @@ fn metadata_cache_component(label: &str, path: &Path) -> anyhow::Result<String> 
             metadata.len(),
             modified_nanos
         ))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn run_osascript(script: &str) -> anyhow::Result<std::process::Output> {
-    run_command_with_timeout(
-        Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(script)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-        Duration::from_secs(5),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn redacted_stderr(stderr: &[u8]) -> &'static str {
-    if stderr.is_empty() {
-        "no stderr"
-    } else {
-        "redacted stderr"
     }
 }
 

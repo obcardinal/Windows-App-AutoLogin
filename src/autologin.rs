@@ -248,45 +248,51 @@ fn perform_login_macos_after_verified_prompt(
 ) -> anyhow::Result<AutoLoginResult> {
     guard()?;
 
-    info!("perform_login_macos: guarded typing path selected; submit remains bounded");
-    guard()?;
-    let login_script_result = try_applescript_login(
+    info!("perform_login_macos: native AX fill path selected; submit remains bounded");
+    let prompt = matching_native_prompt(
         app_name,
         &credentials.username,
-        &password,
         credentials.prompt_window_title.as_deref(),
         credentials.prompt_process_id,
-        guard,
-    );
+    )?;
 
-    match login_script_result {
-        Ok(result) => {
-            match result {
-                AutoLoginResult::Submitted => info!("Login submitted via AppleScript"),
-                AutoLoginResult::PasswordTouchedWithoutSubmit => {
-                    warn!("Password was typed but submit was not confirmed")
-                }
-            }
-            Ok(result)
+    crate::macos_ax::fill_password(
+        app_name,
+        prompt.target.process_id,
+        &prompt.target.window_title,
+        &credentials.username,
+        password.as_str(),
+        crate::macos_ax::MacosFillMethod::Keyboard,
+        guard,
+    )?;
+    guard()?;
+
+    crate::macos_ax::submit_prompt(
+        app_name,
+        prompt.target.process_id,
+        &prompt.target.window_title,
+        &credentials.username,
+        guard,
+    )?;
+    guard()?;
+
+    match crate::macos_ax::post_check_state(
+        app_name,
+        prompt.target.process_id,
+        &credentials.username,
+        std::time::Duration::from_millis(1200),
+    ) {
+        "authenticated" => {
+            info!("Login submitted via native AX backend");
+            Ok(AutoLoginResult::Submitted)
         }
-        Err(e) => {
-            guard()?;
-            if credential_prompt_state_macos(
-                app_name,
-                &credentials.username,
-                credentials.prompt_window_title.as_deref(),
-                credentials.prompt_process_id,
-            )? == CredentialPromptState::Gone
-            {
-                warn!(
-                    "AppleScript reported an error after the credential prompt cleared; treating submit as unverified: {}",
-                    e
-                );
-                Ok(AutoLoginResult::PasswordTouchedWithoutSubmit)
-            } else {
-                Err(e)
-            }
+        "prompt_gone_unknown" => {
+            warn!("Password was submitted but post-submit authentication state was not confirmed");
+            Ok(AutoLoginResult::PasswordTouchedWithoutSubmit)
         }
+        "still_prompt" => anyhow::bail!("Credential prompt is still visible after native submit"),
+        "failed" => anyhow::bail!("Windows App is not running after native submit"),
+        _ => anyhow::bail!("Post-submit state is unknown after native submit"),
     }
 }
 
@@ -297,16 +303,43 @@ fn ensure_matching_prompt_email(
     expected_window_title: Option<&str>,
     expected_process_id: Option<i32>,
 ) -> anyhow::Result<()> {
-    match visible_prompt_email_macos(app_name, expected_window_title, expected_process_id)? {
-        Some(prompt_email) => {
-            if !usernames_match(&prompt_email, username) {
-                anyhow::bail!("Credential prompt email does not match this account");
-            }
-            info!("Credential prompt email matched the selected account");
-            Ok(())
-        }
-        None => anyhow::bail!("Credential prompt has no visible email; password was not loaded"),
+    let _ = matching_native_prompt(
+        app_name,
+        username,
+        expected_window_title,
+        expected_process_id,
+    )?;
+    info!("Credential prompt email matched the selected account");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn matching_native_prompt(
+    app_name: &str,
+    username: &str,
+    expected_window_title: Option<&str>,
+    expected_process_id: Option<i32>,
+) -> anyhow::Result<crate::macos_ax::MacosPrompt> {
+    let Some(prompt) = crate::macos_ax::detect_visible_prompt(
+        app_name,
+        expected_process_id,
+        expected_window_title,
+    )?
+    else {
+        anyhow::bail!("Credential prompt was not detected");
+    };
+    let Some(prompt_email) = prompt
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    else {
+        anyhow::bail!("Credential prompt has no visible email; password was not loaded");
+    };
+    if !usernames_match(prompt_email, username) {
+        anyhow::bail!("Credential prompt email does not match this account");
     }
+    Ok(prompt)
 }
 
 #[cfg(target_os = "macos")]

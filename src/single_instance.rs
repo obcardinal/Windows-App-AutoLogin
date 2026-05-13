@@ -9,7 +9,8 @@ use windows::Win32::System::Threading::CreateMutexW;
 
 #[cfg(not(target_os = "windows"))]
 const LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.lock";
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "macos")]
+const FULL_UI_LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.full-ui.lock";
 const ACTIVATION_FILE_NAME: &str = "activate";
 const MONITOR_COMMAND_FILE_NAME: &str = "monitor-command";
 const MONITOR_STATUS_FILE_NAME: &str = "monitor-status";
@@ -24,6 +25,14 @@ pub(crate) struct SingleInstanceGuard {
     #[cfg(not(target_os = "windows"))]
     lock_dir: PathBuf,
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) struct FullUiInstanceGuard {
+    lock_dir: PathBuf,
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct FullUiInstanceGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MonitorControlCommand {
@@ -65,19 +74,53 @@ impl SingleInstanceGuard {
     }
 }
 
+impl FullUiInstanceGuard {
+    pub(crate) fn acquire() -> anyhow::Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            return acquire_lock_dir_named(
+                FULL_UI_LOCK_DIR_NAME,
+                "Windows App AutoLogin window is already open",
+            )
+            .map(|lock_dir| Self { lock_dir });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        Ok(Self)
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn acquire_lock_dir() -> anyhow::Result<SingleInstanceGuard> {
-    let lock_dir = lock_root()?.join(LOCK_DIR_NAME);
+    acquire_lock_dir_named(LOCK_DIR_NAME, "Windows App AutoLogin is already running")
+        .map(|lock_dir| SingleInstanceGuard { lock_dir })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn acquire_lock_dir_named(
+    lock_dir_name: &str,
+    already_running_message: &str,
+) -> anyhow::Result<PathBuf> {
+    acquire_lock_dir_in_root(&lock_root()?, lock_dir_name, already_running_message)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn acquire_lock_dir_in_root(
+    root: &Path,
+    lock_dir_name: &str,
+    already_running_message: &str,
+) -> anyhow::Result<PathBuf> {
+    let lock_dir = root.join(lock_dir_name);
     match create_lock(&lock_dir) {
-        Ok(()) => Ok(SingleInstanceGuard { lock_dir }),
+        Ok(()) => Ok(lock_dir),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if existing_process_is_alive(&lock_dir) || lock_dir_looks_fresh(&lock_dir) {
-                anyhow::bail!("Windows App AutoLogin is already running");
+                anyhow::bail!("{}", already_running_message);
             }
 
-            std::fs::remove_dir_all(&lock_dir).ok();
+            remove_stale_lock_dir(&lock_dir)?;
             create_lock(&lock_dir)?;
-            Ok(SingleInstanceGuard { lock_dir })
+            Ok(lock_dir)
         }
         Err(e) => Err(e.into()),
     }
@@ -100,15 +143,13 @@ fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn request_activation() -> anyhow::Result<()> {
     let path = activation_request_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        secure_dir_permissions(parent)?;
-    }
-    std::fs::write(path, std::process::id().to_string())?;
-    Ok(())
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    write_private_text(&path, &format!("{}:{nonce}\n", std::process::id()))
 }
 
 pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow::Result<()> {
@@ -167,20 +208,23 @@ impl MonitorCommandWatcher {
     }
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) struct ActivationWatcher {
     path: Option<PathBuf>,
     last_modified: Option<SystemTime>,
+    last_content: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 impl ActivationWatcher {
     pub(crate) fn new() -> Self {
         let path = activation_request_path().ok();
         let last_modified = path.as_deref().and_then(file_modified_time);
+        let last_content = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok());
         Self {
             path,
             last_modified,
+            last_content,
         }
     }
 
@@ -191,8 +235,12 @@ impl ActivationWatcher {
         let Some(modified) = file_modified_time(path) else {
             return false;
         };
-        if self.last_modified.is_none_or(|last| modified > last) {
+        let content = std::fs::read_to_string(path).ok();
+        if self.last_modified.is_none_or(|last| modified > last)
+            || (content.is_some() && content != self.last_content)
+        {
             self.last_modified = Some(modified);
+            self.last_content = content;
             return true;
         }
         false
@@ -202,6 +250,7 @@ impl ActivationWatcher {
     fn for_path(path: PathBuf) -> Self {
         Self {
             last_modified: file_modified_time(&path),
+            last_content: std::fs::read_to_string(&path).ok(),
             path: Some(path),
         }
     }
@@ -215,10 +264,15 @@ impl Drop for SingleInstanceGuard {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            if lock_pid(&self.lock_dir) == Some(std::process::id()) {
-                std::fs::remove_dir_all(&self.lock_dir).ok();
-            }
+            remove_current_process_lock(&self.lock_dir);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for FullUiInstanceGuard {
+    fn drop(&mut self) {
+        remove_current_process_lock(&self.lock_dir);
     }
 }
 
@@ -235,6 +289,25 @@ fn create_lock(lock_dir: &Path) -> std::io::Result<()> {
         std::process::id().to_string().as_bytes(),
     )?;
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn remove_current_process_lock(lock_dir: &Path) {
+    if lock_pid(lock_dir) == Some(std::process::id()) {
+        remove_stale_lock_dir(lock_dir).ok();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn remove_stale_lock_dir(lock_dir: &Path) -> std::io::Result<()> {
+    let file_type = std::fs::symlink_metadata(lock_dir)?.file_type();
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "lock path is not a private directory",
+        ));
+    }
+    std::fs::remove_dir_all(lock_dir)
 }
 
 fn lock_root() -> anyhow::Result<PathBuf> {
@@ -258,12 +331,10 @@ fn monitor_status_path() -> anyhow::Result<PathBuf> {
     Ok(lock_root()?.join(MONITOR_STATUS_FILE_NAME))
 }
 
-#[cfg(target_os = "windows")]
 fn activation_request_path() -> anyhow::Result<PathBuf> {
     Ok(lock_root()?.join(ACTIVATION_FILE_NAME))
 }
 
-#[cfg(target_os = "windows")]
 fn file_modified_time(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -291,7 +362,48 @@ fn lock_dir_looks_fresh(lock_dir: &Path) -> bool {
             .is_some_and(|age| age <= STARTUP_RACE_GRACE)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn process_looks_like_this_app(pid: u32) -> bool {
+    let Some(process_path) = macos_process_executable_path(pid) else {
+        return false;
+    };
+    let Some(current_path) = std::env::current_exe().ok() else {
+        return false;
+    };
+
+    let canonical_process = process_path.canonicalize().unwrap_or(process_path);
+    let canonical_current = current_path.canonicalize().unwrap_or(current_path);
+    if canonical_process == canonical_current {
+        return true;
+    }
+
+    canonical_process.file_name().is_some()
+        && canonical_process.file_name() == canonical_current.file_name()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_executable_path(pid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as i32,
+            buffer.as_mut_ptr().cast(),
+            buffer.len().try_into().ok()?,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(len as usize);
+    let path = String::from_utf8_lossy(&buffer[..end]).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn process_looks_like_this_app(pid: u32) -> bool {
     let Ok(output) = std::process::Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -431,7 +543,6 @@ mod tests {
         assert!(acquire_windows_single_instance(&name).is_ok());
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn activation_watcher_consumes_new_request_once() {
         let path = std::env::temp_dir().join(format!(
@@ -446,7 +557,118 @@ mod tests {
         assert!(watcher.consume_activation_request());
         assert!(!watcher.consume_activation_request());
 
+        std::fs::write(&path, "activate-again").unwrap();
+        assert!(watcher.consume_activation_request());
+        assert!(!watcher.consume_activation_request());
+
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn lock_dir_blocks_second_acquire() {
+        let root = temp_test_root("lock-blocks-second");
+        let lock_dir = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
+        let guard = SingleInstanceGuard {
+            lock_dir: lock_dir.clone(),
+        };
+
+        let Err(error) = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running") else {
+            panic!("second lock-dir acquire succeeded");
+        };
+        assert!(error.to_string().contains("already running"));
+
+        drop(guard);
+        assert!(acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_ui_lock_blocks_second_acquire() {
+        let root = temp_test_root("full-ui-lock-blocks-second");
+        let lock_dir =
+            acquire_lock_dir_in_root(&root, FULL_UI_LOCK_DIR_NAME, "window already open").unwrap();
+        let guard = FullUiInstanceGuard {
+            lock_dir: lock_dir.clone(),
+        };
+
+        let Err(error) =
+            acquire_lock_dir_in_root(&root, FULL_UI_LOCK_DIR_NAME, "window already open")
+        else {
+            panic!("second full-ui lock acquire succeeded");
+        };
+        assert!(error.to_string().contains("window already open"));
+
+        drop(guard);
+        assert!(
+            acquire_lock_dir_in_root(&root, FULL_UI_LOCK_DIR_NAME, "window already open").is_ok()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn lock_drop_only_removes_current_pid_lock() {
+        let root = temp_test_root("drop-keeps-foreign-pid");
+        let lock_dir = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
+        let guard = SingleInstanceGuard {
+            lock_dir: lock_dir.clone(),
+        };
+        std::fs::write(lock_dir.join("pid"), "0").unwrap();
+
+        drop(guard);
+        assert!(lock_dir.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn stale_lock_with_dead_pid_is_reclaimed() {
+        let root = temp_test_root("stale-lock-reclaimed");
+        let lock_dir = root.join(LOCK_DIR_NAME);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("pid"), "99999999").unwrap();
+
+        let acquired = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
+        assert_eq!(lock_pid(&acquired), Some(std::process::id()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn fresh_pidless_lock_blocks_startup_race() {
+        let root = temp_test_root("fresh-pidless-lock");
+        std::fs::create_dir_all(root.join(LOCK_DIR_NAME)).unwrap();
+
+        let Err(error) = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running") else {
+            panic!("fresh pidless lock was reclaimed");
+        };
+        assert!(error.to_string().contains("already running"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "windows")))]
+    #[test]
+    fn lock_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_test_root("lock-file-permissions");
+        let lock_dir = root.join(LOCK_DIR_NAME);
+        create_lock(&lock_dir).unwrap();
+
+        let dir_mode = std::fs::metadata(&lock_dir).unwrap().permissions().mode() & 0o777;
+        let pid_mode = std::fs::metadata(lock_dir.join("pid"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(pid_mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -470,5 +692,20 @@ mod tests {
         assert_eq!(watcher.consume_command(), Some(MonitorControlCommand::Stop));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn temp_test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "windows-app-autologin-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 }

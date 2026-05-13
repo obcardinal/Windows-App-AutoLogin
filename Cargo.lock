@@ -3903,6 +3903,7 @@ dependencies = [
  "auto-launch",
  "base64",
  "chrono",
+ "core-foundation 0.10.1",
  "dirs",
  "eframe",
  "image",
