@@ -91,7 +91,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         .with_menu(Box::new(menu))
         .with_tooltip("Windows App AutoLogin")
         .with_icon(icon)
-        .with_icon_as_template(false)
+        .with_icon_as_template(tray_icon_uses_template_rendering())
         .build()?;
 
     let accounts_id = accounts_i.id().clone();
@@ -259,4 +259,21 @@ fn load_icon() -> anyhow::Result<tray_icon::Icon> {
     let rgba = image.into_rgba8();
     let (width, height) = rgba.dimensions();
     Ok(tray_icon::Icon::from_rgba(rgba.into_raw(), width, height)?)
+}
+
+fn tray_icon_uses_template_rendering() -> bool {
+    cfg!(target_os = "macos")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tray_icon_uses_template_rendering;
+
+    #[test]
+    fn template_rendering_is_only_enabled_on_macos() {
+        assert_eq!(
+            tray_icon_uses_template_rendering(),
+            cfg!(target_os = "macos")
+        );
+    }
 }
