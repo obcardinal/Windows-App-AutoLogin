@@ -182,7 +182,16 @@ fn secure_path_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn secure_path_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
+    match mode {
+        0o700 => crate::private_permissions::secure_windows_private_dir(path),
+        0o600 => crate::private_permissions::secure_windows_private_file(path),
+        _ => anyhow::bail!("unsupported private Windows path mode"),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn secure_path_permissions(_path: &Path, _mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
@@ -202,7 +211,12 @@ fn validate_private_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn validate_private_dir(path: &Path) -> anyhow::Result<()> {
+    crate::private_permissions::secure_windows_private_dir(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn validate_private_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
@@ -222,7 +236,12 @@ fn validate_private_file_for_read(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn validate_private_file_for_read(path: &Path) -> anyhow::Result<()> {
+    crate::private_permissions::secure_windows_private_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn validate_private_file_for_read(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
@@ -236,11 +255,18 @@ fn read_private_file_bytes(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8
 
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[cfg(windows)]
+    validate_private_file_for_read(path)?;
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
 
     let file = match options.open(path) {
         Ok(file) => file,
@@ -253,6 +279,8 @@ fn read_private_file_bytes(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8
     if !metadata.file_type().is_file() {
         anyhow::bail!("{} is not a regular private file", redacted_path(path));
     }
+    #[cfg(windows)]
+    crate::private_permissions::validate_windows_private_file_handle(&file)?;
     if metadata.len() > max_bytes {
         anyhow::bail!("{} is too large", redacted_path(path));
     }
@@ -725,13 +753,19 @@ fn overwrite_private_file_contents(path: &Path, len: u64) -> anyhow::Result<()> 
 
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
 
     let mut options = std::fs::OpenOptions::new();
     options.write(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
 
     let mut file = options.open(path)?;
+    #[cfg(windows)]
+    crate::private_permissions::validate_windows_private_file_handle(&file)?;
     file.seek(SeekFrom::Start(0))?;
     let zeroes = [0u8; 4096];
     let mut remaining = len;
@@ -1284,6 +1318,10 @@ fn write_private_file_atomic(
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
+        if let Err(e) = secure_path_permissions(&temp_path, 0o600) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
         if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(e.into());
@@ -1316,6 +1354,16 @@ fn replace_private_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
     use windows::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
+
+    if let Some(parent) = path.parent() {
+        validate_private_dir(parent)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => validate_private_file_for_read(path)?,
+        Ok(_) => anyhow::bail!("{} is not a regular private file", redacted_path(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
 
     let temp_path = temp_path
         .as_os_str()
@@ -1387,6 +1435,10 @@ fn write_private_file_create_new_atomic(
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
+        if let Err(e) = secure_path_permissions(&temp_path, 0o600) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
         if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(e.into());
@@ -4506,6 +4558,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn private_text_read_rejects_windows_reparse_files() {
+        let root = temp_test_root("windows-reparse-private-read");
+        let target = root.join("target.json");
+        let link = root.join("passwords.json");
+        write_test_private_text(&target, "{}");
+        if !try_create_windows_file_symlink_or_skip(&target, &link) {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        assert!(read_private_text_file(&link, MAX_PASSWORD_FILE_BYTES).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn private_atomic_write_rejects_windows_reparse_target() {
+        let root = temp_test_root("windows-reparse-atomic-write");
+        let target = root.join("target.json");
+        let link = root.join("config.json");
+        write_test_private_text(&target, "target");
+        if !try_create_windows_file_symlink_or_skip(&target, &link) {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        let error = write_private_file_atomic(&link, "json.tmp", b"new")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reparse") || error.contains("regular private file"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_text_read_repairs_broad_permissions() {
@@ -4789,6 +4883,23 @@ mod tests {
             let mut permissions = std::fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o600);
             std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn try_create_windows_file_symlink_or_skip(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(e) => panic!("failed to create Windows file symlink: {e}"),
         }
     }
 }

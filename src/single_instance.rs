@@ -1531,12 +1531,27 @@ fn strip_private_file_acl(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn secure_dir_permissions(path: &Path) -> std::io::Result<()> {
+    crate::private_permissions::secure_windows_private_dir(path).map_err(private_security_io_error)
+}
+
+#[cfg(windows)]
+fn secure_file_permissions(path: &Path, _mode: u32) -> std::io::Result<()> {
+    crate::private_permissions::secure_windows_private_file(path).map_err(private_security_io_error)
+}
+
+#[cfg(windows)]
+fn private_security_io_error(error: anyhow::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn secure_dir_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn secure_file_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1655,6 +1670,7 @@ fn write_private_text(path: &Path, content: &str) -> anyhow::Result<()> {
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
+        secure_file_permissions(&temp_path, 0o600)?;
         file.write_all(content.as_bytes())?;
         file.sync_all().ok();
     }
@@ -1679,11 +1695,15 @@ fn read_private_text_limited(path: &Path, max_bytes: u64) -> std::io::Result<Opt
 
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
 
     let mut open_options = std::fs::OpenOptions::new();
     open_options.read(true);
     #[cfg(unix)]
     open_options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    open_options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
 
     let file = match open_options.open(path) {
         Ok(file) => file,
@@ -1693,6 +1713,14 @@ fn read_private_text_limited(path: &Path, max_bytes: u64) -> std::io::Result<Opt
     };
     let metadata = file.metadata()?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    if crate::private_permissions::validate_windows_private_file_handle(&file).is_err() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    if secure_file_permissions(path, 0o600).is_err() {
         return Ok(None);
     }
     if metadata.len() > max_bytes {

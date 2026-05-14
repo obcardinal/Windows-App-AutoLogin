@@ -130,6 +130,291 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn secure_windows_private_dir(path: &Path) -> anyhow::Result<()> {
+    secure_windows_private_path(path, WindowsPrivatePathKind::Directory)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn secure_windows_private_file(path: &Path) -> anyhow::Result<()> {
+    secure_windows_private_path(path, WindowsPrivatePathKind::File)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn validate_windows_private_file_handle(file: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+
+    let handle = HANDLE(file.as_raw_handle());
+    let info = windows_file_attribute_tag_info(handle)?;
+    reject_windows_reparse_attributes(info.FileAttributes)?;
+    if info.FileAttributes & windows_dir_attribute_mask() != 0 {
+        anyhow::bail!("private app data path must be a regular file");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn secure_windows_private_path(path: &Path, kind: WindowsPrivatePathKind) -> anyhow::Result<()> {
+    let handle = open_windows_private_path(path, kind)?;
+    apply_windows_private_dacl(handle.0, kind)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_private_path(
+    path: &Path,
+    kind: WindowsPrivatePathKind,
+) -> anyhow::Result<WindowsHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    };
+
+    let mut wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if wide[..wide.len().saturating_sub(1)].contains(&0) {
+        anyhow::bail!("private app data path contains an interior NUL byte");
+    }
+
+    let flags = match kind {
+        WindowsPrivatePathKind::Directory => {
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+        }
+        WindowsPrivatePathKind::File => FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAGS_AND_ATTRIBUTES(0),
+    };
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_mut_ptr()),
+            FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open private app data path for Windows security hardening: {error}"
+        )
+    })?;
+    let handle = WindowsHandle(handle);
+
+    let info = windows_file_attribute_tag_info(handle.0)?;
+    reject_windows_reparse_attributes(info.FileAttributes)?;
+    let is_dir = info.FileAttributes & windows_dir_attribute_mask() != 0;
+    match (kind, is_dir) {
+        (WindowsPrivatePathKind::Directory, true) | (WindowsPrivatePathKind::File, false) => {}
+        (WindowsPrivatePathKind::Directory, false) => {
+            anyhow::bail!("private app data path must be a directory");
+        }
+        (WindowsPrivatePathKind::File, true) => {
+            anyhow::bail!("private app data path must be a regular file");
+        }
+    }
+
+    Ok(handle)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_private_dacl(
+    handle: windows::Win32::Foundation::HANDLE,
+    kind: WindowsPrivatePathKind,
+) -> anyhow::Result<()> {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+
+    let sddl = windows_private_sddl(kind)?;
+    let wide = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(|error| {
+        anyhow::anyhow!("failed to build private Windows security descriptor: {error}")
+    })?;
+    let sd = LocalSecurityDescriptor(sd);
+
+    let mut dacl_present = windows::core::BOOL(0);
+    let mut dacl_defaulted = windows::core::BOOL(0);
+    let mut dacl = std::ptr::null_mut();
+    unsafe { GetSecurityDescriptorDacl(sd.0, &mut dacl_present, &mut dacl, &mut dacl_defaulted) }
+        .map_err(|error| {
+        anyhow::anyhow!("failed to inspect private Windows security descriptor: {error}")
+    })?;
+    if !dacl_present.as_bool() || dacl.is_null() {
+        anyhow::bail!("private Windows security descriptor has no DACL");
+    }
+
+    unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl.cast_const()),
+            None,
+        )
+        .ok()
+    }
+    .map_err(|error| anyhow::anyhow!("failed to apply private Windows DACL: {error}"))?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_private_sddl(kind: WindowsPrivatePathKind) -> anyhow::Result<String> {
+    let user_sid = current_windows_user_sid_string()?;
+    let inheritance = match kind {
+        WindowsPrivatePathKind::Directory => "OICI",
+        WindowsPrivatePathKind::File => "",
+    };
+    Ok(format!(
+        "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)(A;{inheritance};FA;;;{user_sid})"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_user_sid_string() -> anyhow::Result<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|error| anyhow::anyhow!("failed to open Windows process token: {error}"))?;
+    let token = WindowsHandle(token);
+
+    let mut required = 0;
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut required) };
+    if required == 0 {
+        anyhow::bail!("failed to query Windows token user size");
+    }
+
+    let mut buffer = vec![0u8; required as usize];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to query Windows token user: {error}"))?;
+
+    let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    let mut sid = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid) }
+        .map_err(|error| anyhow::anyhow!("failed to stringify Windows user SID: {error}"))?;
+    let sid = LocalWideString(sid);
+    unsafe { sid.0.to_string() }.map_err(|_| anyhow::anyhow!("failed to decode Windows user SID"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_attribute_tag_info(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> anyhow::Result<windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO> {
+    use windows::Win32::Storage::FileSystem::{
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_TAG_INFO,
+    };
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to inspect private Windows path: {error}"))?;
+    Ok(info)
+}
+
+#[cfg(target_os = "windows")]
+fn reject_windows_reparse_attributes(attributes: u32) -> anyhow::Result<()> {
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        anyhow::bail!("private app data path must not be a Windows reparse point");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_dir_attribute_mask() -> u32 {
+    windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum WindowsPrivatePathKind {
+    Directory,
+    File,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct LocalSecurityDescriptor(windows::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(target_os = "windows")]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+                self.0 .0,
+            )))
+        };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct LocalWideString(windows::core::PWSTR);
+
+#[cfg(target_os = "windows")]
+impl Drop for LocalWideString {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+                self.0.as_ptr().cast(),
+            )))
+        };
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 #[allow(dead_code)]
 pub(crate) fn strip_macos_acl(_path: &Path) -> anyhow::Result<()> {
