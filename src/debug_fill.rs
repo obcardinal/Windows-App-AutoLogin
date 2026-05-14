@@ -1010,12 +1010,7 @@ fn fill_current_prompt_once_windows(
         }
     };
 
-    let target = inspection.target.clone().or_else(|| {
-        inspection
-            .prompt
-            .as_ref()
-            .map(|prompt| prompt.target.clone())
-    });
+    let target = inspection.target.clone();
     let Some(target) = target else {
         return log.fail("trusted_windows_app_not_running");
     };
@@ -1285,8 +1280,7 @@ fn inspect_windows_prompt_for_fill(
     ) {
         Ok(Some(prompt)) => {
             log.set("prompt_context_revalidation_result", "ok");
-            let target = crate::windows_ui::running_target_process(app_name)
-                .or_else(|| Some(prompt.target.clone()));
+            let target = crate::windows_ui::running_target_process(app_name);
             Ok(crate::windows_ui::WindowsInspection {
                 target,
                 prompt: Some(prompt),
@@ -1433,12 +1427,7 @@ fn runtime_status_report_windows(
         Err(e) => return log.fail(format!("windows_uia_inspection_failed_{e}")),
     };
 
-    let target = inspection.target.clone().or_else(|| {
-        inspection
-            .prompt
-            .as_ref()
-            .map(|prompt| prompt.target.clone())
-    });
+    let target = inspection.target.clone();
     let Some(target) = target else {
         return log.fail("trusted_windows_app_not_running");
     };

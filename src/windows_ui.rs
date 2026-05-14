@@ -8,14 +8,19 @@ use uiautomation::inputs::Keyboard;
 use uiautomation::patterns::{UIInvokePattern, UIValuePattern};
 use uiautomation::types::{ControlType, Handle};
 use uiautomation::{UIAutomation, UIElement};
-use windows::core::BOOL;
-use windows::core::PWSTR;
+use windows::core::{BOOL, GUID, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWow64DirectoryW};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::Shell::{
+    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86,
+    SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
@@ -93,13 +98,17 @@ pub(crate) struct WindowsSubmitResult {
 pub(crate) fn check_status(config: &Config) -> MonitorStatus {
     match inspect(&config.macos_app_name) {
         Ok(inspection) => {
-            if let Some(prompt) = inspection.prompt {
-                return MonitorStatus::LoginWindowDetected {
-                    process_id: prompt.target.process_id,
-                    window_title: prompt.target.window_title,
-                    prompt_email: prompt.email,
-                    prompt_origin: "windows".to_string(),
-                };
+            if inspection.target.is_some() {
+                if let Some(prompt) = inspection.prompt {
+                    return MonitorStatus::LoginWindowDetected {
+                        process_id: prompt.target.process_id,
+                        window_title: prompt.target.window_title,
+                        prompt_email: prompt.email,
+                        prompt_origin: "windows".to_string(),
+                    };
+                }
+            } else if inspection.prompt.is_some() {
+                return MonitorStatus::ProcessNotFound;
             }
 
             if inspection.target.is_none() {
@@ -125,12 +134,14 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
         .then(|| running_target_process(target_app_name))
         .flatten();
 
-    if let Some(prompt) = fast_system_credential_prompt(&automation, target_app_name)? {
-        return Ok(WindowsInspection {
-            target: trusted_running_target,
-            prompt: Some(prompt),
-            has_session: false,
-        });
+    if trusted_running_target.is_some() {
+        if let Some(prompt) = fast_system_credential_prompt(&automation, target_app_name)? {
+            return Ok(WindowsInspection {
+                target: trusted_running_target.clone(),
+                prompt: Some(prompt),
+                has_session: false,
+            });
+        }
     }
 
     let mut inspection = WindowsInspection {
@@ -1254,26 +1265,34 @@ pub(crate) fn running_target_process(target_app_name: &str) -> Option<WindowsTar
 
     running_processes()?
         .into_iter()
-        .find_map(|(process_id, process_name)| {
+        .find_map(|(process_id, snapshot_name)| {
             let normalized = normalized_identifier(
-                Path::new(&process_name)
+                Path::new(&snapshot_name)
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .unwrap_or(&process_name),
+                    .unwrap_or(&snapshot_name),
             );
-            aliases.contains(&normalized).then(|| WindowsTarget {
+            if !aliases.contains(&normalized) {
+                return None;
+            }
+
+            let process_path = process_image_path(process_id)?;
+            let process_name = process_name_from_path(&process_path);
+            let process_name = if process_name.trim().is_empty() {
+                snapshot_name
+            } else {
+                process_name
+            };
+            let target = WindowsTarget {
                 process_id: process_id as i32,
-                process_name: process_name_from_path(&process_name)
-                    .trim()
-                    .is_empty()
-                    .then(|| Some(process_name.clone()))
-                    .flatten()
-                    .unwrap_or_else(|| process_name_from_path(&process_name)),
-                process_path: String::new(),
+                process_name,
+                process_path,
                 window_title: target_app_name.to_string(),
                 window_handle: 0,
                 frontmost: false,
-            })
+            };
+
+            target_app_matches(target_app_name, &target).then_some(target)
         })
 }
 
@@ -1324,9 +1343,15 @@ fn target_app_matches_with_class(
 ) -> bool {
     let aliases = target_aliases(target_app_name);
     let process_name = normalized_identifier(&target.process_name);
+    if is_builtin_target_name(target_app_name) {
+        return aliases
+            .iter()
+            .any(|alias| !alias.is_empty() && process_name == *alias)
+            && trusted_microsoft_rdp_target_path(&target.process_name, &target.process_path);
+    }
+
     let title = target.window_title.to_lowercase();
     let class_name = normalized_identifier(class_name);
-    let path = target.process_path.to_lowercase();
 
     let process_matches = aliases
         .iter()
@@ -1338,16 +1363,7 @@ fn target_app_matches_with_class(
                 .any(|part| normalized_identifier(part) == *alias)
     });
 
-    if is_builtin_target_name(target_app_name) {
-        let hosted_store_window_matches = process_name == "applicationframehost"
-            && trusted_microsoft_rdp_path_hint(&path)
-            && aliases
-                .iter()
-                .any(|alias| !alias.is_empty() && normalized_identifier(&title).contains(alias));
-        (process_matches && trusted_microsoft_rdp_path_hint(&path)) || hosted_store_window_matches
-    } else {
-        process_matches || title_matches
-    }
+    process_matches || title_matches
 }
 
 fn target_aliases(target_app_name: &str) -> Vec<String> {
@@ -1390,13 +1406,182 @@ fn ensure_fixed_target_app(target_app_name: &str) -> anyhow::Result<()> {
     }
 }
 
+fn normalized_windows_path(path: &str) -> String {
+    let canonical_or_original = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| path.trim().to_string());
+    let trimmed = canonical_or_original.trim();
+    let without_extended_prefix = trimmed
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| trimmed.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| trimmed.to_string());
+    let mut normalized = without_extended_prefix.replace('/', "\\").to_lowercase();
+    while normalized.ends_with('\\') && normalized.len() > 3 {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn normalized_windows_file_name(path: &str) -> Option<String> {
+    normalized_windows_path(path)
+        .rsplit('\\')
+        .next()
+        .filter(|file_name| !file_name.is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_windows_file_stem(path: &str) -> Option<String> {
+    normalized_windows_file_name(path).map(|file_name| {
+        file_name
+            .strip_suffix(".exe")
+            .unwrap_or(&file_name)
+            .to_string()
+    })
+}
+
+fn windows_directory_from_api(getter: unsafe fn(Option<&mut [u16]>) -> u32) -> Option<String> {
+    let mut buffer = vec![0_u16; 32768];
+    let len = unsafe { getter(Some(&mut buffer)) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return None;
+    }
+    Some(normalized_windows_path(&wide_buffer_to_string(
+        &buffer, len,
+    )))
+}
+
+fn trusted_windows_system_directories() -> Vec<String> {
+    let mut dirs = Vec::new();
+    for getter in [
+        GetSystemDirectoryW as unsafe fn(Option<&mut [u16]>) -> u32,
+        GetSystemWow64DirectoryW as unsafe fn(Option<&mut [u16]>) -> u32,
+    ] {
+        if let Some(dir) = windows_directory_from_api(getter) {
+            if !dir.is_empty() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+fn trusted_windows_system_exe_path(path: &str, exe_name: &str) -> bool {
+    let normalized_path = normalized_windows_path(path);
+    let exe_name = exe_name.to_ascii_lowercase();
+    trusted_windows_system_directories()
+        .into_iter()
+        .any(|dir| normalized_path == format!(r"{dir}\{exe_name}"))
+}
+
+fn known_folder_path(folder_id: &GUID) -> Option<String> {
+    let path = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None).ok()? };
+    if path.is_null() {
+        return None;
+    }
+
+    let text = unsafe { path.to_string().ok() };
+    unsafe {
+        CoTaskMemFree(Some(path.as_ptr() as *const std::ffi::c_void));
+    }
+    text.map(|path| normalized_windows_path(&path))
+}
+
+fn trusted_program_files_roots() -> Vec<String> {
+    let mut roots = Vec::new();
+    for folder_id in [
+        &FOLDERID_ProgramFiles,
+        &FOLDERID_ProgramFilesX64,
+        &FOLDERID_ProgramFilesX86,
+    ] {
+        if let Some(root) = known_folder_path(folder_id) {
+            if !root.is_empty() && !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+fn path_equals_trusted_program_files_child(path: &str, child_path: &str) -> bool {
+    let normalized_path = normalized_windows_path(path);
+    let normalized_child_path = child_path.replace('/', "\\").to_lowercase();
+    trusted_program_files_roots()
+        .into_iter()
+        .any(|root| normalized_path == format!(r"{root}\{normalized_child_path}"))
+}
+
+fn trusted_remote_desktop_install_path(path: &str, process_name: &str) -> bool {
+    if !matches!(process_name, "msrdc" | "msrdcw") {
+        return false;
+    }
+
+    path_equals_trusted_program_files_child(path, &format!(r"remote desktop\{process_name}.exe"))
+}
+
+fn trusted_windowsapps_microsoft_package_path(path: &str, process_name: &str) -> bool {
+    if !matches!(
+        process_name,
+        "msrdc" | "msrdcw" | "rdclientwinstore" | "windows365" | "windowsapp"
+    ) {
+        return false;
+    }
+
+    let Some(file_stem) = normalized_windows_file_stem(path) else {
+        return false;
+    };
+    if file_stem != process_name {
+        return false;
+    }
+
+    let normalized_path = normalized_windows_path(path);
+    trusted_program_files_roots().into_iter().any(|root| {
+        let prefix = format!(r"{root}\windowsapps\");
+        let Some(rest) = normalized_path.strip_prefix(&prefix) else {
+            return false;
+        };
+        let Some(package_name) = rest.split('\\').next() else {
+            return false;
+        };
+        let known_package = [
+            "microsoft.remotedesktop_",
+            "microsoft.remotedesktoppreview_",
+            "microsoftcorporationii.windows365_",
+            "microsoftcorporationii.windowsapp_",
+        ]
+        .iter()
+        .any(|prefix| package_name.starts_with(prefix));
+
+        known_package && package_name.ends_with("__8wekyb3d8bbwe")
+    })
+}
+
+fn trusted_microsoft_rdp_target_path(process_name: &str, path: &str) -> bool {
+    if path.trim().is_empty() {
+        return false;
+    }
+
+    let process_name = normalized_identifier(process_name);
+    match process_name.as_str() {
+        "mstsc" => trusted_windows_system_exe_path(path, "mstsc.exe"),
+        "msrdc" | "msrdcw" => {
+            trusted_remote_desktop_install_path(path, &process_name)
+                || trusted_windowsapps_microsoft_package_path(path, &process_name)
+        }
+        "rdclientwinstore" | "windows365" | "windowsapp" => {
+            trusted_windowsapps_microsoft_package_path(path, &process_name)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
 fn trusted_microsoft_rdp_path_hint(path: &str) -> bool {
-    path.contains("\\windowsapps\\microsoft")
-        || path.contains("\\program files\\remote desktop\\")
-        || path.ends_with("\\windows\\system32\\mstsc.exe")
-        || path.ends_with("\\windows\\syswow64\\mstsc.exe")
-        || path.ends_with("\\windows\\system32\\applicationframehost.exe")
-        || path.ends_with("\\windows\\syswow64\\applicationframehost.exe")
+    trusted_microsoft_rdp_target_path(
+        &normalized_windows_file_stem(path).unwrap_or_default(),
+        path,
+    )
 }
 
 fn system_credential_dialog_matches(target: &WindowsTarget, class_name: &str) -> bool {
@@ -1422,15 +1607,12 @@ fn credential_dialog_class_like(class_name: &str) -> bool {
 }
 
 fn trusted_windows_credential_broker_path(path: &str) -> bool {
-    let path = path.to_lowercase();
-    path.ends_with("\\windows\\system32\\credentialuibroker.exe")
-        || path.ends_with("\\windows\\syswow64\\credentialuibroker.exe")
+    trusted_windows_system_exe_path(path, "credentialuibroker.exe")
 }
 
 fn trusted_windows_credential_broker(target: &WindowsTarget) -> bool {
-    trusted_windows_credential_broker_path(&target.process_path)
-        || (target.process_path.trim().is_empty()
-            && normalized_identifier(&target.process_name) == "credentialuibroker")
+    normalized_identifier(&target.process_name) == "credentialuibroker"
+        && trusted_windows_credential_broker_path(&target.process_path)
 }
 
 fn normalized_identifier(value: &str) -> String {
@@ -1674,7 +1856,8 @@ mod tests {
         contains_keyword, credential_dialog_title_like, ensure_fixed_target_app,
         extract_email_like, is_preferred_submit_label, is_probable_session_window_title,
         login_title_like, normalized_identifier, system_credential_dialog_matches, target_aliases,
-        text_contains_password_cue, window_title_matches, WindowsTarget,
+        target_app_matches_with_class, text_contains_password_cue, trusted_microsoft_rdp_path_hint,
+        window_title_matches, WindowsTarget,
     };
 
     #[test]
@@ -1692,6 +1875,129 @@ mod tests {
         assert!(aliases.contains(&"windows365".to_string()));
         assert!(aliases.contains(&"msrdc".to_string()));
         assert!(aliases.contains(&"mstsc".to_string()));
+    }
+
+    fn program_files_path(child: &str) -> String {
+        let root = super::trusted_program_files_roots()
+            .into_iter()
+            .find(|path| path.ends_with(r"\program files"))
+            .unwrap_or_else(|| r"c:\program files".to_string());
+        format!(r"{root}\{child}")
+    }
+
+    fn system32_path(file_name: &str) -> String {
+        let dir = super::trusted_windows_system_directories()
+            .into_iter()
+            .find(|path| path.ends_with(r"\system32"))
+            .unwrap_or_else(|| r"c:\windows\system32".to_string());
+        format!(r"{dir}\{file_name}")
+    }
+
+    fn syswow64_path(file_name: &str) -> Option<String> {
+        super::trusted_windows_system_directories()
+            .into_iter()
+            .find(|path| path.ends_with(r"\syswow64"))
+            .map(|dir| format!(r"{dir}\{file_name}"))
+    }
+
+    fn windows_target(process_name: &str, process_path: impl Into<String>) -> WindowsTarget {
+        WindowsTarget {
+            process_id: 42,
+            process_name: process_name.to_string(),
+            process_path: process_path.into(),
+            window_title: "Windows App".to_string(),
+            window_handle: 7,
+            frontmost: true,
+        }
+    }
+
+    #[test]
+    fn builtin_windows_target_requires_trusted_process_path() {
+        let remote_desktop =
+            windows_target("msrdc", program_files_path(r"Remote Desktop\msrdc.exe"));
+        assert!(target_app_matches_with_class(
+            "Windows App",
+            &remote_desktop,
+            ""
+        ));
+
+        let packaged_windows_app = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+        assert!(target_app_matches_with_class(
+            "Windows App",
+            &packaged_windows_app,
+            ""
+        ));
+
+        let empty_path = windows_target("msrdc", "");
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &empty_path,
+            ""
+        ));
+
+        let user_program_files_spoof = windows_target(
+            "msrdc",
+            r"C:\Users\me\Program Files\Remote Desktop\msrdc.exe",
+        );
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &user_program_files_spoof,
+            ""
+        ));
+
+        let user_windowsapps_spoof = windows_target(
+            "Windows365",
+            r"C:\Users\me\WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+        );
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &user_windowsapps_spoof,
+            ""
+        ));
+    }
+
+    #[test]
+    fn builtin_windows_target_rejects_application_frame_host_title_spoof() {
+        let mut hosted_window = windows_target(
+            "ApplicationFrameHost",
+            system32_path("ApplicationFrameHost.exe"),
+        );
+        hosted_window.window_title = "Windows App".to_string();
+
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &hosted_window,
+            "Windows.UI.Core.CoreWindow"
+        ));
+
+        let class_spoof = windows_target("notepad", "");
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &class_spoof,
+            "WindowsApp"
+        ));
+    }
+
+    #[test]
+    fn trusted_microsoft_rdp_path_hint_rejects_unanchored_spoofs() {
+        assert!(trusted_microsoft_rdp_path_hint(&program_files_path(
+            r"Remote Desktop\msrdc.exe"
+        )));
+        assert!(trusted_microsoft_rdp_path_hint(&system32_path("mstsc.exe")));
+        assert!(!trusted_microsoft_rdp_path_hint(
+            r"C:\Users\me\Program Files\Remote Desktop\msrdc.exe"
+        ));
+        assert!(!trusted_microsoft_rdp_path_hint(
+            r"C:\Users\me\WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe"
+        ));
+        assert!(!trusted_microsoft_rdp_path_hint(
+            r"C:\Users\me\Windows\System32\mstsc.exe"
+        ));
     }
 
     #[test]
@@ -1832,7 +2138,7 @@ mod tests {
         WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBroker".to_string(),
-            process_path: r"C:\Windows\System32\CredentialUIBroker.exe".to_string(),
+            process_path: system32_path("CredentialUIBroker.exe"),
             window_title: "Windows Security".to_string(),
             window_handle: 7,
             frontmost: true,
@@ -1878,6 +2184,60 @@ mod tests {
     }
 
     #[test]
+    fn system_windows_security_dialog_rejects_nested_system32_suffix_spoof() {
+        let target = WindowsTarget {
+            process_id: 42,
+            process_name: "CredentialUIBroker".to_string(),
+            process_path: r"C:\Users\me\Windows\System32\CredentialUIBroker.exe".to_string(),
+            window_title: "Windows Security".to_string(),
+            window_handle: 7,
+            frontmost: true,
+        };
+
+        assert!(!system_credential_dialog_matches(
+            &target,
+            "Credential Dialog Xaml Host"
+        ));
+        assert!(!super::target_is_system_credential_prompt(&target));
+    }
+
+    #[test]
+    fn system_windows_security_dialog_rejects_empty_path_process_name_fallback() {
+        let target = WindowsTarget {
+            process_id: 42,
+            process_name: "CredentialUIBroker".to_string(),
+            process_path: String::new(),
+            window_title: "Windows Security".to_string(),
+            window_handle: 7,
+            frontmost: true,
+        };
+
+        assert!(!system_credential_dialog_matches(
+            &target,
+            "Credential Dialog Xaml Host"
+        ));
+        assert!(!super::target_is_system_credential_prompt(&target));
+    }
+
+    #[test]
+    fn system_windows_security_dialog_requires_broker_process_name() {
+        let target = WindowsTarget {
+            process_id: 42,
+            process_name: "CredentialUIBrokerSpoof".to_string(),
+            process_path: system32_path("CredentialUIBroker.exe"),
+            window_title: "Windows Security".to_string(),
+            window_handle: 7,
+            frontmost: true,
+        };
+
+        assert!(!system_credential_dialog_matches(
+            &target,
+            "Credential Dialog Xaml Host"
+        ));
+        assert!(!super::target_is_system_credential_prompt(&target));
+    }
+
+    #[test]
     fn windows_security_title_is_login_prompt_not_session() {
         assert!(credential_dialog_title_like("Windows Security"));
         assert!(credential_dialog_title_like("Windows Security - Sign in"));
@@ -1890,10 +2250,13 @@ mod tests {
 
     #[test]
     fn system_windows_security_dialog_accepts_syswow64_broker_path() {
+        let Some(process_path) = syswow64_path("CredentialUIBroker.exe") else {
+            return;
+        };
         let target = WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBroker".to_string(),
-            process_path: r"C:\Windows\SysWOW64\CredentialUIBroker.exe".to_string(),
+            process_path,
             window_title: "Windows Security".to_string(),
             window_handle: 7,
             frontmost: true,
