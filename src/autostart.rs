@@ -592,7 +592,15 @@ fn ensure_stable_autostart_path(app_path: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if !windows_trusted_autostart_path(app_path) {
+            anyhow::bail!("{}", stable_autostart_path_message());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if is_transient_path(app_path) {
             anyhow::bail!("{}", stable_autostart_path_message());
@@ -608,7 +616,7 @@ fn stable_autostart_path_message() -> &'static str {
     }
     #[cfg(target_os = "windows")]
     {
-        "Open at Login cannot be enabled from a temporary or build folder. Move the app to a stable install folder first."
+        "Open at Login can only be enabled from a protected install folder such as Program Files."
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -626,7 +634,12 @@ fn current_autostart_path_is_stable() -> bool {
         macos_trusted_autostart_path(&path)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_trusted_autostart_path(&path)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         !is_transient_path(&path)
     }
@@ -688,12 +701,12 @@ enum AutostartPlatform {
     Other,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn is_transient_path(path: &str) -> bool {
     is_transient_path_for_platform(path, current_autostart_platform())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn current_autostart_platform() -> AutostartPlatform {
     #[cfg(target_os = "macos")]
     {
@@ -741,6 +754,70 @@ fn is_transient_path_for_platform(path: &str, platform: AutostartPlatform) -> bo
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn has_path_segment(path: &str, segment: &str) -> bool {
     path.split('/').any(|part| part == segment)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_trusted_autostart_path(app_path: &str) -> bool {
+    let path = std::path::Path::new(app_path);
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(canonical_path) = path.canonicalize() else {
+        return false;
+    };
+    windows_trusted_autostart_path_for_roots(
+        &canonical_path.to_string_lossy(),
+        &windows_protected_autostart_roots(),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_protected_autostart_roots() -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(root) = std::env::var_os(var) else {
+            continue;
+        };
+        let root = root.to_string_lossy().to_string();
+        if root.trim().is_empty() {
+            continue;
+        }
+        if !roots
+            .iter()
+            .any(|existing| windows_paths_equal(existing, &root))
+        {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_trusted_autostart_path_for_roots(app_path: &str, protected_roots: &[String]) -> bool {
+    if is_transient_path_for_platform(app_path, AutostartPlatform::Windows) {
+        return false;
+    }
+    if !windows_autostart_executable_name_is_trusted(app_path) {
+        return false;
+    }
+
+    let path = normalize_windows_path_for_compare(app_path);
+    protected_roots
+        .iter()
+        .any(|root| windows_path_is_under_root(&path, root))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_autostart_executable_name_is_trusted(app_path: &str) -> bool {
+    normalize_windows_path_for_compare(app_path).ends_with(r"\windowsappautologin.exe")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_path_is_under_root(normalized_path: &str, root: &str) -> bool {
+    let root = normalize_windows_path_for_compare(root);
+    normalized_path
+        .strip_prefix(&root)
+        .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -880,9 +957,7 @@ fn windows_cleanup_stale() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    if is_transient_path_for_platform(&app_path, AutostartPlatform::Windows)
-        || !std::path::Path::new(&app_path).exists()
-    {
+    if !windows_trusted_autostart_path(&app_path) {
         windows_disable_current_user()?;
     }
 
@@ -1015,10 +1090,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_transient_path_allows_dist_artifact() {
+    fn windows_transient_path_does_not_define_trust_for_dist_artifact() {
         assert!(!is_transient_path_for_platform(
             r"C:\Users\me\repo\dist\WindowsAppAutoLogin-windows-x86_64\WindowsAppAutoLogin.exe",
             AutostartPlatform::Windows
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Users\me\repo\dist\WindowsAppAutoLogin-windows-x86_64\WindowsAppAutoLogin.exe",
+            &[r"C:\Program Files".to_string()]
         ));
     }
 
@@ -1039,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_transient_path_allows_stable_install_locations() {
+    fn windows_transient_path_classifier_allows_non_temp_install_locations() {
         assert!(!is_transient_path_for_platform(
             r"C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
             AutostartPlatform::Windows
@@ -1047,6 +1126,39 @@ mod tests {
         assert!(!is_transient_path_for_platform(
             r"C:\Users\me\AppData\Local\Programs\WindowsAppAutoLogin\WindowsAppAutoLogin.exe",
             AutostartPlatform::Windows
+        ));
+    }
+
+    #[test]
+    fn windows_autostart_trust_requires_protected_install_root() {
+        let protected_roots = vec![
+            r"C:\Program Files".to_string(),
+            r"C:\Program Files (x86)".to_string(),
+        ];
+
+        assert!(windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files (x86)\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Users\me\AppData\Local\Programs\WindowsAppAutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Users\me\repo\dist\WindowsAppAutoLogin-windows-x86_64\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Users\me\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files\Windows App AutoLogin\Other.exe",
+            &protected_roots
         ));
     }
 
