@@ -47,6 +47,8 @@ const MAX_MONITOR_STATUS_BYTES: u64 = 32;
 const MAX_MONITOR_COMMAND_BYTES: u64 = 256;
 #[cfg(not(target_os = "macos"))]
 const MAX_ACTIVATION_REQUEST_BYTES: u64 = 4096;
+#[cfg(target_os = "windows")]
+pub(crate) const MONITOR_CONTROL_TOKEN_ENV: &str = "WAAL_MONITOR_CONTROL_TOKEN";
 #[cfg(target_os = "macos")]
 const IPC_SOCKET_FILE_NAME: &str = "ipc.sock";
 #[cfg(target_os = "macos")]
@@ -136,7 +138,24 @@ impl MonitorControlCommand {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn from_request(value: &str) -> Option<Self> {
+        #[cfg(target_os = "windows")]
+        {
+            return Self::from_request_with_token(
+                value,
+                monitor_control_token_from_env()?.as_str(),
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::from_legacy_request(value)
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    fn from_legacy_request(value: &str) -> Option<Self> {
         if value.len() > MAX_MONITOR_COMMAND_BYTES as usize {
             return None;
         }
@@ -148,6 +167,33 @@ impl MonitorControlCommand {
             return None;
         }
         if !process_looks_like_this_app(pid) {
+            return None;
+        }
+        Self::from_command_name(command)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn from_request_with_token(value: &str, auth_token: &str) -> Option<Self> {
+        if value.len() > MAX_MONITOR_COMMAND_BYTES as usize {
+            return None;
+        }
+        if parse_nonce_field(auth_token).is_none() {
+            return None;
+        }
+
+        let mut parts = value.trim().split(':');
+        let command = parts.next()?.trim();
+        let pid = parts.next().and_then(|pid| parse_pid_field(pid.trim()))?;
+        let nonce = parts.next()?.trim();
+        parse_nonce_field(nonce)?;
+        let signature = parts.next()?.trim();
+        if parts.next().is_some() {
+            return None;
+        }
+        if !process_looks_like_this_app(pid) {
+            return None;
+        }
+        if !monitor_command_signature_matches(auth_token, command, pid, nonce, signature) {
             return None;
         }
         Self::from_command_name(command)
@@ -168,6 +214,8 @@ impl MonitorControlCommand {
 pub(crate) struct MonitorCommandWatcher {
     path: Option<PathBuf>,
     last_content: Option<String>,
+    #[cfg(target_os = "windows")]
+    auth_token: String,
 }
 
 pub(crate) fn is_already_running_error(error: &anyhow::Error) -> bool {
@@ -408,7 +456,21 @@ pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow:
         ));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let token = monitor_control_token_from_env()
+            .ok_or_else(|| anyhow::anyhow!("monitor control token is unavailable"))?;
+        let nonce = random_nonce();
+        let body = signed_monitor_command_request(
+            command.as_str(),
+            std::process::id(),
+            &nonce,
+            token.as_str(),
+        );
+        write_private_text(&monitor_command_path()?, &body)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -465,7 +527,12 @@ impl MonitorCommandWatcher {
             .and_then(|path| read_private_text_limited(path, MAX_MONITOR_COMMAND_BYTES).ok())
             .flatten();
 
-        Self { path, last_content }
+        Self {
+            path,
+            last_content,
+            #[cfg(target_os = "windows")]
+            auth_token: random_nonce(),
+        }
     }
 
     pub(crate) fn consume_command(&mut self) -> Option<MonitorControlCommand> {
@@ -478,7 +545,20 @@ impl MonitorCommandWatcher {
         }
 
         self.last_content = Some(content.clone());
-        MonitorControlCommand::from_request(&content)
+        #[cfg(target_os = "windows")]
+        {
+            MonitorControlCommand::from_request_with_token(&content, &self.auth_token)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            MonitorControlCommand::from_request(&content)
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn control_token(&self) -> &str {
+        &self.auth_token
     }
 
     #[cfg(test)]
@@ -489,6 +569,20 @@ impl MonitorCommandWatcher {
         Self {
             path: Some(path),
             last_content,
+            #[cfg(target_os = "windows")]
+            auth_token: random_nonce(),
+        }
+    }
+
+    #[cfg(all(test, target_os = "windows"))]
+    fn for_path_with_token(path: PathBuf, auth_token: String) -> Self {
+        let last_content = read_private_text_limited(&path, MAX_MONITOR_COMMAND_BYTES)
+            .ok()
+            .flatten();
+        Self {
+            path: Some(path),
+            last_content,
+            auth_token,
         }
     }
 }
@@ -1224,13 +1318,99 @@ fn lock_owner(lock_dir: &Path) -> Option<LockOwner> {
     })
 }
 
-#[cfg(not(target_os = "windows"))]
 fn random_nonce() -> String {
     use rand::RngCore;
 
     let mut bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_control_token_from_env() -> Option<String> {
+    let token = std::env::var(MONITOR_CONTROL_TOKEN_ENV).ok()?;
+    parse_nonce_field(&token).map(str::to_string)
+}
+
+#[cfg(target_os = "windows")]
+fn signed_monitor_command_request(
+    command: &str,
+    pid: u32,
+    nonce: &str,
+    auth_token: &str,
+) -> String {
+    let signature = monitor_command_signature(auth_token, command, pid, nonce);
+    format!("{command}:{pid}:{nonce}:{signature}\n")
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_command_signature(auth_token: &str, command: &str, pid: u32, nonce: &str) -> String {
+    let message = format!("{command}:{pid}:{nonce}");
+    hmac_sha256_hex(auth_token.as_bytes(), message.as_bytes())
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_command_signature_matches(
+    auth_token: &str,
+    command: &str,
+    pid: u32,
+    nonce: &str,
+    actual_signature: &str,
+) -> bool {
+    if actual_signature.len() != 64
+        || !actual_signature
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let expected = monitor_command_signature(auth_token, command, pid, nonce);
+    constant_time_eq(expected.as_bytes(), actual_signature.as_bytes())
+}
+
+#[cfg(target_os = "windows")]
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0_u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = [0x36_u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5c_u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_hash);
+    outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
 }
 
 fn parse_pid_field(value: &str) -> Option<u32> {
@@ -1241,7 +1421,6 @@ fn parse_pid_field(value: &str) -> Option<u32> {
     (pid > 0).then_some(pid)
 }
 
-#[cfg(not(target_os = "windows"))]
 fn parse_nonce_field(value: &str) -> Option<&str> {
     (value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
 }
@@ -2386,6 +2565,44 @@ mod tests {
     }
 
     #[cfg(not(target_os = "macos"))]
+    fn monitor_command_request_for_test(
+        command: MonitorControlCommand,
+        nonce: &str,
+        auth_token: &str,
+    ) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            let nonce = format!("{nonce:0>32}");
+            signed_monitor_command_request(command.as_str(), std::process::id(), &nonce, auth_token)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = auth_token;
+            format!("{}:{}:{nonce}", command.as_str(), std::process::id())
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn forged_monitor_command_request_for_test(auth_token: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            signed_monitor_command_request(
+                MONITOR_COMMAND_START,
+                99_999_999,
+                &random_nonce(),
+                auth_token,
+            )
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = auth_token;
+            "start_monitor:99999999:4".to_string()
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn monitor_command_watcher_consumes_new_commands_once() {
         let path = std::env::temp_dir().join(format!(
@@ -2393,26 +2610,49 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
+
+        #[cfg(target_os = "windows")]
+        let auth_token = random_nonce();
+        #[cfg(not(target_os = "windows"))]
+        let auth_token = String::new();
+
+        #[cfg(target_os = "windows")]
+        let mut watcher =
+            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
+        #[cfg(not(target_os = "windows"))]
         let mut watcher = MonitorCommandWatcher::for_path(path.clone());
 
         assert_eq!(watcher.consume_command(), None);
-        write_test_private_text(&path, format!("start_monitor:{}:1", std::process::id())).unwrap();
+        write_test_private_text(
+            &path,
+            monitor_command_request_for_test(MonitorControlCommand::Start, "1", &auth_token),
+        )
+        .unwrap();
         assert_eq!(
             watcher.consume_command(),
             Some(MonitorControlCommand::Start)
         );
         assert_eq!(watcher.consume_command(), None);
 
-        write_test_private_text(&path, format!("stop_monitor:{}:2", std::process::id())).unwrap();
+        write_test_private_text(
+            &path,
+            monitor_command_request_for_test(MonitorControlCommand::Stop, "2", &auth_token),
+        )
+        .unwrap();
         assert_eq!(watcher.consume_command(), Some(MonitorControlCommand::Stop));
 
-        write_test_private_text(&path, format!("reload_config:{}:3", std::process::id())).unwrap();
+        write_test_private_text(
+            &path,
+            monitor_command_request_for_test(MonitorControlCommand::ReloadConfig, "3", &auth_token),
+        )
+        .unwrap();
         assert_eq!(
             watcher.consume_command(),
             Some(MonitorControlCommand::ReloadConfig)
         );
 
-        write_test_private_text(&path, "start_monitor:99999999:4").unwrap();
+        write_test_private_text(&path, forged_monitor_command_request_for_test(&auth_token))
+            .unwrap();
         assert_eq!(watcher.consume_command(), None);
 
         let _ = std::fs::remove_file(path);
@@ -2444,6 +2684,99 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn monitor_command_requires_windows_auth_signature() {
+        let auth_token = random_nonce();
+        let nonce = random_nonce();
+        let valid = signed_monitor_command_request(
+            MONITOR_COMMAND_START,
+            std::process::id(),
+            &nonce,
+            &auth_token,
+        );
+
+        assert_eq!(
+            MonitorControlCommand::from_request_with_token(&valid, &auth_token),
+            Some(MonitorControlCommand::Start)
+        );
+        assert_eq!(
+            MonitorControlCommand::from_request_with_token(
+                &format!("{}:{}:{}", MONITOR_COMMAND_START, std::process::id(), nonce),
+                &auth_token
+            ),
+            None
+        );
+        assert_eq!(
+            MonitorControlCommand::from_request_with_token(
+                &signed_monitor_command_request(
+                    MONITOR_COMMAND_START,
+                    std::process::id(),
+                    &nonce,
+                    &random_nonce(),
+                ),
+                &auth_token,
+            ),
+            None
+        );
+        assert_eq!(
+            MonitorControlCommand::from_request_with_token(
+                &valid.replacen(MONITOR_COMMAND_START, MONITOR_COMMAND_STOP, 1),
+                &auth_token,
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn monitor_command_watcher_rejects_raw_spoofed_file_with_supervisor_pid() {
+        let path = std::env::temp_dir().join(format!(
+            "windows-app-autologin-monitor-command-spoof-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let auth_token = random_nonce();
+        let mut watcher =
+            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
+
+        write_test_private_text(
+            &path,
+            format!("{}:{}:1", MONITOR_COMMAND_START, std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(watcher.consume_command(), None);
+
+        write_test_private_text(
+            &path,
+            signed_monitor_command_request(
+                MONITOR_COMMAND_START,
+                std::process::id(),
+                &random_nonce(),
+                &random_nonce(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(watcher.consume_command(), None);
+
+        write_test_private_text(
+            &path,
+            signed_monitor_command_request(
+                MONITOR_COMMAND_START,
+                std::process::id(),
+                &random_nonce(),
+                &auth_token,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            watcher.consume_command(),
+            Some(MonitorControlCommand::Start)
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(not(target_os = "macos"))]

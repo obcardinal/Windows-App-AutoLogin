@@ -611,7 +611,16 @@ impl LightweightSupervisor {
             let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
         }
 
-        match spawn_full_ui_window(initial_tab, self.privileged_ipc_available()) {
+        #[cfg(target_os = "windows")]
+        let monitor_control_token = Some(self.monitor_command_watcher.control_token());
+        #[cfg(not(target_os = "windows"))]
+        let monitor_control_token = None;
+
+        match spawn_full_ui_window(
+            initial_tab,
+            self.privileged_ipc_available(),
+            monitor_control_token,
+        ) {
             Ok(child) => {
                 self.settings_child = Some(child);
             }
@@ -812,11 +821,13 @@ fn initial_tab_arg(initial_tab: models::Tab) -> &'static str {
 fn spawn_full_ui_window(
     initial_tab: models::Tab,
     privileged_ipc_available: bool,
+    monitor_control_token: Option<&str>,
 ) -> anyhow::Result<Child> {
     Ok(full_ui_command(
         std::env::current_exe()?,
         initial_tab,
         privileged_ipc_available,
+        monitor_control_token,
     )
     .spawn()?)
 }
@@ -825,14 +836,28 @@ fn full_ui_command(
     current_exe: impl AsRef<std::ffi::OsStr>,
     initial_tab: models::Tab,
     privileged_ipc_available: bool,
+    monitor_control_token: Option<&str>,
 ) -> Command {
     let mut command = Command::new(current_exe);
     command.arg("--full-ui").arg(initial_tab_arg(initial_tab));
-    #[cfg(not(target_os = "macos"))]
-    let _ = privileged_ipc_available;
+    #[cfg(target_os = "windows")]
+    {
+        let _ = privileged_ipc_available;
+        if let Some(token) = monitor_control_token {
+            command.env(single_instance::MONITOR_CONTROL_TOKEN_ENV, token);
+        } else {
+            command.env_remove(single_instance::MONITOR_CONTROL_TOKEN_ENV);
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = privileged_ipc_available;
+        let _ = monitor_control_token;
+    }
     #[cfg(target_os = "macos")]
     {
         let _ = privileged_ipc_available;
+        let _ = monitor_control_token;
         command.env_remove(LEGACY_IPC_TOKEN_ENV);
     }
     command
@@ -975,6 +1000,7 @@ mod tests {
             "/tmp/windows-app-autologin",
             crate::models::Tab::Accounts,
             false,
+            None,
         );
 
         let args = command
@@ -988,6 +1014,30 @@ mod tests {
                 "--full-ui".to_string(),
                 initial_tab_arg(crate::models::Tab::Accounts).to_string()
             ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn full_ui_command_passes_monitor_control_token_env() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let command = full_ui_command(
+            "/tmp/windows-app-autologin",
+            crate::models::Tab::Settings,
+            false,
+            Some(token),
+        );
+
+        let token_env = command
+            .get_envs()
+            .find(|(key, _)| *key == crate::single_instance::MONITOR_CONTROL_TOKEN_ENV);
+
+        assert_eq!(
+            token_env,
+            Some((
+                std::ffi::OsStr::new(crate::single_instance::MONITOR_CONTROL_TOKEN_ENV),
+                Some(std::ffi::OsStr::new(token))
+            ))
         );
     }
 
@@ -1630,6 +1680,7 @@ mod tests {
             "/tmp/windows-app-autologin",
             crate::models::Tab::Settings,
             true,
+            None,
         );
 
         let token_env = command
