@@ -2,8 +2,21 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
+#[cfg(all(waal_release_profile, debug_assertions))]
+compile_error!(
+    "release profile must not enable debug assertions; --debug-fill-once is development-only"
+);
+#[cfg(all(
+    feature = "diagnostics-ui",
+    not(debug_assertions),
+    not(feature = "release-diagnostics")
+))]
+compile_error!(
+    "diagnostics-ui is development-only in release builds; enable release-diagnostics only for intentional support artifacts"
+);
 
 mod app;
+mod app_identity;
 #[allow(dead_code)]
 mod autologin;
 mod autostart;
@@ -15,12 +28,17 @@ mod macos_ax;
 mod macos_identity;
 mod models;
 mod monitor;
+mod private_permissions;
 mod single_instance;
 mod storage;
 mod tray;
 mod ui;
+mod user_paths;
 #[cfg(target_os = "windows")]
 mod windows_ui;
+
+#[cfg(target_os = "macos")]
+include!(concat!(env!("OUT_DIR"), "/waal_build_metadata.rs"));
 
 use eframe::egui;
 use std::process::{Child, Command};
@@ -37,6 +55,8 @@ use winit::window::WindowId;
 
 const _ICON_ASSET_FINGERPRINT: &str = env!("WAAL_ICON_ASSET_FINGERPRINT");
 const SUPERVISOR_TICK: Duration = Duration::from_millis(250);
+#[cfg(target_os = "macos")]
+const LEGACY_IPC_TOKEN_ENV: &str = "WAAL_IPC_TOKEN";
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -44,6 +64,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
     if args.iter().any(|arg| arg == "--debug-fill-once") {
         return debug_fill::run_from_args(&args);
     }
@@ -55,18 +76,30 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_lightweight_supervisor() -> anyhow::Result<()> {
-    let _single_instance = match single_instance::SingleInstanceGuard::acquire() {
+    let single_instance = match single_instance::SingleInstanceGuard::acquire() {
         Ok(guard) => guard,
         Err(e) => {
-            if let Err(activation_error) = single_instance::request_activation() {
-                tracing::warn!(
-                    "Could not request existing instance activation: {activation_error}"
-                );
+            if single_instance::is_already_running_error(&e) {
+                if let Err(activation_error) = single_instance::request_activation() {
+                    tracing::warn!(
+                        "Could not request existing instance activation: {activation_error}"
+                    );
+                }
+                eprintln!("{e}");
+                return Ok(());
             }
             eprintln!("{e}");
-            return Ok(());
+            return Err(e);
         }
     };
+    #[cfg(target_os = "macos")]
+    let (_single_instance, ipc_server) = {
+        let mut single_instance = single_instance;
+        let ipc_server = single_instance.take_ipc_server();
+        (single_instance, ipc_server)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _single_instance = single_instance;
 
     let rt = Runtime::new()?;
     let _rt_guard = rt.enter();
@@ -74,20 +107,34 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     let (worker_tx, worker_rx) = tokio_channel::<background::WorkerCommand>(32);
     let (worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
     let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
+    let worker_invalidator = background::WorkerInvalidator::new();
 
     let config = load_startup_config();
     let settings = config.settings.clone();
     let accounts = config.accounts.clone();
 
-    background::spawn(worker_rx, worker_event_tx, settings.clone(), accounts);
-    if autologin::accessibility_is_trusted() {
-        let _ = worker_tx.try_send(background::WorkerCommand::Start);
-    }
+    background::spawn(
+        worker_rx,
+        worker_event_tx,
+        settings.clone(),
+        accounts,
+        worker_invalidator.clone(),
+    );
+    publish_initial_monitor_status(single_instance::write_monitor_status);
+    start_monitor_on_launch_if_accessibility_trusted(&worker_tx);
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut supervisor =
-        LightweightSupervisor::new(worker_tx, worker_event_rx, tray_tx, tray_rx, config);
+    let mut supervisor = LightweightSupervisor::new(
+        worker_tx,
+        worker_event_rx,
+        tray_tx,
+        tray_rx,
+        worker_invalidator,
+        config,
+        #[cfg(target_os = "macos")]
+        ipc_server,
+    );
     event_loop.run_app(&mut supervisor)?;
 
     Ok(())
@@ -139,7 +186,7 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
 
 fn load_startup_config() -> models::AppConfig {
     let _ = autostart::cleanup_stale();
-    let mut config = storage::load_config();
+    let mut config = load_config_with_storage_recovery();
     let auto_start_enabled = autostart::is_enabled();
     if config.settings.auto_start != auto_start_enabled {
         config.settings.auto_start = auto_start_enabled;
@@ -148,19 +195,71 @@ fn load_startup_config() -> models::AppConfig {
     config
 }
 
+fn load_config_with_storage_recovery() -> models::AppConfig {
+    let mut config = storage::load_config();
+    if let Err(e) = storage::reconcile_pending_storage_operations(&mut config) {
+        tracing::warn!(
+            error = %e,
+            "Pending password storage recovery could not be completed"
+        );
+    }
+    config
+}
+
+fn start_monitor_on_launch_if_accessibility_trusted(
+    worker_tx: &TokioSender<background::WorkerCommand>,
+) {
+    queue_monitor_start_if_accessibility_trusted(worker_tx, autologin::accessibility_is_trusted());
+}
+
+fn queue_monitor_start_if_accessibility_trusted(
+    worker_tx: &TokioSender<background::WorkerCommand>,
+    accessibility_trusted: bool,
+) {
+    if accessibility_trusted {
+        let _ = worker_tx.try_send(background::WorkerCommand::Start);
+    } else {
+        #[cfg(not(test))]
+        {
+            let report = debug_fill::pre_password_skip_report(
+                "accessibility_not_trusted_for_current_process",
+                &[("prompt_context_source", "launch_preflight".to_string())],
+            );
+            if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
+                tracing::warn!("Could not persist launch accessibility report: {e}");
+            }
+        }
+    }
+}
+
+fn publish_initial_monitor_status(
+    mut write_monitor_status: impl FnMut(bool) -> anyhow::Result<()>,
+) {
+    if let Err(e) = write_monitor_status(false) {
+        tracing::warn!("Could not clear stale monitor status during supervisor startup: {e}");
+    }
+}
+
 struct LightweightSupervisor {
     worker_tx: TokioSender<background::WorkerCommand>,
     worker_event_rx: TokioReceiver<background::WorkerEvent>,
     tray_tx: StdSender<tray::TrayCommand>,
     tray_rx: StdReceiver<tray::TrayCommand>,
+    worker_invalidator: background::WorkerInvalidator,
     tray: Option<tray::AppTray>,
     config: models::AppConfig,
     worker_status: models::WorkerStatus,
     accessibility_trusted: bool,
     last_accessibility_check: Instant,
+    #[cfg(not(target_os = "macos"))]
     monitor_command_watcher: single_instance::MonitorCommandWatcher,
     settings_child: Option<Child>,
+    resume_monitor_after_settings: bool,
+    exit_requested: bool,
+    #[cfg(not(target_os = "macos"))]
     activation_watcher: single_instance::ActivationWatcher,
+    #[cfg(target_os = "macos")]
+    ipc_server: Option<single_instance::LocalIpcServer>,
 }
 
 impl LightweightSupervisor {
@@ -169,21 +268,30 @@ impl LightweightSupervisor {
         worker_event_rx: TokioReceiver<background::WorkerEvent>,
         tray_tx: StdSender<tray::TrayCommand>,
         tray_rx: StdReceiver<tray::TrayCommand>,
+        worker_invalidator: background::WorkerInvalidator,
         config: models::AppConfig,
+        #[cfg(target_os = "macos")] ipc_server: Option<single_instance::LocalIpcServer>,
     ) -> Self {
         Self {
             worker_tx,
             worker_event_rx,
             tray_tx,
             tray_rx,
+            worker_invalidator,
             tray: None,
             config,
             worker_status: models::WorkerStatus::Idle,
             accessibility_trusted: autologin::accessibility_is_trusted(),
             last_accessibility_check: Instant::now(),
+            #[cfg(not(target_os = "macos"))]
             monitor_command_watcher: single_instance::MonitorCommandWatcher::new(),
             settings_child: None,
+            resume_monitor_after_settings: false,
+            exit_requested: false,
+            #[cfg(not(target_os = "macos"))]
             activation_watcher: single_instance::ActivationWatcher::new(),
+            #[cfg(target_os = "macos")]
+            ipc_server,
         }
     }
 
@@ -202,7 +310,7 @@ impl LightweightSupervisor {
         }
     }
 
-    fn process_tray_commands(&mut self, event_loop: &ActiveEventLoop) {
+    fn process_tray_commands(&mut self, event_loop: &ActiveEventLoop) -> bool {
         while let Ok(command) = self.tray_rx.try_recv() {
             match command {
                 tray::TrayCommand::OpenAccounts => self.open_accounts_window(),
@@ -210,9 +318,9 @@ impl LightweightSupervisor {
                 tray::TrayCommand::ToggleMonitor => self.toggle_monitor(),
                 tray::TrayCommand::RequestAccessibilityAccess => {
                     let trusted = autologin::request_accessibility_access_prompt();
-                    self.accessibility_trusted = trusted || autologin::accessibility_is_trusted();
-                    self.start_monitor_if_ready();
-                    self.update_tray_status();
+                    self.apply_accessibility_trust_state(
+                        trusted || autologin::accessibility_is_trusted(),
+                    );
                 }
                 tray::TrayCommand::OpenAccessibilitySettings => {
                     if let Err(e) = autologin::open_accessibility_settings() {
@@ -220,24 +328,52 @@ impl LightweightSupervisor {
                     }
                 }
                 tray::TrayCommand::Exit => {
-                    let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+                    self.handle_exit_request();
                     event_loop.exit();
+                    return true;
                 }
             }
         }
+        false
     }
 
+    fn handle_exit_request(&mut self) {
+        self.handle_exit_request_with_monitor_status_writer(single_instance::write_monitor_status);
+    }
+
+    fn handle_exit_request_with_monitor_status_writer(
+        &mut self,
+        mut write_monitor_status: impl FnMut(bool) -> anyhow::Result<()>,
+    ) {
+        if self.exit_requested {
+            self.close_settings_child_for_exit();
+            return;
+        }
+        self.exit_requested = true;
+        self.worker_invalidator.invalidate();
+        self.worker_status = models::WorkerStatus::Idle;
+        if let Err(e) = write_monitor_status(false) {
+            tracing::warn!("Could not publish stopped monitor status during quit: {e}");
+        }
+        let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+        self.close_settings_child_for_exit();
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn process_monitor_commands(&mut self) {
         let Some(command) = self.monitor_command_watcher.consume_command() else {
             return;
         };
 
         match command {
-            single_instance::MonitorControlCommand::Start => self.start_monitor_if_ready(),
-            single_instance::MonitorControlCommand::Stop => {
-                if self.worker_status == models::WorkerStatus::Running {
-                    let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+            single_instance::SupervisorFileCommand::Monitor(command) => match command {
+                single_instance::MonitorControlCommand::Start => {
+                    self.start_monitor_from_control_command()
                 }
+                single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
+            },
+            single_instance::SupervisorFileCommand::ReloadConfig => {
+                self.reload_config_after_settings()
             }
         }
     }
@@ -250,6 +386,9 @@ impl LightweightSupervisor {
                     self.update_tray_status();
                 }
                 background::WorkerEvent::FillAttemptReport(report) => {
+                    if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
+                        tracing::warn!("Could not persist last fill attempt report: {e}");
+                    }
                     if let Some(tray) = &self.tray {
                         tray.set_last_result(&fill_result_label(&report));
                     }
@@ -259,10 +398,63 @@ impl LightweightSupervisor {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn process_activation_requests(&mut self) {
         if self.activation_watcher.consume_activation_request() {
             self.open_settings_window();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_local_ipc_commands(&mut self) {
+        let settings_child_pid = self.settings_child_pid_for_local_ipc();
+        let Some(ipc_server) = &self.ipc_server else {
+            return;
+        };
+        let commands = ipc_server.consume_commands();
+        for peer_command in commands {
+            if !local_ipc_command_authorized(
+                peer_command.command,
+                peer_command.peer_pid,
+                settings_child_pid,
+            ) {
+                tracing::warn!(
+                    peer_pid = peer_command.peer_pid,
+                    "Rejected privileged local IPC command from unauthorized peer"
+                );
+                continue;
+            }
+
+            self.handle_authorized_local_ipc_command(peer_command.command);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_authorized_local_ipc_command(&mut self, command: single_instance::LocalIpcCommand) {
+        match command {
+            single_instance::LocalIpcCommand::Activate => self.handle_activation_request(),
+            single_instance::LocalIpcCommand::ReloadConfig => self.reload_config_after_settings(),
+            single_instance::LocalIpcCommand::Monitor(command) => match command {
+                single_instance::MonitorControlCommand::Start => {
+                    self.start_monitor_from_control_command()
+                }
+                single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_activation_request(&mut self) {
+        self.poll_settings_window();
+        if self.settings_child.is_none() {
+            self.open_accounts_window_without_stopping_monitor();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn settings_child_pid_for_local_ipc(&mut self) -> Option<u32> {
+        self.poll_settings_window();
+        self.settings_child.as_ref().map(|child| child.id())
     }
 
     fn poll_accessibility(&mut self) {
@@ -270,36 +462,126 @@ impl LightweightSupervisor {
             return;
         }
         self.last_accessibility_check = Instant::now();
+        self.refresh_accessibility_trust_state();
+    }
+
+    fn refresh_accessibility_trust_state(&mut self) -> bool {
+        self.refresh_accessibility_trust_state_with_grant_start(true)
+    }
+
+    fn refresh_accessibility_trust_state_for_start(&mut self) -> bool {
+        self.refresh_accessibility_trust_state_with_grant_start(false)
+    }
+
+    fn refresh_accessibility_trust_state_with_grant_start(
+        &mut self,
+        start_monitor_on_grant: bool,
+    ) -> bool {
         let trusted = autologin::accessibility_is_trusted();
         if trusted != self.accessibility_trusted {
-            self.accessibility_trusted = trusted;
-            if trusted {
-                self.start_monitor_if_ready();
-            } else if self.worker_status == models::WorkerStatus::Running {
-                let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
-            }
-            self.update_tray_status();
+            self.apply_accessibility_trust_state_with_grant_start(trusted, start_monitor_on_grant);
         }
+        self.accessibility_trusted
+    }
+
+    fn apply_accessibility_trust_state(&mut self, trusted: bool) {
+        self.apply_accessibility_trust_state_with_grant_start(trusted, true);
+    }
+
+    fn apply_accessibility_trust_state_with_grant_start(
+        &mut self,
+        trusted: bool,
+        start_monitor_on_grant: bool,
+    ) {
+        if trusted == self.accessibility_trusted {
+            self.update_tray_status();
+            return;
+        }
+
+        self.accessibility_trusted = trusted;
+        if trusted {
+            if start_monitor_on_grant {
+                self.start_monitor_after_accessibility_grant();
+            }
+        } else if self.worker_status == models::WorkerStatus::Running {
+            self.worker_invalidator.invalidate();
+            let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+        }
+        self.update_tray_status();
     }
 
     fn toggle_monitor(&mut self) {
         match self.worker_status {
-            models::WorkerStatus::Running => {
-                let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
-            }
-            models::WorkerStatus::Idle => {
-                if self.accessibility_trusted {
-                    let _ = self.worker_tx.try_send(background::WorkerCommand::Start);
-                } else {
-                    tracing::warn!("Automation permission is required before starting monitor");
-                }
-            }
+            models::WorkerStatus::Running => self.stop_monitor(),
+            models::WorkerStatus::Idle => self.start_monitor_if_ready(),
         }
     }
 
-    fn start_monitor_if_ready(&self) {
-        if self.accessibility_trusted && self.worker_status == models::WorkerStatus::Idle {
+    fn accessibility_ready_for_start(&mut self) -> bool {
+        if !self.accessibility_trusted {
+            self.refresh_accessibility_trust_state_for_start();
+        }
+        self.accessibility_trusted
+    }
+
+    fn start_monitor_if_ready(&mut self) {
+        if !self.accessibility_ready_for_start() {
+            tracing::warn!("Automation permission is required before starting monitor");
+            return;
+        }
+        if self.worker_status != models::WorkerStatus::Idle {
+            return;
+        }
+        if self.settings_child.is_some() {
+            self.resume_monitor_after_settings = true;
+            return;
+        }
+
+        let _ = self.worker_tx.try_send(background::WorkerCommand::Start);
+    }
+
+    fn start_monitor_after_accessibility_grant(&mut self) {
+        if self.worker_status != models::WorkerStatus::Idle {
+            return;
+        }
+        if self.settings_child.is_some() {
+            self.resume_monitor_after_settings = true;
+            return;
+        }
+        let _ = self.worker_tx.try_send(background::WorkerCommand::Start);
+    }
+
+    fn start_monitor_from_control_command(&mut self) {
+        self.start_monitor_from_control_command_with_loader(load_config_with_storage_recovery);
+    }
+
+    fn start_monitor_from_control_command_with_loader(
+        &mut self,
+        load_config: impl FnOnce() -> models::AppConfig,
+    ) {
+        if !self.accessibility_ready_for_start() {
+            tracing::warn!("Automation permission is required before starting monitor");
+            return;
+        }
+        self.resume_monitor_after_settings = false;
+        if self.settings_child.is_some()
+            && !self.reload_config_after_settings_with_loader(load_config)
+        {
+            tracing::warn!(
+                "Monitor left stopped because saved settings could not be delivered before start"
+            );
+            return;
+        }
+        if self.worker_status == models::WorkerStatus::Idle {
             let _ = self.worker_tx.try_send(background::WorkerCommand::Start);
+        }
+    }
+
+    fn stop_monitor(&mut self) {
+        self.resume_monitor_after_settings = false;
+        self.worker_invalidator.invalidate();
+        if self.worker_status == models::WorkerStatus::Running {
+            let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
         }
     }
 
@@ -307,26 +589,71 @@ impl LightweightSupervisor {
         self.open_full_ui_window(models::Tab::Accounts);
     }
 
+    #[cfg(target_os = "macos")]
+    fn open_accounts_window_without_stopping_monitor(&mut self) {
+        self.open_full_ui_window_with_monitor_policy(models::Tab::Accounts, false);
+    }
+
     fn open_settings_window(&mut self) {
         self.open_full_ui_window(models::Tab::Settings);
     }
 
     fn open_full_ui_window(&mut self, initial_tab: models::Tab) {
+        self.open_full_ui_window_with_monitor_policy(initial_tab, false);
+    }
+
+    fn open_full_ui_window_with_monitor_policy(
+        &mut self,
+        initial_tab: models::Tab,
+        pause_monitor: bool,
+    ) {
         if self.settings_child.is_some() {
             return;
         }
 
-        match spawn_full_ui_window(initial_tab) {
+        self.resume_monitor_after_settings =
+            pause_monitor && self.worker_status == models::WorkerStatus::Running;
+        if self.resume_monitor_after_settings {
+            self.worker_invalidator.invalidate();
+            let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+        }
+
+        match spawn_full_ui_window(initial_tab, self.privileged_ipc_available()) {
             Ok(child) => {
                 self.settings_child = Some(child);
             }
             Err(e) => {
                 tracing::warn!("Could not open settings window: {e}");
+                let should_resume = self.resume_monitor_after_settings;
+                self.resume_monitor_after_settings = false;
+                if should_resume {
+                    self.start_monitor_if_ready();
+                }
             }
         }
     }
 
     fn poll_settings_window(&mut self) {
+        self.poll_settings_window_with_loader(load_config_with_storage_recovery);
+    }
+
+    fn close_settings_child_for_exit(&mut self) {
+        self.resume_monitor_after_settings = false;
+        let Some(mut child) = self.settings_child.take() else {
+            return;
+        };
+
+        if child_has_exited(&mut child) {
+            return;
+        }
+
+        terminate_child_process(&mut child, "settings window");
+    }
+
+    fn poll_settings_window_with_loader(
+        &mut self,
+        load_config: impl FnOnce() -> models::AppConfig,
+    ) {
         let Some(child) = self.settings_child.as_mut() else {
             return;
         };
@@ -334,33 +661,58 @@ impl LightweightSupervisor {
         match child.try_wait() {
             Ok(Some(_)) => {
                 self.settings_child = None;
-                self.reload_config_after_settings();
+                let reload_succeeded = self.reload_config_after_settings_with_loader(load_config);
+                if self.resume_monitor_after_settings {
+                    self.resume_monitor_after_settings = false;
+                    if reload_succeeded {
+                        self.start_monitor_if_ready();
+                    } else {
+                        tracing::warn!(
+                            "Monitor left stopped because settings reload could not be delivered safely"
+                        );
+                    }
+                }
             }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!("Settings window status check failed: {e}");
                 self.settings_child = None;
+                self.resume_monitor_after_settings = false;
             }
         }
     }
 
     fn reload_config_after_settings(&mut self) {
-        let next_config = storage::load_config();
-        let _ = self
+        self.reload_config_after_settings_with_loader(load_config_with_storage_recovery);
+    }
+
+    fn reload_config_after_settings_with_loader(
+        &mut self,
+        load_config: impl FnOnce() -> models::AppConfig,
+    ) -> bool {
+        let next_config = load_config();
+        self.worker_invalidator.invalidate();
+        if let Err(e) = self
             .worker_tx
-            .try_send(background::WorkerCommand::UpdateSettings(
-                next_config.settings.clone(),
-            ));
-        let _ = self
-            .worker_tx
-            .try_send(background::WorkerCommand::UpdateAccounts(
-                next_config.accounts.clone(),
-            ));
-        let _ = self
-            .worker_tx
-            .try_send(background::WorkerCommand::RefreshPasswords);
+            .try_send(background::WorkerCommand::ApplyConfig {
+                settings: next_config.settings.clone(),
+                accounts: next_config.accounts.clone(),
+                refresh_passwords: true,
+            })
+        {
+            self.resume_monitor_after_settings = false;
+            if self.worker_status == models::WorkerStatus::Running {
+                let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
+            }
+            tracing::error!(
+                error = %e,
+                "Could not deliver saved config to worker; monitor will remain stopped"
+            );
+            return false;
+        }
         self.config = next_config;
         self.update_tray_status();
+        true
     }
 
     fn update_tray_status(&self) {
@@ -375,6 +727,16 @@ impl LightweightSupervisor {
         tray.set_accessibility_trusted(self.accessibility_trusted);
         tray.set_keychain_enabled(self.config.settings.use_keyring);
         tray.set_monitor_running(running);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn privileged_ipc_available(&self) -> bool {
+        self.ipc_server.is_some()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn privileged_ipc_available(&self) -> bool {
+        false
     }
 }
 
@@ -397,13 +759,37 @@ impl ApplicationHandler for LightweightSupervisor {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_tray();
-        self.process_tray_commands(event_loop);
-        self.process_monitor_commands();
-        self.process_activation_requests();
+        if self.process_tray_commands(event_loop) {
+            return;
+        }
         self.process_worker_events();
-        self.poll_accessibility();
+        #[cfg(target_os = "macos")]
+        self.process_local_ipc_commands();
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.process_monitor_commands();
+            self.process_activation_requests();
+        }
         self.poll_settings_window();
+        self.poll_accessibility();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + SUPERVISOR_TICK));
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.handle_exit_request();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_ipc_command_authorized(
+    command: single_instance::LocalIpcCommand,
+    peer_pid: u32,
+    settings_child_pid: Option<u32>,
+) -> bool {
+    match command {
+        single_instance::LocalIpcCommand::Activate => true,
+        single_instance::LocalIpcCommand::ReloadConfig
+        | single_instance::LocalIpcCommand::Monitor(_) => Some(peer_pid) == settings_child_pid,
     }
 }
 
@@ -430,29 +816,95 @@ fn initial_tab_arg(initial_tab: models::Tab) -> &'static str {
     }
 }
 
-fn spawn_full_ui_window(initial_tab: models::Tab) -> anyhow::Result<Child> {
-    let status = autologin::accessibility_status();
-    if !status.app_bundle_path.is_empty() {
-        return Ok(Command::new("/usr/bin/open")
-            .arg("-n")
-            .arg("-W")
-            .arg(status.app_bundle_path)
-            .arg("--args")
-            .arg("--full-ui")
-            .arg(initial_tab_arg(initial_tab))
-            .spawn()?);
+fn spawn_full_ui_window(
+    initial_tab: models::Tab,
+    privileged_ipc_available: bool,
+) -> anyhow::Result<Child> {
+    Ok(full_ui_command(
+        std::env::current_exe()?,
+        initial_tab,
+        privileged_ipc_available,
+    )
+    .spawn()?)
+}
+
+fn full_ui_command(
+    current_exe: impl AsRef<std::ffi::OsStr>,
+    initial_tab: models::Tab,
+    privileged_ipc_available: bool,
+) -> Command {
+    let mut command = Command::new(current_exe);
+    command.arg("--full-ui").arg(initial_tab_arg(initial_tab));
+    #[cfg(not(target_os = "macos"))]
+    let _ = privileged_ipc_available;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = privileged_ipc_available;
+        command.env_remove(LEGACY_IPC_TOKEN_ENV);
+    }
+    command
+}
+
+fn child_has_exited(child: &mut Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("Could not check child process state before exit: {e}");
+            true
+        }
+    }
+}
+
+fn terminate_child_process(child: &mut Child, label: &str) {
+    request_child_termination(child, label);
+    if wait_for_child_exit(child, Duration::from_millis(500)) {
+        return;
     }
 
-    Ok(Command::new(std::env::current_exe()?)
-        .arg("--full-ui")
-        .arg(initial_tab_arg(initial_tab))
-        .spawn()?)
+    if let Err(e) = child.kill() {
+        tracing::warn!("Could not force quit {label}: {e}");
+        return;
+    }
+    let _ = wait_for_child_exit(child, Duration::from_millis(500));
+}
+
+#[cfg(unix)]
+fn request_child_termination(child: &mut Child, label: &str) {
+    let status = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if status != 0 {
+        tracing::warn!(
+            "Could not request graceful shutdown for {label}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn request_child_termination(child: &mut Child, label: &str) {
+    if let Err(e) = child.kill() {
+        tracing::warn!("Could not request shutdown for {label}: {e}");
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if child_has_exited(child) {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn fill_result_label(report: &debug_fill::FillAttemptReport) -> String {
     match report.field("post_check_state").unwrap_or("unknown") {
         "authenticated" => "authenticated".to_string(),
         "still_prompt" => "still prompt".to_string(),
+        "prompt_mismatch" => "prompt mismatch".to_string(),
         "prompt_gone_unknown" => "prompt gone".to_string(),
         _ if report.success => "submitted".to_string(),
         _ => report
@@ -480,8 +932,13 @@ fn load_icon() -> anyhow::Result<egui::IconData> {
 
 #[cfg(test)]
 mod tests {
-    use super::fill_result_label;
+    use super::{
+        fill_result_label, full_ui_command, initial_tab_arg, publish_initial_monitor_status,
+        std_channel, tokio_channel, LightweightSupervisor,
+    };
+    use crate::background::{WorkerCommand, WorkerInvalidator};
     use crate::debug_fill::FillAttemptReport;
+    use crate::models::{Account, AppConfig};
 
     fn report(success: bool, fields: &[(&str, &str)], failure: Option<&str>) -> FillAttemptReport {
         FillAttemptReport {
@@ -510,5 +967,658 @@ mod tests {
         );
 
         assert!(fill_result_label(&report).len() <= 48);
+    }
+
+    #[test]
+    fn fill_result_label_reports_prompt_mismatch() {
+        let report = report(false, &[("post_check_state", "prompt_mismatch")], None);
+
+        assert_eq!(fill_result_label(&report), "prompt mismatch");
+    }
+
+    #[test]
+    fn full_ui_command_includes_full_ui_args() {
+        let command = full_ui_command(
+            "/tmp/windows-app-autologin",
+            crate::models::Tab::Accounts,
+            false,
+        );
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "--full-ui".to_string(),
+                initial_tab_arg(crate::models::Tab::Accounts).to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_init_queues_monitor_start_when_accessibility_is_trusted() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+
+        super::queue_monitor_start_if_accessibility_trusted(&worker_tx, true);
+
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_init_leaves_monitor_idle_without_accessibility() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+
+        super::queue_monitor_start_if_accessibility_trusted(&worker_tx, false);
+
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn launch_init_publishes_idle_status_before_worker_ack() {
+        let mut published_statuses = Vec::new();
+
+        publish_initial_monitor_status(|running| {
+            published_statuses.push(running);
+            Ok(())
+        });
+
+        assert_eq!(published_statuses, vec![false]);
+    }
+
+    #[test]
+    fn reload_config_after_settings_uses_recovered_config_before_worker_refresh() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+
+        let mut recovered = AppConfig::default();
+        recovered.settings.use_keyring = false;
+        let mut account = Account::new("user@example.com");
+        account.id = "account-1".to_string();
+        account.has_saved_password = true;
+        recovered.accounts.push(account);
+        let expected = recovered.clone();
+
+        assert!(supervisor.reload_config_after_settings_with_loader(|| recovered));
+
+        assert_eq!(supervisor.config, expected);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::ApplyConfig {
+                settings,
+                accounts,
+                refresh_passwords,
+            } => {
+                assert_eq!(settings, expected.settings);
+                assert_eq!(accounts, expected.accounts);
+                assert!(refresh_passwords);
+            }
+            other => panic!("expected ApplyConfig, got {other:?}"),
+        }
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reload_config_after_settings_fails_closed_when_worker_sync_cannot_be_queued() {
+        let (worker_tx, worker_rx) = tokio_channel(1);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        worker_tx.try_send(WorkerCommand::Start).unwrap();
+        let original_config = AppConfig::default();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            original_config.clone(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.resume_monitor_after_settings = true;
+
+        let mut recovered = AppConfig::default();
+        recovered.settings.use_keyring = false;
+
+        assert!(!supervisor.reload_config_after_settings_with_loader(|| recovered));
+        assert_eq!(supervisor.config, original_config);
+        assert!(!supervisor.resume_monitor_after_settings);
+        assert_eq!(worker_rx.capacity(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_ipc_authorization_requires_settings_child_for_privileged_commands() {
+        use super::single_instance::{LocalIpcCommand, MonitorControlCommand};
+
+        assert!(super::local_ipc_command_authorized(
+            LocalIpcCommand::Activate,
+            42,
+            None
+        ));
+        assert!(!super::local_ipc_command_authorized(
+            LocalIpcCommand::ReloadConfig,
+            42,
+            None
+        ));
+        assert!(!super::local_ipc_command_authorized(
+            LocalIpcCommand::Monitor(MonitorControlCommand::Start),
+            42,
+            Some(7)
+        ));
+        assert!(super::local_ipc_command_authorized(
+            LocalIpcCommand::Monitor(MonitorControlCommand::Stop),
+            42,
+            Some(42)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn activate_ipc_does_not_stop_running_monitor() {
+        use super::single_instance::LocalIpcCommand;
+
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.accessibility_trusted = true;
+        supervisor.resume_monitor_after_settings = false;
+
+        supervisor.handle_authorized_local_ipc_command(LocalIpcCommand::Activate);
+
+        assert!(worker_rx.try_recv().is_err());
+        assert_eq!(
+            supervisor.worker_status,
+            crate::models::WorkerStatus::Running
+        );
+        assert!(!supervisor.resume_monitor_after_settings);
+        assert!(supervisor.settings_child.is_some());
+        let _ = supervisor.settings_child.take().unwrap().kill();
+    }
+
+    #[test]
+    fn opening_settings_window_does_not_pause_running_monitor() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.accessibility_trusted = true;
+        supervisor.resume_monitor_after_settings = false;
+
+        supervisor.open_settings_window();
+
+        assert!(worker_rx.try_recv().is_err());
+        assert_eq!(
+            supervisor.worker_status,
+            crate::models::WorkerStatus::Running
+        );
+        assert!(!supervisor.resume_monitor_after_settings);
+        assert!(supervisor.settings_child.is_some());
+        let _ = supervisor.settings_child.take().unwrap().kill();
+    }
+
+    #[test]
+    fn accessibility_grant_starts_idle_monitor() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = false;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+
+        supervisor.apply_accessibility_trust_state(true);
+
+        assert!(supervisor.accessibility_trusted);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accessibility_grant_defers_monitor_start_while_settings_child_is_open() {
+        let (worker_tx, worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = false;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+        supervisor.settings_child = Some(spawn_test_child("sleep 1"));
+
+        supervisor.apply_accessibility_trust_state(true);
+
+        assert!(supervisor.accessibility_trusted);
+        assert!(supervisor.resume_monitor_after_settings);
+        assert!(worker_rx.is_empty());
+        let _ = supervisor.settings_child.take().unwrap().kill();
+    }
+
+    #[test]
+    fn accessibility_start_check_updates_trust_without_implicit_start() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = false;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+
+        supervisor.apply_accessibility_trust_state_with_grant_start(true, false);
+
+        assert!(supervisor.accessibility_trusted);
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn accessibility_loss_stops_running_monitor() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+
+        supervisor.apply_accessibility_trust_state(false);
+
+        assert!(!supervisor.accessibility_trusted);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Stop => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_request_terminates_settings_child_and_stops_worker() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.resume_monitor_after_settings = true;
+        let child = spawn_test_child("exec sleep 30");
+        let child_pid = child.id();
+        supervisor.settings_child = Some(child);
+
+        supervisor.handle_exit_request();
+
+        assert!(supervisor.exit_requested);
+        assert!(supervisor.settings_child.is_none());
+        assert!(!supervisor.resume_monitor_after_settings);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Stop => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        #[cfg(unix)]
+        {
+            let still_running = process_is_running(child_pid);
+            if still_running {
+                unsafe {
+                    libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            assert!(!still_running);
+        }
+
+        supervisor.handle_exit_request();
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn exit_request_publishes_idle_status_before_worker_ack() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        let mut published_statuses = Vec::new();
+
+        supervisor.handle_exit_request_with_monitor_status_writer(|running| {
+            published_statuses.push(running);
+            Ok(())
+        });
+
+        assert_eq!(published_statuses, vec![false]);
+        assert_eq!(supervisor.worker_status, crate::models::WorkerStatus::Idle);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Stop => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_toggle_starts_when_accessibility_is_trusted() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+
+        supervisor.toggle_monitor();
+
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_toggle_defers_start_while_settings_child_is_open() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+        supervisor.settings_child = Some(spawn_test_child("sleep 1"));
+
+        supervisor.toggle_monitor();
+
+        assert!(worker_rx.try_recv().is_err());
+        assert!(supervisor.resume_monitor_after_settings);
+        let _ = supervisor.settings_child.take().unwrap().kill();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monitor_start_ipc_from_settings_child_reloads_config_before_start() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+        supervisor.resume_monitor_after_settings = true;
+        supervisor.settings_child = Some(spawn_test_child("sleep 1"));
+
+        let mut recovered = AppConfig::default();
+        recovered.settings.use_keyring = false;
+        let mut account = Account::new("user@example.com");
+        account.id = "account-1".to_string();
+        account.has_saved_password = true;
+        recovered.accounts.push(account);
+        let expected = recovered.clone();
+
+        supervisor.start_monitor_from_control_command_with_loader(|| recovered);
+
+        assert_eq!(supervisor.config, expected);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::ApplyConfig {
+                settings,
+                accounts,
+                refresh_passwords,
+            } => {
+                assert_eq!(settings, expected.settings);
+                assert_eq!(accounts, expected.accounts);
+                assert!(refresh_passwords);
+            }
+            other => panic!("expected ApplyConfig, got {other:?}"),
+        }
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
+        assert!(!supervisor.resume_monitor_after_settings);
+        assert!(supervisor.settings_child.is_some());
+        let _ = supervisor.settings_child.take().unwrap().kill();
+    }
+
+    #[test]
+    fn deferred_toggle_reloads_config_before_starting_after_settings_exit() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+        supervisor.settings_child = Some(spawn_test_child("exit 0"));
+
+        supervisor.toggle_monitor();
+        assert!(supervisor.resume_monitor_after_settings);
+        assert!(worker_rx.try_recv().is_err());
+
+        let mut recovered = AppConfig::default();
+        recovered.settings.use_keyring = false;
+        let mut account = Account::new("user@example.com");
+        account.id = "account-1".to_string();
+        account.has_saved_password = true;
+        recovered.accounts.push(account);
+        let expected = recovered.clone();
+        wait_for_test_child_exit(&mut supervisor);
+
+        supervisor.poll_settings_window_with_loader(|| recovered);
+
+        assert_eq!(supervisor.config, expected);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::ApplyConfig {
+                settings,
+                accounts,
+                refresh_passwords,
+            } => {
+                assert_eq!(settings, expected.settings);
+                assert_eq!(accounts, expected.accounts);
+                assert!(refresh_passwords);
+            }
+            other => panic!("expected ApplyConfig, got {other:?}"),
+        }
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
+        assert!(worker_rx.try_recv().is_err());
+        assert!(!supervisor.resume_monitor_after_settings);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_settings_child_is_cleared_before_ipc_authorization() {
+        use super::single_instance::LocalIpcCommand;
+        use std::time::Duration;
+
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let stale_child_pid = child.id();
+        supervisor.settings_child = Some(child);
+
+        let mut authorized_pid = Some(stale_child_pid);
+        for _ in 0..50 {
+            authorized_pid = supervisor.settings_child_pid_for_local_ipc();
+            if authorized_pid.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(supervisor.settings_child.is_none());
+        assert_eq!(authorized_pid, None);
+        assert!(!super::local_ipc_command_authorized(
+            LocalIpcCommand::ReloadConfig,
+            stale_child_pid,
+            authorized_pid
+        ));
+    }
+
+    fn spawn_test_child(command: &str) -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_test_child_exit(supervisor: &mut LightweightSupervisor) {
+        for _ in 0..50 {
+            if supervisor
+                .settings_child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_ui_command_removes_legacy_ipc_token_env() {
+        let command = full_ui_command(
+            "/tmp/windows-app-autologin",
+            crate::models::Tab::Settings,
+            true,
+        );
+
+        let token_env = command
+            .get_envs()
+            .find(|(key, _)| *key == super::LEGACY_IPC_TOKEN_ENV);
+
+        assert_eq!(
+            token_env,
+            Some((std::ffi::OsStr::new(super::LEGACY_IPC_TOKEN_ENV), None))
+        );
     }
 }

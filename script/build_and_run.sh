@@ -3,6 +3,8 @@ set -euo pipefail
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${HOME:-}/.cargo/bin"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=script/macos_bundle.sh
+source "$ROOT_DIR/script/macos_bundle.sh"
 APP_NAME="WindowsAppAutoLogin"
 APP_DISPLAY_NAME="Windows App AutoLogin"
 BUNDLE_ID="dev.codex.windows-app-autologin"
@@ -10,16 +12,15 @@ BINARY_NAME="windows-app-autologin"
 BUNDLE_DIR="$ROOT_DIR/dist/$APP_NAME.app"
 CONTENTS_DIR="$BUNDLE_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
-RESOURCES_DIR="$CONTENTS_DIR/Resources"
-APP_ICON="$ROOT_DIR/assets/icon.png"
 APP_EXECUTABLE="$MACOS_DIR/$BINARY_NAME"
 TARGET_EXECUTABLE="$ROOT_DIR/target/release/$BINARY_NAME"
-DEFAULT_CACHE_ROOT="${HOME:-/tmp}/Library/Caches"
-LOCK_ROOT="${XDG_CACHE_HOME:-$DEFAULT_CACHE_ROOT}/WindowsAppAutoLogin"
+DEFAULT_RUNTIME_ROOT="${HOME:-/tmp}/Library/Application Support/WindowsAppAutoLogin/Runtime"
+LOCK_ROOT="${WAAL_RUNTIME_ROOT:-$DEFAULT_RUNTIME_ROOT}"
 LOCK_DIR="$LOCK_ROOT/WindowsAppAutoLogin.lock"
 FULL_UI_LOCK_DIR="$LOCK_ROOT/WindowsAppAutoLogin.full-ui.lock"
-CARGO_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
-BUILD_VERSION="${CARGO_VERSION}.$(date +%Y%m%d%H%M%S)"
+MONITOR_STATUS_FILE="$LOCK_ROOT/monitor-status"
+CARGO_VERSION="$(waal_cargo_version "$ROOT_DIR")"
+BUILD_VERSION="$(waal_build_version "$CARGO_VERSION")"
 
 VERIFY=false
 FULL_UI=false
@@ -34,131 +35,112 @@ for arg in "$@"; do
 done
 
 app_pids() {
-  ps -axo pid=,command= | awk -v app="$APP_EXECUTABLE" -v target="$TARGET_EXECUTABLE" '
+  ps -axo pid=,command= | awk \
+    -v app="$APP_EXECUTABLE" \
+    -v target="$TARGET_EXECUTABLE" \
+    -v app_name="$APP_NAME" \
+    -v binary_name="$BINARY_NAME" '
     {
       pid = $1
       sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-      if ($0 == app || index($0, app " ") == 1 || $0 == target || index($0, target " ") == 1) {
+      exe = $1
+      bundle_suffix = "/" app_name ".app/Contents/MacOS/" binary_name
+      if (exe == app || exe == target || substr(exe, length(exe) - length(bundle_suffix) + 1) == bundle_suffix) {
         print pid
       }
     }
   '
 }
 
-for pid in $(app_pids); do
-  pkill -P "$pid" 2>/dev/null || true
-  kill "$pid" 2>/dev/null || true
-done
+cleanup_app_instances() {
+  for pid in $(app_pids); do
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  done
 
-lock_pid=""
-if [ -f "$LOCK_DIR/pid" ]; then
-  lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-  if [ -n "$lock_pid" ] && app_pids | grep -qx "$lock_pid"; then
-    pkill -P "$lock_pid" 2>/dev/null || true
-    kill "$lock_pid" 2>/dev/null || true
+  local lock_pid=""
+  if [ -f "$LOCK_DIR/pid" ]; then
+    lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$lock_pid" ] && app_pids | grep -qx "$lock_pid"; then
+      pkill -P "$lock_pid" 2>/dev/null || true
+      kill "$lock_pid" 2>/dev/null || true
+    fi
   fi
-fi
 
-for _ in 1 2 3 4 5; do
-  if [ -z "$(app_pids)" ]; then
-    break
-  fi
-  sleep 0.2
-done
-
-if [ -n "$lock_pid" ]; then
   for _ in 1 2 3 4 5; do
-    if ! ps -p "$lock_pid" >/dev/null 2>&1; then
+    if [ -z "$(app_pids)" ]; then
       break
     fi
     sleep 0.2
   done
-  if app_pids | grep -qx "$lock_pid"; then
-    kill -9 "$lock_pid" 2>/dev/null || true
-  fi
-fi
 
-for pid in $(app_pids); do
-  kill -9 "$pid" 2>/dev/null || true
-done
-rm -rf "$LOCK_DIR"
-rm -rf "$FULL_UI_LOCK_DIR"
+  if [ -n "$lock_pid" ]; then
+    for _ in 1 2 3 4 5; do
+      if ! ps -p "$lock_pid" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.2
+    done
+    if app_pids | grep -qx "$lock_pid"; then
+      kill -9 "$lock_pid" 2>/dev/null || true
+    fi
+  fi
+
+  for pid in $(app_pids); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  rm -rf "$LOCK_DIR"
+  rm -rf "$FULL_UI_LOCK_DIR"
+  if [ -f "$MONITOR_STATUS_FILE" ]; then
+    /usr/bin/printf 'idle\n' >"$MONITOR_STATUS_FILE" 2>/dev/null || true
+  fi
+}
+
+read_monitor_status_file() {
+  if [ ! -f "$MONITOR_STATUS_FILE" ]; then
+    return 1
+  fi
+  /usr/bin/head -n 1 "$MONITOR_STATUS_FILE" 2>/dev/null | /usr/bin/tr -d '[:space:]'
+}
+
+wait_for_monitor_status() {
+  local status=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    status="$(read_monitor_status_file || true)"
+    case "$status" in
+      running|idle)
+        /usr/bin/printf 'Monitor status: %s\n' "$status"
+        return 0
+        ;;
+    esac
+    sleep 0.5
+  done
+  echo "Monitor status was not published by the launched app." >&2
+  return 1
+}
+
+cleanup_app_instances
+rm -f "$MONITOR_STATUS_FILE"
 
 cd "$ROOT_DIR"
 if [ "$DEV_UI" = true ]; then
-  cargo build --release --features dev-tools --bin "$BINARY_NAME"
+  env -u WAAL_RELEASE_BUNDLE_ID -u WAAL_MACOS_TEAM_ID WAAL_DEVELOPMENT_RELEASE=1 cargo build --release --features dev-tools --bin "$BINARY_NAME"
 else
-  cargo build --release --bin "$BINARY_NAME"
+  env -u WAAL_RELEASE_BUNDLE_ID -u WAAL_MACOS_TEAM_ID WAAL_DEVELOPMENT_RELEASE=1 cargo build --release --bin "$BINARY_NAME"
 fi
 
-rm -rf "$BUNDLE_DIR"
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
-cp "$TARGET_EXECUTABLE" "$APP_EXECUTABLE"
-chmod +x "$MACOS_DIR/$BINARY_NAME"
-
-if [ ! -f "$APP_ICON" ]; then
-  echo "Missing app icon: $APP_ICON" >&2
-  exit 1
-fi
-if ! command -v sips >/dev/null 2>&1 || ! command -v iconutil >/dev/null 2>&1; then
-  echo "sips and iconutil are required to build the macOS app icon" >&2
-  exit 1
-fi
-
-ICONSET_DIR="$RESOURCES_DIR/AppIcon.iconset"
-rm -rf "$ICONSET_DIR"
-mkdir -p "$ICONSET_DIR"
-for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$APP_ICON" --out "$ICONSET_DIR/icon_${size}x${size}.png" >/dev/null
-  retina_size=$((size * 2))
-  sips -z "$retina_size" "$retina_size" "$APP_ICON" --out "$ICONSET_DIR/icon_${size}x${size}@2x.png" >/dev/null
-done
-iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns" >/dev/null
-rm -rf "$ICONSET_DIR"
-if [ ! -s "$RESOURCES_DIR/AppIcon.icns" ]; then
-  echo "Failed to build AppIcon.icns" >&2
-  exit 1
-fi
-
-cat > "$CONTENTS_DIR/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleInfoDictionaryVersion</key>
-  <string>6.0</string>
-  <key>CFBundleExecutable</key>
-  <string>$BINARY_NAME</string>
-  <key>CFBundleIdentifier</key>
-  <string>$BUNDLE_ID</string>
-  <key>CFBundleName</key>
-  <string>$APP_DISPLAY_NAME</string>
-  <key>CFBundleDisplayName</key>
-  <string>$APP_DISPLAY_NAME</string>
-  <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>CFBundleShortVersionString</key>
-  <string>$CARGO_VERSION</string>
-  <key>CFBundleVersion</key>
-  <string>$BUILD_VERSION</string>
-  <key>LSMinimumSystemVersion</key>
-  <string>11.0</string>
-  <key>LSApplicationCategoryType</key>
-  <string>public.app-category.utilities</string>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-  <key>NSPrincipalClass</key>
-  <string>NSApplication</string>
-  <key>LSUIElement</key>
-  <true/>
-</dict>
-</plist>
-PLIST
+waal_assemble_app_bundle \
+  "$ROOT_DIR" \
+  "$BUNDLE_DIR" \
+  "$BINARY_NAME" \
+  "$TARGET_EXECUTABLE" \
+  "$BUNDLE_ID" \
+  "$APP_DISPLAY_NAME" \
+  "$CARGO_VERSION" \
+  "$BUILD_VERSION"
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --sign - "$BUNDLE_DIR"
+  waal_codesign_development_bundle "$BUNDLE_DIR" "$BUNDLE_ID"
   codesign --verify --strict "$BUNDLE_DIR"
 fi
 
@@ -182,6 +164,15 @@ else
 fi
 
 if [ "$VERIFY" = true ]; then
-  sleep 2
+  trap cleanup_app_instances EXIT
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -n "$(app_pids)" ]; then
+      break
+    fi
+    sleep 0.5
+  done
   test -n "$(app_pids)"
+  if [ "$FULL_UI" != true ]; then
+    wait_for_monitor_status
+  fi
 fi

@@ -3,7 +3,7 @@ use crate::autologin::{
     AccessibilityStatus,
 };
 use crate::background::{WorkerCommand, WorkerEvent};
-use crate::debug_fill::FillAttemptReport;
+use crate::debug_fill::{self, FillAttemptReport};
 use crate::models::{
     Account, AccountId, AppConfig, AppSettings, LogEntry, LogLevel, Tab, WorkerStatus,
 };
@@ -76,6 +76,11 @@ impl AutoLoginApp {
         let settings_draft = config.settings.clone();
         let accessibility_status = accessibility_status();
 
+        #[cfg(not(test))]
+        let last_fill_report = debug_fill::read_last_fill_attempt_report().ok().flatten();
+        #[cfg(test)]
+        let last_fill_report = None;
+
         let mut app = Self {
             config,
             selected_tab: initial_tab,
@@ -90,7 +95,7 @@ impl AutoLoginApp {
             temp_password: Zeroizing::new(String::new()),
             show_password: false,
             status_message: None,
-            last_fill_report: None,
+            last_fill_report,
             quit_requested: false,
             #[cfg(feature = "diagnostics-ui")]
             diagnose_running: false,
@@ -145,6 +150,35 @@ impl AutoLoginApp {
         }
     }
 
+    pub(crate) fn request_supervisor_config_reload(&mut self) -> bool {
+        if !self.settings_window_mode {
+            return false;
+        }
+        if let Err(e) = single_instance::request_config_reload() {
+            self.set_status(format!("Saved, but supervisor reload failed: {e}"));
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn sync_saved_config_to_worker(&mut self, refresh_passwords: bool) {
+        if self.settings_window_mode {
+            let _ = self.request_supervisor_config_reload();
+            return;
+        }
+
+        if let Err(e) = self.worker_tx.try_send(WorkerCommand::ApplyConfig {
+            settings: self.config.settings.clone(),
+            accounts: self.config.accounts.clone(),
+            refresh_passwords,
+        }) {
+            self.worker_status = WorkerStatus::Idle;
+            self.set_status(format!(
+                "Saved, but monitor was stopped because it could not reload safely: {e}"
+            ));
+        }
+    }
+
     fn send_monitor_control_command(&mut self, command: MonitorControlCommand) {
         if self.settings_window_mode {
             if let Err(e) = single_instance::request_monitor_command(command) {
@@ -183,10 +217,7 @@ impl AutoLoginApp {
         self.add_log(LogEntry {
             timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
             level,
-            message: format!(
-                "{event} ax_trusted_for_current_process={} current_process_path={} app_bundle_path={}",
-                status.trusted, status.current_process_path, status.app_bundle_path
-            ),
+            message: accessibility_log_message(event, status),
         });
     }
 
@@ -223,11 +254,18 @@ impl AutoLoginApp {
     }
 
     fn handle_accessibility_granted(&mut self) {
-        self.accessibility_status = accessibility_status();
+        self.apply_accessibility_granted_status(accessibility_status());
+    }
+
+    fn apply_accessibility_granted_status(&mut self, status: AccessibilityStatus) {
+        self.accessibility_status = status;
         self.log_accessibility_event("accessibility_granted", LogLevel::Info);
-        self.status_message = Some(("Accessibility permission granted".to_string(), 5.0));
+        self.status_message = Some((
+            "Accessibility permission granted. Starting monitor.".to_string(),
+            5.0,
+        ));
         if self.worker_status == WorkerStatus::Idle {
-            self.send_worker_command(WorkerCommand::Start);
+            self.send_monitor_control_command(MonitorControlCommand::Start);
         }
     }
 
@@ -309,6 +347,13 @@ impl AutoLoginApp {
                     self.add_log(entry);
                 }
                 WorkerEvent::FillAttemptReport(report) => {
+                    if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
+                        self.add_log(LogEntry {
+                            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                            level: LogLevel::Warn,
+                            message: format!("Could not persist last fill attempt report: {e}"),
+                        });
+                    }
                     self.last_fill_report = Some(report);
                 }
             }
@@ -328,11 +373,40 @@ impl AutoLoginApp {
         if let Some(status) = bridged_monitor_status() {
             self.worker_status = status;
         }
+        #[cfg(feature = "diagnostics-ui")]
+        self.refresh_persisted_last_fill_report();
+    }
+
+    #[cfg(feature = "diagnostics-ui")]
+    fn refresh_persisted_last_fill_report(&mut self) {
+        let Ok(Some(report)) = debug_fill::read_last_fill_attempt_report() else {
+            return;
+        };
+        let next_attempt = report.field("attempt_id");
+        let current_attempt = self
+            .last_fill_report
+            .as_ref()
+            .and_then(|report| report.field("attempt_id"));
+        if next_attempt != current_attempt {
+            self.last_fill_report = Some(report);
+        }
     }
 }
 
 fn redact_sensitive_log_text(message: &str) -> String {
-    redact_secret_assignments(&redact_email_addresses(message))
+    redact_path_assignments(&redact_secret_assignments(&redact_email_addresses(message)))
+}
+
+fn accessibility_log_message(
+    event: &str,
+    status: &crate::autologin::AccessibilityStatus,
+) -> String {
+    format!(
+        "{event} ax_trusted_for_current_process={} current_process_path_redacted={} app_bundle_path_redacted={}",
+        status.trusted,
+        crate::user_paths::redacted_path(&status.current_process_path),
+        crate::user_paths::redacted_path(&status.app_bundle_path)
+    )
 }
 
 fn redact_email_addresses(message: &str) -> String {
@@ -386,6 +460,134 @@ fn redact_secret_assignments(message: &str) -> String {
     }
 
     out
+}
+
+fn redact_path_assignments(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::new();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        if let Some((prefix, value, value_end)) = path_assignment_at(&chars, idx) {
+            out.push_str(&prefix);
+            out.push_str(&crate::user_paths::redacted_path(&value));
+            idx = value_end;
+            continue;
+        }
+
+        out.push(chars[idx]);
+        idx += 1;
+    }
+
+    out
+}
+
+fn path_assignment_at(chars: &[char], idx: usize) -> Option<(String, String, usize)> {
+    if idx > 0 && (chars[idx - 1].is_ascii_alphanumeric() || chars[idx - 1] == '_') {
+        return None;
+    }
+
+    let key_len = path_key_len_at(chars, idx)?;
+    let mut cursor = idx + key_len;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= chars.len() || !matches!(chars[cursor], '=' | ':') {
+        return None;
+    }
+    cursor += 1;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= chars.len() || value_delimiter(chars[cursor]) {
+        return None;
+    }
+
+    let value_start = cursor;
+    if chars[cursor] == '"' || chars[cursor] == char::from(39) {
+        let quote = chars[cursor];
+        cursor += 1;
+        while cursor < chars.len() {
+            let current = chars[cursor];
+            cursor += 1;
+            if current == quote {
+                break;
+            }
+        }
+    } else {
+        while cursor < chars.len() && !path_value_delimiter_at(chars, cursor) {
+            cursor += 1;
+        }
+    }
+
+    Some((
+        chars[idx..value_start].iter().collect(),
+        chars[value_start..cursor]
+            .iter()
+            .collect::<String>()
+            .trim_matches(['"', '\''])
+            .trim()
+            .to_string(),
+        cursor,
+    ))
+}
+
+fn path_value_delimiter_at(chars: &[char], idx: usize) -> bool {
+    if matches!(chars[idx], ',' | ';') {
+        return true;
+    }
+    if !chars[idx].is_whitespace() {
+        return false;
+    }
+
+    let mut next = idx;
+    while next < chars.len() && chars[next].is_whitespace() {
+        next += 1;
+    }
+    if next >= chars.len() {
+        return true;
+    }
+
+    assignment_starts_at(chars, next)
+}
+
+fn assignment_starts_at(chars: &[char], idx: usize) -> bool {
+    if idx > 0 && (chars[idx - 1].is_ascii_alphanumeric() || chars[idx - 1] == '_') {
+        return false;
+    }
+
+    let Some(key_len) = path_key_len_at(chars, idx).or_else(|| secret_key_len_at(chars, idx))
+    else {
+        return false;
+    };
+    let mut cursor = idx + key_len;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+
+    cursor < chars.len() && matches!(chars[cursor], '=' | ':')
+}
+
+fn path_key_len_at(chars: &[char], idx: usize) -> Option<usize> {
+    [
+        "current_process_path",
+        "app_bundle_path",
+        "executable_path",
+        "windows_app_path",
+        "keychain_process_path",
+    ]
+    .iter()
+    .find_map(|key| {
+        let key_chars = key.chars().collect::<Vec<_>>();
+        if idx + key_chars.len() > chars.len() {
+            return None;
+        }
+        let matches = key_chars
+            .iter()
+            .enumerate()
+            .all(|(offset, expected)| chars[idx + offset] == *expected);
+        matches.then_some(key_chars.len())
+    })
 }
 
 fn secret_assignment_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
@@ -654,9 +856,15 @@ fn show_accessibility_onboarding(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
 
 #[cfg(test)]
 mod tests {
-    use super::{push_bounded_log, redact_sensitive_log_text, MAX_LOG_ENTRIES};
-    use crate::models::{LogEntry, LogLevel};
+    use super::{
+        accessibility_log_message, push_bounded_log, redact_sensitive_log_text, AutoLoginApp,
+        WorkerCommand, MAX_LOG_ENTRIES,
+    };
+    use crate::autologin::AccessibilityStatus;
+    use crate::models::{AppConfig, LogEntry, LogLevel, Tab, WorkerStatus};
     use std::collections::VecDeque;
+    use std::sync::mpsc::channel as std_channel;
+    use tokio::sync::mpsc::channel as tokio_channel;
 
     #[test]
     fn log_redaction_removes_email_addresses_and_secret_assignments() {
@@ -739,5 +947,93 @@ mod tests {
         assert!(message.contains("token=[redacted]"));
         assert!(!message.contains("user@example.com"));
         assert!(!message.contains("super-secret"));
+    }
+
+    #[test]
+    fn log_buffer_redacts_path_assignments_before_retaining_message() {
+        let mut logs = VecDeque::new();
+        push_bounded_log(
+            &mut logs,
+            LogEntry {
+                timestamp: "00:00".to_string(),
+                level: LogLevel::Warn,
+                message: "current_process_path=/Users/alice/Private Projects/target/debug/windows-app-autologin app_bundle_path=/Users/alice/Applications/Windows App AutoLogin.app".to_string(),
+            },
+        );
+
+        let message = &logs[0].message;
+        assert!(message.contains("current_process_path=[path]"));
+        assert!(message.contains("app_bundle_path=[path]"));
+        assert!(!message.contains("windows-app-autologin"));
+        assert!(!message.contains("Windows App AutoLogin.app"));
+        assert!(!message.contains("/Users/alice"));
+        assert!(!message.contains("Private Projects"));
+        assert!(!message.contains("Applications"));
+    }
+
+    #[test]
+    fn accessibility_event_log_redacts_paths_with_spaces_before_retaining_message() {
+        let status = AccessibilityStatus {
+            trusted: false,
+            raw_trusted: true,
+            identity_trusted: false,
+            current_process_path:
+                "/Applications/Windows App AutoLogin.app/Contents/MacOS/windows-app-autologin"
+                    .to_string(),
+            app_bundle_path: "/Applications/Windows App AutoLogin.app".to_string(),
+        };
+
+        let mut logs = VecDeque::new();
+        push_bounded_log(
+            &mut logs,
+            LogEntry {
+                timestamp: "00:00".to_string(),
+                level: LogLevel::Warn,
+                message: accessibility_log_message("accessibility_still_missing", &status),
+            },
+        );
+
+        let message = &logs[0].message;
+        assert!(message.contains("current_process_path_redacted=[path]"));
+        assert!(message.contains("app_bundle_path_redacted=[path]"));
+        assert!(!message.contains("windows-app-autologin"));
+        assert!(!message.contains("Windows App AutoLogin.app"));
+        assert!(!message.contains("/Applications"));
+        assert!(!message.contains("Contents/MacOS"));
+        assert!(!message.contains("current_process_path=/"));
+        assert!(!message.contains("app_bundle_path=/"));
+    }
+
+    #[test]
+    fn accessibility_granted_status_starts_idle_worker() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        );
+        app.worker_status = WorkerStatus::Idle;
+
+        app.apply_accessibility_granted_status(AccessibilityStatus {
+            trusted: true,
+            raw_trusted: true,
+            identity_trusted: true,
+            current_process_path: "/Applications/WindowsAppAutoLogin.app".to_string(),
+            app_bundle_path: "/Applications/WindowsAppAutoLogin.app".to_string(),
+        });
+
+        assert!(app.accessibility_status.trusted);
+        assert!(app.status_message.as_ref().is_some_and(
+            |(message, _)| message == "Accessibility permission granted. Starting monitor."
+        ));
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
     }
 }

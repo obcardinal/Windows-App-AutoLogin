@@ -1,6 +1,11 @@
 use crate::app::AutoLoginApp;
-use crate::models::Account;
-use crate::storage::{delete_account, load_password, save_account, save_config};
+use crate::models::{Account, AccountId, AppConfig};
+use crate::storage::{
+    begin_account_config_save_journal, begin_account_delete_journal,
+    cleanup_unused_fallback_key_material, clear_pending_storage_operation, delete_account,
+    is_pending_storage_operation_in_progress, load_password, pending_storage_recovery_user_status,
+    save_account, save_account_with_outcome, save_config, StaleBackendCleanupWarning,
+};
 use crate::ui::theme;
 use eframe::egui;
 use zeroize::Zeroizing;
@@ -11,10 +16,10 @@ const EDIT_BUTTON_WIDTH: f32 = 40.0;
 const DELETE_BUTTON_WIDTH: f32 = 40.0;
 const ROW_BUTTON_HEIGHT: f32 = 30.0;
 const ACTIONS_COLUMN_WIDTH: f32 = EDIT_BUTTON_WIDTH + TABLE_SPACING + DELETE_BUTTON_WIDTH;
-const ACCOUNT_ROW_HEIGHT: f32 = 34.0;
-const ACCOUNT_EDITOR_WIDTH: f32 = 388.0;
-const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 300.0;
-const ACCOUNT_EDITOR_PASSWORD_WIDTH: f32 = 254.0;
+const ACCOUNT_ROW_HEIGHT: f32 = 36.0;
+const ACCOUNT_EDITOR_WIDTH: f32 = 430.0;
+const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
+const ACCOUNT_EDITOR_PASSWORD_WIDTH: f32 = 286.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
 const ACTION_ICON_SIZE: f32 = 17.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
@@ -117,20 +122,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                     .iter()
                     .enumerate()
                     .any(|(other_idx, other)| {
-                        other_idx != idx
-                            && other.enabled
-                            && other.username.trim().eq_ignore_ascii_case(&email)
+                        other_idx != idx && enabled_account_conflicts_with_candidate(other, &email)
                     })
             {
                 app.set_status("An enabled account with this email already exists");
             } else {
                 next_config.accounts[idx].enabled = enabling;
                 if let Err(e) = save_config(&next_config) {
-                    app.set_status(format!("Failed to save: {}", e));
+                    let _ = e;
+                    app.set_status("Failed to update account. The account was left unchanged.");
                 } else {
                     app.config = next_config;
                     app.set_status("Account updated");
-                    sync_worker_accounts(app);
+                    sync_worker_accounts(app, false);
                 }
             }
         }
@@ -139,25 +143,120 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     show_delete_confirmation(ui, app, &mut delete_idx);
 
     if let Some(idx) = delete_idx {
-        let account_id = app.config.accounts[idx].id.clone();
-        let mut next_config = app.config.clone();
-        next_config.accounts.remove(idx);
-        if let Err(e) = save_config(&next_config) {
-            app.set_status(format!("Failed to save: {}", e));
-        } else {
-            app.config = next_config;
-            let cleanup_result = delete_account(&account_id);
-            if let Err(e) = cleanup_result {
-                app.set_status(format!("Account deleted; password cleanup failed: {}", e));
-            } else {
-                app.set_status("Account deleted");
+        match delete_account_transaction(
+            &app.config,
+            idx,
+            |account, use_keyring| begin_account_delete_journal(account, use_keyring),
+            |account_id| delete_account(account_id),
+            save_config,
+            clear_pending_storage_operation,
+        ) {
+            Ok(outcome) => {
+                let cleanup_warning =
+                    if outcome.password_cleanup_warning || outcome.journal_cleanup_warning {
+                        false
+                    } else {
+                        cleanup_unused_fallback_key_material().is_err()
+                    };
+                app.config = outcome.config;
+                if outcome.password_cleanup_warning {
+                    tracing::warn!(
+                        "Account deleted, but saved password cleanup failed after config save"
+                    );
+                    app.set_status(
+                        "Account deleted. Saved password cleanup is still pending and will retry on next launch. Stored credential changes are blocked until recovery completes.",
+                    );
+                } else if outcome.journal_cleanup_warning {
+                    tracing::warn!(
+                        "Account deleted and saved password cleanup succeeded, but recovery journal cleanup failed"
+                    );
+                    app.set_status(
+                        "Account deleted. Saved password cleanup succeeded, but recovery journal cleanup is still pending; restart to verify cleanup.",
+                    );
+                } else if cleanup_warning {
+                    tracing::warn!(
+                        "Account deleted, but unused fallback key cleanup failed after config save"
+                    );
+                    app.set_status(
+                        "Account deleted. Old fallback key cleanup failed; old key material may require manual cleanup.",
+                    );
+                } else {
+                    app.set_status("Account deleted");
+                }
+                sync_worker_accounts(app, false);
             }
-            sync_worker_accounts(app);
-            app.confirm_delete_account = None;
+            Err(status) => app.set_status(status),
         }
+        app.confirm_delete_account = None;
     }
 
     show_account_editor(ui, app);
+}
+
+fn delete_account_transaction<J, D, C, R>(
+    config: &AppConfig,
+    idx: usize,
+    mut begin_delete_journal_op: J,
+    mut delete_account_op: D,
+    mut save_config_op: C,
+    mut clear_journal_op: R,
+) -> Result<DeleteAccountOutcome, String>
+where
+    J: FnMut(&Account, bool) -> anyhow::Result<()>,
+    D: FnMut(&AccountId) -> anyhow::Result<()>,
+    C: FnMut(&AppConfig) -> anyhow::Result<()>,
+    R: FnMut() -> anyhow::Result<()>,
+{
+    let Some(account) = config.accounts.get(idx).cloned() else {
+        return Err("Account no longer exists".to_string());
+    };
+    let use_keyring = config.settings.use_keyring;
+    if let Err(e) = begin_delete_journal_op(&account, use_keyring) {
+        return Err(storage_prepare_failure_status(
+            &e,
+            "The account was not deleted and saved password storage was left unchanged.",
+            "Failed to prepare account removal. The account was not deleted and saved password storage was left unchanged.",
+        ));
+    }
+
+    let mut next_config = config.clone();
+    next_config.accounts.remove(idx);
+    if let Err(e) = save_config_op(&next_config) {
+        let _ = e;
+        let _ = clear_journal_op();
+        return Err("Failed to save the account removal. The account was not deleted and saved password storage was left unchanged.".to_string());
+    }
+
+    let password_cleanup_warning = delete_account_op(&account.id).is_err();
+    let journal_cleanup_warning = if password_cleanup_warning {
+        false
+    } else {
+        clear_journal_op().is_err()
+    };
+    Ok(DeleteAccountOutcome {
+        config: next_config,
+        password_cleanup_warning,
+        journal_cleanup_warning,
+    })
+}
+
+#[derive(Debug)]
+struct DeleteAccountOutcome {
+    config: AppConfig,
+    password_cleanup_warning: bool,
+    journal_cleanup_warning: bool,
+}
+
+fn storage_prepare_failure_status(
+    error: &anyhow::Error,
+    pending_detail: &str,
+    fallback: &str,
+) -> String {
+    if is_pending_storage_operation_in_progress(error) {
+        pending_storage_recovery_user_status(pending_detail)
+    } else {
+        fallback.to_string()
+    }
 }
 
 struct AccountColumns {
@@ -173,7 +272,7 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             cells.email,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(table_header_text("Email"));
+                ui.label(table_header_text("Account"));
             },
         );
         show_cell(
@@ -222,7 +321,7 @@ fn show_account_row(
                     ui.label(theme::muted("Missing email"));
                 } else {
                     ui.add_sized(
-                        [ui.available_width(), ACCOUNT_ROW_HEIGHT],
+                        [ui.available_width(), 21.0],
                         egui::Label::new(egui::RichText::new(email).strong()).truncate(),
                     )
                     .on_hover_text(email);
@@ -330,7 +429,7 @@ fn account_columns(width: f32) -> AccountColumns {
 }
 
 fn open_account_editor(app: &mut AutoLoginApp, account: Account) {
-    tracing::info!(account_id = %account.id, "Opening account editor");
+    tracing::info!("Opening account editor");
     app.editing_account = Some(account);
     clear_temp_password(app);
     app.show_password = false;
@@ -365,7 +464,7 @@ fn show_delete_confirmation(
             theme::glass_frame().show(ui, |ui| {
                 ui.heading("Delete account?");
                 ui.label(theme::muted(format!(
-                    "This removes \"{}\" and its saved password.",
+                    "This removes \"{}\" and attempts to delete its saved password storage.",
                     account_name
                 )));
                 ui.add_space(8.0);
@@ -581,11 +680,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
     if account.enabled
         && app.config.accounts.iter().any(|existing| {
             existing.id != account.id
-                && existing.enabled
-                && existing
-                    .username
-                    .trim()
-                    .eq_ignore_ascii_case(account.username.trim())
+                && enabled_account_conflicts_with_candidate(existing, account.username.trim())
         })
     {
         app.set_status("An enabled account with this email already exists");
@@ -614,6 +709,8 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
 
     let new_password =
         (!app.temp_password.is_empty()).then(|| Zeroizing::new(app.temp_password.to_string()));
+    let username_changed = existing_account
+        .is_some_and(|existing| existing.username.trim() != account.username.trim());
     let only_password_changed = new_password.is_some()
         && existing_account.is_some_and(|existing| {
             previous_password_saved
@@ -623,69 +720,159 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         });
 
     if only_password_changed {
-        if let Some(password) = new_password.as_ref() {
-            if let Err(e) =
-                save_account(&account, password.as_str(), app.config.settings.use_keyring)
-            {
-                app.set_status(format!("Failed to save password: {}", e));
+        let mut after_account = account.clone();
+        after_account.has_saved_password = true;
+        let account_journal_started = match begin_account_config_save_journal(
+            existing_account,
+            &after_account,
+            app.config.settings.use_keyring,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                app.set_status(storage_prepare_failure_status(
+                    &e,
+                    "The password was left unchanged.",
+                    "Failed to prepare password storage update. The password was left unchanged.",
+                ));
                 return false;
             }
+        };
+        let mut cleanup_warning = None;
+        if let Some(password) = new_password.as_ref() {
+            match save_account_with_outcome(
+                &account,
+                password.as_str(),
+                app.config.settings.use_keyring,
+            ) {
+                Ok(outcome) => {
+                    cleanup_warning = outcome.stale_cleanup_warning;
+                }
+                Err(e) => {
+                    let _ = e;
+                    clear_account_journal_after_terminal_result(account_journal_started, false);
+                    app.set_status("Failed to save password. The account was left unchanged.");
+                    return false;
+                }
+            }
         }
-        app.set_status("Account saved");
-        if let Err(e) = app
-            .worker_tx
-            .try_send(crate::background::WorkerCommand::RefreshPasswords)
-        {
-            app.set_status(format!("Account saved, but monitor update failed: {}", e));
-        }
+        clear_account_journal_after_terminal_result(
+            account_journal_started,
+            cleanup_warning.is_some(),
+        );
+        app.set_status(account_saved_status(cleanup_warning.as_ref()));
+        app.sync_saved_config_to_worker(true);
         return true;
     }
 
-    let previous_password = if is_existing && previous_password_saved && new_password.is_some() {
-        match load_password(&account.id, app.config.settings.use_keyring) {
+    let previous_account = existing_account.cloned();
+    let needs_previous_password =
+        is_existing && previous_password_saved && (new_password.is_some() || username_changed);
+    let previous_password = if needs_previous_password {
+        let Some(existing) = previous_account.as_ref() else {
+            app.set_status("Failed to find current account for rollback");
+            return false;
+        };
+        match load_password(existing, app.config.settings.use_keyring) {
             Ok(password) => Some(password),
             Err(e) => {
-                app.set_status(format!(
-                    "Failed to read current password for rollback: {}",
-                    e
-                ));
+                let _ = e;
+                app.set_status(
+                    "Failed to read the current password for rollback. The account was left unchanged.",
+                );
                 return false;
             }
         }
     } else {
         None
     };
+    let password_write_before_config =
+        new_password.is_some() || (username_changed && previous_password.is_some());
+    let account_journal_started = if password_write_before_config {
+        let mut after_account = account.clone();
+        after_account.has_saved_password = true;
+        match begin_account_config_save_journal(
+            previous_account.as_ref(),
+            &after_account,
+            app.config.settings.use_keyring,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                app.set_status(storage_prepare_failure_status(
+                    &e,
+                    "The account was left unchanged.",
+                    "Failed to prepare account storage update. The account was left unchanged.",
+                ));
+                return false;
+            }
+        }
+    } else {
+        false
+    };
+    let mut cleanup_warning = None;
     if let Some(password) = new_password.as_ref() {
-        if let Err(e) = save_account(&account, password.as_str(), app.config.settings.use_keyring) {
-            let mut rollback_errors = Vec::new();
-            if is_existing {
-                if let Some(previous_password) = previous_password.as_ref() {
-                    if let Err(rollback_error) = save_account(
-                        &account,
-                        previous_password.as_str(),
-                        app.config.settings.use_keyring,
-                    ) {
-                        rollback_errors.push(rollback_error.to_string());
+        match save_account_with_outcome(
+            &account,
+            password.as_str(),
+            app.config.settings.use_keyring,
+        ) {
+            Ok(outcome) => {
+                cleanup_warning = outcome.stale_cleanup_warning;
+            }
+            Err(e) => {
+                let _ = e;
+                let mut rollback_errors = Vec::new();
+                if is_existing {
+                    if let (Some(previous_account), Some(previous_password)) =
+                        (previous_account.as_ref(), previous_password.as_ref())
+                    {
+                        if let Err(rollback_error) = save_account(
+                            previous_account,
+                            previous_password.as_str(),
+                            app.config.settings.use_keyring,
+                        ) {
+                            let _ = rollback_error;
+                            rollback_errors.push(());
+                        }
+                    } else if let Err(rollback_error) = delete_account(&account.id) {
+                        let _ = rollback_error;
+                        rollback_errors.push(());
                     }
                 } else if let Err(rollback_error) = delete_account(&account.id) {
-                    rollback_errors.push(rollback_error.to_string());
+                    let _ = rollback_error;
+                    rollback_errors.push(());
                 }
-            } else if let Err(rollback_error) = delete_account(&account.id) {
-                rollback_errors.push(rollback_error.to_string());
-            }
 
-            if rollback_errors.is_empty() {
-                app.set_status(format!("Failed to save password: {}", e));
-            } else {
-                app.set_status(format!(
-                    "Failed to save password: {}; password rollback failed: {}",
-                    e,
-                    rollback_errors.join("; ")
-                ));
+                if rollback_errors.is_empty() {
+                    clear_account_journal_after_terminal_result(account_journal_started, false);
+                    app.set_status("Failed to save password. The account was left unchanged.");
+                } else {
+                    app.set_status("Failed to save password, and automatic password rollback could not be confirmed. Please check storage before trying again.");
+                }
+                return false;
             }
-            return false;
         }
         account.has_saved_password = true;
+    } else if username_changed {
+        if let Some(previous_password) = previous_password.as_ref() {
+            match save_account_with_outcome(
+                &account,
+                previous_password.as_str(),
+                app.config.settings.use_keyring,
+            ) {
+                Ok(outcome) => {
+                    cleanup_warning = outcome.stale_cleanup_warning;
+                }
+                Err(e) => {
+                    let _ = e;
+                    clear_account_journal_after_terminal_result(account_journal_started, false);
+                    app.set_status(
+                        "Failed to rebind the saved password to the updated email. The account was left unchanged.",
+                    );
+                    return false;
+                }
+            }
+            account.has_saved_password = true;
+        }
     } else if !is_existing {
         account.has_saved_password = false;
     }
@@ -698,50 +885,371 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
     }
 
     if let Err(e) = save_config(&next_config) {
+        let _ = e;
         let mut rollback_errors = Vec::new();
-        if new_password.is_some() {
+        if new_password.is_some() || username_changed {
             if is_existing {
-                if let Some(previous_password) = previous_password.as_deref() {
+                if let (Some(previous_account), Some(previous_password)) =
+                    (previous_account.as_ref(), previous_password.as_deref())
+                {
                     let previous_password = previous_password.as_str();
-                    if let Err(rollback_error) =
-                        save_account(&account, previous_password, app.config.settings.use_keyring)
-                    {
-                        rollback_errors.push(rollback_error.to_string());
+                    if let Err(rollback_error) = save_account(
+                        previous_account,
+                        previous_password,
+                        app.config.settings.use_keyring,
+                    ) {
+                        let _ = rollback_error;
+                        rollback_errors.push(());
                     }
                 } else if let Err(rollback_error) = delete_account(&account.id) {
-                    rollback_errors.push(rollback_error.to_string());
+                    let _ = rollback_error;
+                    rollback_errors.push(());
                 }
             } else if let Err(rollback_error) = delete_account(&account.id) {
-                rollback_errors.push(rollback_error.to_string());
+                let _ = rollback_error;
+                rollback_errors.push(());
             }
         }
         if rollback_errors.is_empty() {
-            app.set_status(format!("Failed to save config: {}", e));
+            clear_account_journal_after_terminal_result(account_journal_started, false);
+            app.set_status("Failed to save account changes. The account was left unchanged.");
         } else {
-            app.set_status(format!(
-                "Failed to save config: {}; password rollback failed: {}",
-                e,
-                rollback_errors.join("; ")
-            ));
+            app.set_status("Failed to save account changes, and automatic password rollback could not be confirmed. Please check storage before trying again.");
         }
         return false;
     } else {
+        clear_account_journal_after_terminal_result(
+            account_journal_started,
+            cleanup_warning.is_some(),
+        );
         app.config = next_config;
-        app.set_status("Account saved");
+        app.set_status(account_saved_status(cleanup_warning.as_ref()));
     }
 
-    sync_worker_accounts(app);
+    sync_worker_accounts(app, false);
 
     true
 }
 
-fn sync_worker_accounts(app: &mut AutoLoginApp) {
-    if let Err(e) = app
-        .worker_tx
-        .try_send(crate::background::WorkerCommand::UpdateAccounts(
-            app.config.accounts.clone(),
-        ))
-    {
-        app.set_status(format!("Saved, but monitor update failed: {}", e));
+fn enabled_account_conflicts_with_candidate(existing: &Account, candidate_email: &str) -> bool {
+    existing.enabled
+        && existing
+            .username
+            .trim()
+            .eq_ignore_ascii_case(candidate_email.trim())
+}
+
+fn account_saved_status(cleanup_warning: Option<&StaleBackendCleanupWarning>) -> String {
+    cleanup_warning.map_or_else(
+        || "Account saved".to_string(),
+        |warning| {
+            format!(
+                "Account saved. Password was written to {}, but old {} cleanup is still pending and will retry on next launch. Stored credential changes are blocked until recovery completes.",
+                warning.saved_backend.label(),
+                warning.stale_backend.label()
+            )
+        },
+    )
+}
+
+fn clear_account_journal_after_terminal_result(started: bool, keep_for_cleanup_retry: bool) {
+    clear_account_journal_after_terminal_result_with(
+        started,
+        keep_for_cleanup_retry,
+        clear_pending_storage_operation,
+    )
+}
+
+fn clear_account_journal_after_terminal_result_with<C>(
+    started: bool,
+    keep_for_cleanup_retry: bool,
+    mut clear_journal_op: C,
+) where
+    C: FnMut() -> anyhow::Result<()>,
+{
+    if !started {
+        return;
+    }
+    if keep_for_cleanup_retry {
+        tracing::warn!(
+            "Keeping pending account storage operation journal so stale password cleanup can retry"
+        );
+        return;
+    }
+    if let Err(e) = clear_journal_op() {
+        tracing::warn!(
+            error = %e,
+            "Failed to clear pending account storage operation journal after terminal result"
+        );
+    }
+}
+
+fn sync_worker_accounts(app: &mut AutoLoginApp, refresh_passwords: bool) {
+    app.sync_saved_config_to_worker(refresh_passwords);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enabled_account_conflicts_with_candidate;
+    use super::{
+        account_saved_status, clear_account_journal_after_terminal_result_with,
+        delete_account_transaction,
+    };
+    use crate::models::{Account, AppConfig};
+    use crate::storage::{PasswordStorageBackend, StaleBackendCleanupWarning};
+    use std::cell::RefCell;
+
+    #[test]
+    fn delete_account_transaction_aborts_when_journal_prepare_fails() {
+        let config = config_with_account(true);
+        let events = RefCell::new(Vec::new());
+
+        let error = delete_account_transaction(
+            &config,
+            0,
+            |account, use_keyring| {
+                events.borrow_mut().push("journal");
+                assert_eq!(account.id, "account-1");
+                assert!(use_keyring);
+                anyhow::bail!("journal failed")
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("save_config");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("clear_journal");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Failed to prepare account removal"));
+        assert!(!error.contains("journal failed"));
+        assert_eq!(events.into_inner(), vec!["journal"]);
+    }
+
+    #[test]
+    fn delete_account_transaction_keeps_password_when_config_save_fails() {
+        let config = config_with_account(true);
+        let events = RefCell::new(Vec::new());
+
+        let error = delete_account_transaction(
+            &config,
+            0,
+            |_, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("save_config");
+                anyhow::bail!("config save failed")
+            },
+            || {
+                events.borrow_mut().push("clear_journal");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Failed to save the account removal"));
+        assert!(!error.contains("config save failed"));
+        assert_eq!(
+            events.into_inner(),
+            vec!["journal", "save_config", "clear_journal"]
+        );
+    }
+
+    #[test]
+    fn delete_account_transaction_saves_config_before_password_cleanup() {
+        let config = config_with_account(true);
+        let events = RefCell::new(Vec::new());
+
+        let outcome = delete_account_transaction(
+            &config,
+            0,
+            |_, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+            |next_config| {
+                events.borrow_mut().push("save_config");
+                assert!(next_config.accounts.is_empty());
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("clear_journal");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.config.accounts.is_empty());
+        assert!(!outcome.password_cleanup_warning);
+        assert!(!outcome.journal_cleanup_warning);
+        assert_eq!(
+            events.into_inner(),
+            vec!["journal", "save_config", "delete", "clear_journal"]
+        );
+    }
+
+    #[test]
+    fn delete_account_transaction_retains_journal_after_delete_failure() {
+        let config = config_with_account(true);
+        let events = RefCell::new(Vec::new());
+
+        let outcome = delete_account_transaction(
+            &config,
+            0,
+            |_, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                anyhow::bail!("delete failed")
+            },
+            |next_config| {
+                events.borrow_mut().push("save_config");
+                assert!(next_config.accounts.is_empty());
+                Ok(())
+            },
+            || panic!("journal must remain pending for delete cleanup retry"),
+        )
+        .unwrap();
+
+        assert!(outcome.config.accounts.is_empty());
+        assert!(outcome.password_cleanup_warning);
+        assert!(!outcome.journal_cleanup_warning);
+        assert_eq!(
+            events.into_inner(),
+            vec!["journal", "save_config", "delete"]
+        );
+    }
+
+    #[test]
+    fn delete_account_transaction_surfaces_journal_clear_warning_after_commit() {
+        let config = config_with_account(true);
+        let events = RefCell::new(Vec::new());
+
+        let outcome = delete_account_transaction(
+            &config,
+            0,
+            |_, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+            |next_config| {
+                events.borrow_mut().push("save_config");
+                assert!(next_config.accounts.is_empty());
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("clear_journal");
+                anyhow::bail!("clear failed")
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.config.accounts.is_empty());
+        assert!(!outcome.password_cleanup_warning);
+        assert!(outcome.journal_cleanup_warning);
+        assert_eq!(
+            events.into_inner(),
+            vec!["journal", "save_config", "delete", "clear_journal"]
+        );
+    }
+
+    #[test]
+    fn account_saved_status_surfaces_stale_cleanup_warning() {
+        let warning = StaleBackendCleanupWarning {
+            saved_backend: PasswordStorageBackend::SystemSecureStorage,
+            stale_backend: PasswordStorageBackend::EncryptedFallbackFile,
+            error_kind: "storage_error",
+        };
+
+        let status = account_saved_status(Some(&warning));
+
+        assert!(status.contains("Account saved"));
+        assert!(status.contains("system secure storage"));
+        assert!(status.contains("old encrypted fallback file cleanup is still pending"));
+        assert!(status.contains("will retry on next launch"));
+        assert!(status.contains("Stored credential changes are blocked"));
+        assert!(!status.contains("storage_error"));
+    }
+
+    #[test]
+    fn account_save_stale_cleanup_warning_retains_journal_for_retry() {
+        let warning = StaleBackendCleanupWarning {
+            saved_backend: PasswordStorageBackend::SystemSecureStorage,
+            stale_backend: PasswordStorageBackend::EncryptedFallbackFile,
+            error_kind: "storage_error",
+        };
+        let cleared = RefCell::new(false);
+
+        clear_account_journal_after_terminal_result_with(true, true, || {
+            *cleared.borrow_mut() = true;
+            Ok(())
+        });
+
+        assert!(!*cleared.borrow());
+
+        clear_account_journal_after_terminal_result_with(true, false, || {
+            *cleared.borrow_mut() = true;
+            Ok(())
+        });
+
+        assert!(*cleared.borrow());
+        assert_eq!(
+            account_saved_status(Some(&warning)),
+            "Account saved. Password was written to system secure storage, but old encrypted fallback file cleanup is still pending and will retry on next launch. Stored credential changes are blocked until recovery completes."
+        );
+    }
+
+    #[test]
+    fn enabled_account_conflict_policy_matches_email_only() {
+        let mut existing = Account::new(" User@Example.com ");
+        existing.enabled = true;
+
+        assert!(enabled_account_conflicts_with_candidate(
+            &existing,
+            "user@example.com"
+        ));
+        assert!(!enabled_account_conflicts_with_candidate(
+            &existing,
+            "other@example.com"
+        ));
+
+        existing.enabled = false;
+        assert!(!enabled_account_conflicts_with_candidate(
+            &existing,
+            "user@example.com"
+        ));
+    }
+
+    fn config_with_account(has_saved_password: bool) -> AppConfig {
+        let mut account = Account::new("user@example.com");
+        account.id = "account-1".to_string();
+        account.has_saved_password = has_saved_password;
+        AppConfig {
+            accounts: vec![account],
+            ..AppConfig::default()
+        }
     }
 }

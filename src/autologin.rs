@@ -2,6 +2,8 @@ use crate::config::CredentialsConfig;
 #[cfg(target_os = "macos")]
 use crate::macos_identity;
 #[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
 use tracing::info;
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -9,6 +11,8 @@ use zeroize::Zeroizing;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AccessibilityStatus {
     pub(crate) trusted: bool,
+    pub(crate) raw_trusted: bool,
+    pub(crate) identity_trusted: bool,
     pub(crate) current_process_path: String,
     pub(crate) app_bundle_path: String,
 }
@@ -119,11 +123,18 @@ pub(crate) fn check_accessibility_permissions() -> anyhow::Result<()> {
     {
         let status = accessibility_status();
         if !status.trusted {
+            if status.raw_trusted && !status.identity_trusted {
+                anyhow::bail!(
+                    "Accessibility is granted, but this app bundle is not trusted for automation: {}. \
+                     Install a properly signed Windows App AutoLogin bundle at /Applications/WindowsAppAutoLogin.app.",
+                    crate::user_paths::redacted_path(&status.current_process_path)
+                );
+            }
             anyhow::bail!(
                 "Accessibility permission missing for this exact app: {}. \
                  Add or re-enable Windows App AutoLogin in System Settings → \
                  Privacy & Security → Accessibility, then restart the app.",
-                status.current_process_path
+                crate::user_paths::redacted_path(&status.current_process_path)
             );
         }
     }
@@ -134,8 +145,12 @@ pub(crate) fn accessibility_status() -> AccessibilityStatus {
     let current_process_path = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    let raw_trusted = raw_accessibility_is_trusted();
+    let identity_trusted = current_app_identity_is_trusted();
     AccessibilityStatus {
-        trusted: accessibility_is_trusted(),
+        trusted: raw_trusted && identity_trusted,
+        raw_trusted,
+        identity_trusted,
         app_bundle_path: app_bundle_path_for_process(&current_process_path).unwrap_or_default(),
         current_process_path,
     }
@@ -143,12 +158,126 @@ pub(crate) fn accessibility_status() -> AccessibilityStatus {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn accessibility_is_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() != 0 }
+    raw_accessibility_is_trusted() && current_app_identity_is_trusted()
 }
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn accessibility_is_trusted() -> bool {
     true
+}
+
+#[cfg(target_os = "macos")]
+fn raw_accessibility_is_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raw_accessibility_is_trusted() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+static CURRENT_APP_IDENTITY_TRUSTED: OnceLock<bool> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+pub(crate) fn current_app_identity_is_trusted() -> bool {
+    *CURRENT_APP_IDENTITY_TRUSTED.get_or_init(current_app_identity_is_trusted_uncached)
+}
+
+#[cfg(target_os = "macos")]
+fn current_app_identity_is_trusted_uncached() -> bool {
+    let Ok(exe_path) = std::env::current_exe() else {
+        return false;
+    };
+    if crate::macos_identity::path_has_symlink_component(&exe_path) {
+        return false;
+    }
+    let Some(bundle_path) = containing_app_bundle(&exe_path) else {
+        return false;
+    };
+    if crate::macos_identity::path_has_symlink_component(&bundle_path) {
+        return false;
+    }
+    app_bundle_identity_is_trusted(&bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn trusted_app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
+    app_bundle_identity_is_trusted(bundle_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn current_app_identity_is_trusted() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
+    let Ok(bundle_path) = bundle_path.canonicalize() else {
+        return false;
+    };
+    if crate::macos_identity::path_has_symlink_component(&bundle_path) {
+        return false;
+    }
+    if bundle_identifier(&bundle_path).as_deref() != Some(crate::app_identity::macos_bundle_id()) {
+        return false;
+    }
+
+    if crate::app_identity::macos_development_identity() {
+        return development_app_bundle_identity_is_trusted(&bundle_path);
+    }
+
+    bundle_path == std::path::Path::new(crate::app_identity::TRUSTED_MACOS_BUNDLE_PATH)
+        && app_bundle_signature_is_trusted(&bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn development_app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
+    if !development_app_bundle_path_is_trusted(bundle_path) {
+        return false;
+    }
+    crate::macos_identity::static_code_path_has_valid_internal_signature(bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn development_app_bundle_path_is_trusted(bundle_path: &std::path::Path) -> bool {
+    [
+        crate::app_identity::TRUSTED_MACOS_BUNDLE_PATH,
+        crate::app_identity::DEVELOPMENT_MACOS_BUNDLE_PATH,
+    ]
+    .into_iter()
+    .filter_map(|path| std::path::Path::new(path).canonicalize().ok())
+    .any(|candidate| candidate == bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn app_bundle_signature_is_trusted(bundle_path: &std::path::Path) -> bool {
+    let Some(team_id) = crate::app_identity::macos_team_id()
+        .filter(|team_id| macos_identity::valid_team_id(team_id))
+    else {
+        return false;
+    };
+
+    macos_identity::verify_bundle_designated_requirement(
+        bundle_path,
+        crate::app_identity::macos_bundle_id(),
+        team_id,
+    )
+    .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_identifier(bundle_path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleIdentifier"])
+        .arg(bundle_path.join("Contents/Info.plist"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(target_os = "macos")]
@@ -169,7 +298,7 @@ pub(crate) fn request_accessibility_access_prompt() -> bool {
         }
         let trusted = AXIsProcessTrustedWithOptions(options) != 0;
         CFRelease(options);
-        trusted
+        trusted && current_app_identity_is_trusted()
     }
 }
 
@@ -189,10 +318,14 @@ pub(crate) fn open_accessibility_settings() -> anyhow::Result<()> {
 }
 
 fn app_bundle_path_for_process(process_path: &str) -> Option<String> {
-    std::path::Path::new(process_path)
+    containing_app_bundle(std::path::Path::new(process_path)).map(|path| path.display().to_string())
+}
+
+fn containing_app_bundle(process_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    process_path
         .ancestors()
         .find(|path| path.extension().is_some_and(|ext| ext == "app"))
-        .map(|path| path.display().to_string())
+        .map(std::path::Path::to_path_buf)
 }
 
 #[cfg(target_os = "macos")]
@@ -256,10 +389,11 @@ fn perform_login_macos_after_verified_prompt(
         credentials.prompt_process_id,
     )?;
 
-    crate::macos_ax::fill_password(
+    let fill_result = crate::macos_ax::fill_password(
         app_name,
         prompt.target.process_id,
         &prompt.target.window_title,
+        prompt.origin.as_str(),
         &credentials.username,
         password.as_str(),
         crate::macos_ax::MacosFillMethod::Keyboard,
@@ -267,10 +401,12 @@ fn perform_login_macos_after_verified_prompt(
     )?;
     guard()?;
 
-    crate::macos_ax::submit_prompt(
+    let submit_result = crate::macos_ax::submit_prompt_after_fill(
         app_name,
+        fill_result.filled_prompt.as_ref(),
         prompt.target.process_id,
         &prompt.target.window_title,
+        prompt.origin.as_str(),
         &credentials.username,
         guard,
     )?;
@@ -279,7 +415,9 @@ fn perform_login_macos_after_verified_prompt(
     match crate::macos_ax::post_check_state(
         app_name,
         prompt.target.process_id,
+        &prompt.target.window_title,
         &credentials.username,
+        submit_result.submitted_prompt.as_ref(),
         std::time::Duration::from_millis(1200),
     ) {
         "authenticated" => {
@@ -289,6 +427,9 @@ fn perform_login_macos_after_verified_prompt(
         "prompt_gone_unknown" => {
             warn!("Password was submitted but post-submit authentication state was not confirmed");
             Ok(AutoLoginResult::PasswordTouchedWithoutSubmit)
+        }
+        "prompt_mismatch" => {
+            anyhow::bail!("A different credential prompt is visible after native submit")
         }
         "still_prompt" => anyhow::bail!("Credential prompt is still visible after native submit"),
         "failed" => anyhow::bail!("Windows App is not running after native submit"),
@@ -324,6 +465,7 @@ fn matching_native_prompt(
         app_name,
         expected_process_id,
         expected_window_title,
+        Some(username),
     )?
     else {
         anyhow::bail!("Credential prompt was not detected");
@@ -340,113 +482,6 @@ fn matching_native_prompt(
         anyhow::bail!("Credential prompt email does not match this account");
     }
     Ok(prompt)
-}
-
-#[cfg(target_os = "macos")]
-fn activate_and_ensure_frontmost(
-    app_name: &str,
-    expected_process_id: Option<i32>,
-) -> anyhow::Result<()> {
-    use std::process::Command;
-    use std::thread;
-    use std::time::Duration;
-
-    let app_name_literal = applescript_string_literal(app_name);
-    let trusted_pids = trusted_pids_for_prompt(app_name, expected_process_id)?;
-    if trusted_pids.is_empty() {
-        anyhow::bail!("No trusted Microsoft Windows App process is running");
-    }
-    let trusted_pids_literal = macos_identity::applescript_pid_list_literal(&trusted_pids);
-
-    let activate_script = format!("tell application {} to activate", app_name_literal);
-    let _ = run_osascript(&activate_script);
-    thread::sleep(Duration::from_millis(300));
-
-    let frontmost_script = format!(
-        r#"on processMatches(procRef, expectedName, trustedPIDs)
-    tell application "System Events"
-        try
-            if (name of procRef as string) is not expectedName then return false
-            set procPID to unix id of procRef as string
-            repeat with trustedPID in trustedPIDs
-                if procPID is (trustedPID as string) then return true
-            end repeat
-            return false
-        on error
-            return false
-        end try
-    end tell
-end processMatches
-
-tell application "System Events"
-    set expectedName to {}
-    set trustedPIDs to {}
-    repeat with procRef in every application process
-        try
-            if frontmost of procRef and my processMatches(procRef, expectedName, trustedPIDs) then
-                return "matched"
-            end if
-        end try
-    end repeat
-    return "not_matched"
-end tell"#,
-        app_name_literal, trusted_pids_literal
-    );
-    let output = run_osascript(&frontmost_script)?;
-    let frontmost = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_lowercase();
-
-    if frontmost != "matched" {
-        warn!("Target app is not frontmost, forcing it to front");
-        let _ = run_osascript(&activate_script);
-        thread::sleep(Duration::from_millis(300));
-        if let Some(bundle_path) = macos_identity::trusted_bundle_path(app_name)? {
-            let _ = Command::new("/usr/bin/open").arg(bundle_path).output();
-            thread::sleep(Duration::from_millis(300));
-        }
-        let force_script = format!(
-            r#"on processMatches(procRef, expectedName, trustedPIDs)
-    tell application "System Events"
-        try
-            if (name of procRef as string) is not expectedName then return false
-            set procPID to unix id of procRef as string
-            repeat with trustedPID in trustedPIDs
-                if procPID is (trustedPID as string) then return true
-            end repeat
-            return false
-        on error
-            return false
-        end try
-    end tell
-end processMatches
-
-tell application "System Events"
-    set expectedName to {}
-    set trustedPIDs to {}
-    repeat with procRef in every application process
-        if my processMatches(procRef, expectedName, trustedPIDs) then
-            set frontmost of procRef to true
-            return "ok"
-        end if
-    end repeat
-    error "verified target process not found"
-end tell"#,
-            app_name_literal, trusted_pids_literal
-        );
-        let _ = run_osascript(&force_script)?;
-        thread::sleep(Duration::from_millis(500));
-
-        let output = run_osascript(&frontmost_script)?;
-        let frontmost = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_lowercase();
-        if frontmost != "matched" {
-            anyhow::bail!("Could not make '{}' frontmost", app_name);
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -614,6 +649,16 @@ on elementIsSecureTextField(elem)
     return my elementIsCredentialPasswordField(elem, true)
 end elementIsSecureTextField
 
+on elementIsHidden(elem)
+    tell application "System Events"
+        try
+            return (value of attribute "AXHidden" of elem) as boolean
+        on error
+            return false
+        end try
+    end tell
+end elementIsHidden
+
 on elementLabelText(elem)
     tell application "System Events"
         set labelText to ""
@@ -621,19 +666,7 @@ on elementLabelText(elem)
             set labelText to labelText & " " & (name of elem as string)
         end try
         try
-            set labelText to labelText & " " & (description of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (help of elem as string)
-        end try
-        try
             set labelText to labelText & " " & (value of attribute "AXTitle" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXDescription" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXHelp" of elem as string)
         end try
         try
             set labelText to labelText & " " & (value of attribute "AXPlaceholderValue" of elem as string)
@@ -670,12 +703,14 @@ on countPasswordFields(containerRef)
     tell application "System Events"
         try
             repeat with elem in (every UI element of containerRef)
-                if my elementIsSecureTextField(elem) then
-                    set fieldCount to fieldCount + 1
-                else
-                    try
-                        set fieldCount to fieldCount + my countPasswordFields(elem)
-                    end try
+                if not my elementIsHidden(elem) then
+                    if my elementIsSecureTextField(elem) then
+                        set fieldCount to fieldCount + 1
+                    else
+                        try
+                            set fieldCount to fieldCount + my countPasswordFields(elem)
+                        end try
+                    end if
                 end if
             end repeat
         end try
@@ -688,11 +723,15 @@ on countPromptButtons(containerRef)
     tell application "System Events"
         tell containerRef
             try
-                set buttonCount to buttonCount + (count of every button)
+                repeat with buttonRef in (every button)
+                    if not my elementIsHidden(buttonRef) then set buttonCount to buttonCount + 1
+                end repeat
             end try
             try
                 repeat with elem in (every UI element)
-                    set buttonCount to buttonCount + my countPromptButtons(elem)
+                    if not my elementIsHidden(elem) then
+                        set buttonCount to buttonCount + my countPromptButtons(elem)
+                    end if
                 end repeat
             end try
         end tell
@@ -706,7 +745,7 @@ on collectPromptText(containerRef, baseText)
         tell containerRef
             try
                 repeat with tf in (every text field)
-                    if not my elementIsSecureTextField(tf) then
+                    if (not my elementIsHidden(tf)) and (not my elementIsSecureTextField(tf)) then
                         try
                             set promptText to promptText & " " & (name of tf as string)
                         end try
@@ -718,40 +757,32 @@ on collectPromptText(containerRef, baseText)
             end try
             try
                 repeat with staticRef in (every static text)
-                    try
-                        set promptText to promptText & " " & (name of staticRef as string)
-                    end try
-                    try
-                        set promptText to promptText & " " & (value of staticRef as string)
-                    end try
+                    if not my elementIsHidden(staticRef) then
+                        try
+                            set promptText to promptText & " " & (name of staticRef as string)
+                        end try
+                        try
+                            set promptText to promptText & " " & (value of staticRef as string)
+                        end try
+                    end if
                 end repeat
             end try
             try
                 repeat with elem in (every UI element)
-                    if not my elementIsSecureTextField(elem) then
-                        try
-                            set promptText to promptText & " " & (name of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (description of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (help of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of attribute "AXTitle" of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of attribute "AXDescription" of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of attribute "AXHelp" of elem as string)
-                        end try
+                    if not my elementIsHidden(elem) then
+                        if not my elementIsSecureTextField(elem) then
+                            try
+                                set promptText to promptText & " " & (name of elem as string)
+                            end try
+                            try
+                                set promptText to promptText & " " & (value of elem as string)
+                            end try
+                            try
+                                set promptText to promptText & " " & (value of attribute "AXTitle" of elem as string)
+                            end try
+                        end if
+                        set promptText to my collectPromptText(elem, promptText)
                     end if
-                    set promptText to my collectPromptText(elem, promptText)
                 end repeat
             end try
         end tell
@@ -793,24 +824,28 @@ tell application "System Events"
     repeat with procRef in procList
         if my processMatches(procRef, expectedName, trustedPIDs) then
             repeat with w in (every window of procRef)
-                try
-                    set wName to name of w as string
-                    if my windowTitleMatches(wName, expectedWindowTitle) then
-                        repeat with s in (every sheet of w)
-                            set sheetButtonCount to my countPromptButtons(s)
-                            set sheetButtonCount to sheetButtonCount + my countPromptButtons(w)
-                            if my countPasswordFields(s) >= 1 and sheetButtonCount >= 1 then
-                                set sawCredentialPrompt to true
-                                if my promptMatchesAccount(my collectPromptText(s, ""), usernameValue) then return "same"
-                            end if
-                        end repeat
+                if not my elementIsHidden(w) then
+                    try
+                        set wName to name of w as string
+                        if my windowTitleMatches(wName, expectedWindowTitle) then
+                            repeat with s in (every sheet of w)
+                                if not my elementIsHidden(s) then
+                                    set sheetButtonCount to my countPromptButtons(s)
+                                    set sheetButtonCount to sheetButtonCount + my countPromptButtons(w)
+                                    if my countPasswordFields(s) >= 1 and sheetButtonCount >= 1 then
+                                        set sawCredentialPrompt to true
+                                        if my promptMatchesAccount(my collectPromptText(s, ""), usernameValue) then return "same"
+                                    end if
+                                end if
+                            end repeat
 
-                        if my countPasswordFields(w) >= 1 and my countPromptButtons(w) >= 1 then
-                            set sawCredentialPrompt to true
-                            if my promptMatchesAccount(my collectPromptText(w, ""), usernameValue) then return "same"
+                            if my countPasswordFields(w) >= 1 and my countPromptButtons(w) >= 1 then
+                                set sawCredentialPrompt to true
+                                if my promptMatchesAccount(my collectPromptText(w, ""), usernameValue) then return "same"
+                            end if
                         end if
-                    end if
-                end try
+                    end try
+                end if
             end repeat
         end if
     end repeat
@@ -885,7 +920,7 @@ on appendAccountFieldValues(containerRef, currentOutput)
         tell containerRef
             try
                 repeat with tf in (every text field)
-                    if not my elementIsSecureTextField(tf) then
+                    if (not my elementIsHidden(tf)) and (not my elementIsSecureTextField(tf)) then
                         try
                             set outputText to outputText & (name of tf as string) & "\n"
                         end try
@@ -897,40 +932,32 @@ on appendAccountFieldValues(containerRef, currentOutput)
             end try
             try
                 repeat with staticRef in (every static text)
-                    try
-                        set outputText to outputText & (name of staticRef as string) & "\n"
-                    end try
-                    try
-                        set outputText to outputText & (value of staticRef as string) & "\n"
-                    end try
+                    if not my elementIsHidden(staticRef) then
+                        try
+                            set outputText to outputText & (name of staticRef as string) & "\n"
+                        end try
+                        try
+                            set outputText to outputText & (value of staticRef as string) & "\n"
+                        end try
+                    end if
                 end repeat
             end try
             try
                 repeat with elem in (every UI element)
-                    if not my elementIsSecureTextField(elem) then
-                        try
-                            set outputText to outputText & (name of elem as string) & "\n"
-                        end try
-                        try
-                            set outputText to outputText & (value of elem as string) & "\n"
-                        end try
-                        try
-                            set outputText to outputText & (description of elem as string) & "\n"
-                        end try
-                        try
-                            set outputText to outputText & (help of elem as string) & "\n"
-                        end try
-                        try
-                            set outputText to outputText & (value of attribute "AXTitle" of elem as string) & "\n"
-                        end try
-                        try
-                            set outputText to outputText & (value of attribute "AXDescription" of elem as string) & "\n"
-                        end try
-                        try
-                            set outputText to outputText & (value of attribute "AXHelp" of elem as string) & "\n"
-                        end try
+                    if not my elementIsHidden(elem) then
+                        if not my elementIsSecureTextField(elem) then
+                            try
+                                set outputText to outputText & (name of elem as string) & "\n"
+                            end try
+                            try
+                                set outputText to outputText & (value of elem as string) & "\n"
+                            end try
+                            try
+                                set outputText to outputText & (value of attribute "AXTitle" of elem as string) & "\n"
+                            end try
+                        end if
+                        set outputText to my appendAccountFieldValues(elem, outputText)
                     end if
-                    set outputText to my appendAccountFieldValues(elem, outputText)
                 end repeat
             end try
         end tell
@@ -990,6 +1017,16 @@ on elementIsSecureTextField(elem)
     return my elementIsCredentialPasswordField(elem, true)
 end elementIsSecureTextField
 
+on elementIsHidden(elem)
+    tell application "System Events"
+        try
+            return (value of attribute "AXHidden" of elem) as boolean
+        on error
+            return false
+        end try
+    end tell
+end elementIsHidden
+
 on elementLabelText(elem)
     tell application "System Events"
         set labelText to ""
@@ -997,19 +1034,7 @@ on elementLabelText(elem)
             set labelText to labelText & " " & (name of elem as string)
         end try
         try
-            set labelText to labelText & " " & (description of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (help of elem as string)
-        end try
-        try
             set labelText to labelText & " " & (value of attribute "AXTitle" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXDescription" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXHelp" of elem as string)
         end try
         try
             set labelText to labelText & " " & (value of attribute "AXPlaceholderValue" of elem as string)
@@ -1046,12 +1071,14 @@ on countPasswordFields(containerRef)
     tell application "System Events"
         try
             repeat with elem in (every UI element of containerRef)
-                if my elementIsSecureTextField(elem) then
-                    set fieldCount to fieldCount + 1
-                else
-                    try
-                        set fieldCount to fieldCount + my countPasswordFields(elem)
-                    end try
+                if not my elementIsHidden(elem) then
+                    if my elementIsSecureTextField(elem) then
+                        set fieldCount to fieldCount + 1
+                    else
+                        try
+                            set fieldCount to fieldCount + my countPasswordFields(elem)
+                        end try
+                    end if
                 end if
             end repeat
         end try
@@ -1064,11 +1091,15 @@ on countPromptButtons(containerRef)
     tell application "System Events"
         tell containerRef
             try
-                set buttonCount to buttonCount + (count of every button)
+                repeat with buttonRef in (every button)
+                    if not my elementIsHidden(buttonRef) then set buttonCount to buttonCount + 1
+                end repeat
             end try
             try
                 repeat with elem in (every UI element)
-                    set buttonCount to buttonCount + my countPromptButtons(elem)
+                    if not my elementIsHidden(elem) then
+                        set buttonCount to buttonCount + my countPromptButtons(elem)
+                    end if
                 end repeat
             end try
         end tell
@@ -1086,14 +1117,17 @@ tell application "System Events"
         repeat with procRef in procList
             if my processMatches(procRef, expectedName, trustedPIDs) then
             repeat with w in (every window of procRef)
+                if not my elementIsHidden(w) then
                 try
                     set wName to name of w as string
                     if my windowTitleMatches(wName, expectedWindowTitle) then
                     repeat with s in (every sheet of w)
+                        if not my elementIsHidden(s) then
                         set sheetButtonCount to my countPromptButtons(s)
                         set sheetButtonCount to sheetButtonCount + my countPromptButtons(w)
                         if my countPasswordFields(s) >= 1 and sheetButtonCount >= 1 then
                             set output to my appendAccountFieldValues(s, output)
+                        end if
                         end if
                     end repeat
                     end if
@@ -1106,6 +1140,7 @@ tell application "System Events"
                     end if
                     end if
                 end try
+                end if
             end repeat
             end if
         end repeat
@@ -1136,12 +1171,14 @@ fn usernames_match(prompt_email: &str, account_username: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn extract_email_like(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
-    let mut at_positions = chars
+    let at_positions = chars
         .iter()
         .enumerate()
-        .filter_map(|(idx, c)| (*c == '@').then_some(idx));
+        .filter_map(|(idx, c)| (*c == '@').then_some(idx))
+        .collect::<Vec<_>>();
 
-    at_positions.find_map(|at| {
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for at in at_positions {
         let mut start = at;
         while start > 0 && is_email_char(chars[start - 1]) {
             start -= 1;
@@ -1167,11 +1204,17 @@ fn extract_email_like(text: &str) -> Option<String> {
             && !domain.starts_with('.')
             && !domain.ends_with('.')
         {
-            Some(candidate)
-        } else {
-            None
+            let normalized = candidate.trim().to_lowercase();
+            if !matches.iter().any(|(existing, _)| existing == &normalized) {
+                matches.push((normalized, candidate));
+            }
         }
-    })
+    }
+
+    let [(_, email)] = matches.as_slice() else {
+        return None;
+    };
+    Some(email.clone())
 }
 
 #[cfg(target_os = "macos")]
@@ -1186,40 +1229,6 @@ fn applescript_string_literal(value: &str) -> String {
         .replace('"', "\\\"")
         .replace(['\r', '\n'], " ");
     format!("\"{}\"", escaped)
-}
-
-#[cfg(target_os = "macos")]
-fn run_osascript_stdin(script: &str) -> anyhow::Result<std::process::Output> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let mut child = Command::new("/usr/bin/osascript")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes())?;
-    }
-
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
-        }
-
-        if started.elapsed() >= Duration::from_secs(3) {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("login osascript timed out");
-        }
-
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1247,551 +1256,6 @@ fn run_osascript(script: &str) -> anyhow::Result<std::process::Output> {
         }
 
         thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn try_applescript_login(
-    app_name: &str,
-    username: &str,
-    password: &str,
-    expected_window_title: Option<&str>,
-    expected_process_id: Option<i32>,
-    guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<AutoLoginResult> {
-    activate_and_ensure_frontmost(app_name, expected_process_id)?;
-    guard()?;
-
-    let trusted_pids = trusted_pids_for_prompt(app_name, expected_process_id)?;
-    if trusted_pids.is_empty() {
-        anyhow::bail!("No trusted Microsoft Windows App process is running");
-    }
-    let trusted_pids_literal = macos_identity::applescript_pid_list_literal(&trusted_pids);
-    let app_name_literal = applescript_string_literal(app_name);
-    let username_literal = applescript_string_literal(username);
-    let password_literal = Zeroizing::new(applescript_string_literal(password));
-    let expected_window_title_literal =
-        applescript_string_literal(expected_window_title.unwrap_or_default());
-    let script = Zeroizing::new(format!(
-        r#"on pressButtonFast(buttonRef)
-    tell application "System Events"
-        try
-            with timeout of 0.35 seconds
-                perform action "AXPress" of buttonRef
-            end timeout
-            delay 0.02
-            return true
-        on error
-            return false
-        end try
-    end tell
-end pressButtonFast
-
-on clickPreferredSubmit(containerRef, expectedName, trustedPIDs)
-    if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
-    return my clickContinueSubmit(containerRef, expectedName, trustedPIDs)
-end clickPreferredSubmit
-
-on clickContinueSubmit(containerRef, expectedName, trustedPIDs)
-    tell application "System Events"
-        try
-            repeat with b in (every button of containerRef)
-                if my buttonLooksContinue(b) then
-                    if my targetIsFrontmost(expectedName, trustedPIDs) then
-                        if my pressButtonFast(b) then return true
-                    end if
-                end if
-            end repeat
-        end try
-
-        try
-            repeat with elem in (every UI element of containerRef)
-                if my clickContinueSubmit(elem, expectedName, trustedPIDs) then return true
-            end repeat
-        end try
-
-        return false
-    end tell
-end clickContinueSubmit
-
-on buttonLooksContinue(buttonRef)
-    tell application "System Events"
-        try
-            if my buttonTextIsContinue(name of buttonRef as string) then return true
-        end try
-        try
-            if my buttonTextIsContinue(value of buttonRef as string) then return true
-        end try
-        try
-            if my buttonTextIsContinue(value of attribute "AXTitle" of buttonRef as string) then return true
-        end try
-    end tell
-    return false
-end buttonLooksContinue
-
-on buttonTextIsContinue(buttonTextValue)
-    ignoring case
-        if buttonTextValue is "Continue" then return true
-    end ignoring
-    if buttonTextValue is "Продолжить" then return true
-    return false
-end buttonTextIsContinue
-
-on pressDefaultSubmit(containerRef, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
-        if my focusedSecureTextField(containerRef, expectedName, trustedPIDs, allowPasswordLike) is missing value then return false
-        key code 36
-        delay 0.05
-        return true
-    end tell
-end pressDefaultSubmit
-
-on processMatches(procRef, expectedName, trustedPIDs)
-    tell application "System Events"
-        try
-            if (name of procRef as string) is not expectedName then return false
-            set procPID to unix id of procRef as string
-            repeat with trustedPID in trustedPIDs
-                if procPID is (trustedPID as string) then return true
-            end repeat
-            return false
-        on error
-            return false
-        end try
-    end tell
-end processMatches
-
-on targetIsFrontmost(expectedName, trustedPIDs)
-    tell application "System Events"
-        try
-            repeat with procRef in every application process
-                if frontmost of procRef and my processMatches(procRef, expectedName, trustedPIDs) then return true
-            end repeat
-        end try
-    end tell
-    return false
-end targetIsFrontmost
-
-on countPromptButtons(containerRef)
-    set buttonCount to 0
-    tell application "System Events"
-        tell containerRef
-            try
-                set buttonCount to buttonCount + (count of every button)
-            end try
-            try
-                repeat with elem in (every UI element)
-                    set buttonCount to buttonCount + my countPromptButtons(elem)
-                end repeat
-            end try
-        end tell
-    end tell
-    return buttonCount
-end countPromptButtons
-
-on collectPromptText(containerRef, baseText)
-    set promptText to baseText
-    tell application "System Events"
-        tell containerRef
-            try
-                repeat with tf in (every text field)
-                    if not my elementIsSecureTextField(tf) then
-                        try
-                            set promptText to promptText & " " & (name of tf as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of tf as string)
-                        end try
-                    end if
-                end repeat
-            end try
-            try
-                repeat with staticRef in (every static text)
-                    try
-                        set promptText to promptText & " " & (name of staticRef as string)
-                    end try
-                    try
-                        set promptText to promptText & " " & (value of staticRef as string)
-                    end try
-                end repeat
-            end try
-            try
-                repeat with elem in (every UI element)
-                    if not my elementIsSecureTextField(elem) then
-                        try
-                            set promptText to promptText & " " & (name of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (description of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (help of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of attribute "AXTitle" of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of attribute "AXDescription" of elem as string)
-                        end try
-                        try
-                            set promptText to promptText & " " & (value of attribute "AXHelp" of elem as string)
-                        end try
-                    end if
-                    set promptText to my collectPromptText(elem, promptText)
-                end repeat
-            end try
-        end tell
-    end tell
-    return promptText
-end collectPromptText
-
-on promptMatchesAccount(promptText, usernameValue)
-    set promptLength to length of promptText
-    set usernameLength to length of usernameValue
-    if usernameLength is 0 or promptLength is less than usernameLength then return false
-    ignoring case
-        repeat with idx from 1 to (promptLength - usernameLength + 1)
-            if text idx thru (idx + usernameLength - 1) of promptText is usernameValue then
-                set beforeOk to true
-                set afterOk to true
-                if idx > 1 then set beforeOk to not my isEmailCharacter(character (idx - 1) of promptText)
-                if (idx + usernameLength) <= promptLength then set afterOk to not my isEmailCharacter(character (idx + usernameLength) of promptText)
-                if beforeOk and afterOk then return true
-            end if
-        end repeat
-    end ignoring
-    return false
-end promptMatchesAccount
-
-on isEmailCharacter(ch)
-    set emailChars to "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-@"
-    return emailChars contains (ch as string)
-end isEmailCharacter
-
-on windowTitleMatches(wName, expectedTitle)
-    if expectedTitle is "" then return true
-    ignoring case
-        if wName is expectedTitle then return true
-    end ignoring
-    return false
-end windowTitleMatches
-
-on elementRoleText(elem)
-    tell application "System Events"
-        set roleText to ""
-        try
-            set roleText to roleText & " " & (value of attribute "AXRole" of elem as string)
-        end try
-        try
-            set roleText to roleText & " " & (value of attribute "AXSubrole" of elem as string)
-        end try
-        try
-            set roleText to roleText & " " & (value of attribute "AXRoleDescription" of elem as string)
-        end try
-        try
-            set roleText to roleText & " " & (class of elem as string)
-        end try
-        try
-            set roleText to roleText & " " & (role of elem as string)
-        end try
-        try
-            set roleText to roleText & " " & (role description of elem as string)
-        end try
-    end tell
-    return roleText
-end elementRoleText
-
-on elementIsNativeSecureTextField(elem)
-    set roleText to my elementRoleText(elem)
-    ignoring case
-        if roleText contains "AXSecureTextField" then return true
-        if roleText contains "secure text field" then return true
-        if roleText contains "securetextfield" then return true
-        if (roleText contains "AXTextField") and (roleText contains "secure") then return true
-    end ignoring
-    return false
-end elementIsNativeSecureTextField
-
-on elementIsCredentialPasswordField(elem, allowPasswordLike)
-    if my elementIsNativeSecureTextField(elem) then return true
-    if allowPasswordLike then
-        set roleText to my elementRoleText(elem)
-        set labelText to my elementLabelText(elem)
-        ignoring case
-            if my roleLooksLikeTextField(roleText) and my textContainsPasswordCue(labelText) then return true
-        end ignoring
-    end if
-    return false
-end elementIsCredentialPasswordField
-
-on elementIsSecureTextField(elem)
-    return my elementIsCredentialPasswordField(elem, true)
-end elementIsSecureTextField
-
-on elementLabelText(elem)
-    tell application "System Events"
-        set labelText to ""
-        try
-            set labelText to labelText & " " & (name of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (description of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (help of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXTitle" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXDescription" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXHelp" of elem as string)
-        end try
-        try
-            set labelText to labelText & " " & (value of attribute "AXPlaceholderValue" of elem as string)
-        end try
-    end tell
-    return labelText
-end elementLabelText
-
-on roleLooksLikeTextField(roleText)
-    ignoring case
-        if roleText contains "AXTextField" then return true
-        if roleText contains "text field" then return true
-    end ignoring
-    return false
-end roleLooksLikeTextField
-
-on textContainsPasswordCue(textValue)
-    ignoring case
-        if textValue contains "password" then return true
-        if textValue contains "passwort" then return true
-        if textValue contains "kennwort" then return true
-        if textValue contains "mot de passe" then return true
-        if textValue contains "contraseña" then return true
-        if textValue contains "contrasena" then return true
-        if textValue contains "hasło" then return true
-        if textValue contains "haslo" then return true
-        if textValue contains "пароль" then return true
-    end ignoring
-    return false
-end textContainsPasswordCue
-
-on elementIsPlainTextField(elem, allowPasswordLike)
-    set roleText to my elementRoleText(elem)
-    if my elementIsCredentialPasswordField(elem, allowPasswordLike) then return false
-    ignoring case
-        if roleText contains "text field" then return true
-        if roleText contains "AXTextField" then return true
-    end ignoring
-    return false
-end elementIsPlainTextField
-
-on firstSecureTextField(containerRef, allowPasswordLike)
-    tell application "System Events"
-        try
-            repeat with elem in (every UI element of containerRef)
-                if my elementIsCredentialPasswordField(elem, allowPasswordLike) then return elem
-                try
-                    set nestedField to my firstSecureTextField(elem, allowPasswordLike)
-                    if nestedField is not missing value then return nestedField
-                end try
-            end repeat
-        end try
-    end tell
-    return missing value
-end firstSecureTextField
-
-on focusedSecureTextField(containerRef, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        if not my targetIsFrontmost(expectedName, trustedPIDs) then return missing value
-        try
-            repeat with elem in (every UI element of containerRef)
-                if my elementIsCredentialPasswordField(elem, allowPasswordLike) then
-                    if my secureFieldHasVerifiedFocus(elem, expectedName, trustedPIDs, allowPasswordLike) then return elem
-                else
-                    try
-                        set nestedField to my focusedSecureTextField(elem, expectedName, trustedPIDs, allowPasswordLike)
-                        if nestedField is not missing value then return nestedField
-                    end try
-                end if
-            end repeat
-        end try
-    end tell
-    return missing value
-end focusedSecureTextField
-
-on firstPlainTextField(containerRef, allowPasswordLike)
-    tell application "System Events"
-        try
-            repeat with elem in (every UI element of containerRef)
-                if my elementIsPlainTextField(elem, allowPasswordLike) then return elem
-                try
-                    set nestedField to my firstPlainTextField(elem, allowPasswordLike)
-                    if nestedField is not missing value then return nestedField
-                end try
-            end repeat
-        end try
-    end tell
-    return missing value
-end firstPlainTextField
-
-on focusPasswordField(passwordField, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
-        if not my elementIsCredentialPasswordField(passwordField, allowPasswordLike) then return false
-        try
-            set focused of passwordField to true
-        end try
-        try
-            click passwordField
-        end try
-        delay 0.08
-        try
-            if focused of passwordField then return true
-        on error
-            return false
-        end try
-    end tell
-    return false
-end focusPasswordField
-
-on secureFieldHasVerifiedFocus(passwordField, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
-        if not my elementIsCredentialPasswordField(passwordField, allowPasswordLike) then return false
-        try
-            if not (focused of passwordField) then return false
-        on error
-            return false
-        end try
-        try
-            if not ((value of attribute "AXFocused" of passwordField as boolean) is true) then return false
-        end try
-        return true
-    end tell
-end secureFieldHasVerifiedFocus
-
-on clearFocusedTextField(passwordField, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        if not my secureFieldHasVerifiedFocus(passwordField, expectedName, trustedPIDs, allowPasswordLike) then return false
-        keystroke "a" using command down
-        delay 0.04
-        if not my secureFieldHasVerifiedFocus(passwordField, expectedName, trustedPIDs, allowPasswordLike) then return false
-        key code 51
-        delay 0.04
-        return my secureFieldHasVerifiedFocus(passwordField, expectedName, trustedPIDs, allowPasswordLike)
-    end tell
-end clearFocusedTextField
-
-on fillPasswordField(passwordField, passwordValue, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        if not my targetIsFrontmost(expectedName, trustedPIDs) then return false
-        if not my elementIsCredentialPasswordField(passwordField, allowPasswordLike) then return false
-
-        -- Keyboard path is allowed only when the same trusted process remains
-        -- frontmost, the account text still matched the prompt, and the
-        -- password-like field can be confirmed as focused.
-        if my focusPasswordField(passwordField, expectedName, trustedPIDs, allowPasswordLike) then
-            if my secureFieldHasVerifiedFocus(passwordField, expectedName, trustedPIDs, allowPasswordLike) then
-                if my clearFocusedTextField(passwordField, expectedName, trustedPIDs, allowPasswordLike) then
-                    if my secureFieldHasVerifiedFocus(passwordField, expectedName, trustedPIDs, allowPasswordLike) then
-                        try
-                            keystroke passwordValue
-                            delay 0.05
-                            return true
-                        end try
-                    end if
-                end if
-            end if
-        end if
-
-        return false
-    end tell
-end fillPasswordField
-
-on fillLoginFields(containerRef, usernameValue, passwordValue, expectedName, trustedPIDs, allowPasswordLike)
-    tell application "System Events"
-        set passwordField to my firstSecureTextField(containerRef, allowPasswordLike)
-        if passwordField is not missing value then
-            set usernameField to my firstPlainTextField(containerRef, allowPasswordLike)
-            if usernameField is not missing value then
-                try
-                    set value of usernameField to usernameValue
-                end try
-            end if
-            if my fillPasswordField(passwordField, passwordValue, expectedName, trustedPIDs, allowPasswordLike) then return true
-        end if
-    end tell
-    return false
-end fillLoginFields
-
-tell application "System Events"
-            set expectedName to {}
-            set trustedPIDs to {}
-            set procList to every application process whose name is expectedName
-            repeat with procRef in procList
-                if my processMatches(procRef, expectedName, trustedPIDs) then
-                set usernameValue to {}
-                set passwordValue to {}
-                set expectedWindowTitle to {}
-                repeat with w in (every window of procRef)
-	                    set wName to name of w as string
-		                    if my windowTitleMatches(wName, expectedWindowTitle) then
-		                        repeat with s in (every sheet of w)
-		                            set promptText to my collectPromptText(s, "")
-		                            set sheetButtonCount to my countPromptButtons(s)
-		                            set sheetButtonCount to sheetButtonCount + my countPromptButtons(w)
-		                            if sheetButtonCount >= 1 and my promptMatchesAccount(promptText, usernameValue) then
-				                            if my fillLoginFields(s, usernameValue, passwordValue, expectedName, trustedPIDs, true) then
-			                                if my clickPreferredSubmit(s, expectedName, trustedPIDs) then return "ok"
-                                            if my clickPreferredSubmit(w, expectedName, trustedPIDs) then return "ok"
-                                            if my pressDefaultSubmit(s, expectedName, trustedPIDs, true) then return "ok"
-                                            return "password_touched"
-			                            end if
-		                            end if
-		                        end repeat
-		                        set promptText to my collectPromptText(w, "")
-		                        if my countPromptButtons(w) >= 1 and my promptMatchesAccount(promptText, usernameValue) then
-				                        if my fillLoginFields(w, usernameValue, passwordValue, expectedName, trustedPIDs, true) then
-			                            if my clickPreferredSubmit(w, expectedName, trustedPIDs) then return "ok"
-                                        if my pressDefaultSubmit(w, expectedName, trustedPIDs, true) then return "ok"
-                                        return "password_touched"
-			                        end if
-		                        end if
-                    end if
-                end repeat
-                end if
-            end repeat
-        end tell
-        error "No suitable login window found""#,
-        app_name_literal,
-        trusted_pids_literal,
-        username_literal,
-        password_literal.as_str(),
-        expected_window_title_literal
-    ));
-
-    guard()?;
-    let output = run_osascript_stdin(script.as_str())?;
-
-    if output.status.success() {
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            "ok" => Ok(AutoLoginResult::Submitted),
-            "password_touched" => Ok(AutoLoginResult::PasswordTouchedWithoutSubmit),
-            _ => anyhow::bail!("AppleScript returned an unexpected result"),
-        }
-    } else {
-        anyhow::bail!(
-            "AppleScript login failed: {}",
-            redacted_stderr(&output.stderr)
-        )
     }
 }
 
@@ -1829,8 +1293,8 @@ mod accessibility_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        extract_email_like, prompt_window_title_matches, redacted_stderr,
-        trusted_pids_for_expected_prompt, usernames_match, ExpectedPidMismatch,
+        app_bundle_signature_is_trusted, extract_email_like, prompt_window_title_matches,
+        redacted_stderr, trusted_pids_for_expected_prompt, usernames_match, ExpectedPidMismatch,
     };
 
     const PASSWORD_CUES: &[&str] = &[
@@ -1865,16 +1329,24 @@ mod tests {
         label_text: &str,
         verified_prompt_context: bool,
     ) -> bool {
+        let _ = (label_text, verified_prompt_context);
         native_secure_field_for_test(role_text)
-            || (verified_prompt_context && password_like_text_field_for_test(role_text, label_text))
     }
 
     fn prompt_text_collection_reads_field_for_test(
         role_text: &str,
         label_text: &str,
-        verified_prompt_context: bool,
+        _verified_prompt_context: bool,
     ) -> bool {
-        !credential_password_field_for_test(role_text, label_text, verified_prompt_context)
+        !native_secure_field_for_test(role_text)
+            && !password_like_text_field_for_test(role_text, label_text)
+    }
+
+    #[test]
+    fn own_app_signature_requires_configured_valid_team_id() {
+        assert!(!app_bundle_signature_is_trusted(std::path::Path::new(
+            "/Applications/WindowsAppAutoLogin.app"
+        )));
     }
 
     #[test]
@@ -1898,7 +1370,7 @@ mod tests {
             "AXDescription Password",
             false,
         ));
-        assert!(credential_password_field_for_test(
+        assert!(!credential_password_field_for_test(
             "AXTextField",
             "AXDescription Password",
             true,
@@ -1946,6 +1418,18 @@ mod tests {
     #[test]
     fn missing_visible_prompt_email_blocks_password_load_gate() {
         assert_eq!(extract_email_like("Sign in to continue"), None);
+    }
+
+    #[test]
+    fn visible_prompt_email_rejects_multiple_distinct_emails() {
+        assert_eq!(
+            extract_email_like("user@example.com recovery other@example.com"),
+            None
+        );
+        assert_eq!(
+            extract_email_like("user@example.com signed in as USER@example.com"),
+            Some("user@example.com".to_string())
+        );
     }
 
     #[test]

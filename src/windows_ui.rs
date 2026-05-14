@@ -98,6 +98,7 @@ pub(crate) fn check_status(config: &Config) -> MonitorStatus {
                     process_id: prompt.target.process_id,
                     window_title: prompt.target.window_title,
                     prompt_email: prompt.email,
+                    prompt_origin: "windows".to_string(),
                 };
             }
 
@@ -483,21 +484,22 @@ pub(crate) fn post_check_state(
                 });
 
                 if let Some(prompt) = inspection.prompt {
-                    if prompt
-                        .email
-                        .as_deref()
-                        .is_some_and(|email| usernames_match(email, expected_email))
-                    {
-                        return "still_prompt";
-                    }
-                    return "prompt_gone_unknown";
+                    return classify_post_submit_state(
+                        prompt.email.as_deref(),
+                        target_running,
+                        inspection.has_session,
+                        expected_email,
+                    )
+                    .unwrap_or("prompt_gone_unknown");
                 }
 
-                if !target_running {
-                    return "failed";
-                }
-                if inspection.has_session {
-                    return "authenticated";
+                if let Some(state) = classify_post_submit_state(
+                    None,
+                    target_running,
+                    inspection.has_session,
+                    expected_email,
+                ) {
+                    return state;
                 }
             }
             Err(_) => return "failed",
@@ -508,6 +510,29 @@ pub(crate) fn post_check_state(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn classify_post_submit_state(
+    prompt_email: Option<&str>,
+    target_running: bool,
+    has_session: bool,
+    expected_email: &str,
+) -> Option<&'static str> {
+    if let Some(prompt_email) = prompt_email {
+        return if usernames_match(prompt_email, expected_email) {
+            Some("still_prompt")
+        } else {
+            Some("prompt_mismatch")
+        };
+    }
+
+    if !target_running {
+        return Some("failed");
+    }
+    if has_session {
+        return Some("authenticated");
+    }
+    None
 }
 
 fn detect_matching_prompt(
@@ -1598,6 +1623,40 @@ mod tests {
         assert!(is_preferred_submit_label("OK OkButton"));
         assert!(!is_preferred_submit_label("Cancel"));
         assert!(!is_preferred_submit_label("More choices"));
+    }
+
+    #[test]
+    fn post_submit_prompt_email_mismatch_returns_prompt_mismatch() {
+        assert_eq!(
+            super::classify_post_submit_state(
+                Some("other@example.com"),
+                true,
+                false,
+                "user@example.com"
+            ),
+            Some("prompt_mismatch")
+        );
+    }
+
+    #[test]
+    fn post_submit_prompt_matching_email_returns_still_prompt() {
+        assert_eq!(
+            super::classify_post_submit_state(
+                Some("USER@example.com"),
+                true,
+                false,
+                "user@example.com"
+            ),
+            Some("still_prompt")
+        );
+    }
+
+    #[test]
+    fn post_submit_no_prompt_without_session_stays_unknown_until_timeout() {
+        assert_eq!(
+            super::classify_post_submit_state(None, true, false, "user@example.com"),
+            None
+        );
     }
 
     fn trusted_windows_security_target() -> WindowsTarget {

@@ -36,6 +36,8 @@ Before loading a password, it requires:
 
 Before typing or submitting, it revalidates the target process, PID/window context, prompt contents, visible email, and password field.
 
+Diagnostics use the same trusted target constraints as autofill: supported Microsoft identity, expected install path, signing identity, and verified live PID. App names, process names, and window titles are labels, not sufficient authority for diagnostic traversal.
+
 The app does not:
 
 - preload all saved passwords;
@@ -71,15 +73,23 @@ Other app names, copied bundles, unsigned bundles, modified bundles, or unexpect
 - Rust matching the version in `Cargo.toml` (`rust-version = "1.93"`).
 - Windows App installed on the same desktop session.
 - macOS Accessibility permission for the exact app or binary you launch on macOS.
-- For bundle creation: `sips`, `iconutil`, and optionally `codesign`.
+- macOS may also ask for Automation permission to control System Events; approve it only for the expected Windows App AutoLogin bundle.
+- For macOS bundle creation: `sips` and `iconutil`.
+- For macOS release packaging: a Developer ID Application signing identity available to `codesign`, plus an `xcrun notarytool` keychain profile.
 
 ## Build
 
-Build the release binary:
+Create a production macOS release ZIP with a freshly built, signed, notarized, and stapled app bundle:
 
 ```bash
-cargo build --release
+WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
+WAAL_MACOS_TEAM_ID=ABCDE12345 \
+WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
+WAAL_NOTARY_PROFILE=windows-app-autologin-release \
+script/package_macos.sh --release
 ```
+
+For a local macOS development bundle, use `./script/build_and_run.sh --verify` instead.
 
 Build-check the Windows implementation from another host when the target is installed:
 
@@ -87,7 +97,7 @@ Build-check the Windows implementation from another host when the target is inst
 cargo check --target x86_64-pc-windows-gnu --all-targets --all-features
 ```
 
-Build and launch the macOS app bundle:
+Build and launch the local macOS development app bundle. This path uses the development bundle identity and ad-hoc signing; it is not a production release build:
 
 ```bash
 ./script/build_and_run.sh --verify
@@ -120,10 +130,11 @@ System Settings -> Privacy & Security -> Accessibility
 ```
 
 5. Return to the app. It checks Accessibility status every second.
-6. Add an account in the **Accounts** tab.
-7. Save the email and password.
-8. Keep the account enabled.
-9. Start the monitor from the menu-bar item if it is not already running.
+6. If macOS prompts for Automation permission to control System Events, approve it for the expected Windows App AutoLogin bundle. The app uses that only for Open at Login cleanup and guarded diagnostics/prompt inspection.
+7. Add an account in the **Accounts** tab.
+8. Save the email and password.
+9. Keep the account enabled.
+10. Start the monitor from the menu-bar item if it is not already running.
 
 When the matching Windows App credential prompt is visible and Windows App is frontmost, the background worker attempts one guarded fill and submit sequence.
 
@@ -137,7 +148,7 @@ The default launch mode is a lightweight supervisor with no always-on egui windo
 - **Request Accessibility Access**
 - **Open Accessibility Settings**
 - Accessibility status
-- Keychain status
+- Password storage status
 - Last fill result
 - **Quit**
 
@@ -182,14 +193,14 @@ Example:
 }
 ```
 
-Password records are keyed by account ID. Manually editing account IDs can disconnect metadata from the saved password.
+Password records are keyed by account ID and bound to account metadata. Manually editing account IDs or email can disconnect metadata from the saved password and fail closed.
 
 ## Password Storage
 
 By default, passwords are stored in the system secure store:
 
 - Service: `WindowsAppAutoLogin`
-- Account: the saved account UUID
+- Account: the saved account ID
 
 If **Use system secure storage** is disabled, passwords are stored in an encrypted local fallback file:
 
@@ -202,7 +213,11 @@ That fallback uses AES-256-GCM. Its encryption key is still stored in the system
 - Service: `WindowsAppAutoLoginFallbackKey`
 - Account: `fallback-encryption-key`
 
-Switching storage mode does not automatically migrate existing passwords. Re-save each account password after changing the storage setting.
+The fallback file is not independent of Keychain or Credential Manager: if the fallback key cannot be created or read from the system secure store, fallback password save/load will fail. New fallback records are bound to the app service, account ID, and normalized email hash; manual metadata edits fail closed.
+
+Recent builds migrate saved passwords when switching storage mode. The app copies and verifies passwords in the new storage before saving the setting, then attempts to remove old copies from the previous backend. If copying or verification fails, the setting is left unchanged. If only old-copy cleanup fails after a save or migration succeeds, passwords remain available in the selected storage and cleanup remains pending for the next launch instead of being forgotten.
+
+During storage-mode and account metadata changes, the app writes a private pending-operation journal so a restart can finish cleanup or restore a consistent config after a crash. Cleanup warnings mean a migration target was verified or an account save completed in the selected backend, but stale old material may remain until recovery succeeds. While that journal exists, stored credential changes are blocked and the app retries cleanup on startup. Manual cleanup targets, if the warning persists, are the old `WindowsAppAutoLogin` account-ID secure-store entries, stale `passwords.json` records, and old fallback key material under `WindowsAppAutoLoginFallbackKey` / `fallback-encryption-key` or legacy `fallback.key`. Do not delete the fallback key while any fallback password records remain.
 
 If Keychain asks for permission repeatedly, make sure you are launching the same app bundle each time and choose **Always Allow** for the intended app identity.
 
@@ -219,11 +234,11 @@ At a high level:
 5. Collect visible prompt text while excluding secure/password-like fields.
 6. Extract the visible email.
 7. Match that email against enabled accounts.
-8. Load only the matching account password.
-9. Revalidate the same prompt and target process.
+8. Revalidate the same frontmost prompt and target process before password load.
+9. Load only the matching account password.
 10. Detect the intended password field.
-11. Focus the field and type the password through guarded keyboard input.
-12. Submit with a bounded `AXPress` action or a guarded Enter fallback.
+11. Focus the field and set the password on that exact AX element with a target-bound `AXValue` update after fresh prompt/focus checks.
+12. Submit only with a bounded `AXPress` action on the verified submit button.
 13. Post-check whether the app reached an authenticated/normal state, still shows the prompt, or ended in an unknown state.
 
 Windows App may expose its password box as `AXTextField` rather than `AXSecureTextField`. The app treats password-like `AXTextField` controls as password fields only inside a verified credential prompt context.
@@ -233,25 +248,22 @@ Windows App may expose its password box as `AXTextField` rather than `AXSecureTe
 Run a sanitized macOS UI diagnostic report:
 
 ```bash
-cargo run --quiet --bin diagnose-macos-ui
+cargo run --quiet --features diagnostics-ui --bin diagnose-macos-ui
 ```
 
 The diagnostic binary prints JSON describing visible target processes, windows, controls, and selected system dialogs. Sensitive values are redacted. Raw AppleScript output is not printed.
 
-Run one guarded fill attempt from the current process:
+Diagnostic target discovery uses the same trusted-target constraints as autofill: supported Microsoft identity, expected install path, signing identity, and verified live PID. App names, process names, and window titles are treated only as report labels; they are not enough to select or traverse an arbitrary process.
+
+`release-diagnostics` is reserved for intentional support artifacts, not general releases. Diagnostic output is redacted and capped, but it can still include process IDs, bundle/signing identifiers, and timing data; review it before sharing with support.
+
+Run one guarded fill attempt from a development build compiled with `debug-fill` or `dev-tools` and launched from the trusted app bundle:
 
 ```bash
-cargo run --bin windows-app-autologin -- --debug-fill-once
+/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin --debug-fill-once
 ```
 
-Optional fill method:
-
-```bash
-cargo run --bin windows-app-autologin -- --debug-fill-once --fill-method=keyboard
-cargo run --bin windows-app-autologin -- --debug-fill-once --fill-method=direct
-```
-
-The one-shot command is intended for development and troubleshooting. Accessibility permission must belong to the exact process you run. If you run it from Cargo, macOS may require permission for Terminal, your IDE, or the generated debug binary instead of the bundled app.
+The one-shot command is intended for development and troubleshooting. It is available only in debug builds with the explicit debug-fill feature enabled and requires Accessibility permission for the trusted `/Applications/WindowsAppAutoLogin.app` bundle identity. Do not package, distribute, or leave a debug-fill build installed as the production app.
 
 ## Development Features
 
@@ -264,8 +276,10 @@ none
 Optional features:
 
 ```text
+debug-fill
 diagnostics-ui
-dev-tools
+dev-tools (enables debug-fill and diagnostics-ui)
+release-diagnostics (explicitly permits diagnostics-ui in release support artifacts)
 ```
 
 Build and launch the full UI with diagnostics enabled:
@@ -298,7 +312,7 @@ Additional feature coverage:
 cargo check --all-targets --all-features
 ```
 
-The test suite covers the main safety decisions: visible-email matching, missing/mismatched/duplicate accounts, disabled accounts, PID/window drift, settings-generation cancellation, bounded logs, redaction, diagnostic output caps, and target identity checks.
+The test suite covers the main safety decisions: visible-email matching, missing/mismatched/duplicate accounts, disabled accounts, PID/window drift, settings-generation cancellation, bounded logs, redaction, diagnostic output caps, diagnostics name-spoof rejection, and target identity checks.
 
 ## Packaging Notes
 
@@ -310,11 +324,28 @@ Current development bundle ID:
 dev.codex.windows-app-autologin
 ```
 
-The script does not perform Developer ID signing or notarization. For distribution outside local development, replace the development bundle ID/signing setup with a stable production identity and add a proper notarization flow.
+The development script does not perform Developer ID signing or notarization. It opts into `WAAL_DEVELOPMENT_RELEASE=1` only for local non-production release-profile bundles.
+
+Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script builds the release binary from the current checkout in a staging target directory, assembles the `.app`, signs it with `WAAL_CODESIGN_IDENTITY`, notarizes it with `WAAL_NOTARY_PROFILE`, staples the ticket, and then zips only the verified staged bundle. Pre-existing `dist/*.app` bundles are ignored as inputs.
+
+Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID and Team ID, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It removes any stale output ZIP before validation, strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, then validates the staged bundle and the extracted ZIP artifact before publishing the ZIP.
+
+Use `script/package_macos.sh --release-diagnostics-artifact` only for an intentional support artifact. A release diagnostics artifact is built by the package script with `--features release-diagnostics`, a separate `WAAL_DIAGNOSTICS_BUNDLE_ID`, and the diagnostics app name `WindowsAppAutoLoginDiagnostics.app`; the package script requires both `WAAL_RELEASE_BUNDLE_ID` and `WAAL_DIAGNOSTICS_BUNDLE_ID` and refuses to package if the diagnostics bundle ID matches the production or development bundle ID. `script/build_and_run.sh --dev-ui` is not a release diagnostics path because it builds `dev-tools`, which includes `debug-fill` and is rejected by packaging.
+
+Example release diagnostics packaging command:
+
+```bash
+WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
+WAAL_DIAGNOSTICS_BUNDLE_ID=com.example.WindowsAppAutoLogin.Diagnostics \
+WAAL_MACOS_TEAM_ID=ABCDE12345 \
+WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
+WAAL_NOTARY_PROFILE=windows-app-autologin-release \
+script/package_macos.sh --release-diagnostics-artifact
+```
 
 The app bundle sets `LSUIElement=true`, so it behaves like a menu-bar utility rather than a Dock-first application.
 
-On macOS, Open at Login should be enabled only from a stable app location such as `/Applications`; the app intentionally refuses autostart from transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`. On Windows, the portable `dist/WindowsAppAutoLogin-windows-x86_64` build can register itself for Startup, while `target/` and temporary folders are still rejected.
+On macOS, Open at Login is trusted only for the exact canonical bundle path `/Applications/WindowsAppAutoLogin.app` with the expected bundle identifier; the app intentionally refuses autostart from other bundle locations, including transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`. On Windows, the portable `dist/WindowsAppAutoLogin-windows-x86_64` build can register itself for Startup, while `target/` and temporary folders are still rejected.
 
 ## Troubleshooting
 
@@ -359,7 +390,7 @@ The app fails closed if:
 The diagnostic tool uses bounded Accessibility traversal and discards raw output on timeout. A timeout should not expose field values. Try closing unrelated modal dialogs and rerun:
 
 ```bash
-cargo run --quiet --bin diagnose-macos-ui
+cargo run --quiet --features diagnostics-ui --bin diagnose-macos-ui
 ```
 
 ## Limitations

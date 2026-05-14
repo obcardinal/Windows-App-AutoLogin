@@ -5,9 +5,6 @@ use crate::ui::theme;
 #[cfg(feature = "diagnostics-ui")]
 use eframe::egui;
 
-#[cfg(any(test, feature = "diagnostics-ui"))]
-const MAX_DIAGNOSE_OUTPUT_BYTES: usize = 64 * 1024;
-
 #[cfg(feature = "diagnostics-ui")]
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     theme::page_header(
@@ -152,10 +149,19 @@ const RUNTIME_STATUS_FIELDS: &[&str] = &[
     "windows_app_team_id",
     "windows_app_path",
     "windows_app_frontmost",
+    "prompt_context_present",
+    "prompt_context_source",
+    "prompt_context_age_ms",
+    "prompt_context_max_age_ms",
+    "prompt_context_revalidation_result",
     "prompt_detected",
     "detected_email_redacted",
+    "account_enabled_email_match_count",
+    "account_saved_email_match_count",
     "account_match_count",
     "selected_account_id",
+    "password_load_attempted",
+    "password_load_skip_reason",
     "keychain_service_name",
     "keychain_account_key",
     "keychain_process_path",
@@ -188,10 +194,19 @@ const LAST_FILL_FIELDS: &[&str] = &[
     "windows_app_bundle_id",
     "windows_app_team_id",
     "windows_app_frontmost",
+    "prompt_context_present",
+    "prompt_context_source",
+    "prompt_context_age_ms",
+    "prompt_context_max_age_ms",
+    "prompt_context_revalidation_result",
     "prompt_detected",
     "detected_email_redacted",
+    "account_enabled_email_match_count",
+    "account_saved_email_match_count",
     "account_match_count",
     "selected_account_id",
+    "password_load_attempted",
+    "password_load_skip_reason",
     "password_load_ms",
     "storage_lookup_start_ms",
     "account_id_lookup_ms",
@@ -243,11 +258,20 @@ fn show_report_fields(
 #[cfg(feature = "diagnostics-ui")]
 pub(crate) fn poll_diagnosis(app: &mut AutoLoginApp) {
     if let Some(ref rx) = app.diagnose_rx {
-        if let Ok(result) = rx.try_recv() {
-            app.diagnose_result = result;
-            app.diagnose_running = false;
-            app.diagnose_rx = None;
-            app.set_status("Diagnosis complete");
+        match rx.try_recv() {
+            Ok(result) => {
+                app.diagnose_result = result;
+                app.diagnose_running = false;
+                app.diagnose_rx = None;
+                app.set_status("Diagnosis complete");
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.diagnose_result = "Diagnostic failed: worker stopped unexpectedly".to_string();
+                app.diagnose_running = false;
+                app.diagnose_rx = None;
+                app.set_status("Diagnosis failed");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
 }
@@ -263,11 +287,19 @@ fn clear_diagnosis(app: &mut AutoLoginApp) {
 #[cfg(feature = "diagnostics-ui")]
 pub(crate) fn poll_runtime_status(app: &mut AutoLoginApp) {
     if let Some(ref rx) = app.runtime_status_rx {
-        if let Ok(report) = rx.try_recv() {
-            app.runtime_status_report = Some(report);
-            app.runtime_status_running = false;
-            app.runtime_status_rx = None;
-            app.set_status("Runtime status refreshed");
+        match rx.try_recv() {
+            Ok(report) => {
+                app.runtime_status_report = Some(report);
+                app.runtime_status_running = false;
+                app.runtime_status_rx = None;
+                app.set_status("Runtime status refreshed");
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.runtime_status_running = false;
+                app.runtime_status_rx = None;
+                app.set_status("Runtime status failed");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
 }
@@ -283,7 +315,9 @@ fn start_diagnosis(app: &mut AutoLoginApp) {
 
     std::thread::spawn(move || {
         let output = match windows_app_autologin::diagnose::run_for_app(&app_name) {
-            Ok(report) => cap_diagnose_output(report.to_plaintext()),
+            Ok(report) => {
+                windows_app_autologin::diagnose::cap_diagnostic_output(report.to_plaintext())
+            }
             Err(e) => format!("Diagnostic failed: {}", e),
         };
         let _ = tx.send(output);
@@ -305,28 +339,39 @@ pub(crate) fn start_runtime_status(app: &mut AutoLoginApp) {
     });
 }
 
-#[cfg(any(test, feature = "diagnostics-ui"))]
-fn cap_diagnose_output(output: String) -> String {
-    if output.len() <= MAX_DIAGNOSE_OUTPUT_BYTES {
-        return output;
-    }
-
-    let mut capped = output;
-    capped.truncate(MAX_DIAGNOSE_OUTPUT_BYTES);
-    capped.push_str("\n\n[diagnostic output truncated]\n");
-    capped
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "diagnostics-ui"))]
 mod tests {
-    use super::{cap_diagnose_output, MAX_DIAGNOSE_OUTPUT_BYTES};
+    use super::poll_runtime_status;
+    use crate::app::AutoLoginApp;
+    use crate::models::{AppConfig, Tab};
+    use std::sync::mpsc::channel as std_channel;
+    use tokio::sync::mpsc::channel as tokio_channel;
 
     #[test]
-    fn diagnose_output_is_capped() {
-        let output = "x".repeat(MAX_DIAGNOSE_OUTPUT_BYTES + 1024);
-        let capped = cap_diagnose_output(output);
+    fn runtime_status_disconnect_clears_running_state() {
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            true,
+            Tab::Diagnose,
+        );
+        let (tx, rx) = std_channel();
+        drop(tx);
+        app.runtime_status_running = true;
+        app.runtime_status_rx = Some(rx);
 
-        assert!(capped.len() < MAX_DIAGNOSE_OUTPUT_BYTES + 128);
-        assert!(capped.contains("[diagnostic output truncated]"));
+        poll_runtime_status(&mut app);
+
+        assert!(!app.runtime_status_running);
+        assert!(app.runtime_status_rx.is_none());
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message == "Runtime status failed"));
     }
 }

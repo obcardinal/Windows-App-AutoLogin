@@ -2,7 +2,6 @@
 use crate::macos_identity;
 use crate::models::{Account, AppSettings};
 use crate::storage;
-use sha2::{Digest, Sha256};
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,7 +13,11 @@ use std::time::{Duration, Instant, SystemTime};
 struct PromptInfo {
     process_id: i32,
     window_title: String,
+    prompt_origin: String,
+    verified_prompt: Option<crate::macos_ax::MacosVerifiedPrompt>,
 }
+
+const LAST_FILL_ATTEMPT_REPORT_FILE: &str = "last-fill-attempt.json";
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -23,6 +26,7 @@ pub(crate) struct VerifiedPromptContext {
     pub(crate) process_id: i32,
     pub(crate) window_title: String,
     pub(crate) prompt_email: String,
+    pub(crate) prompt_origin: String,
     pub(crate) detected_at: Instant,
 }
 
@@ -38,16 +42,17 @@ impl VerifiedPromptContext {
     }
 }
 
-#[cfg(target_os = "macos")]
 const VERIFIED_PROMPT_CONTEXT_MAX_AGE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillMethod {
     Keyboard,
+    #[cfg(target_os = "windows")]
     DirectAxSetValue,
 }
 
 impl FillMethod {
+    #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
     pub(crate) fn parse(args: &[String]) -> anyhow::Result<Self> {
         let method = args
             .iter()
@@ -56,10 +61,19 @@ impl FillMethod {
 
         match method {
             "keyboard" => Ok(Self::Keyboard),
-            "direct" | "direct_ax_set_value" => Ok(Self::DirectAxSetValue),
-            other => anyhow::bail!(
-                "unsupported fill method '{other}'; use --fill-method=keyboard or --fill-method=direct"
-            ),
+            "direct" | "direct_ax_set_value" => {
+                #[cfg(target_os = "windows")]
+                {
+                    Ok(Self::DirectAxSetValue)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    anyhow::bail!(
+                        "unsupported fill method '{method}'; direct password fill is not available on this platform"
+                    )
+                }
+            }
+            other => anyhow::bail!("unsupported fill method '{other}'; use --fill-method=keyboard"),
         }
     }
 
@@ -67,12 +81,13 @@ impl FillMethod {
     fn as_windows_strategy(self) -> crate::windows_ui::WindowsFillStrategy {
         match self {
             Self::Keyboard => crate::windows_ui::WindowsFillStrategy::Keyboard,
+            #[cfg(target_os = "windows")]
             Self::DirectAxSetValue => crate::windows_ui::WindowsFillStrategy::DirectSetValue,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FillAttemptReport {
     pub(crate) fields: Vec<(String, String)>,
     pub(crate) success: bool,
@@ -87,6 +102,10 @@ impl FillAttemptReport {
             .map(|(_, value)| value.as_str())
     }
 
+    #[cfg_attr(
+        not(all(feature = "debug-fill", debug_assertions, not(waal_release_profile))),
+        allow(dead_code)
+    )]
     pub(crate) fn print(&self) {
         println!("debug_fill_once_log_start");
         for (key, value) in &self.fields {
@@ -99,11 +118,19 @@ impl FillAttemptReport {
         let result = if self.success { "success" } else { "failed" };
         let failure = self.failure_reason.as_deref().unwrap_or("");
         format!(
-            "fill_current_prompt_once result={} prompt_detected={} account_match_count={} selected_account_id={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} failure_reason={}",
+            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_load_skip_reason={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} failure_reason={}",
             result,
+            self.field("prompt_context_source").unwrap_or("live_scan"),
+            self.field("prompt_context_age_ms").unwrap_or("0"),
+            self.field("prompt_context_revalidation_result")
+                .unwrap_or("not_needed"),
             self.field("prompt_detected").unwrap_or("false"),
+            self.field("account_enabled_email_match_count").unwrap_or("0"),
+            self.field("account_saved_email_match_count").unwrap_or("0"),
             self.field("account_match_count").unwrap_or("0"),
             self.field("selected_account_id").unwrap_or(""),
+            self.field("password_load_attempted").unwrap_or("false"),
+            self.field("password_load_skip_reason").unwrap_or(""),
             self.field("password_load_ms").unwrap_or("0"),
             self.field("fill_method").unwrap_or("none"),
             self.field("submit_method").unwrap_or("none"),
@@ -112,6 +139,45 @@ impl FillAttemptReport {
             self.field("post_check_state").unwrap_or("unknown"),
             failure,
         )
+    }
+}
+
+pub(crate) fn pre_password_skip_report(
+    reason: impl Into<String>,
+    fields: &[(&'static str, String)],
+) -> FillAttemptReport {
+    let mut log = DebugLog::new(make_attempt_id());
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    apply_current_process_fields(&mut log);
+    #[cfg(target_os = "macos")]
+    log.set(
+        "ax_trusted_for_current_process",
+        ax_is_process_trusted().to_string(),
+    );
+    for (field, value) in fields {
+        log.set(field, value.clone());
+    }
+    log.fail(reason)
+}
+
+pub(crate) fn write_last_fill_attempt_report(report: &FillAttemptReport) -> anyhow::Result<()> {
+    let dir = crate::user_paths::runtime_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(LAST_FILL_ATTEMPT_REPORT_FILE);
+    let tmp_path = dir.join(format!("{LAST_FILL_ATTEMPT_REPORT_FILE}.tmp"));
+    let bytes = serde_json::to_vec_pretty(report)?;
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn read_last_fill_attempt_report() -> anyhow::Result<Option<FillAttemptReport>> {
+    let path = crate::user_paths::runtime_dir()?.join(LAST_FILL_ATTEMPT_REPORT_FILE);
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -144,13 +210,25 @@ impl DebugLog {
             ("windows_app_bundle_id", String::new()),
             ("windows_app_team_id", String::new()),
             ("windows_app_frontmost", "false".to_string()),
+            ("prompt_context_present", "false".to_string()),
             ("prompt_context_source", "live_scan".to_string()),
             ("prompt_context_age_ms", "0".to_string()),
+            (
+                "prompt_context_max_age_ms",
+                VERIFIED_PROMPT_CONTEXT_MAX_AGE.as_millis().to_string(),
+            ),
+            (
+                "prompt_context_revalidation_result",
+                "not_needed".to_string(),
+            ),
             ("prompt_detected", "false".to_string()),
             ("detected_email_redacted", String::new()),
             ("account_match_count", "0".to_string()),
+            ("account_enabled_email_match_count", "0".to_string()),
+            ("account_saved_email_match_count", "0".to_string()),
             ("selected_account_id", String::new()),
             ("password_load_attempted", "false".to_string()),
+            ("password_load_skip_reason", String::new()),
             ("password_load_ms", "0".to_string()),
             ("storage_lookup_start_ms", "0".to_string()),
             ("account_id_lookup_ms", "0".to_string()),
@@ -171,6 +249,7 @@ impl DebugLog {
             ("password_field_role", String::new()),
             ("password_field_description_redacted", String::new()),
             ("password_field_focused", "unknown".to_string()),
+            ("submit_button_ready_after_fill", "false".to_string()),
             ("fill_method", "none".to_string()),
             ("fill_attempted", "false".to_string()),
             ("fill_duration_ms", "0".to_string()),
@@ -204,15 +283,24 @@ impl DebugLog {
             "total_local_attempt_ms",
             self.started.elapsed().as_millis().to_string(),
         );
+        let failure_reason = failure_reason.map(|reason| sanitize_failure_reason(&reason));
         if let Some(reason) = failure_reason.as_deref() {
             self.set("failure_reason", reason.to_string());
+            let password_load_attempted = self
+                .fields
+                .iter()
+                .find(|(field, _)| *field == "password_load_attempted")
+                .is_some_and(|(_, value)| value == "true");
+            if !password_load_attempted {
+                self.set("password_load_skip_reason", reason.to_string());
+            }
         }
 
         FillAttemptReport {
             fields: self
                 .fields
                 .into_iter()
-                .map(|(key, value)| (key.to_string(), sanitize_log_value(&value)))
+                .map(|(key, value)| (key.to_string(), sanitize_log_field(key, &value)))
                 .collect(),
             success: failure_reason.is_none(),
             failure_reason,
@@ -231,6 +319,7 @@ fn log_value(log: &DebugLog, key: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+#[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
 pub(crate) fn run_from_args(args: &[String]) -> anyhow::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
@@ -243,7 +332,12 @@ pub(crate) fn run_from_args(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "windows"),
+    feature = "debug-fill",
+    debug_assertions,
+    not(waal_release_profile)
+))]
 fn run_platform(args: &[String]) -> anyhow::Result<()> {
     let method = FillMethod::parse(args)?;
     let config = storage::load_config();
@@ -255,6 +349,10 @@ fn run_platform(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(
+    not(all(feature = "debug-fill", debug_assertions, not(waal_release_profile))),
+    allow(dead_code)
+)]
 pub(crate) fn fill_current_prompt_once(
     settings: &AppSettings,
     accounts: &[Account],
@@ -285,6 +383,13 @@ pub(crate) fn runtime_status_report(
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "diagnostics-ui",
+        all(feature = "debug-fill", debug_assertions, not(waal_release_profile))
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn fill_current_prompt_once_guarded(
     settings: &AppSettings,
     accounts: &[Account],
@@ -319,6 +424,15 @@ pub(crate) fn fill_current_prompt_once_guarded_with_context(
         DebugLog::new(make_attempt_id())
             .fail("debug-fill-once is only supported on macOS and Windows")
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn detect_current_prompt_context(
+    accounts: &[Account],
+    guard: impl Fn() -> anyhow::Result<()>,
+) -> Result<Option<VerifiedPromptContext>, String> {
+    let app_name = crate::config::TARGET_APP_NAME;
+    detect_current_prompt_context_macos(app_name, accounts, &guard)
 }
 
 #[cfg(target_os = "macos")]
@@ -369,88 +483,117 @@ fn fill_current_prompt_once_macos(
         "keychain_process_team_id",
         log_value(&log, "current_team_id").unwrap_or_default(),
     );
-    let password =
-        match storage::load_password_with_timing(&selected_account.id, settings.use_keyring) {
-            Ok(result) => {
-                log.set(
-                    "storage_lookup_start_ms",
-                    result.timing.storage_lookup_start_ms.to_string(),
-                );
-                log.set(
-                    "keychain_query_start",
-                    result.timing.keychain_query_start_ms.to_string(),
-                );
-                log.set(
-                    "keychain_query_ms",
-                    result.timing.keychain_query_ms.to_string(),
-                );
-                log.set(
-                    "keychain_prompt_suspected",
-                    result.timing.keychain_prompt_suspected.to_string(),
-                );
-                log.set(
-                    "fallback_lookup_ms",
-                    result.timing.fallback_lookup_ms.to_string(),
-                );
-                log.set(
-                    "zeroizing_wrap_ms",
-                    result.timing.zeroizing_wrap_ms.to_string(),
-                );
-                log.set(
-                    "total_password_load_ms",
-                    result.timing.total_password_load_ms.to_string(),
-                );
-                log.set(
-                    "password_load_ms",
-                    result.timing.total_password_load_ms.to_string(),
-                );
-                result.password
-            }
-            Err(e) => {
-                log.set(
-                    "storage_lookup_start_ms",
-                    e.timing.storage_lookup_start_ms.to_string(),
-                );
-                log.set(
-                    "keychain_query_start",
-                    e.timing.keychain_query_start_ms.to_string(),
-                );
-                log.set("keychain_query_ms", e.timing.keychain_query_ms.to_string());
-                log.set(
-                    "keychain_prompt_suspected",
-                    e.timing.keychain_prompt_suspected.to_string(),
-                );
-                log.set(
-                    "fallback_lookup_ms",
-                    e.timing.fallback_lookup_ms.to_string(),
-                );
-                log.set("zeroizing_wrap_ms", e.timing.zeroizing_wrap_ms.to_string());
-                log.set(
-                    "total_password_load_ms",
-                    e.timing.total_password_load_ms.to_string(),
-                );
-                log.set(
-                    "password_load_ms",
-                    e.timing.total_password_load_ms.to_string(),
-                );
-                log.set("keychain_error_redacted", e.kind);
-                return log.fail("password_load_failed_for_selected_account");
-            }
-        };
+    let password_result = {
+        #[cfg(target_os = "macos")]
+        {
+            storage::load_password_for_prompt_with_timing(
+                selected_account,
+                settings.use_keyring,
+                &prompt.window_title,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            storage::load_password_with_timing(selected_account, settings.use_keyring)
+        }
+    };
+    let password = match password_result {
+        Ok(result) => {
+            log.set(
+                "storage_lookup_start_ms",
+                result.timing.storage_lookup_start_ms.to_string(),
+            );
+            log.set(
+                "keychain_query_start",
+                result.timing.keychain_query_start_ms.to_string(),
+            );
+            log.set(
+                "keychain_query_ms",
+                result.timing.keychain_query_ms.to_string(),
+            );
+            log.set(
+                "keychain_prompt_suspected",
+                result.timing.keychain_prompt_suspected.to_string(),
+            );
+            log.set(
+                "fallback_lookup_ms",
+                result.timing.fallback_lookup_ms.to_string(),
+            );
+            log.set(
+                "zeroizing_wrap_ms",
+                result.timing.zeroizing_wrap_ms.to_string(),
+            );
+            log.set(
+                "total_password_load_ms",
+                result.timing.total_password_load_ms.to_string(),
+            );
+            log.set(
+                "password_load_ms",
+                result.timing.total_password_load_ms.to_string(),
+            );
+            result.password
+        }
+        Err(e) => {
+            log.set(
+                "storage_lookup_start_ms",
+                e.timing.storage_lookup_start_ms.to_string(),
+            );
+            log.set(
+                "keychain_query_start",
+                e.timing.keychain_query_start_ms.to_string(),
+            );
+            log.set("keychain_query_ms", e.timing.keychain_query_ms.to_string());
+            log.set(
+                "keychain_prompt_suspected",
+                e.timing.keychain_prompt_suspected.to_string(),
+            );
+            log.set(
+                "fallback_lookup_ms",
+                e.timing.fallback_lookup_ms.to_string(),
+            );
+            log.set("zeroizing_wrap_ms", e.timing.zeroizing_wrap_ms.to_string());
+            log.set(
+                "total_password_load_ms",
+                e.timing.total_password_load_ms.to_string(),
+            );
+            log.set(
+                "password_load_ms",
+                e.timing.total_password_load_ms.to_string(),
+            );
+            log.set("keychain_error_redacted", e.kind);
+            return log.fail("password_load_failed_for_selected_account");
+        }
+    };
     if let Err(e) = guard() {
         return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
     }
 
     let fill_start = Instant::now();
-    let fill_result = match crate::macos_ax::fill_password(
-        &app_name,
-        prompt.process_id,
-        &prompt.window_title,
-        &prompt_email,
-        password.as_str(),
-        macos_fill_method(method),
-        guard,
-    ) {
+    let prepared_prompt = prompt.verified_prompt.clone();
+    let fill_result = match if let Some(verified_prompt) = prepared_prompt {
+        crate::macos_ax::fill_verified_password(
+            &app_name,
+            verified_prompt,
+            prompt.process_id,
+            &prompt.window_title,
+            &prompt.prompt_origin,
+            &prompt_email,
+            password.as_str(),
+            macos_fill_method(method),
+            guard,
+        )
+    } else {
+        crate::macos_ax::fill_password(
+            &app_name,
+            prompt.process_id,
+            &prompt.window_title,
+            &prompt.prompt_origin,
+            &prompt_email,
+            password.as_str(),
+            macos_fill_method(method),
+            guard,
+        )
+    } {
         Ok(result) => result,
         Err(e) => {
             log.set(
@@ -471,10 +614,12 @@ fn fill_current_prompt_once_macos(
     }
 
     let submit_start = Instant::now();
-    let submit_result = match crate::macos_ax::submit_prompt(
+    let submit_result = match crate::macos_ax::submit_prompt_after_fill(
         &app_name,
+        fill_result.filled_prompt.as_ref(),
         prompt.process_id,
         &prompt.window_title,
+        &prompt.prompt_origin,
         &prompt_email,
         guard,
     ) {
@@ -487,8 +632,10 @@ fn fill_current_prompt_once_macos(
             let post_state = post_check_state(
                 settings,
                 prompt.process_id,
+                &prompt.window_title,
                 &prompt_email,
-                Duration::from_millis(1200),
+                None,
+                Duration::from_millis(450),
             );
             log.set("post_check_state", post_state);
             return if post_state == "authenticated" {
@@ -507,8 +654,10 @@ fn fill_current_prompt_once_macos(
     let post_state = post_check_state(
         settings,
         prompt.process_id,
+        &prompt.window_title,
         &prompt_email,
-        Duration::from_millis(1200),
+        submit_result.submitted_prompt.as_ref(),
+        Duration::from_millis(450),
     );
     log.set("post_check_state", post_state);
     if post_state == "authenticated" {
@@ -520,10 +669,64 @@ fn fill_current_prompt_once_macos(
     match post_state {
         "authenticated" => log.finish(None),
         "still_prompt" => log.fail("credential_prompt_still_visible_after_submit"),
+        "prompt_mismatch" => log.fail("post_submit_prompt_mismatch"),
         "prompt_gone_unknown" => log.fail("post_submit_prompt_gone_unknown"),
         "failed" => log.fail("windows_app_not_running_after_submit"),
         _ => log.fail("post_submit_state_unknown"),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_current_prompt_context_macos(
+    app_name: &str,
+    accounts: &[Account],
+    guard: &dyn Fn() -> anyhow::Result<()>,
+) -> Result<Option<VerifiedPromptContext>, String> {
+    let trusted_infos = macos_identity::trusted_process_infos(app_name)
+        .map_err(|_| "windows_app_trust_check_failed".to_string())?;
+    if trusted_infos.is_empty() {
+        return Ok(None);
+    }
+
+    let native_prompt = crate::macos_ax::detect_visible_prompt(app_name, None, None, None)
+        .map_err(|e| format!("prompt_detection_failed_{e}"))?;
+    let Some(native_prompt) = native_prompt else {
+        return Ok(None);
+    };
+    let Some(_target) = trusted_infos
+        .iter()
+        .find(|target| target.pid == native_prompt.target.process_id)
+    else {
+        return Err("prompt_pid_does_not_match_trusted_target".to_string());
+    };
+
+    let Some(prompt_email) = native_prompt
+        .email
+        .clone()
+        .filter(|email| !email.trim().is_empty())
+    else {
+        return Err("visible_prompt_email_missing".to_string());
+    };
+    guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
+
+    let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
+    let matches = matching_macos_accounts(accounts, &prompt_email);
+    let [selected_account] = matches.as_slice() else {
+        return if matches.is_empty() {
+            Err(account_match_failure_reason(enabled_email_matches).to_string())
+        } else {
+            Err("visible_prompt_email_matches_multiple_enabled_accounts".to_string())
+        };
+    };
+
+    Ok(Some(VerifiedPromptContext {
+        account_id: selected_account.id.clone(),
+        process_id: native_prompt.target.process_id,
+        window_title: native_prompt.target.window_title.clone(),
+        prompt_email,
+        prompt_origin: native_prompt.origin.as_str().to_string(),
+        detected_at: Instant::now(),
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -535,51 +738,31 @@ fn select_prompt_and_account<'a>(
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> Result<(PromptInfo, String, &'a Account), String> {
     if let Some(context) = verified_prompt {
+        log.set("prompt_context_present", "true");
         let context_age = context.age();
         log.set("prompt_context_age_ms", context_age.as_millis().to_string());
         if context.is_fresh() {
             log.set("prompt_context_source", "monitor_snapshot");
-            log.set("windows_app_pid", context.process_id.to_string());
-            log.set("prompt_detected", "true");
-
-            let prompt_email = context.prompt_email.trim().to_string();
-            if prompt_email.is_empty() {
-                return Err("visible_prompt_email_missing".to_string());
+            match select_fresh_prompt_context(log, app_name, accounts, context, guard) {
+                Ok(selection) => return Ok(selection),
+                Err(reason) => {
+                    if reason.starts_with("attempt_cancelled_") {
+                        return Err(reason);
+                    }
+                    let revalidation_result = log_value(log, "prompt_context_revalidation_result")
+                        .filter(|value| value != "not_needed")
+                        .unwrap_or_else(|| "failed".to_string());
+                    log.set("prompt_context_source", "monitor_snapshot_fresh_live_scan");
+                    log.set(
+                        "prompt_context_revalidation_result",
+                        format!("{revalidation_result}_live_scan"),
+                    );
+                }
             }
-            log.set("detected_email_redacted", redacted_email(&prompt_email));
-
-            guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
-
-            let account_lookup_start = Instant::now();
-            let matches = matching_accounts(accounts, &prompt_email);
-            log.set(
-                "account_id_lookup_ms",
-                account_lookup_start.elapsed().as_millis().to_string(),
-            );
-            log.set("account_match_count", matches.len().to_string());
-            let [selected_account] = matches.as_slice() else {
-                return if matches.is_empty() {
-                    Err("visible_prompt_email_matches_no_enabled_account".to_string())
-                } else {
-                    Err("visible_prompt_email_matches_multiple_enabled_accounts".to_string())
-                };
-            };
-            if selected_account.id != context.account_id {
-                return Err("monitor_prompt_context_account_changed".to_string());
-            }
-            log.set("selected_account_id", selected_account.id.clone());
-
-            return Ok((
-                PromptInfo {
-                    process_id: context.process_id,
-                    window_title: context.window_title.clone(),
-                },
-                prompt_email,
-                *selected_account,
-            ));
+        } else {
+            log.set("prompt_context_source", "monitor_snapshot_stale_live_scan");
+            log.set("prompt_context_revalidation_result", "stale_live_scan");
         }
-
-        log.set("prompt_context_source", "live_scan_after_stale_context");
     }
 
     let trusted_infos = macos_identity::trusted_process_infos(app_name)
@@ -588,9 +771,9 @@ fn select_prompt_and_account<'a>(
         return Err("trusted_windows_app_not_running".to_string());
     };
 
-    let inspection =
-        crate::macos_ax::inspect(app_name).map_err(|e| format!("prompt_detection_failed_{e}"))?;
-    let Some(native_prompt) = inspection.prompt else {
+    let native_prompt = crate::macos_ax::detect_visible_prompt(app_name, None, None, None)
+        .map_err(|e| format!("prompt_detection_failed_{e}"))?;
+    let Some(native_prompt) = native_prompt else {
         return Err("visible_credential_prompt_not_detected".to_string());
     };
     log.set("prompt_detected", "true");
@@ -604,10 +787,6 @@ fn select_prompt_and_account<'a>(
         "windows_app_frontmost",
         native_prompt.target.frontmost.to_string(),
     );
-    if !native_prompt.target.frontmost {
-        return Err("windows_app_not_frontmost".to_string());
-    }
-
     if native_prompt.target.process_id != target.pid {
         return Err("prompt_pid_does_not_match_trusted_target".to_string());
     }
@@ -623,15 +802,21 @@ fn select_prompt_and_account<'a>(
     guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
 
     let account_lookup_start = Instant::now();
-    let matches = matching_accounts(accounts, &prompt_email);
+    let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
+    let matches = matching_macos_accounts(accounts, &prompt_email);
     log.set(
         "account_id_lookup_ms",
         account_lookup_start.elapsed().as_millis().to_string(),
     );
+    log.set(
+        "account_enabled_email_match_count",
+        enabled_email_matches.to_string(),
+    );
+    log.set("account_saved_email_match_count", matches.len().to_string());
     log.set("account_match_count", matches.len().to_string());
     let [selected_account] = matches.as_slice() else {
         return if matches.is_empty() {
-            Err("visible_prompt_email_matches_no_enabled_account".to_string())
+            Err(account_match_failure_reason(enabled_email_matches).to_string())
         } else {
             Err("visible_prompt_email_matches_multiple_enabled_accounts".to_string())
         };
@@ -641,7 +826,122 @@ fn select_prompt_and_account<'a>(
     Ok((
         PromptInfo {
             process_id: native_prompt.target.process_id,
-            window_title: native_prompt.target.window_title,
+            window_title: native_prompt.target.window_title.clone(),
+            prompt_origin: native_prompt.origin.as_str().to_string(),
+            verified_prompt: None,
+        },
+        prompt_email,
+        *selected_account,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn select_fresh_prompt_context<'a>(
+    log: &mut DebugLog,
+    app_name: &str,
+    accounts: &'a [Account],
+    context: &VerifiedPromptContext,
+    guard: &dyn Fn() -> anyhow::Result<()>,
+) -> Result<(PromptInfo, String, &'a Account), String> {
+    let verified_prompt = match crate::macos_ax::revalidate_visible_prompt(
+        app_name,
+        context.process_id,
+        &context.window_title,
+        &context.prompt_origin,
+        &context.prompt_email,
+    ) {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            log.set("prompt_context_revalidation_result", "inspection_failed");
+            return Err(format!("prompt_context_live_revalidation_failed_{e}"));
+        }
+    };
+    let native_prompt = &verified_prompt.prompt;
+    log.set("prompt_detected", "true");
+    log.set(
+        "windows_app_frontmost",
+        native_prompt.target.frontmost.to_string(),
+    );
+    if native_prompt.target.process_id != context.process_id {
+        log.set("prompt_context_revalidation_result", "pid_changed");
+        return Err("monitor_prompt_context_pid_changed".to_string());
+    }
+
+    let prompt_email = native_prompt
+        .email
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if prompt_email.is_empty() {
+        log.set("prompt_context_revalidation_result", "email_missing");
+        return Err("visible_prompt_email_missing".to_string());
+    }
+    if !prompt_email.eq_ignore_ascii_case(context.prompt_email.trim()) {
+        log.set("prompt_context_revalidation_result", "email_changed");
+        return Err("monitor_prompt_context_email_changed".to_string());
+    }
+    if !native_prompt
+        .origin
+        .as_str()
+        .eq_ignore_ascii_case(context.prompt_origin.trim())
+    {
+        log.set("prompt_context_revalidation_result", "origin_changed");
+        return Err("monitor_prompt_context_origin_changed".to_string());
+    }
+    log.set(
+        "windows_app_pid",
+        native_prompt.target.process_id.to_string(),
+    );
+    log.set("detected_email_redacted", redacted_email(&prompt_email));
+
+    guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
+
+    let account_lookup_start = Instant::now();
+    let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
+    let matches = matching_macos_accounts(accounts, &prompt_email);
+    log.set(
+        "account_id_lookup_ms",
+        account_lookup_start.elapsed().as_millis().to_string(),
+    );
+    log.set(
+        "account_enabled_email_match_count",
+        enabled_email_matches.to_string(),
+    );
+    log.set("account_saved_email_match_count", matches.len().to_string());
+    log.set("account_match_count", matches.len().to_string());
+    let [selected_account] = matches.as_slice() else {
+        return if matches.is_empty() {
+            log.set(
+                "prompt_context_revalidation_result",
+                if enabled_email_matches == 0 {
+                    "no_account_match"
+                } else {
+                    "no_saved_password_match"
+                },
+            );
+            Err(account_match_failure_reason(enabled_email_matches).to_string())
+        } else {
+            log.set(
+                "prompt_context_revalidation_result",
+                "multiple_account_matches",
+            );
+            Err("visible_prompt_email_matches_multiple_enabled_accounts".to_string())
+        };
+    };
+    if selected_account.id != context.account_id {
+        log.set("prompt_context_revalidation_result", "account_changed");
+        return Err("monitor_prompt_context_account_changed".to_string());
+    }
+    log.set("selected_account_id", selected_account.id.clone());
+    log.set("prompt_context_revalidation_result", "ok");
+
+    Ok((
+        PromptInfo {
+            process_id: native_prompt.target.process_id,
+            window_title: native_prompt.target.window_title.clone(),
+            prompt_origin: native_prompt.origin.as_str().to_string(),
+            verified_prompt: Some(verified_prompt),
         },
         prompt_email,
         *selected_account,
@@ -726,10 +1026,16 @@ fn fill_current_prompt_once_windows(
         "account_id_lookup_ms",
         account_lookup_start.elapsed().as_millis().to_string(),
     );
+    let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
+    log.set(
+        "account_enabled_email_match_count",
+        enabled_email_matches.to_string(),
+    );
+    log.set("account_saved_email_match_count", matches.len().to_string());
     log.set("account_match_count", matches.len().to_string());
     let [selected_account] = matches.as_slice() else {
         return if matches.is_empty() {
-            log.fail("visible_prompt_email_matches_no_enabled_account")
+            log.fail(account_match_failure_reason(enabled_email_matches))
         } else {
             log.fail("visible_prompt_email_matches_multiple_enabled_accounts")
         };
@@ -745,74 +1051,74 @@ fn fill_current_prompt_once_windows(
         log_value(&log, "current_process_path").unwrap_or_default(),
     );
 
-    let password =
-        match storage::load_password_with_timing(&selected_account.id, settings.use_keyring) {
-            Ok(result) => {
-                log.set(
-                    "storage_lookup_start_ms",
-                    result.timing.storage_lookup_start_ms.to_string(),
-                );
-                log.set(
-                    "keychain_query_start",
-                    result.timing.keychain_query_start_ms.to_string(),
-                );
-                log.set(
-                    "keychain_query_ms",
-                    result.timing.keychain_query_ms.to_string(),
-                );
-                log.set(
-                    "keychain_prompt_suspected",
-                    result.timing.keychain_prompt_suspected.to_string(),
-                );
-                log.set(
-                    "fallback_lookup_ms",
-                    result.timing.fallback_lookup_ms.to_string(),
-                );
-                log.set(
-                    "zeroizing_wrap_ms",
-                    result.timing.zeroizing_wrap_ms.to_string(),
-                );
-                log.set(
-                    "total_password_load_ms",
-                    result.timing.total_password_load_ms.to_string(),
-                );
-                log.set(
-                    "password_load_ms",
-                    result.timing.total_password_load_ms.to_string(),
-                );
-                result.password
-            }
-            Err(e) => {
-                log.set(
-                    "storage_lookup_start_ms",
-                    e.timing.storage_lookup_start_ms.to_string(),
-                );
-                log.set(
-                    "keychain_query_start",
-                    e.timing.keychain_query_start_ms.to_string(),
-                );
-                log.set("keychain_query_ms", e.timing.keychain_query_ms.to_string());
-                log.set(
-                    "keychain_prompt_suspected",
-                    e.timing.keychain_prompt_suspected.to_string(),
-                );
-                log.set(
-                    "fallback_lookup_ms",
-                    e.timing.fallback_lookup_ms.to_string(),
-                );
-                log.set("zeroizing_wrap_ms", e.timing.zeroizing_wrap_ms.to_string());
-                log.set(
-                    "total_password_load_ms",
-                    e.timing.total_password_load_ms.to_string(),
-                );
-                log.set(
-                    "password_load_ms",
-                    e.timing.total_password_load_ms.to_string(),
-                );
-                log.set("keychain_error_redacted", e.kind);
-                return log.fail("password_load_failed_for_selected_account");
-            }
-        };
+    let password = match storage::load_password_with_timing(selected_account, settings.use_keyring)
+    {
+        Ok(result) => {
+            log.set(
+                "storage_lookup_start_ms",
+                result.timing.storage_lookup_start_ms.to_string(),
+            );
+            log.set(
+                "keychain_query_start",
+                result.timing.keychain_query_start_ms.to_string(),
+            );
+            log.set(
+                "keychain_query_ms",
+                result.timing.keychain_query_ms.to_string(),
+            );
+            log.set(
+                "keychain_prompt_suspected",
+                result.timing.keychain_prompt_suspected.to_string(),
+            );
+            log.set(
+                "fallback_lookup_ms",
+                result.timing.fallback_lookup_ms.to_string(),
+            );
+            log.set(
+                "zeroizing_wrap_ms",
+                result.timing.zeroizing_wrap_ms.to_string(),
+            );
+            log.set(
+                "total_password_load_ms",
+                result.timing.total_password_load_ms.to_string(),
+            );
+            log.set(
+                "password_load_ms",
+                result.timing.total_password_load_ms.to_string(),
+            );
+            result.password
+        }
+        Err(e) => {
+            log.set(
+                "storage_lookup_start_ms",
+                e.timing.storage_lookup_start_ms.to_string(),
+            );
+            log.set(
+                "keychain_query_start",
+                e.timing.keychain_query_start_ms.to_string(),
+            );
+            log.set("keychain_query_ms", e.timing.keychain_query_ms.to_string());
+            log.set(
+                "keychain_prompt_suspected",
+                e.timing.keychain_prompt_suspected.to_string(),
+            );
+            log.set(
+                "fallback_lookup_ms",
+                e.timing.fallback_lookup_ms.to_string(),
+            );
+            log.set("zeroizing_wrap_ms", e.timing.zeroizing_wrap_ms.to_string());
+            log.set(
+                "total_password_load_ms",
+                e.timing.total_password_load_ms.to_string(),
+            );
+            log.set(
+                "password_load_ms",
+                e.timing.total_password_load_ms.to_string(),
+            );
+            log.set("keychain_error_redacted", e.kind);
+            return log.fail("password_load_failed_for_selected_account");
+        }
+    };
     if let Err(e) = guard() {
         return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
     }
@@ -895,10 +1201,8 @@ fn fill_current_prompt_once_windows(
     log.set("post_check_state", post_state);
     match post_state {
         "authenticated" => log.finish(None),
-        "prompt_gone_unknown" => {
-            log.set("post_check_state", "submitted_prompt_closed");
-            log.finish(None)
-        }
+        "prompt_mismatch" => log.fail("post_submit_prompt_mismatch"),
+        "prompt_gone_unknown" => log.fail("post_submit_prompt_gone_unknown"),
         "still_prompt" => log.fail("credential_prompt_still_visible_after_submit"),
         "failed" => log.fail("windows_app_not_running_after_submit"),
         _ => log.fail("post_submit_state_unknown"),
@@ -906,7 +1210,7 @@ fn fill_current_prompt_once_windows(
 }
 
 #[cfg(all(target_os = "macos", feature = "diagnostics-ui"))]
-fn runtime_status_report_macos(settings: &AppSettings, accounts: &[Account]) -> FillAttemptReport {
+fn runtime_status_report_macos(_settings: &AppSettings, accounts: &[Account]) -> FillAttemptReport {
     let mut log = DebugLog::new(format!("status-{}", make_attempt_id()));
 
     apply_current_process_fields(&mut log);
@@ -928,14 +1232,23 @@ fn runtime_status_report_macos(settings: &AppSettings, accounts: &[Account]) -> 
     };
     apply_windows_app_fields(&mut log, target);
 
-    let inspection = match crate::macos_ax::inspect(&app_name) {
-        Ok(inspection) => inspection,
+    let prompt = match crate::macos_ax::detect_visible_prompt(&app_name, None, None, None) {
+        Ok(prompt) => prompt,
         Err(e) => return log.fail(format!("prompt_detection_failed_{e}")),
     };
-    let Some(prompt) = inspection.prompt else {
+    let Some(prompt) = prompt else {
         return log.fail("visible_credential_prompt_not_detected");
     };
     log.set("prompt_detected", "true");
+    log.set("password_field_detected", "true");
+    log.set("password_field_role", prompt.password_field_role.clone());
+    log.set(
+        "password_field_focused",
+        prompt.password_field_focused().unwrap_or(false).to_string(),
+    );
+    if !prompt.password_field_description.trim().is_empty() {
+        log.set("password_field_description_redacted", "[redacted]");
+    }
     let target = trusted_infos
         .iter()
         .find(|target| target.pid == prompt.target.process_id)
@@ -954,15 +1267,21 @@ fn runtime_status_report_macos(settings: &AppSettings, accounts: &[Account]) -> 
         return log.fail("visible_prompt_email_missing");
     };
     log.set("detected_email_redacted", redacted_email(&prompt_email));
-    let matches = matching_accounts(accounts, &prompt_email);
+    let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
+    let matches = matching_macos_accounts(accounts, &prompt_email);
     log.set(
         "account_id_lookup_ms",
         account_lookup_start.elapsed().as_millis().to_string(),
     );
+    log.set(
+        "account_enabled_email_match_count",
+        enabled_email_matches.to_string(),
+    );
+    log.set("account_saved_email_match_count", matches.len().to_string());
     log.set("account_match_count", matches.len().to_string());
     let [selected_account] = matches.as_slice() else {
         return if matches.is_empty() {
-            log.fail("visible_prompt_email_matches_no_enabled_account")
+            log.fail(account_match_failure_reason(enabled_email_matches))
         } else {
             log.fail("visible_prompt_email_matches_multiple_enabled_accounts")
         };
@@ -1030,10 +1349,10 @@ fn runtime_status_report_windows(
     );
 
     let account_lookup_start = Instant::now();
-    let matches = match windows_prompt_account_matches(accounts, &prompt) {
+    let (matches, prompt_email) = match windows_prompt_account_matches(accounts, &prompt) {
         Ok((matches, prompt_email)) => {
             log.set("detected_email_redacted", redacted_email(&prompt_email));
-            matches
+            (matches, prompt_email)
         }
         Err(reason) => return log.fail(reason),
     };
@@ -1041,10 +1360,16 @@ fn runtime_status_report_windows(
         "account_id_lookup_ms",
         account_lookup_start.elapsed().as_millis().to_string(),
     );
+    let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
+    log.set(
+        "account_enabled_email_match_count",
+        enabled_email_matches.to_string(),
+    );
+    log.set("account_saved_email_match_count", matches.len().to_string());
     log.set("account_match_count", matches.len().to_string());
     let [selected_account] = matches.as_slice() else {
         return if matches.is_empty() {
-            log.fail("visible_prompt_email_matches_no_enabled_account")
+            log.fail(account_match_failure_reason(enabled_email_matches))
         } else {
             log.fail("visible_prompt_email_matches_multiple_enabled_accounts")
         };
@@ -1063,6 +1388,22 @@ fn runtime_status_report_windows(
 fn matching_accounts<'a>(accounts: &'a [Account], prompt_email: &str) -> Vec<&'a Account> {
     accounts
         .iter()
+        .filter(|account| {
+            account.enabled && account.has_saved_password && !account.username.trim().is_empty()
+        })
+        .filter(|account| {
+            account
+                .username
+                .trim()
+                .eq_ignore_ascii_case(prompt_email.trim())
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn enabled_email_match_count(accounts: &[Account], prompt_email: &str) -> usize {
+    accounts
+        .iter()
         .filter(|account| account.enabled && !account.username.trim().is_empty())
         .filter(|account| {
             account
@@ -1070,8 +1411,21 @@ fn matching_accounts<'a>(accounts: &'a [Account], prompt_email: &str) -> Vec<&'a
                 .trim()
                 .eq_ignore_ascii_case(prompt_email.trim())
         })
-        .take(2)
-        .collect()
+        .count()
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn account_match_failure_reason(enabled_email_matches: usize) -> &'static str {
+    if enabled_email_matches == 0 {
+        "visible_prompt_email_matches_no_enabled_account"
+    } else {
+        "visible_prompt_email_matches_no_saved_password"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn matching_macos_accounts<'a>(accounts: &'a [Account], prompt_email: &str) -> Vec<&'a Account> {
+    matching_accounts(accounts, prompt_email)
 }
 
 #[cfg(target_os = "windows")]
@@ -1145,7 +1499,21 @@ mod windows_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_context_tests {
     use super::VerifiedPromptContext;
+    use crate::models::Account;
     use std::time::{Duration, Instant};
+
+    fn account(id: &str, username: &str) -> Account {
+        account_with_saved_password(id, username, true)
+    }
+
+    fn account_with_saved_password(id: &str, username: &str, has_saved_password: bool) -> Account {
+        Account {
+            id: id.to_string(),
+            username: username.to_string(),
+            has_saved_password,
+            enabled: true,
+        }
+    }
 
     fn context(detected_at: Instant) -> VerifiedPromptContext {
         VerifiedPromptContext {
@@ -1153,6 +1521,7 @@ mod macos_context_tests {
             process_id: 42,
             window_title: "Sign in".to_string(),
             prompt_email: "user@example.com".to_string(),
+            prompt_origin: "window".to_string(),
             detected_at,
         }
     }
@@ -1163,21 +1532,151 @@ mod macos_context_tests {
     }
 
     #[test]
+    fn stale_monitor_prompt_context_is_not_fresh() {
+        assert!(!context(
+            Instant::now() - super::VERIFIED_PROMPT_CONTEXT_MAX_AGE - Duration::from_millis(1)
+        )
+        .is_fresh());
+    }
+
+    #[test]
     fn stale_monitor_prompt_context_falls_back_to_live_scan() {
-        assert!(!context(Instant::now() - Duration::from_secs(3)).is_fresh());
+        let stale = context(
+            Instant::now() - super::VERIFIED_PROMPT_CONTEXT_MAX_AGE - Duration::from_secs(1),
+        );
+        let mut log = super::DebugLog::new("test".to_string());
+
+        let result = super::select_prompt_and_account(
+            &mut log,
+            "__must_not_be_used_for_stale_context__",
+            &[],
+            Some(&stale),
+            &|| panic!("guard should not run for stale context"),
+        );
+
+        match result {
+            Ok(_) => panic!("stale context unexpectedly selected a prompt"),
+            Err(error) => assert_eq!(error, "windows_app_trust_check_failed"),
+        }
+        assert_eq!(
+            super::log_value(&log, "prompt_context_present").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            super::log_value(&log, "prompt_context_source").as_deref(),
+            Some("monitor_snapshot_stale_live_scan")
+        );
+        assert_eq!(
+            super::log_value(&log, "prompt_context_revalidation_result").as_deref(),
+            Some("stale_live_scan")
+        );
+        assert_eq!(
+            super::log_value(&log, "prompt_detected").as_deref(),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn fresh_monitor_prompt_context_revalidation_failure_falls_back_to_live_scan() {
+        let fresh = context(Instant::now());
+        let mut log = super::DebugLog::new("test".to_string());
+
+        let result = super::select_prompt_and_account(
+            &mut log,
+            "__must_not_be_used_for_fresh_context__",
+            &[],
+            Some(&fresh),
+            &|| panic!("guard should not run without a revalidated prompt"),
+        );
+
+        match result {
+            Ok(_) => panic!("fresh context unexpectedly selected a prompt"),
+            Err(error) => assert_eq!(error, "windows_app_trust_check_failed"),
+        }
+        assert_eq!(
+            super::log_value(&log, "prompt_context_present").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            super::log_value(&log, "prompt_context_source").as_deref(),
+            Some("monitor_snapshot_fresh_live_scan")
+        );
+        assert!(super::log_value(&log, "prompt_context_revalidation_result")
+            .as_deref()
+            .is_some_and(|value| value.ends_with("_live_scan")));
+    }
+
+    #[test]
+    fn macos_account_matching_allows_one_email_match() {
+        let accounts = vec![account("a1", "user@example.com")];
+
+        let matches = super::matching_macos_accounts(&accounts, " user@example.com ");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id.as_str(), "a1");
+    }
+
+    #[test]
+    fn macos_account_matching_returns_duplicate_email_matches() {
+        let accounts = vec![
+            account("a1", "user@example.com"),
+            account("a2", "USER@example.com"),
+            account("a3", "other@example.com"),
+        ];
+
+        let matches = super::matching_macos_accounts(&accounts, " user@example.com ");
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].id.as_str(), "a1");
+        assert_eq!(matches[1].id.as_str(), "a2");
+    }
+
+    #[test]
+    fn macos_account_matching_keeps_all_duplicate_email_matches() {
+        let accounts = vec![
+            account("a1", "user@example.com"),
+            account("a2", "user@example.com"),
+            account("a3", "USER@example.com"),
+        ];
+
+        let matches = super::matching_macos_accounts(&accounts, "user@example.com");
+
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].id.as_str(), "a1");
+        assert_eq!(matches[1].id.as_str(), "a2");
+        assert_eq!(matches[2].id.as_str(), "a3");
+    }
+
+    #[test]
+    fn macos_account_matching_reports_enabled_match_without_saved_password() {
+        let accounts = vec![account_with_saved_password("a1", "user@example.com", false)];
+
+        let saved_matches = super::matching_macos_accounts(&accounts, "user@example.com");
+        let enabled_matches = super::enabled_email_match_count(&accounts, " user@example.com ");
+
+        assert!(saved_matches.is_empty());
+        assert_eq!(enabled_matches, 1);
+        assert_eq!(
+            super::account_match_failure_reason(enabled_matches),
+            "visible_prompt_email_matches_no_saved_password"
+        );
     }
 }
 #[cfg(target_os = "macos")]
 fn post_check_state(
     _settings: &AppSettings,
     prompt_pid: i32,
+    prompt_window_title: &str,
     expected_email: &str,
+    submitted_prompt: Option<&crate::macos_ax::MacosSubmittedPrompt>,
     timeout: Duration,
 ) -> &'static str {
     crate::macos_ax::post_check_state(
         crate::config::TARGET_APP_NAME,
         prompt_pid,
+        prompt_window_title,
         expected_email,
+        submitted_prompt,
         timeout,
     )
 }
@@ -1185,7 +1684,6 @@ fn post_check_state(
 fn macos_fill_method(method: FillMethod) -> crate::macos_ax::MacosFillMethod {
     match method {
         FillMethod::Keyboard => crate::macos_ax::MacosFillMethod::Keyboard,
-        FillMethod::DirectAxSetValue => crate::macos_ax::MacosFillMethod::DirectAxSetValue,
     }
 }
 
@@ -1200,6 +1698,10 @@ fn apply_macos_fill_fields(log: &mut DebugLog, result: &crate::macos_ax::MacosFi
     log.set("fill_method", result.fill_method);
     log.set("fill_attempted", "true");
     log.set("fill_status", result.fill_status);
+    log.set(
+        "submit_button_ready_after_fill",
+        result.submit_button_ready_after_fill.to_string(),
+    );
     if result.password_field_description_present {
         log.set("password_field_description_redacted", "[redacted]");
     }
@@ -1220,13 +1722,7 @@ fn apply_macos_submit_fields(log: &mut DebugLog, result: &crate::macos_ax::Macos
 }
 #[cfg(target_os = "macos")]
 fn ax_is_process_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() != 0 }
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn AXIsProcessTrusted() -> u8;
+    crate::autologin::accessibility_is_trusted()
 }
 
 #[cfg(target_os = "macos")]
@@ -1374,16 +1870,9 @@ fn current_signing_info(exe_path: &Path) -> CurrentSigningInfo {
         team_id,
     }
 }
-fn redacted_email(email: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(email.trim().to_lowercase().as_bytes());
-    let digest = hasher.finalize();
-    let short = digest
-        .iter()
-        .take(6)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("[email:{short}]")
+pub(crate) fn redacted_email(email: &str) -> String {
+    let _ = email;
+    "[email]".to_string()
 }
 
 fn make_attempt_id() -> String {
@@ -1394,10 +1883,168 @@ fn make_attempt_id() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
+fn sanitize_log_field(key: &str, value: &str) -> String {
+    match key {
+        "selected_account_id" | "keychain_account_key" => redacted_account_presence(value),
+        "current_process_path"
+        | "app_bundle_path"
+        | "executable_path"
+        | "windows_app_path"
+        | "keychain_process_path" => crate::user_paths::redacted_path(value),
+        "failure_reason" => sanitize_failure_reason(value),
+        _ => sanitize_log_value(value),
+    }
+}
+
+fn redacted_account_presence(value: &str) -> String {
+    let value = sanitize_log_value(value);
+    if value.is_empty() {
+        String::new()
+    } else {
+        "[account]".to_string()
+    }
+}
+
 fn sanitize_log_value(value: &str) -> String {
     let value = value.replace(['\r', '\n'], " ");
     if value.trim().is_empty() {
         return String::new();
     }
     value
+}
+
+fn sanitize_failure_reason(value: &str) -> String {
+    let value = sanitize_log_value(value);
+    if value.is_empty() {
+        return value;
+    }
+
+    const DYNAMIC_PREFIXES: &[&str] = &[
+        "attempt_cancelled_after_password_load_",
+        "attempt_cancelled_",
+        "credential_prompt_activation_failed_",
+        "fill_failed_",
+        "fill_script_failed_",
+        "post_submit_state_",
+        "prompt_detection_failed_",
+        "prompt_context_live_revalidation_failed_",
+        "submit_failed_",
+        "submit_script_failed_",
+        "windows_uia_inspection_failed_",
+        "windows_uia_reinspection_failed_",
+    ];
+
+    for prefix in DYNAMIC_PREFIXES {
+        if value.starts_with(prefix) {
+            return prefix.trim_end_matches('_').to_string();
+        }
+    }
+
+    let allowed = value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if allowed && value.len() <= 96 {
+        value
+    } else {
+        "redacted_failure".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redacted_email;
+    #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
+    use super::FillMethod;
+
+    #[test]
+    fn redacted_email_is_not_stable_identifier() {
+        assert_eq!(redacted_email("user@example.com"), "[email]");
+        assert_eq!(redacted_email("other@example.com"), "[email]");
+    }
+
+    #[test]
+    fn account_id_fields_are_not_stable_identifiers() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set("selected_account_id", "account-1".to_string());
+        log.set("keychain_account_key", "user@example.com".to_string());
+
+        let report = log.finish(None);
+        let selected = report.field("selected_account_id").unwrap();
+        let keychain_key = report.field("keychain_account_key").unwrap();
+        let summary = report.summary_line();
+
+        assert_eq!(selected, "[account]");
+        assert_eq!(keychain_key, "[account]");
+        assert!(summary.contains("selected_account_id=[account]"));
+        assert!(!summary.contains("account-1"));
+        assert!(!summary.contains("user@example.com"));
+        assert!(!summary.contains("[account:"));
+    }
+
+    #[test]
+    fn empty_account_id_fields_stay_empty() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set("selected_account_id", "   ".to_string());
+        log.set("keychain_account_key", String::new());
+
+        let report = log.finish(None);
+
+        assert_eq!(report.field("selected_account_id").unwrap(), "");
+        assert_eq!(report.field("keychain_account_key").unwrap(), "");
+    }
+
+    #[test]
+    fn pre_password_load_failure_records_skip_reason() {
+        let report = super::DebugLog::new("test".to_string()).fail("visible_prompt_email_missing");
+
+        assert_eq!(report.field("password_load_attempted").unwrap(), "false");
+        assert_eq!(
+            report.field("password_load_skip_reason").unwrap(),
+            "visible_prompt_email_missing"
+        );
+        assert!(report
+            .summary_line()
+            .contains("password_load_skip_reason=visible_prompt_email_missing"));
+    }
+
+    #[test]
+    fn password_load_failure_does_not_record_skip_reason() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set("password_load_attempted", "true");
+
+        let report = log.fail("password_load_failed_for_selected_account");
+
+        assert_eq!(report.field("password_load_attempted").unwrap(), "true");
+        assert_eq!(report.field("password_load_skip_reason").unwrap(), "");
+    }
+
+    #[test]
+    fn path_fields_are_redacted_to_hash_without_leaf_name() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set(
+            "current_process_path",
+            "/Users/alice/private/project/target/debug/windows-app-autologin",
+        );
+        let report = log.finish(None);
+        let value = report.field("current_process_path").unwrap();
+
+        assert_eq!(value, "[path]");
+        assert!(!value.contains("windows-app-autologin"));
+        assert!(!value.contains("/Users/alice"));
+        assert!(!value.contains("private"));
+        assert!(!value.contains("project"));
+    }
+
+    #[cfg(all(
+        feature = "debug-fill",
+        debug_assertions,
+        not(waal_release_profile),
+        not(target_os = "windows")
+    ))]
+    #[test]
+    fn direct_fill_method_is_not_available_off_windows() {
+        let args = vec!["--fill-method=direct".to_string()];
+
+        assert!(FillMethod::parse(&args).is_err());
+    }
 }

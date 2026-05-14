@@ -11,6 +11,7 @@ pub(crate) enum MonitorStatus {
         process_id: i32,
         window_title: String,
         prompt_email: Option<String>,
+        prompt_origin: String,
     },
     Unknown,
 }
@@ -62,6 +63,7 @@ struct FormInspection {
     process_id: i32,
     title: String,
     prompt_email: Option<String>,
+    prompt_origin: &'static str,
 }
 
 #[cfg(target_os = "macos")]
@@ -106,20 +108,25 @@ fn status_from_macos_inspection(inspection: &WindowInspection) -> MonitorStatus 
                     process_id: title.process_id,
                     window_title: title.title.clone(),
                     prompt_email: form.and_then(|form| form.prompt_email.clone()),
+                    prompt_origin: form
+                        .map(|form| form.prompt_origin)
+                        .unwrap_or("window")
+                        .to_string(),
                 };
             }
         }
     }
 
     if let Some(dialog_form) = inspection.forms.first() {
-        let form = matching_form(inspection, dialog_form.process_id, &dialog_form.title)
-            .cloned()
-            .unwrap_or_else(|| dialog_form.clone());
+        let matching_prompt_form =
+            matching_form(inspection, dialog_form.process_id, &dialog_form.title);
+        let form = matching_prompt_form.unwrap_or(dialog_form);
         debug!("Login dialog detected on macOS inside trusted Windows App process");
         return MonitorStatus::LoginWindowDetected {
             process_id: form.process_id,
-            window_title: form.title,
-            prompt_email: form.prompt_email,
+            window_title: form.title.clone(),
+            prompt_email: matching_prompt_form.and_then(|form| form.prompt_email.clone()),
+            prompt_origin: form.prompt_origin.to_string(),
         };
     }
 
@@ -156,6 +163,7 @@ fn inspect_windows_app_macos_native(app_name: &str, _include_form_text: bool) ->
                     process_id: form.process_id,
                     title: form.title,
                     prompt_email: form.prompt_email,
+                    prompt_origin: form.prompt_origin,
                 })
                 .collect(),
         },
@@ -172,11 +180,32 @@ fn matching_form<'a>(
     process_id: i32,
     title: &str,
 ) -> Option<&'a FormInspection> {
-    inspection.forms.iter().find(|form| {
+    let mut matching = inspection.forms.iter().filter(|form| {
         form.process_id == process_id
             && form.title == title
             && form.prompt_email.as_deref().is_some()
-    })
+    });
+    let first = matching.next()?;
+    let first_email = first
+        .prompt_email
+        .as_deref()
+        .map(canonical_prompt_email)
+        .unwrap_or_default();
+    if matching.any(|form| {
+        form.prompt_email
+            .as_deref()
+            .map(canonical_prompt_email)
+            .is_some_and(|email| email != first_email)
+    }) {
+        return None;
+    }
+
+    Some(first)
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_prompt_email(email: &str) -> String {
+    email.trim().to_lowercase()
 }
 
 #[cfg(target_os = "macos")]
@@ -243,9 +272,15 @@ const NON_SESSION_TITLE_KEYWORDS: &[&str] = &[
     "settings",
     "preferences",
     "about windows app",
+    "connection center",
     "connection lost",
     "disconnected",
     "unable to connect",
+    "add pc",
+    "add workspace",
+    "workspaces",
+    "workspace",
+    "accounts",
     "sign in",
     "authentication",
     "credentials",
@@ -281,6 +316,10 @@ mod tests {
     fn session_title_filter_rejects_shell_windows_but_allows_desktops() {
         assert!(!is_probable_session_window_title("Windows App"));
         assert!(!is_probable_session_window_title("About Windows App"));
+        assert!(!is_probable_session_window_title("Connection Center"));
+        assert!(!is_probable_session_window_title("Workspaces"));
+        assert!(!is_probable_session_window_title("Accounts"));
+        assert!(!is_probable_session_window_title("Add PC"));
         assert!(!is_probable_session_window_title("Disconnected from VM"));
         assert!(!is_probable_session_window_title(
             "Unable to connect to host"
@@ -314,6 +353,7 @@ mod tests {
                 process_id: 42,
                 window_title: "Sign in".to_string(),
                 prompt_email: Some("user@example.com".to_string()),
+                prompt_origin: "window".to_string(),
             }
         );
     }
@@ -331,6 +371,7 @@ mod tests {
                 process_id: 42,
                 window_title: "Sign in".to_string(),
                 prompt_email: Some("user@example.com".to_string()),
+                prompt_origin: "window".to_string(),
             }
         );
     }
@@ -351,6 +392,7 @@ mod tests {
                 process_id: 42,
                 window_title: "Sign in".to_string(),
                 prompt_email: None,
+                prompt_origin: "window".to_string(),
             }
         );
     }
@@ -368,6 +410,7 @@ mod tests {
                 process_id: 77,
                 window_title: "Finance Desktop 01".to_string(),
                 prompt_email: Some("person@example.com".to_string()),
+                prompt_origin: "window".to_string(),
             }
         );
     }
@@ -388,6 +431,7 @@ mod tests {
                 process_id: 77,
                 window_title: "Finance Desktop 01".to_string(),
                 prompt_email: Some("person@example.com".to_string()),
+                prompt_origin: "window".to_string(),
             }
         );
     }
@@ -408,6 +452,67 @@ mod tests {
                 process_id: 77,
                 window_title: "Finance Desktop 01".to_string(),
                 prompt_email: None,
+                prompt_origin: "window".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn matching_form_rejects_conflicting_prompt_emails() {
+        let status = status_from_macos_inspection(&inspection(
+            vec![title(77, "Finance Desktop 01")],
+            vec![
+                form(77, "Finance Desktop 01", Some("person@example.com")),
+                form(77, "Finance Desktop 01", Some("other@example.com")),
+            ],
+        ));
+
+        assert_eq!(
+            status,
+            MonitorStatus::LoginWindowDetected {
+                process_id: 77,
+                window_title: "Finance Desktop 01".to_string(),
+                prompt_email: None,
+                prompt_origin: "window".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn title_detection_keeps_prompt_email_scoped_to_same_pid_when_titles_match() {
+        let status = status_from_macos_inspection(&inspection(
+            vec![title(42, "Sign in"), title(43, "Sign in")],
+            vec![form(43, "Sign in", Some("other@example.com"))],
+        ));
+
+        assert_eq!(
+            status,
+            MonitorStatus::LoginWindowDetected {
+                process_id: 42,
+                window_title: "Sign in".to_string(),
+                prompt_email: None,
+                prompt_origin: "window".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn title_detection_uses_prompt_email_from_same_pid_when_titles_match() {
+        let status = status_from_macos_inspection(&inspection(
+            vec![title(42, "Sign in"), title(43, "Sign in")],
+            vec![
+                form(42, "Sign in", Some("person@example.com")),
+                form(43, "Sign in", Some("other@example.com")),
+            ],
+        ));
+
+        assert_eq!(
+            status,
+            MonitorStatus::LoginWindowDetected {
+                process_id: 42,
+                window_title: "Sign in".to_string(),
+                prompt_email: Some("person@example.com".to_string()),
+                prompt_origin: "window".to_string(),
             }
         );
     }
@@ -432,6 +537,7 @@ mod tests {
             process_id,
             title: title.to_string(),
             prompt_email: prompt_email.map(str::to_string),
+            prompt_origin: "window",
         }
     }
 }

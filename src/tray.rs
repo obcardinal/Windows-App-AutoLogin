@@ -59,7 +59,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let request_accessibility_i = automation_request_item();
     let open_accessibility_i = automation_settings_item();
     let accessibility_i = automation_status_item();
-    let keychain_i = MenuItem::new("Secure storage: Checking", false, None);
+    let keychain_i = MenuItem::new("Password storage: Checking", false, None);
     let last_result_i = MenuItem::new("Last fill: none", false, None);
     let permission_separator = PredefinedMenuItem::separator();
     let status_separator = PredefinedMenuItem::separator();
@@ -247,9 +247,9 @@ fn automation_status_label(ready: bool) -> &'static str {
 
 fn secure_storage_label(enabled: bool) -> &'static str {
     if enabled {
-        "Secure storage: Enabled"
+        "Password storage: System store"
     } else {
-        "Secure storage: Disabled"
+        "Password storage: Encrypted file"
     }
 }
 

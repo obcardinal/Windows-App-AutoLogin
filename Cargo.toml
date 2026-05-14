@@ -18,6 +18,7 @@ path = "src/main.rs"
 [[bin]]
 name = "diagnose-macos-ui"
 path = "src/bin/diagnose-macos-ui.rs"
+required-features = ["diagnostics-ui"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -31,20 +32,19 @@ aes-gcm = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
-whoami = "1"
 auto-launch = "0.6"
 libc = "0.2"
 
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow"] }
 egui_extras = { version = "0.34", features = ["svg"] }
-tray-icon = "0.24"
+tray-icon = { version = "0.24", default-features = false }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 uuid = { version = "1.11", features = ["v4"] }
 dirs = "6.0"
 chrono = "0.4"
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["serde"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 uiautomation = { version = "0.25", features = ["process"] }
@@ -59,11 +59,14 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+security-framework = "3.7"
 
 [features]
 default = []
+debug-fill = []
 diagnostics-ui = []
-dev-tools = ["diagnostics-ui"]
+dev-tools = ["debug-fill", "diagnostics-ui"]
+release-diagnostics = ["diagnostics-ui"]
 
 [profile.release]
 opt-level = 3
