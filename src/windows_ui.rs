@@ -586,32 +586,19 @@ fn prompt_from_window(
         elements.truncate(MAX_ELEMENT_COUNT);
     }
 
-    let submit_button = select_submit_button(&elements);
-    let prompt_text = collect_prompt_text(&target.window_title, &elements);
-    let prompt_email = extract_email_like(&prompt_text);
-    let login_title = login_title_like(&target.window_title);
-    let verified_context = submit_button.is_some() && (prompt_email.is_some() || login_title);
-
-    let password_field = select_password_field(&elements, verified_context);
-    let Some(password_field) = password_field else {
+    let Some(prompt_candidate) = select_prompt_candidate(&target.window_title, &elements) else {
         return Ok(None);
     };
-    if submit_button.is_none() {
-        return Ok(None);
-    }
-    if prompt_email.is_none() && !login_title {
-        return Ok(None);
-    }
 
-    let password_field_description = redacted_element_description(&password_field);
-    let password_field_role = element_role_text(&password_field);
+    let password_field_description = redacted_element_description(&prompt_candidate.password_field);
+    let password_field_role = element_role_text(&prompt_candidate.password_field);
     Ok(Some(WindowsPrompt {
         target,
-        email: prompt_email,
+        email: prompt_candidate.email,
         password_field_description,
         password_field_role,
-        password_field,
-        submit_button,
+        password_field: prompt_candidate.password_field,
+        submit_button: prompt_candidate.submit_button,
     }))
 }
 
@@ -1070,66 +1057,222 @@ fn wait_for_submit_ready(
     }
 }
 
-fn select_password_field(elements: &[UIElement], verified_context: bool) -> Option<UIElement> {
-    elements
-        .iter()
-        .find(|element| is_native_password_field(element))
-        .cloned()
-        .or_else(|| {
-            verified_context.then(|| {
-                elements
-                    .iter()
-                    .find(|element| is_password_like_edit(element))
-                    .cloned()
-            })?
-        })
+#[derive(Clone)]
+struct PromptCandidate {
+    email: Option<String>,
+    password_field: UIElement,
+    submit_button: Option<UIElement>,
+    password_kind: PasswordFieldKind,
 }
 
-fn select_submit_button(elements: &[UIElement]) -> Option<UIElement> {
+#[derive(Clone)]
+struct PasswordFieldCandidate {
+    element: UIElement,
+    rect: ElementRect,
+    kind: PasswordFieldKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasswordFieldKind {
+    Native,
+    PasswordLikeEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ElementRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl ElementRect {
+    fn new(left: i32, top: i32, right: i32, bottom: i32) -> Option<Self> {
+        if right <= left || bottom <= top {
+            return None;
+        }
+
+        Some(Self {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    }
+
+    fn width(self) -> i32 {
+        self.right - self.left
+    }
+
+    fn height(self) -> i32 {
+        self.bottom - self.top
+    }
+
+    fn center_x(self) -> i32 {
+        self.left + self.width() / 2
+    }
+
+    fn horizontal_overlap(self, other: Self) -> i32 {
+        (self.right.min(other.right) - self.left.max(other.left)).max(0)
+    }
+
+    fn horizontal_gap(self, other: Self) -> i32 {
+        if self.right < other.left {
+            other.left - self.right
+        } else if other.right < self.left {
+            self.left - other.right
+        } else {
+            0
+        }
+    }
+}
+
+fn select_prompt_candidate(window_title: &str, elements: &[UIElement]) -> Option<PromptCandidate> {
+    let login_title = login_title_like(window_title);
+    let mut selected = None;
+
+    for candidate in password_field_candidates(elements) {
+        let submit_button = select_submit_button_for_password(elements, candidate.rect);
+        if candidate.kind == PasswordFieldKind::PasswordLikeEdit && submit_button.is_none() {
+            continue;
+        }
+        let submit_rect = submit_button.as_ref().and_then(prompt_element_rect);
+        let prompt_text = collect_prompt_text(elements, candidate.rect, submit_rect);
+        let prompt_email = extract_email_like(&prompt_text);
+        if prompt_email.is_none() && !login_title {
+            continue;
+        }
+
+        let prompt_candidate = PromptCandidate {
+            email: prompt_email,
+            password_field: candidate.element,
+            submit_button,
+            password_kind: candidate.kind,
+        };
+        if selected
+            .as_ref()
+            .is_some_and(|selected| prompt_candidates_conflict(selected, &prompt_candidate))
+        {
+            return None;
+        }
+        if selected.as_ref().map_or(true, |selected| {
+            prompt_candidate_preferred(&prompt_candidate, selected)
+        }) {
+            selected = Some(prompt_candidate);
+        }
+    }
+
+    selected
+}
+
+fn prompt_candidates_conflict(left: &PromptCandidate, right: &PromptCandidate) -> bool {
+    match (left.email.as_deref(), right.email.as_deref()) {
+        (Some(left), Some(right)) => !usernames_match(left, right),
+        _ => false,
+    }
+}
+
+fn prompt_candidate_preferred(candidate: &PromptCandidate, current: &PromptCandidate) -> bool {
+    prompt_candidate_score(candidate) > prompt_candidate_score(current)
+}
+
+fn prompt_candidate_score(candidate: &PromptCandidate) -> u8 {
+    u8::from(candidate.email.is_some()) * 4
+        + u8::from(candidate.password_kind == PasswordFieldKind::Native) * 2
+        + u8::from(candidate.submit_button.is_some())
+}
+
+fn password_field_candidates(elements: &[UIElement]) -> Vec<PasswordFieldCandidate> {
+    let mut candidates = Vec::new();
+    for element in elements {
+        if !is_native_password_field(element) {
+            continue;
+        }
+        if let Some(rect) = prompt_element_rect(element) {
+            candidates.push(PasswordFieldCandidate {
+                element: element.clone(),
+                rect,
+                kind: PasswordFieldKind::Native,
+            });
+        }
+    }
+    for element in elements {
+        if is_native_password_field(element) || !is_password_like_edit(element) {
+            continue;
+        }
+        if let Some(rect) = prompt_element_rect(element) {
+            candidates.push(PasswordFieldCandidate {
+                element: element.clone(),
+                rect,
+                kind: PasswordFieldKind::PasswordLikeEdit,
+            });
+        }
+    }
+    candidates
+}
+
+fn select_submit_button_for_password(
+    elements: &[UIElement],
+    password_rect: ElementRect,
+) -> Option<UIElement> {
     let buttons = elements
         .iter()
         .filter(|element| element.get_control_type().ok() == Some(ControlType::Button))
         .filter(|element| !element.is_offscreen().unwrap_or(true))
+        .filter_map(|element| {
+            let rect = prompt_element_rect(element)?;
+            submit_rect_related_to_password(password_rect, rect).then_some((element, rect))
+        })
         .collect::<Vec<_>>();
 
+    ranked_submit_button(&buttons, password_rect, |element| {
+        let text = submit_button_text(element);
+        element.is_enabled().unwrap_or(false) && submit_label_rank(&text) == Some(0)
+    })
+    .or_else(|| {
+        ranked_submit_button(&buttons, password_rect, |element| {
+            let text = submit_button_text(element);
+            element.is_enabled().unwrap_or(false) && is_preferred_submit_label(&text)
+        })
+    })
+    .or_else(|| {
+        ranked_submit_button(&buttons, password_rect, |element| {
+            let text = submit_button_text(element);
+            submit_label_rank(&text) == Some(0)
+        })
+    })
+    .or_else(|| {
+        ranked_submit_button(&buttons, password_rect, |element| {
+            let text = submit_button_text(element);
+            is_preferred_submit_label(&text)
+        })
+    })
+}
+
+fn ranked_submit_button<F>(
+    buttons: &[(&UIElement, ElementRect)],
+    password_rect: ElementRect,
+    matches_rank: F,
+) -> Option<UIElement>
+where
+    F: Fn(&UIElement) -> bool,
+{
     buttons
         .iter()
-        .find(|element| {
-            let text = submit_button_text(element);
-            element.is_enabled().unwrap_or(false) && submit_label_rank(&text) == Some(0)
-        })
-        .copied()
-        .cloned()
-        .or_else(|| {
-            buttons
-                .iter()
-                .find(|element| {
-                    let text = submit_button_text(element);
-                    element.is_enabled().unwrap_or(false) && is_preferred_submit_label(&text)
-                })
-                .copied()
-                .cloned()
-        })
-        .or_else(|| {
-            buttons
-                .iter()
-                .find(|element| {
-                    let text = submit_button_text(element);
-                    submit_label_rank(&text) == Some(0)
-                })
-                .copied()
-                .cloned()
-        })
-        .or_else(|| {
-            buttons
-                .iter()
-                .find(|element| {
-                    let text = submit_button_text(element);
-                    is_preferred_submit_label(&text)
-                })
-                .copied()
-                .cloned()
-        })
+        .filter(|(element, _)| matches_rank(element))
+        .min_by_key(|(_, rect)| submit_rect_distance(password_rect, *rect))
+        .map(|(element, _)| (*element).clone())
+}
+
+fn submit_rect_distance(password: ElementRect, submit: ElementRect) -> i32 {
+    let vertical_gap = if submit.top > password.bottom {
+        submit.top - password.bottom
+    } else if password.top > submit.bottom {
+        password.top - submit.bottom
+    } else {
+        0
+    };
+    vertical_gap.saturating_mul(4) + (password.center_x() - submit.center_x()).abs()
 }
 
 fn submit_button_text(element: &UIElement) -> String {
@@ -1141,10 +1284,20 @@ fn submit_button_text(element: &UIElement) -> String {
     text
 }
 
-fn collect_prompt_text(window_title: &str, elements: &[UIElement]) -> String {
-    let mut text = String::from(window_title);
+fn collect_prompt_text(
+    elements: &[UIElement],
+    password_rect: ElementRect,
+    submit_rect: Option<ElementRect>,
+) -> String {
+    let mut text = String::new();
     for element in elements {
-        if should_skip_prompt_text(element) {
+        if !prompt_text_element_should_contribute(element) {
+            continue;
+        }
+        let Some(rect) = prompt_element_rect(element) else {
+            continue;
+        };
+        if !prompt_text_rect_related_to_password(password_rect, submit_rect, rect) {
             continue;
         }
 
@@ -1161,8 +1314,55 @@ fn collect_prompt_text(window_title: &str, elements: &[UIElement]) -> String {
     text
 }
 
-fn should_skip_prompt_text(element: &UIElement) -> bool {
-    is_native_password_field(element) || is_password_like_edit(element)
+fn prompt_text_element_should_contribute(element: &UIElement) -> bool {
+    if element.is_offscreen().unwrap_or(true)
+        || is_native_password_field(element)
+        || is_password_like_edit(element)
+    {
+        return false;
+    }
+
+    element.get_control_type().ok() != Some(ControlType::Button)
+}
+
+fn prompt_element_rect(element: &UIElement) -> Option<ElementRect> {
+    let rect = element.get_bounding_rectangle().ok()?;
+    ElementRect::new(
+        rect.get_left(),
+        rect.get_top(),
+        rect.get_right(),
+        rect.get_bottom(),
+    )
+}
+
+fn submit_rect_related_to_password(password: ElementRect, submit: ElementRect) -> bool {
+    let max_above = 80;
+    let max_below = 520.max(password.height() * 12);
+    submit.bottom >= password.top - max_above
+        && submit.top <= password.bottom + max_below
+        && rects_horizontally_related(password, submit, 420)
+}
+
+fn prompt_text_rect_related_to_password(
+    password: ElementRect,
+    submit: Option<ElementRect>,
+    text: ElementRect,
+) -> bool {
+    if submit.is_some_and(|submit| text.top > submit.bottom + 160) {
+        return false;
+    }
+
+    text.bottom >= password.top - 520
+        && text.top <= password.bottom + 180
+        && rects_horizontally_related(password, text, 420)
+}
+
+fn rects_horizontally_related(primary: ElementRect, other: ElementRect, max_gap: i32) -> bool {
+    let min_width = primary.width().min(other.width()).max(1);
+    primary.horizontal_overlap(other) >= min_width / 4
+        || primary.horizontal_gap(other) <= max_gap
+        || (primary.center_x() - other.center_x()).abs()
+            <= primary.width().max(other.width()).max(max_gap)
 }
 
 fn is_native_password_field(element: &UIElement) -> bool {
@@ -1869,9 +2069,10 @@ mod tests {
     use super::{
         contains_keyword, credential_dialog_title_like, ensure_fixed_target_app,
         extract_email_like, is_preferred_submit_label, is_probable_session_window_title,
-        login_title_like, normalized_identifier, system_credential_dialog_matches, target_aliases,
+        login_title_like, normalized_identifier, prompt_text_rect_related_to_password,
+        submit_rect_related_to_password, system_credential_dialog_matches, target_aliases,
         target_app_matches_with_class, text_contains_password_cue, trusted_microsoft_rdp_path_hint,
-        window_title_matches, WindowsTarget,
+        window_title_matches, ElementRect, WindowsTarget,
     };
 
     #[test]
@@ -2076,6 +2277,49 @@ mod tests {
             extract_email_like("user@example.com signed in as USER@example.com"),
             Some("user@example.com".to_string())
         );
+    }
+
+    #[test]
+    fn prompt_text_scope_accepts_only_local_form_text() {
+        let password = ElementRect::new(200, 300, 430, 330).unwrap();
+        let submit = ElementRect::new(300, 350, 430, 382).unwrap();
+        let account_text = ElementRect::new(190, 238, 470, 260).unwrap();
+        let far_side_account = ElementRect::new(900, 238, 1160, 260).unwrap();
+        let near_below_submit_account = ElementRect::new(200, 430, 470, 452).unwrap();
+        let below_submit_account = ElementRect::new(200, 560, 470, 582).unwrap();
+
+        assert!(prompt_text_rect_related_to_password(
+            password,
+            Some(submit),
+            account_text
+        ));
+        assert!(!prompt_text_rect_related_to_password(
+            password,
+            Some(submit),
+            far_side_account
+        ));
+        assert!(prompt_text_rect_related_to_password(
+            password,
+            Some(submit),
+            near_below_submit_account
+        ));
+        assert!(!prompt_text_rect_related_to_password(
+            password,
+            Some(submit),
+            below_submit_account
+        ));
+    }
+
+    #[test]
+    fn submit_scope_accepts_only_local_form_button() {
+        let password = ElementRect::new(200, 300, 430, 330).unwrap();
+        let submit = ElementRect::new(300, 350, 430, 382).unwrap();
+        let far_side_submit = ElementRect::new(900, 350, 1030, 382).unwrap();
+        let far_above_submit = ElementRect::new(300, 80, 430, 112).unwrap();
+
+        assert!(submit_rect_related_to_password(password, submit));
+        assert!(!submit_rect_related_to_password(password, far_side_submit));
+        assert!(!submit_rect_related_to_password(password, far_above_submit));
     }
 
     #[test]
