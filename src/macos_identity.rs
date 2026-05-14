@@ -296,13 +296,9 @@ fn verify_trusted_live_process(
     }
 
     with_code_sign_requirement(identity.bundle_id, identity.team_id, |requirement| {
-        if code
-            .check_validity(code_validation_flags(), requirement)
-            .is_ok()
-        {
-            return Ok(true);
-        }
-        static_code_matches_requirement(bundle_path, requirement)
+        Ok(code
+            .check_validity(live_code_validation_flags(), requirement)
+            .is_ok())
     })
 }
 
@@ -413,33 +409,16 @@ fn static_code_has_valid_internal_signature(code: &SecStaticCode) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn static_code_matches_requirement(
-    path: &Path,
-    requirement: &SecRequirement,
-) -> anyhow::Result<bool> {
-    let Some(code) = static_code_at_path(path) else {
-        return Ok(false);
-    };
-    Ok(unsafe {
-        SecStaticCodeCheckValidity(
-            code.as_CFTypeRef().cast(),
-            static_code_validation_flags().bits(),
-            requirement.as_CFTypeRef().cast(),
-        ) == 0
-    })
-}
-
-#[cfg(target_os = "macos")]
 fn static_code_validation_flags() -> CodeSignFlags {
-    CodeSignFlags::STRICT_VALIDATE | CodeSignFlags::CHECK_ALL_ARCHITECTURES
-}
-
-#[cfg(target_os = "macos")]
-fn code_validation_flags() -> CodeSignFlags {
     CodeSignFlags::STRICT_VALIDATE
         | CodeSignFlags::CHECK_ALL_ARCHITECTURES
         | CodeSignFlags::CHECK_NESTED_CODE
         | CodeSignFlags::RESTRICT_SYMLINKS
+}
+
+#[cfg(target_os = "macos")]
+fn live_code_validation_flags() -> CodeSignFlags {
+    CodeSignFlags::NONE
 }
 
 #[cfg(target_os = "macos")]
@@ -649,8 +628,9 @@ fn run_command_with_timeout(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        code_sign_requirement_source, path_has_symlink_component, proc_pidpath_buffer_to_path,
-        signature_cache_key, trusted_process_infos_from_identities, valid_team_id, ProcessIdentity,
+        code_sign_requirement_source, live_code_validation_flags, path_has_symlink_component,
+        proc_pidpath_buffer_to_path, signature_cache_key, static_code_validation_flags,
+        trusted_process_infos_from_identities, valid_team_id, CodeSignFlags, ProcessIdentity,
         TrustedIdentity,
     };
     use std::path::PathBuf;
@@ -730,6 +710,27 @@ mod tests {
         .unwrap();
 
         assert!(trusted.is_empty());
+    }
+
+    #[test]
+    fn live_code_validation_uses_only_live_safe_flags() {
+        let flags = live_code_validation_flags();
+
+        assert_eq!(flags.bits(), CodeSignFlags::NONE.bits());
+        assert!(!flags.contains(CodeSignFlags::STRICT_VALIDATE));
+        assert!(!flags.contains(CodeSignFlags::CHECK_ALL_ARCHITECTURES));
+        assert!(!flags.contains(CodeSignFlags::CHECK_NESTED_CODE));
+        assert!(!flags.contains(CodeSignFlags::RESTRICT_SYMLINKS));
+    }
+
+    #[test]
+    fn static_code_validation_keeps_static_bundle_architecture_check() {
+        let flags = static_code_validation_flags();
+
+        assert!(flags.contains(CodeSignFlags::STRICT_VALIDATE));
+        assert!(flags.contains(CodeSignFlags::CHECK_ALL_ARCHITECTURES));
+        assert!(flags.contains(CodeSignFlags::CHECK_NESTED_CODE));
+        assert!(flags.contains(CodeSignFlags::RESTRICT_SYMLINKS));
     }
 
     #[test]
