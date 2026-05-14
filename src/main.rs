@@ -369,6 +369,9 @@ impl LightweightSupervisor {
                 self.start_monitor_from_control_command()
             }
             single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
+            single_instance::MonitorControlCommand::ReloadConfig => {
+                self.reload_config_after_settings()
+            }
         }
     }
 
@@ -1309,6 +1312,7 @@ mod tests {
         supervisor.worker_status = crate::models::WorkerStatus::Running;
         supervisor.resume_monitor_after_settings = true;
         let child = spawn_test_child("exec sleep 30");
+        #[cfg(unix)]
         let child_pid = child.id();
         supervisor.settings_child = Some(child);
 
@@ -1570,10 +1574,33 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     fn spawn_test_child(command: &str) -> std::process::Child {
         std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(command)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_child(command: &str) -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let (program, args): (&str, &[&str]) = match command {
+            "exit 0" => ("cmd.exe", &["/C", "exit 0"]),
+            "sleep 1" => ("timeout.exe", &["/T", "1", "/NOBREAK"]),
+            "exec sleep 30" => ("timeout.exe", &["/T", "30", "/NOBREAK"]),
+            other => panic!("unsupported Windows test child command: {other}"),
+        };
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .unwrap()
     }

@@ -765,7 +765,7 @@ fn load_password_file() -> anyhow::Result<PasswordFile> {
         Ok(c) => c,
         Err(e) => {
             warn!(path = %redacted_path(&path), error = %e, "Failed to read password file");
-            return Err(e.into());
+            return Err(e);
         }
     };
     let file: PasswordFile = match serde_json::from_str::<PasswordFile>(&content) {
@@ -908,7 +908,10 @@ fn write_private_file_atomic(
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
-    std::fs::rename(&temp_path, path)?;
+    if let Err(e) = replace_private_file(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
     secure_path_permissions(path, 0o600)?;
     if let Err(e) = sync_parent_dir(path) {
         warn!(
@@ -917,6 +920,41 @@ fn write_private_file_atomic(
             "private file write committed, but parent directory sync failed"
         );
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_private_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temp_path = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temp_path.as_ptr()),
+            PCWSTR(path.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_private_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
+    std::fs::rename(temp_path, path)?;
     Ok(())
 }
 
@@ -981,11 +1019,17 @@ fn write_private_file_create_new_atomic(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
     std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -1014,7 +1058,7 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
     }
 
     if let Some((legacy_key_path, legacy_key)) = load_legacy_fallback_key_from_file()? {
-        let encoded = Zeroizing::new(STANDARD.encode(&*legacy_key));
+        let encoded = Zeroizing::new(STANDARD.encode(*legacy_key));
         entry.set_password(encoded.as_str()).map_err(|e| {
             anyhow::anyhow!(
                 "{} refused to migrate fallback key: {e}",
@@ -1027,7 +1071,7 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
 
     let mut key = Zeroizing::new([0u8; 32]);
     rand::thread_rng().fill(&mut *key);
-    let encoded = Zeroizing::new(STANDARD.encode(&*key));
+    let encoded = Zeroizing::new(STANDARD.encode(*key));
     entry.set_password(encoded.as_str()).map_err(|e| {
         anyhow::anyhow!(
             "{} refused to save fallback key: {e}",
@@ -1209,7 +1253,7 @@ fn decrypt_password(b64: &str) -> anyhow::Result<(Zeroizing<String>, bool)> {
     }
     let data = STANDARD.decode(b64)?;
     let key = fallback_encryption_key()?;
-    decrypt_password_with_key(&*key, &data).map(|password| (password, false))
+    decrypt_password_with_key(&key, &data).map(|password| (password, false))
 }
 
 fn save_to_file(account: &Account, password: &str) -> anyhow::Result<()> {
@@ -1535,7 +1579,7 @@ pub(crate) fn migrate_storage_mode(
                     migrated_account_ids,
                     from_use_keyring,
                     to_use_keyring,
-                    e.into(),
+                    e,
                 )?;
                 unreachable!("rollback_partial_storage_migration always returns Err");
             }
@@ -1562,7 +1606,7 @@ pub(crate) fn migrate_storage_mode(
                 migrated_account_ids,
                 from_use_keyring,
                 to_use_keyring,
-                e.into(),
+                e,
             )?;
             unreachable!("rollback_partial_storage_migration always returns Err");
         }
@@ -2213,6 +2257,7 @@ pub(crate) fn load_password_with_timing(
     load_password_with_timing_for_prompt(account, use_keyring, None)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn load_password_for_prompt_with_timing(
     account: &Account,
     use_keyring: bool,
@@ -2303,7 +2348,7 @@ fn load_from_keyring_timed(account: &Account) -> anyhow::Result<LoadedStoredPass
 
 fn cleanup_migrated_legacy_credentials(account_ids: &[AccountId]) {
     for account_id in account_ids {
-        if let Err(e) = delete_password(&account_id) {
+        if let Err(e) = delete_password(account_id) {
             debug!(
                 account_id = %redacted_account_id(account_id),
                 error = %e,
@@ -2391,9 +2436,9 @@ pub(crate) fn save_account_with_outcome(
     debug!(account_id = %redacted_account_id(&account.id), use_keyring, "save_account called");
     if password.is_empty() {
         warn!(account_id = %redacted_account_id(&account.id), "save_account received empty password, skipping keyring storage");
-        return Ok(SaveAccountOutcome::default());
+        Ok(SaveAccountOutcome::default())
     } else {
-        return save_password(account, password, use_keyring);
+        save_password(account, password, use_keyring)
     }
 }
 
@@ -2423,29 +2468,32 @@ pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::backup_invalid_file;
     use super::{
-        backup_invalid_file, cleanup_fallback_key_if_password_file_empty,
-        cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
-        clear_pending_storage_operation_paths, decode_bound_password, decrypt_password_with_key,
-        delete_fallback_key_material_with_ops, encode_bound_password,
-        ensure_no_pending_storage_operation, is_pending_storage_operation_in_progress,
-        legacy_account_id_for_migrated_config, legacy_migration_target_cleanup_id,
-        legacy_password_migration_ready_to_persist, load_config_file,
-        load_pending_storage_operation_record_or_quarantine_from_paths, migrate_legacy_config,
-        normalize_config, password_entry_for_account, pending_storage_backend_to_cleanup,
-        pending_storage_operation_account_ids_known, quarantine_pending_storage_operation_file,
-        read_private_text_file, reconcile_account_config_save_operation_with_ops,
+        cleanup_fallback_key_if_password_file_empty, cleanup_stale_backend_after_successful_save,
+        cleanup_storage_backend_with_ops, clear_pending_storage_operation_paths,
+        decode_bound_password, decrypt_password_with_key, delete_fallback_key_material_with_ops,
+        encode_bound_password, ensure_no_pending_storage_operation,
+        is_pending_storage_operation_in_progress, legacy_account_id_for_migrated_config,
+        legacy_migration_target_cleanup_id, legacy_password_migration_ready_to_persist,
+        load_config_file, load_pending_storage_operation_record_or_quarantine_from_paths,
+        migrate_legacy_config, normalize_config, password_entry_for_account,
+        pending_storage_backend_to_cleanup, pending_storage_operation_account_ids_known,
+        quarantine_pending_storage_operation_file, read_private_text_file,
+        reconcile_account_config_save_operation_with_ops,
         reconcile_account_delete_operation_with_ops, redact_password_load_error,
         redacted_account_id, save_pending_storage_operation_to_paths, sha256_hex,
         storage_error_kind, username_binding_hash, validate_password_file_shape,
-        validate_pending_storage_operation, validate_private_dir, validate_private_file_for_read,
-        verify_pending_storage_surviving_backend, write_private_file_atomic,
-        write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
-        LegacyPasswordMigration, PasswordFile, PasswordStorageBackend, PendingStorageOperation,
-        StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
-        PASSWORD_ENVELOPE_V2_PREFIX, PASSWORD_ENVELOPE_V2_VERSION,
+        validate_pending_storage_operation, verify_pending_storage_surviving_backend,
+        write_private_file_atomic, write_private_file_create_new_atomic, LegacyConfig,
+        LegacyCredentialsConfig, LegacyPasswordMigration, PasswordFile, PasswordStorageBackend,
+        PendingStorageOperation, StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES,
+        MAX_PASSWORD_FILE_BYTES, PASSWORD_ENVELOPE_V2_PREFIX, PASSWORD_ENVELOPE_V2_VERSION,
         PENDING_STORAGE_OPERATION_VERSION, SERVICE_NAME,
     };
+    #[cfg(unix)]
+    use super::{validate_private_dir, validate_private_file_for_read};
     use crate::models::{Account, AppConfig, FIXED_POLL_INTERVAL_SECS};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -3591,6 +3639,18 @@ mod tests {
 
         assert!(read_private_text_file(&path, MAX_PASSWORD_FILE_BYTES).is_err());
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_file_atomic_write_replaces_existing_target() {
+        let root = temp_storage_test_dir("atomic-replace-existing");
+        let path = root.join("config.json");
+        std::fs::write(&path, "old").unwrap();
+
+        write_private_file_atomic(&path, "json.tmp", b"new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         let _ = std::fs::remove_dir_all(root);
     }
 

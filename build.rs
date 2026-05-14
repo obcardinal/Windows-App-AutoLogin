@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    error::Error,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -23,6 +25,7 @@ fn main() {
     if env::var("PROFILE").as_deref() == Ok("release") {
         println!("cargo:rustc-cfg=waal_release_profile");
     }
+    embed_windows_resources(icon).expect("embed Windows resources");
 
     let macos_identity = macos_identity();
     let macos_bundle_id = macos_identity.bundle_id.clone();
@@ -49,6 +52,55 @@ fn main() {
 
     println!("cargo:rustc-env=WAAL_ICON_ASSET_FINGERPRINT={fingerprint}");
     write_build_metadata(&macos_identity, &macos_team_id);
+}
+
+fn embed_windows_resources(icon: &Path) -> Result<(), Box<dyn Error>> {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return Ok(());
+    }
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is set")?);
+    let ico_path = out_dir.join("WindowsAppAutoLogin.ico");
+    let rc_path = out_dir.join("WindowsAppAutoLogin.rc");
+    write_windows_icon(icon, &ico_path)?;
+
+    let rc = format!("1 ICON \"{}\"\n", rc_escaped_path(&ico_path));
+    fs::write(&rc_path, rc)?;
+    let result = embed_resource::compile(&rc_path, embed_resource::NONE);
+    let result = if env::var("PROFILE").as_deref() == Ok("release") {
+        result.manifest_required()
+    } else {
+        result.manifest_optional()
+    };
+    result.map_err(|err| format!("failed to compile Windows resources: {err}"))?;
+    Ok(())
+}
+
+fn write_windows_icon(png_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {
+    let icon = image::open(png_path)?;
+    let sizes = [16, 24, 32, 48, 64, 128, 256];
+    let mut frames = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        let rgba = icon
+            .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+            .to_rgba8();
+        frames.push(image::codecs::ico::IcoFrame::as_png(
+            rgba.as_raw(),
+            size,
+            size,
+            image::ColorType::Rgba8.into(),
+        )?);
+    }
+    let ico = fs::File::create(ico_path)?;
+    image::codecs::ico::IcoEncoder::new(ico).encode_images(&frames)?;
+    if fs::metadata(ico_path)?.len() == 0 {
+        return Err(format!("generated Windows icon is empty: {}", ico_path.display()).into());
+    }
+    Ok(())
+}
+
+fn rc_escaped_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "\\\\")
 }
 
 struct MacosIdentity {
@@ -103,9 +155,9 @@ static WAAL_BUILD_METADATA_DEBUG: [u8; {}] = [{}];
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__TEXT,__const"))]
 static WAAL_BUILD_METADATA_RELEASE: [u8; {}] = [{}];
 "#,
-        debug_metadata.as_bytes().len(),
+        debug_metadata.len(),
         debug_bytes,
-        release_metadata.as_bytes().len(),
+        release_metadata.len(),
         release_bytes
     );
 

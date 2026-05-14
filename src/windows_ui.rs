@@ -18,8 +18,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
+    GA_ROOTOWNER, GW_OWNER, SW_RESTORE,
 };
 
 const MAX_ELEMENT_COUNT: usize = 900;
@@ -120,57 +121,55 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
     ensure_fixed_target_app(target_app_name)?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
     let allow_system_credential_dialogs = is_builtin_target_name(target_app_name);
-    let trusted_target = allow_system_credential_dialogs
+    let trusted_running_target = allow_system_credential_dialogs
         .then(|| running_target_process(target_app_name))
         .flatten();
 
-    if let Some(trusted_target) = trusted_target.clone() {
-        if let Some(prompt) = fast_system_credential_prompt(&automation)? {
-            return Ok(WindowsInspection {
-                target: Some(trusted_target),
-                prompt: Some(prompt),
-                has_session: false,
-            });
-        }
-
+    if let Some(prompt) = fast_system_credential_prompt(&automation, target_app_name)? {
         return Ok(WindowsInspection {
-            target: Some(trusted_target),
-            prompt: None,
+            target: trusted_running_target,
+            prompt: Some(prompt),
             has_session: false,
         });
     }
 
-    let root = automation.get_root_element()?;
-    let walker = automation.get_raw_view_walker()?;
-    let mut windows = walker.get_children(&root).unwrap_or_default();
-
-    windows.sort_by_key(|window| !window_frontmost(window));
-
-    let mut inspection = WindowsInspection::default();
-    let mut trusted_target_seen = false;
-    let mut target_prompt_frontmost: Option<WindowsPrompt> = None;
+    let mut inspection = WindowsInspection {
+        target: trusted_running_target,
+        ..Default::default()
+    };
+    let mut trusted_target_seen = inspection.target.is_some();
     let mut target_prompt: Option<WindowsPrompt> = None;
-    let mut system_prompt_frontmost: Option<WindowsPrompt> = None;
     let mut system_prompt: Option<WindowsPrompt> = None;
 
-    for window in windows {
-        if let Some((target, class_name)) = target_from_window(target_app_name, &window) {
+    for candidate in native_visible_windows() {
+        if target_app_matches_with_class(target_app_name, &candidate.target, &candidate.class_name)
+        {
             trusted_target_seen = true;
             if inspection.target.is_none() {
-                inspection.target = Some(target.clone());
+                inspection.target = Some(candidate.target.clone());
             }
 
-            if target_window_should_be_scanned_for_prompt(target_app_name, &target, &class_name) {
+            if target_window_should_be_scanned_for_prompt(
+                target_app_name,
+                &candidate.target,
+                &candidate.class_name,
+            ) {
+                let Ok(window) =
+                    automation.element_from_handle(Handle::from(candidate.window_handle))
+                else {
+                    continue;
+                };
                 if let Some(prompt) =
-                    prompt_from_window(&automation, target.clone(), window.clone())?
+                    prompt_from_window(&automation, candidate.target.clone(), window)?
                 {
                     if prompt.target.frontmost {
-                        target_prompt_frontmost = Some(prompt);
+                        inspection.prompt = Some(prompt);
+                        return Ok(inspection);
                     } else if target_prompt.is_none() {
                         target_prompt = Some(prompt);
                     }
                 }
-            } else if is_probable_session_window_title(&target.window_title) {
+            } else if is_probable_session_window_title(&candidate.target.window_title) {
                 inspection.has_session = true;
             }
 
@@ -178,35 +177,83 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
         }
 
         if allow_system_credential_dialogs {
-            if let Some(target) = system_credential_target_from_window(&window) {
-                if let Some(prompt) = prompt_from_window(&automation, target, window.clone())? {
-                    if window_handle_is_foreground(prompt.target.window_handle) {
-                        system_prompt_frontmost = Some(prompt);
-                    } else if system_prompt.is_none() {
-                        system_prompt = Some(prompt);
-                    }
+            if !(system_credential_dialog_matches(&candidate.target, &candidate.class_name)
+                && system_credential_prompt_owned_by_target(
+                    target_app_name,
+                    candidate.window_handle,
+                ))
+            {
+                continue;
+            }
+            let Ok(window) = automation.element_from_handle(Handle::from(candidate.window_handle))
+            else {
+                continue;
+            };
+            if let Some(prompt) = prompt_from_window(&automation, candidate.target, window)? {
+                if window_handle_is_foreground(prompt.target.window_handle) {
+                    inspection.prompt = Some(prompt);
+                    return Ok(inspection);
+                } else if system_prompt.is_none() {
+                    system_prompt = Some(prompt);
                 }
             }
         }
     }
 
-    let system_prompt = system_prompt_frontmost
-        .filter(|prompt| {
-            trusted_target_seen && window_handle_is_foreground(prompt.target.window_handle)
-        })
-        .or_else(|| system_prompt.filter(|_| trusted_target_seen));
-    inspection.prompt = target_prompt_frontmost.or(system_prompt).or(target_prompt);
+    let system_prompt = system_prompt.filter(|_| trusted_target_seen);
+    inspection.prompt = system_prompt.or(target_prompt);
 
     Ok(inspection)
+}
+
+pub(crate) fn inspect_prompt_snapshot(
+    target_app_name: &str,
+    process_id: i32,
+    window_title: &str,
+    prompt_email: Option<&str>,
+) -> anyhow::Result<Option<WindowsPrompt>> {
+    ensure_fixed_target_app(target_app_name)?;
+    let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+    let allow_system_credential_dialogs = is_builtin_target_name(target_app_name);
+
+    for candidate in native_prompt_snapshot_candidates(process_id, window_title) {
+        let target_matches = target_app_matches_with_class(
+            target_app_name,
+            &candidate.target,
+            &candidate.class_name,
+        ) && target_window_should_be_scanned_for_prompt(
+            target_app_name,
+            &candidate.target,
+            &candidate.class_name,
+        );
+        let system_prompt_matches = allow_system_credential_dialogs
+            && system_credential_dialog_matches(&candidate.target, &candidate.class_name)
+            && system_credential_prompt_owned_by_target(target_app_name, candidate.window_handle);
+
+        if !target_matches && !system_prompt_matches {
+            continue;
+        }
+
+        let Ok(window) = automation.element_from_handle(Handle::from(candidate.window_handle))
+        else {
+            continue;
+        };
+        let Some(prompt) = prompt_from_window(&automation, candidate.target, window)? else {
+            continue;
+        };
+        if prompt_matches_snapshot(&prompt, process_id, window_title, prompt_email) {
+            return Ok(Some(prompt));
+        }
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn activate_window(window_handle: isize) -> anyhow::Result<()> {
     if window_handle == 0 {
         anyhow::bail!("target window handle is unavailable");
     }
-    let hwnd = HWND(std::ptr::with_exposed_provenance_mut(
-        window_handle as usize,
-    ));
+    let hwnd = hwnd_from_handle(window_handle);
     unsafe {
         let _ = ShowWindow(hwnd, SW_RESTORE);
         let _ = SetForegroundWindow(hwnd);
@@ -215,6 +262,12 @@ pub(crate) fn activate_window(window_handle: isize) -> anyhow::Result<()> {
         anyhow::bail!("target window could not be made foreground");
     }
     Ok(())
+}
+
+fn hwnd_from_handle(window_handle: isize) -> HWND {
+    HWND(std::ptr::with_exposed_provenance_mut(
+        window_handle as usize,
+    ))
 }
 
 pub(crate) fn fill_password(
@@ -226,23 +279,22 @@ pub(crate) fn fill_password(
 ) -> anyhow::Result<WindowsFillResult> {
     activate_window(prompt.target.window_handle)?;
     guard()?;
+    let prompt = revalidate_prompt(target_app_name, prompt)?;
+    guard()?;
 
     match strategy {
         WindowsFillStrategy::DirectSetValue => set_password_value(
-            prompt,
+            &prompt,
             password,
             WindowsFillStrategy::DirectSetValue.label(),
         ),
         WindowsFillStrategy::Keyboard => {
             if target_is_system_credential_prompt(&prompt.target) {
-                if let Ok(result) = set_password_value(prompt, password, "direct_uia_value_system")
+                if let Ok(result) = set_password_value(&prompt, password, "direct_uia_value_system")
                 {
                     return Ok(result);
                 }
             }
-
-            let prompt = revalidate_prompt(target_app_name, prompt)?;
-            guard()?;
 
             let focus = focus_password_field(&prompt)?;
             if !focus.verified {
@@ -485,10 +537,26 @@ fn revalidate_prompt(
     target_app_name: &str,
     expected: &WindowsPrompt,
 ) -> anyhow::Result<WindowsPrompt> {
+    if let Ok(Some(prompt)) = inspect_prompt_snapshot(
+        target_app_name,
+        expected.target.process_id,
+        &expected.target.window_title,
+        expected.email.as_deref(),
+    ) {
+        return ensure_same_revalidated_prompt(prompt, expected);
+    }
+
     let inspection = inspect(target_app_name)?;
     let Some(prompt) = inspection.prompt else {
         anyhow::bail!("credential prompt disappeared before automation");
     };
+    ensure_same_revalidated_prompt(prompt, expected)
+}
+
+fn ensure_same_revalidated_prompt(
+    prompt: WindowsPrompt,
+    expected: &WindowsPrompt,
+) -> anyhow::Result<WindowsPrompt> {
     if prompt.target.process_id != expected.target.process_id {
         anyhow::bail!("credential prompt process changed before automation");
     }
@@ -563,16 +631,6 @@ fn prompt_from_window(
     }))
 }
 
-fn target_from_window(
-    target_app_name: &str,
-    window: &UIElement,
-) -> Option<(WindowsTarget, String)> {
-    let (target, class_name) = target_details_from_window(window)?;
-
-    target_app_matches_with_class(target_app_name, &target, &class_name)
-        .then_some((target, class_name))
-}
-
 fn target_window_should_be_scanned_for_prompt(
     target_app_name: &str,
     target: &WindowsTarget,
@@ -583,16 +641,14 @@ fn target_window_should_be_scanned_for_prompt(
         || credential_dialog_class_like(class_name)
 }
 
-fn system_credential_target_from_window(window: &UIElement) -> Option<WindowsTarget> {
-    let (target, class_name) = target_details_from_window(window)?;
-
-    system_credential_dialog_matches(&target, &class_name).then_some(target)
-}
-
 fn fast_system_credential_prompt(
     automation: &UIAutomation,
+    target_app_name: &str,
 ) -> anyhow::Result<Option<WindowsPrompt>> {
     for (target, window_handle) in native_system_credential_windows() {
+        if !system_credential_prompt_owned_by_target(target_app_name, window_handle) {
+            continue;
+        }
         let Ok(window) = automation.element_from_handle(Handle::from(window_handle)) else {
             continue;
         };
@@ -604,37 +660,195 @@ fn fast_system_credential_prompt(
     Ok(None)
 }
 
-fn target_details_from_window(window: &UIElement) -> Option<(WindowsTarget, String)> {
-    if !is_usable_window(window) {
+struct NativePromptSnapshotCandidate {
+    target: WindowsTarget,
+    class_name: String,
+    window_handle: isize,
+}
+
+struct NativePromptSnapshotSearch {
+    process_id: i32,
+    window_title: String,
+    candidates: Vec<NativePromptSnapshotCandidate>,
+}
+
+fn native_prompt_snapshot_candidates(
+    process_id: i32,
+    window_title: &str,
+) -> Vec<NativePromptSnapshotCandidate> {
+    if process_id <= 0 {
+        return Vec::new();
+    }
+
+    let mut search = NativePromptSnapshotSearch {
+        process_id,
+        window_title: window_title.trim().to_string(),
+        candidates: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_native_prompt_snapshot_window),
+            LPARAM(&mut search as *mut _ as isize),
+        );
+    }
+    search
+        .candidates
+        .sort_by_key(|candidate| !window_handle_is_foreground(candidate.window_handle));
+    search.candidates
+}
+
+fn native_visible_windows() -> Vec<NativePromptSnapshotCandidate> {
+    let mut candidates = Vec::<NativePromptSnapshotCandidate>::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_native_visible_window),
+            LPARAM(&mut candidates as *mut _ as isize),
+        );
+    }
+    candidates.sort_by_key(|candidate| !window_handle_is_foreground(candidate.window_handle));
+    candidates
+}
+
+unsafe extern "system" fn enum_native_visible_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let candidates = unsafe { &mut *(lparam.0 as *mut Vec<NativePromptSnapshotCandidate>) };
+
+    if !native_window_is_visible_and_sized(hwnd) {
+        return true.into();
+    }
+
+    let Some((target, class_name)) = target_details_from_hwnd(hwnd) else {
+        return true.into();
+    };
+    candidates.push(NativePromptSnapshotCandidate {
+        target,
+        class_name,
+        window_handle: hwnd.0.addr() as isize,
+    });
+    true.into()
+}
+
+unsafe extern "system" fn enum_native_prompt_snapshot_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam.0 as *mut NativePromptSnapshotSearch) };
+
+    if !native_window_is_visible_and_sized(hwnd) {
+        return true.into();
+    }
+
+    let Some((target, class_name)) = target_details_from_hwnd(hwnd) else {
+        return true.into();
+    };
+    if target.process_id != search.process_id {
+        return true.into();
+    }
+    if !search.window_title.is_empty()
+        && !window_title_matches(&target.window_title, &search.window_title)
+    {
+        return true.into();
+    }
+
+    search.candidates.push(NativePromptSnapshotCandidate {
+        target,
+        class_name,
+        window_handle: hwnd.0.addr() as isize,
+    });
+    true.into()
+}
+
+fn native_window_is_visible_and_sized(hwnd: HWND) -> bool {
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return false;
+    }
+
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
+        && rect.right - rect.left > 20
+        && rect.bottom - rect.top > 20
+}
+
+fn prompt_matches_snapshot(
+    prompt: &WindowsPrompt,
+    process_id: i32,
+    window_title: &str,
+    prompt_email: Option<&str>,
+) -> bool {
+    prompt_metadata_matches_snapshot(
+        &prompt.target,
+        prompt.email.as_deref(),
+        process_id,
+        window_title,
+        prompt_email,
+    )
+}
+
+fn prompt_metadata_matches_snapshot(
+    target: &WindowsTarget,
+    current_email: Option<&str>,
+    process_id: i32,
+    window_title: &str,
+    prompt_email: Option<&str>,
+) -> bool {
+    target.process_id == process_id
+        && (window_title.trim().is_empty()
+            || window_title_matches(&target.window_title, window_title))
+        && match (current_email, prompt_email.map(str::trim)) {
+            (Some(current), Some(expected)) if !expected.is_empty() => {
+                current.eq_ignore_ascii_case(expected)
+            }
+            (_, None) => true,
+            (_, Some(expected)) => expected.is_empty(),
+        }
+}
+
+fn window_title_matches(current: &str, expected: &str) -> bool {
+    current.trim().eq_ignore_ascii_case(expected.trim())
+}
+
+fn target_details_from_hwnd(hwnd: HWND) -> Option<(WindowsTarget, String)> {
+    if hwnd.0.addr() == 0 {
         return None;
     }
 
-    let process_id = window.get_process_id().ok()? as i32;
-    let process_path = process_image_path(process_id as u32).unwrap_or_default();
+    let mut process_id = 0_u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    }
+    if process_id == 0 {
+        return None;
+    }
+
+    let process_path = process_image_path(process_id).unwrap_or_default();
     let process_name = process_name_from_path(&process_path)
         .trim()
         .is_empty()
-        .then(|| process_name_from_snapshot(process_id as u32))
+        .then(|| process_name_from_snapshot(process_id))
         .flatten()
         .unwrap_or_else(|| process_name_from_path(&process_path));
-    let window_title = window.get_name().unwrap_or_default();
-    let window_handle = window
-        .get_native_window_handle()
-        .ok()
-        .map(Into::<isize>::into)
-        .unwrap_or_default();
-    let class_name = window.get_classname().unwrap_or_default();
-
+    let window_handle = hwnd.0.addr() as isize;
     let target = WindowsTarget {
-        process_id,
+        process_id: process_id as i32,
         process_name,
         process_path,
-        window_title,
+        window_title: native_window_text(hwnd),
         window_handle,
-        frontmost: window_frontmost(window),
+        frontmost: window_handle_is_foreground(window_handle),
     };
 
-    Some((target, class_name))
+    Some((target, native_window_class(hwnd)))
+}
+
+fn system_credential_prompt_owned_by_target(target_app_name: &str, window_handle: isize) -> bool {
+    let hwnd = hwnd_from_handle(window_handle);
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER).ok() };
+    let root_owner = unsafe { Some(GetAncestor(hwnd, GA_ROOTOWNER)) };
+
+    owner
+        .into_iter()
+        .chain(root_owner)
+        .filter(|hwnd| hwnd.0.addr() != 0 && hwnd.0.addr() as isize != window_handle)
+        .filter_map(target_details_from_hwnd)
+        .any(|(target, class_name)| {
+            target_app_matches_with_class(target_app_name, &target, &class_name)
+        })
 }
 
 fn native_system_credential_windows() -> Vec<(WindowsTarget, isize)> {
@@ -726,29 +940,6 @@ fn is_usable_window(window: &UIElement) -> bool {
         .get_bounding_rectangle()
         .map(|rect| rect.get_width() > 20 && rect.get_height() > 20)
         .unwrap_or(true)
-}
-
-fn window_frontmost(window: &UIElement) -> bool {
-    let handle = window
-        .get_native_window_handle()
-        .ok()
-        .map(Into::<isize>::into)
-        .unwrap_or_default();
-    if handle == 0 {
-        return false;
-    }
-    if window_handle_is_foreground(handle) {
-        return true;
-    }
-
-    unsafe {
-        let foreground = GetForegroundWindow();
-        let mut foreground_pid = 0_u32;
-        GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
-        window
-            .get_process_id()
-            .is_ok_and(|pid| pid != 0 && pid == foreground_pid)
-    }
 }
 
 fn window_handle_is_foreground(window_handle: isize) -> bool {
@@ -1036,8 +1227,10 @@ fn process_name_from_path(path: &str) -> String {
 fn process_name_from_snapshot(process_id: u32) -> Option<String> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
 
         let mut found = Process32FirstW(snapshot, &mut entry).is_ok();
         while found {
@@ -1053,7 +1246,7 @@ fn process_name_from_snapshot(process_id: u32) -> Option<String> {
     }
 }
 
-fn running_target_process(target_app_name: &str) -> Option<WindowsTarget> {
+pub(crate) fn running_target_process(target_app_name: &str) -> Option<WindowsTarget> {
     let aliases = target_aliases(target_app_name);
     if aliases.is_empty() {
         return None;
@@ -1087,8 +1280,10 @@ fn running_target_process(target_app_name: &str) -> Option<WindowsTarget> {
 fn running_processes() -> Option<Vec<(u32, String)>> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
 
         let mut processes = Vec::new();
         let mut found = Process32FirstW(snapshot, &mut entry).is_ok();
@@ -1162,16 +1357,15 @@ fn target_aliases(target_app_name: &str) -> Vec<String> {
         aliases.push(configured.clone());
     }
 
-    match configured.as_str() {
-        "windowsapp" => aliases.extend([
+    if configured.as_str() == "windowsapp" {
+        aliases.extend([
             "windowsapp".to_string(),
             "windows365".to_string(),
             "msrdc".to_string(),
             "msrdcw".to_string(),
             "rdclientwinstore".to_string(),
             "mstsc".to_string(),
-        ]),
-        _ => {}
+        ])
     }
 
     aliases.sort();
@@ -1359,12 +1553,14 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
 
 fn extract_email_like(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
-    let mut at_positions = chars
+    let at_positions = chars
         .iter()
         .enumerate()
-        .filter_map(|(idx, c)| (*c == '@').then_some(idx));
+        .filter_map(|(idx, c)| (*c == '@').then_some(idx))
+        .collect::<Vec<_>>();
 
-    at_positions.find_map(|at| {
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for at in at_positions {
         let mut start = at;
         while start > 0 && is_email_char(chars[start - 1]) {
             start -= 1;
@@ -1390,11 +1586,17 @@ fn extract_email_like(text: &str) -> Option<String> {
             && !domain.starts_with('.')
             && !domain.ends_with('.')
         {
-            Some(candidate)
-        } else {
-            None
+            let normalized = candidate.trim().to_lowercase();
+            if !matches.iter().any(|(existing, _)| existing == &normalized) {
+                matches.push((normalized, candidate));
+            }
         }
-    })
+    }
+
+    let [(_, email)] = matches.as_slice() else {
+        return None;
+    };
+    Some(email.clone())
 }
 
 fn is_email_char(c: char) -> bool {
@@ -1472,7 +1674,7 @@ mod tests {
         contains_keyword, credential_dialog_title_like, ensure_fixed_target_app,
         extract_email_like, is_preferred_submit_label, is_probable_session_window_title,
         login_title_like, normalized_identifier, system_credential_dialog_matches, target_aliases,
-        text_contains_password_cue, WindowsTarget,
+        text_contains_password_cue, window_title_matches, WindowsTarget,
     };
 
     #[test]
@@ -1517,6 +1719,14 @@ mod tests {
         );
         assert_eq!(
             extract_email_like("id=8d4d52b8-72a4-4688-87fe-1f3fd2e2911b\nuser@example.com"),
+            Some("user@example.com".to_string())
+        );
+        assert_eq!(
+            extract_email_like("user@example.com recovery other@example.com"),
+            None
+        );
+        assert_eq!(
+            extract_email_like("user@example.com signed in as USER@example.com"),
             Some("user@example.com".to_string())
         );
     }
@@ -1565,6 +1775,57 @@ mod tests {
             super::classify_post_submit_state(None, true, false, "user@example.com"),
             None
         );
+    }
+
+    #[test]
+    fn window_title_snapshot_match_ignores_case_and_surrounding_space() {
+        assert!(window_title_matches(
+            " Windows Security - Sign in ",
+            "windows security - sign in"
+        ));
+        assert!(!window_title_matches("Windows Security", "Windows App"));
+    }
+
+    #[test]
+    fn prompt_snapshot_match_requires_same_pid_title_and_email() {
+        let target = WindowsTarget {
+            process_id: 42,
+            process_name: "CredentialUIBroker".to_string(),
+            process_path: r"C:\Windows\System32\CredentialUIBroker.exe".to_string(),
+            window_title: "Windows Security".to_string(),
+            window_handle: 7,
+            frontmost: true,
+        };
+        let email = Some("USER@example.com");
+
+        assert!(super::prompt_metadata_matches_snapshot(
+            &target,
+            email,
+            42,
+            "windows security",
+            Some("user@example.com")
+        ));
+        assert!(!super::prompt_metadata_matches_snapshot(
+            &target,
+            email,
+            43,
+            "windows security",
+            Some("user@example.com")
+        ));
+        assert!(!super::prompt_metadata_matches_snapshot(
+            &target,
+            email,
+            42,
+            "other title",
+            Some("user@example.com")
+        ));
+        assert!(!super::prompt_metadata_matches_snapshot(
+            &target,
+            email,
+            42,
+            "windows security",
+            Some("other@example.com")
+        ));
     }
 
     fn trusted_windows_security_target() -> WindowsTarget {

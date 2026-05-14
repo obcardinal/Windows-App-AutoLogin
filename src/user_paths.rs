@@ -38,6 +38,7 @@ pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) fn home_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {

@@ -96,7 +96,7 @@ fn enable() -> anyhow::Result<()> {
                 "Open at Login was written, but Windows Startup Apps still marks this app disabled."
             );
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -132,7 +132,7 @@ fn disable() -> anyhow::Result<()> {
             }
         }
         windows_disable_current_user()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -170,9 +170,9 @@ pub(crate) fn is_enabled() -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        return current_autostart_path_is_stable()
+        current_autostart_path_is_stable()
             && windows_registered_command_matches_path(&app_path)
-            && windows_startup_approved_enabled();
+            && windows_startup_approved_enabled()
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -199,7 +199,7 @@ pub(crate) fn cleanup_stale() -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
         windows_cleanup_stale()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -701,7 +701,7 @@ fn current_autostart_platform() -> AutostartPlatform {
     }
     #[cfg(target_os = "windows")]
     {
-        return AutostartPlatform::Windows;
+        AutostartPlatform::Windows
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

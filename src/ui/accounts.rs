@@ -146,8 +146,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         match delete_account_transaction(
             &app.config,
             idx,
-            |account, use_keyring| begin_account_delete_journal(account, use_keyring),
-            |account_id| delete_account(account_id),
+            begin_account_delete_journal,
+            delete_account,
             save_config,
             clear_pending_storage_operation,
         ) {

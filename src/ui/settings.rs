@@ -87,6 +87,7 @@ struct SettingsSaveTransactionResult {
     storage_mode_changed: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_settings_transaction<A, J, M, S, R, C, X>(
     current_config: &AppConfig,
     settings_draft: AppSettings,

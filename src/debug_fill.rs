@@ -28,6 +28,8 @@ pub(crate) struct VerifiedPromptContext {
     pub(crate) prompt_email: String,
     pub(crate) prompt_origin: String,
     pub(crate) detected_at: Instant,
+    #[cfg(target_os = "windows")]
+    pub(crate) monitor_check_ms: u128,
 }
 
 impl VerifiedPromptContext {
@@ -40,6 +42,16 @@ impl VerifiedPromptContext {
     fn is_fresh(&self) -> bool {
         self.age() <= VERIFIED_PROMPT_CONTEXT_MAX_AGE
     }
+
+    #[cfg(target_os = "windows")]
+    fn windows_age(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.detected_at)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn is_fresh_for_windows(&self) -> bool {
+        self.windows_age() <= VERIFIED_PROMPT_CONTEXT_MAX_AGE
+    }
 }
 
 const VERIFIED_PROMPT_CONTEXT_MAX_AGE: Duration = Duration::from_secs(2);
@@ -48,6 +60,7 @@ const VERIFIED_PROMPT_CONTEXT_MAX_AGE: Duration = Duration::from_secs(2);
 pub(crate) enum FillMethod {
     Keyboard,
     #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
     DirectAxSetValue,
 }
 
@@ -221,6 +234,8 @@ impl DebugLog {
                 "prompt_context_revalidation_result",
                 "not_needed".to_string(),
             ),
+            ("windows_monitor_check_ms", "0".to_string()),
+            ("windows_prompt_inspect_ms", "0".to_string()),
             ("prompt_detected", "false".to_string()),
             ("detected_email_redacted", String::new()),
             ("account_match_count", "0".to_string()),
@@ -412,8 +427,13 @@ pub(crate) fn fill_current_prompt_once_guarded_with_context(
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = verified_prompt;
-        fill_current_prompt_once_windows(settings, accounts, method, &guard)
+        fill_current_prompt_once_windows(
+            settings,
+            accounts,
+            method,
+            verified_prompt.as_ref(),
+            &guard,
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -953,6 +973,7 @@ fn fill_current_prompt_once_windows(
     settings: &AppSettings,
     accounts: &[Account],
     method: FillMethod,
+    verified_prompt: Option<&VerifiedPromptContext>,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> FillAttemptReport {
     let mut log = DebugLog::new(make_attempt_id());
@@ -965,9 +986,23 @@ fn fill_current_prompt_once_windows(
     }
 
     let app_name = crate::config::TARGET_APP_NAME;
-    let mut inspection = match crate::windows_ui::inspect(app_name) {
-        Ok(inspection) => inspection,
-        Err(e) => return log.fail(format!("windows_uia_inspection_failed_{e}")),
+    let inspect_start = Instant::now();
+    let mut inspection = match inspect_windows_prompt_for_fill(app_name, verified_prompt, &mut log)
+    {
+        Ok(inspection) => {
+            log.set(
+                "windows_prompt_inspect_ms",
+                inspect_start.elapsed().as_millis().to_string(),
+            );
+            inspection
+        }
+        Err(e) => {
+            log.set(
+                "windows_prompt_inspect_ms",
+                inspect_start.elapsed().as_millis().to_string(),
+            );
+            return log.fail(format!("windows_uia_inspection_failed_{e}"));
+        }
     };
 
     let target = inspection.target.clone().or_else(|| {
@@ -988,7 +1023,7 @@ fn fill_current_prompt_once_windows(
         if let Err(e) = crate::windows_ui::activate_window(prompt.target.window_handle) {
             return log.fail(format!("credential_prompt_activation_failed_{e}"));
         }
-        inspection = match crate::windows_ui::inspect(&app_name) {
+        inspection = match crate::windows_ui::inspect(app_name) {
             Ok(inspection) => inspection,
             Err(e) => return log.fail(format!("windows_uia_reinspection_failed_{e}")),
         };
@@ -1125,7 +1160,7 @@ fn fill_current_prompt_once_windows(
 
     let fill_start = Instant::now();
     let fill_result = match crate::windows_ui::fill_password(
-        &app_name,
+        app_name,
         &prompt,
         password.as_str(),
         method.as_windows_strategy(),
@@ -1153,7 +1188,7 @@ fn fill_current_prompt_once_windows(
     );
 
     let submit_start = Instant::now();
-    let submit_result = match crate::windows_ui::submit_prompt(&app_name, &prompt, guard) {
+    let submit_result = match crate::windows_ui::submit_prompt(app_name, &prompt, guard) {
         Ok(result) => result,
         Err(e) => {
             log.set(
@@ -1161,7 +1196,7 @@ fn fill_current_prompt_once_windows(
                 submit_start.elapsed().as_millis().to_string(),
             );
             let post_state = crate::windows_ui::post_check_state(
-                &app_name,
+                app_name,
                 target.process_id,
                 expected_email,
                 Duration::from_millis(1200),
@@ -1193,7 +1228,7 @@ fn fill_current_prompt_once_windows(
     log.set("enter_fallback_result", submit_result.enter_fallback_result);
 
     let post_state = crate::windows_ui::post_check_state(
-        &app_name,
+        app_name,
         target.process_id,
         expected_email,
         Duration::from_millis(1200),
@@ -1206,6 +1241,72 @@ fn fill_current_prompt_once_windows(
         "still_prompt" => log.fail("credential_prompt_still_visible_after_submit"),
         "failed" => log.fail("windows_app_not_running_after_submit"),
         _ => log.fail("post_submit_state_unknown"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn inspect_windows_prompt_for_fill(
+    app_name: &str,
+    verified_prompt: Option<&VerifiedPromptContext>,
+    log: &mut DebugLog,
+) -> anyhow::Result<crate::windows_ui::WindowsInspection> {
+    let Some(context) = verified_prompt else {
+        return crate::windows_ui::inspect(app_name);
+    };
+
+    log.set("prompt_context_present", "true");
+    log.set(
+        "prompt_context_age_ms",
+        context.windows_age().as_millis().to_string(),
+    );
+    log.set(
+        "windows_monitor_check_ms",
+        context.monitor_check_ms.to_string(),
+    );
+
+    if !context.is_fresh_for_windows() {
+        log.set("prompt_context_source", "monitor_snapshot_stale_live_scan");
+        log.set("prompt_context_revalidation_result", "stale_live_scan");
+        return crate::windows_ui::inspect(app_name);
+    }
+
+    log.set("prompt_context_source", "monitor_snapshot_windows_fast");
+    match crate::windows_ui::inspect_prompt_snapshot(
+        app_name,
+        context.process_id,
+        &context.window_title,
+        Some(&context.prompt_email),
+    ) {
+        Ok(Some(prompt)) => {
+            log.set("prompt_context_revalidation_result", "ok");
+            let target = crate::windows_ui::running_target_process(app_name)
+                .or_else(|| Some(prompt.target.clone()));
+            Ok(crate::windows_ui::WindowsInspection {
+                target,
+                prompt: Some(prompt),
+                has_session: false,
+            })
+        }
+        Ok(None) => {
+            log.set(
+                "prompt_context_source",
+                "monitor_snapshot_windows_fast_live_scan",
+            );
+            log.set("prompt_context_revalidation_result", "not_found_live_scan");
+            crate::windows_ui::inspect(app_name)
+        }
+        Err(e) => {
+            log.set(
+                "prompt_context_source",
+                "monitor_snapshot_windows_fast_live_scan",
+            );
+            log.set(
+                "prompt_context_revalidation_result",
+                "inspection_failed_live_scan",
+            );
+            tracing::debug!(error = %e, "Windows prompt snapshot revalidation failed");
+            crate::windows_ui::inspect(app_name)
+        }
     }
 }
 
@@ -1311,7 +1412,7 @@ fn runtime_status_report_macos(_settings: &AppSettings, accounts: &[Account]) ->
 
 #[cfg(all(target_os = "windows", feature = "diagnostics-ui"))]
 fn runtime_status_report_windows(
-    settings: &AppSettings,
+    _settings: &AppSettings,
     accounts: &[Account],
 ) -> FillAttemptReport {
     let mut log = DebugLog::new(format!("status-{}", make_attempt_id()));
@@ -1953,7 +2054,12 @@ fn sanitize_failure_reason(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::redacted_email;
-    #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
+    #[cfg(all(
+        feature = "debug-fill",
+        debug_assertions,
+        not(waal_release_profile),
+        not(target_os = "windows")
+    ))]
     use super::FillMethod;
 
     #[test]

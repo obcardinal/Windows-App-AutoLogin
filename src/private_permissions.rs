@@ -131,21 +131,25 @@ unsafe extern "C" {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn strip_macos_acl(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn path_has_macos_acl(_path: &Path) -> anyhow::Result<bool> {
     Ok(false)
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn strip_macos_acl_fd(_file: &std::fs::File) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn file_has_macos_acl_fd(_file: &std::fs::File) -> anyhow::Result<bool> {
     Ok(false)
 }

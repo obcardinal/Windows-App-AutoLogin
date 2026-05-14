@@ -48,6 +48,7 @@ impl WorkerInvalidator {
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
 const AUTOMATION_SLEEP: Duration = Duration::from_millis(250);
 const PROMPT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_FALLBACK_PROMPT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const UNKNOWN_POLL_BACKOFF_MAX: Duration = Duration::from_secs(3);
@@ -155,6 +156,7 @@ impl LoginPromptKey {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn from_verified_context(context: &debug_fill::VerifiedPromptContext) -> Self {
         Self::new(
             context.account_id.clone(),
@@ -640,7 +642,11 @@ pub(crate) fn spawn(
 
             let monitor = AppMonitor::new(runtime_config(&settings));
             let tick_start = Instant::now();
+            #[cfg(target_os = "windows")]
+            let status_check_start = Instant::now();
             let status = monitor.check_status();
+            #[cfg(target_os = "windows")]
+            let monitor_check_ms = status_check_start.elapsed().as_millis();
             let status_poll_delay = poll_cadence.next_delay(&settings, &status);
             let next_poll_delay = status_poll_delay.min(PROMPT_STATUS_POLL_INTERVAL);
             trace!(
@@ -742,6 +748,8 @@ pub(crate) fn spawn(
                                     prompt_email,
                                     prompt_origin,
                                     detected_at: Instant::now(),
+                                    #[cfg(target_os = "windows")]
+                                    monitor_check_ms,
                                 };
                                 let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
                                     trigger: FillTrigger::Automatic,
@@ -1625,6 +1633,8 @@ mod tests {
             prompt_email: prompt_email.to_string(),
             prompt_origin: "window".to_string(),
             detected_at,
+            #[cfg(target_os = "windows")]
+            monitor_check_ms: 0,
         }
     }
 

@@ -21,11 +21,16 @@ const MAX_DIAGNOSTIC_RAW_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_DIAGNOSTIC_OUTPUT_BYTES: usize = 64 * 1024;
 const DIAGNOSTIC_OUTPUT_TRUNCATED_TEXT: &str = "diagnostic output truncated";
 const DIAGNOSTIC_OUTPUT_TRUNCATED_MARKER: &str = "\n\n[diagnostic output truncated]\n";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DIAGNOSTIC_COLLECTION_TRUNCATED_TEXT: &str = "diagnostic collection truncated";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DIAGNOSTIC_PARSE_TRUNCATED_TEXT: &str = "diagnostic parser truncated input";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DIAGNOSTIC_RAW_OUTPUT_TRUNCATED_TEXT: &str = "diagnostic raw output truncated";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DIAGNOSTIC_SECURE_TRAVERSAL_TRUNCATED_TEXT: &str =
     "diagnostic secure-field traversal truncated";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DIAGNOSTIC_STDERR_TRUNCATED_TEXT: &str = "diagnostic subprocess stderr truncated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1334,6 +1339,7 @@ fn finish_current_process(
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn add_truncation_reason(reasons: &mut Vec<String>, reason: &str) {
     if !reasons.iter().any(|existing| existing == reason) {
         reasons.push(reason.to_string());

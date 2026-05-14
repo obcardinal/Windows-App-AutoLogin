@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "macos")]
 use std::{
     io::{Read, Write},
@@ -9,11 +11,14 @@ use std::{
     sync::OnceLock,
 };
 #[cfg(target_os = "windows")]
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 #[cfg(not(target_os = "windows"))]
 const LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.lock";
@@ -28,6 +33,8 @@ const MONITOR_STATUS_FILE_NAME: &str = "monitor-status";
 const LOCK_OWNER_FILE_NAME: &str = "owner";
 const MONITOR_COMMAND_START: &str = "start_monitor";
 const MONITOR_COMMAND_STOP: &str = "stop_monitor";
+#[cfg(not(target_os = "macos"))]
+const MONITOR_COMMAND_RELOAD_CONFIG: &str = "reload_config";
 const ALREADY_RUNNING_MESSAGE: &str = "Windows App AutoLogin is already running";
 #[cfg(target_os = "macos")]
 const FULL_UI_ALREADY_RUNNING_MESSAGE: &str = "Windows App AutoLogin window is already open";
@@ -114,6 +121,8 @@ pub(crate) struct FullUiInstanceGuard;
 pub(crate) enum MonitorControlCommand {
     Start,
     Stop,
+    #[cfg(not(target_os = "macos"))]
+    ReloadConfig,
 }
 
 impl MonitorControlCommand {
@@ -121,6 +130,8 @@ impl MonitorControlCommand {
         match self {
             Self::Start => MONITOR_COMMAND_START,
             Self::Stop => MONITOR_COMMAND_STOP,
+            #[cfg(not(target_os = "macos"))]
+            Self::ReloadConfig => MONITOR_COMMAND_RELOAD_CONFIG,
         }
     }
 
@@ -146,6 +157,8 @@ impl MonitorControlCommand {
         match command {
             MONITOR_COMMAND_START => Some(Self::Start),
             MONITOR_COMMAND_STOP => Some(Self::Stop),
+            #[cfg(not(target_os = "macos"))]
+            MONITOR_COMMAND_RELOAD_CONFIG => Some(Self::ReloadConfig),
             _ => None,
         }
     }
@@ -175,7 +188,7 @@ impl SingleInstanceGuard {
     pub(crate) fn acquire() -> anyhow::Result<Self> {
         #[cfg(target_os = "windows")]
         {
-            return acquire_windows_single_instance(WINDOWS_SINGLE_INSTANCE_MUTEX);
+            acquire_windows_single_instance(WINDOWS_SINGLE_INSTANCE_MUTEX)
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -341,7 +354,7 @@ fn secure_lock_root_parent_if_app_runtime(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn secure_lock_root_parent_if_app_runtime(_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -414,7 +427,7 @@ pub(crate) fn request_config_reload() -> anyhow::Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(())
+        request_monitor_command(MonitorControlCommand::ReloadConfig)
     }
 }
 
@@ -513,10 +526,10 @@ impl ActivationWatcher {
         let content = read_private_text_limited(path, MAX_ACTIVATION_REQUEST_BYTES)
             .ok()
             .flatten();
-        let valid_request = content.as_deref().is_some_and(activation_request_is_valid);
         if self.last_modified.is_none_or(|last| modified > last)
             || (content.is_some() && content != self.last_content)
         {
+            let valid_request = content.as_deref().is_some_and(activation_request_is_valid);
             self.last_modified = Some(modified);
             self.last_content = content;
             return valid_request;
@@ -1106,29 +1119,35 @@ fn macos_proc_pidpath_buffer_to_path(buffer: &[u8]) -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn process_looks_like_this_app(pid: u32) -> bool {
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("(Get-Process -Id {pid} -ErrorAction Stop).Path"),
-        ])
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-
-    let process_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let Some(current_path) = std::env::current_exe().ok() else {
         return false;
     };
-    let process_path = PathBuf::from(process_path);
+    let Some(process_path) = windows_process_path(pid) else {
+        return false;
+    };
     match (process_path.canonicalize(), current_path.canonicalize()) {
         (Ok(process_path), Ok(current_path)) => process_path == current_path,
         _ => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_path(pid: u32) -> Option<PathBuf> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = vec![0_u16; 32768];
+        let mut len = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        result.ok()?;
+        Some(PathBuf::from(String::from_utf16_lossy(
+            &buffer[..len as usize],
+        )))
     }
 }
 
@@ -2387,7 +2406,13 @@ mod tests {
         write_test_private_text(&path, format!("stop_monitor:{}:2", std::process::id())).unwrap();
         assert_eq!(watcher.consume_command(), Some(MonitorControlCommand::Stop));
 
-        write_test_private_text(&path, "start_monitor:99999999:3").unwrap();
+        write_test_private_text(&path, format!("reload_config:{}:3", std::process::id())).unwrap();
+        assert_eq!(
+            watcher.consume_command(),
+            Some(MonitorControlCommand::ReloadConfig)
+        );
+
+        write_test_private_text(&path, "start_monitor:99999999:4").unwrap();
         assert_eq!(watcher.consume_command(), None);
 
         let _ = std::fs::remove_file(path);

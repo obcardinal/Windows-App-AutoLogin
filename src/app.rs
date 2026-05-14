@@ -190,6 +190,8 @@ impl AutoLoginApp {
         match command {
             MonitorControlCommand::Start => self.send_worker_command(WorkerCommand::Start),
             MonitorControlCommand::Stop => self.send_worker_command(WorkerCommand::Stop),
+            #[cfg(not(target_os = "macos"))]
+            MonitorControlCommand::ReloadConfig => self.sync_saved_config_to_worker(true),
         }
     }
 
