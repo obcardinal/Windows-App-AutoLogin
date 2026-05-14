@@ -124,9 +124,21 @@ rm -f "$MONITOR_STATUS_FILE"
 
 cd "$ROOT_DIR"
 if [ "$DEV_UI" = true ]; then
-  env -u WAAL_RELEASE_BUNDLE_ID -u WAAL_MACOS_TEAM_ID WAAL_DEVELOPMENT_RELEASE=1 cargo build --release --features dev-tools --bin "$BINARY_NAME"
+  env \
+    -u WAAL_RELEASE_BUNDLE_ID \
+    -u WAAL_MACOS_TEAM_ID \
+    WAAL_DEVELOPMENT_RELEASE=1 \
+    WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH=1 \
+    WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH="$BUNDLE_DIR" \
+    cargo build --release --features dev-tools --bin "$BINARY_NAME"
 else
-  env -u WAAL_RELEASE_BUNDLE_ID -u WAAL_MACOS_TEAM_ID WAAL_DEVELOPMENT_RELEASE=1 cargo build --release --bin "$BINARY_NAME"
+  env \
+    -u WAAL_RELEASE_BUNDLE_ID \
+    -u WAAL_MACOS_TEAM_ID \
+    WAAL_DEVELOPMENT_RELEASE=1 \
+    WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH=1 \
+    WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH="$BUNDLE_DIR" \
+    cargo build --release --bin "$BINARY_NAME"
 fi
 
 waal_assemble_app_bundle \

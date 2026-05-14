@@ -126,18 +126,35 @@ cleanup() {
 build_release_executable() {
   BUILD_TARGET_DIR="$STAGE_DIR/target"
   TARGET_EXECUTABLE="$BUILD_TARGET_DIR/release/$BINARY_NAME"
+  local release_rustflags="${RUSTFLAGS:-}"
+  release_rustflags="${release_rustflags:+$release_rustflags }--remap-path-prefix=$ROOT_DIR=."
+  if [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/" ]; then
+    release_rustflags="$release_rustflags --remap-path-prefix=$HOME=~"
+  fi
 
   (
     cd "$ROOT_DIR"
     if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-      CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build \
+      env \
+        -u CARGO_ENCODED_RUSTFLAGS \
+        -u WAAL_DEVELOPMENT_RELEASE \
+        -u WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH \
+        -u WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH \
+        RUSTFLAGS="$release_rustflags" \
+        CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build \
         --locked \
         --release \
         --no-default-features \
         --features release-diagnostics \
         --bin "$BINARY_NAME"
     else
-      CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build --locked --release --bin "$BINARY_NAME"
+      env \
+        -u CARGO_ENCODED_RUSTFLAGS \
+        -u WAAL_DEVELOPMENT_RELEASE \
+        -u WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH \
+        -u WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH \
+        RUSTFLAGS="$release_rustflags" \
+        CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build --locked --release --bin "$BINARY_NAME"
     fi
   )
 
@@ -343,6 +360,40 @@ verify_release_build_metadata() {
   fi
 }
 
+verify_no_developer_path_strings() {
+  local bundle_dir="$1"
+  local bundle_executable
+  bundle_executable="$(/usr/bin/plutil -extract CFBundleExecutable raw "$bundle_dir/Contents/Info.plist")"
+  local executable="$bundle_dir/Contents/MacOS/$bundle_executable"
+  local strings_file="$STAGE_DIR/release-executable-strings.txt"
+  local findings_file="$STAGE_DIR/release-developer-path-strings.txt"
+  local unique_findings="$STAGE_DIR/release-developer-path-strings.unique.txt"
+  local pattern
+
+  /usr/bin/strings -a "$executable" >"$strings_file"
+  : >"$findings_file"
+
+  for pattern in \
+    "$ROOT_DIR" \
+    "${HOME:-}" \
+    "/Users/" \
+    "/private/var/folders/" \
+    "/var/folders/" \
+    "CARGO_MANIFEST_DIR" \
+    "WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH"; do
+    if [ -n "$pattern" ]; then
+      /usr/bin/grep -F "$pattern" "$strings_file" >>"$findings_file" || true
+    fi
+  done
+
+  LC_ALL=C /usr/bin/sort -u "$findings_file" >"$unique_findings"
+  if [ -s "$unique_findings" ]; then
+    echo "Release executable contains developer-local path strings:" >&2
+    /usr/bin/head -n 20 "$unique_findings" >&2
+    exit 1
+  fi
+}
+
 require_metadata_field() {
   local metadata="$1"
   local key="$2"
@@ -419,6 +470,7 @@ verify_release_bundle() {
   fi
 
   verify_release_build_metadata "$bundle_dir"
+  verify_no_developer_path_strings "$bundle_dir"
   verify_no_nested_code "$bundle_dir"
   verify_release_entitlements "$bundle_dir"
 

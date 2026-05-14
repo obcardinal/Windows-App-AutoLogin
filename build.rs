@@ -21,6 +21,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WAAL_DIAGNOSTICS_BUNDLE_ID");
     println!("cargo:rerun-if-env-changed=WAAL_MACOS_TEAM_ID");
     println!("cargo:rerun-if-env-changed=WAAL_DEVELOPMENT_RELEASE");
+    println!("cargo:rerun-if-env-changed=WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH");
+    println!("cargo:rerun-if-env-changed=WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH");
     println!("cargo:rustc-check-cfg=cfg(waal_release_profile)");
     if env::var("PROFILE").as_deref() == Ok("release") {
         println!("cargo:rustc-cfg=waal_release_profile");
@@ -33,11 +35,7 @@ fn main() {
     let app_name = app_name();
     let trusted_bundle_path = format!("/Applications/{app_name}.app");
     let development_bundle_path =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"))
-            .join("dist")
-            .join(format!("{app_name}.app"))
-            .to_string_lossy()
-            .to_string();
+        development_bundle_path(&macos_identity, &macos_team_id, app_name);
     println!("cargo:rustc-env=WAAL_APP_NAME={app_name}");
     println!("cargo:rustc-env=WAAL_TRUSTED_MACOS_BUNDLE_PATH={trusted_bundle_path}");
     println!("cargo:rustc-env=WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH={development_bundle_path}");
@@ -266,10 +264,41 @@ fn is_macos_release_profile() -> bool {
 }
 
 fn development_release_allowed() -> bool {
+    truthy_env("WAAL_DEVELOPMENT_RELEASE")
+}
+
+fn development_bundle_path_embedding_allowed() -> bool {
+    truthy_env("WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH")
+}
+
+fn truthy_env(name: &str) -> bool {
     matches!(
-        trimmed_env("WAAL_DEVELOPMENT_RELEASE").as_deref(),
+        trimmed_env(name).as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES")
     )
+}
+
+fn development_bundle_path(
+    macos_identity: &MacosIdentity,
+    macos_team_id: &str,
+    app_name: &str,
+) -> String {
+    if macos_identity.bundle_id != DEVELOPMENT_MACOS_BUNDLE_ID
+        || !macos_team_id.is_empty()
+        || !development_bundle_path_embedding_allowed()
+    {
+        return String::new();
+    }
+
+    if let Some(configured_path) = trimmed_env("WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH") {
+        return configured_path;
+    }
+
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"))
+        .join("dist")
+        .join(format!("{app_name}.app"))
+        .to_string_lossy()
+        .to_string()
 }
 
 fn app_name() -> &'static str {

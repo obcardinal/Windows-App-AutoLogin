@@ -221,7 +221,7 @@ fn validate_private_file_for_read(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_private_text_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+fn read_private_file_bytes(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
 
     if let Some(parent) = path.parent() {
@@ -268,7 +268,13 @@ fn read_private_text_file(path: &Path, max_bytes: u64) -> anyhow::Result<String>
         anyhow::bail!("{} is too large", redacted_path(path));
     }
 
-    Ok(String::from_utf8(bytes)?)
+    Ok(bytes)
+}
+
+fn read_private_text_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+    Ok(String::from_utf8(read_private_file_bytes(
+        path, max_bytes,
+    )?)?)
 }
 
 #[cfg(unix)]
@@ -293,8 +299,8 @@ pub(crate) fn load_config() -> AppConfig {
         Ok(config) => normalize_config(config),
         Err(e) => {
             warn!(path = %redacted_path(&path), error = %e, "Failed to load config; using defaults");
-            if let Err(backup_error) = backup_invalid_file(&path) {
-                warn!(path = %redacted_path(&path), error = %backup_error, "Failed to back up invalid config before using defaults");
+            if let Err(backup_error) = backup_invalid_config_file(&path, &e) {
+                warn!(path = %redacted_path(&path), error = %backup_error, "Failed to write invalid config diagnostics before using defaults");
             }
             normalize_config(AppConfig::default())
         }
@@ -569,7 +575,23 @@ fn normalize_account_selection_metadata(accounts: &mut [Account]) {
     }
 }
 
-fn backup_invalid_file(path: &Path) -> anyhow::Result<()> {
+#[derive(Debug, serde::Serialize)]
+struct InvalidConfigDiagnosticBackup {
+    redaction_version: u8,
+    kind: &'static str,
+    original_file_name: String,
+    original_size_bytes: usize,
+    original_sha256: String,
+    load_error_kind: &'static str,
+    json_parse_status: &'static str,
+    json_top_level_type: &'static str,
+    has_accounts: bool,
+    account_count: Option<usize>,
+    has_settings: bool,
+    raw_content: &'static str,
+}
+
+fn backup_invalid_config_file(path: &Path, load_error: &anyhow::Error) -> anyhow::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -583,12 +605,94 @@ fn backup_invalid_file(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     validate_private_file_for_read(path)?;
+    let content = read_private_file_bytes(path, MAX_CONFIG_FILE_BYTES)?;
+    let backup_content = invalid_config_diagnostic_backup_bytes(path, &content, load_error)?;
 
-    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-    let backup_path = path.with_extension(format!("json.invalid.{timestamp}"));
-    std::fs::rename(path, &backup_path)?;
-    secure_path_permissions(&backup_path, 0o600)?;
+    let backup_path = invalid_config_diagnostic_backup_path(path);
+    write_private_file_create_new_atomic(&backup_path, "json.tmp", &backup_content)?;
+    delete_sensitive_private_file_if_present(path)?;
     Ok(())
+}
+
+fn invalid_config_diagnostic_backup_path(path: &Path) -> PathBuf {
+    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+    let nonce = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .unsigned_abs();
+    path.with_extension(format!(
+        "json.invalid.{timestamp}.{}.{}",
+        std::process::id(),
+        nonce
+    ))
+}
+
+fn invalid_config_diagnostic_backup_bytes(
+    path: &Path,
+    content: &[u8],
+    load_error: &anyhow::Error,
+) -> anyhow::Result<Vec<u8>> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(content);
+    let (json_parse_status, json_top_level_type, has_accounts, account_count, has_settings) =
+        match parsed.as_ref() {
+            Ok(value) => (
+                "parsed",
+                json_value_kind(value),
+                value.get("accounts").is_some(),
+                value
+                    .get("accounts")
+                    .and_then(|accounts| accounts.as_array())
+                    .map(Vec::len),
+                value.get("settings").is_some(),
+            ),
+            Err(_) => ("invalid_json", "unknown", false, None, false),
+        };
+
+    let backup = InvalidConfigDiagnosticBackup {
+        redaction_version: 1,
+        kind: "invalid_config_diagnostic",
+        original_file_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CONFIG_FILE_NAME)
+            .to_string(),
+        original_size_bytes: content.len(),
+        original_sha256: sha256_hex(content),
+        load_error_kind: invalid_config_load_error_kind(load_error),
+        json_parse_status,
+        json_top_level_type,
+        has_accounts,
+        account_count,
+        has_settings,
+        raw_content: "[omitted]",
+    };
+    Ok(serde_json::to_vec_pretty(&backup)?)
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn invalid_config_load_error_kind(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("UTF-8") || message.contains("utf-8") {
+        "invalid_utf8"
+    } else if message.contains("line")
+        || message.contains("column")
+        || message.contains("EOF")
+        || message.contains("trailing")
+    {
+        "json_parse_failed"
+    } else {
+        "schema_invalid"
+    }
 }
 
 fn delete_sensitive_private_file_if_present(path: &Path) -> anyhow::Result<()> {
@@ -2650,10 +2754,8 @@ pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use super::backup_invalid_file;
     use super::{
-        cleanup_fallback_key_if_password_file_empty,
+        backup_invalid_config_file, cleanup_fallback_key_if_password_file_empty,
         cleanup_legacy_fallback_key_residue_files_in_dir,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
         clear_pending_storage_operation_paths, decode_bound_password, decrypt_password_with_key,
@@ -3550,6 +3652,90 @@ mod tests {
     }
 
     #[test]
+    fn invalid_config_backup_does_not_retain_account_metadata() {
+        let root = temp_storage_test_dir("invalid-config-backup-redacted");
+        let config_path = root.join("config.json");
+        let original = r#"{
+  "accounts": [
+    {
+      "id": "account-secret-id",
+      "username": "user@example.com",
+      "has_saved_password": "invalid-bool",
+      "enabled": true
+    }
+  ],
+  "settings": {
+    "auto_start": true
+  }
+}"#;
+        write_test_private_text(&config_path, original);
+
+        backup_invalid_config_file(
+            &config_path,
+            &anyhow::anyhow!("schema failed for user@example.com account-secret-id"),
+        )
+        .unwrap();
+
+        assert!(!config_path.exists());
+        let backups = invalid_storage_operation_entries(&root, "config.json.invalid.");
+        assert_eq!(backups.len(), 1);
+        let backup = std::fs::read_to_string(&backups[0]).unwrap();
+        assert!(!backup.contains("user@example.com"));
+        assert!(!backup.contains("account-secret-id"));
+        assert!(!backup.contains("has_saved_password"));
+        assert!(!backup.contains("invalid-bool"));
+
+        let diagnostic: serde_json::Value = serde_json::from_str(&backup).unwrap();
+        assert_eq!(diagnostic["kind"], "invalid_config_diagnostic");
+        assert_eq!(diagnostic["raw_content"], "[omitted]");
+        assert_eq!(diagnostic["json_parse_status"], "parsed");
+        assert_eq!(diagnostic["has_accounts"], true);
+        assert_eq!(diagnostic["account_count"], 1);
+        assert_eq!(diagnostic["has_settings"], true);
+        assert_eq!(
+            diagnostic["original_sha256"],
+            sha256_hex(original.as_bytes())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_invalid_config_backup_omits_raw_content() {
+        let root = temp_storage_test_dir("malformed-config-backup-redacted");
+        let config_path = root.join("config.json");
+        let original = r#"{"accounts":[{"id":"account-secret-id","username":"user@example.com"}],"#;
+        write_test_private_text(&config_path, original);
+
+        backup_invalid_config_file(
+            &config_path,
+            &anyhow::anyhow!("parse failed for user@example.com account-secret-id"),
+        )
+        .unwrap();
+
+        assert!(!config_path.exists());
+        let backups = invalid_storage_operation_entries(&root, "config.json.invalid.");
+        assert_eq!(backups.len(), 1);
+        let backup = std::fs::read_to_string(&backups[0]).unwrap();
+        assert!(!backup.contains("user@example.com"));
+        assert!(!backup.contains("account-secret-id"));
+        assert!(!backup.contains(original));
+
+        let diagnostic: serde_json::Value = serde_json::from_str(&backup).unwrap();
+        assert_eq!(diagnostic["kind"], "invalid_config_diagnostic");
+        assert_eq!(diagnostic["raw_content"], "[omitted]");
+        assert_eq!(diagnostic["json_parse_status"], "invalid_json");
+        assert_eq!(diagnostic["has_accounts"], false);
+        assert_eq!(diagnostic["has_settings"], false);
+        assert_eq!(
+            diagnostic["original_sha256"],
+            sha256_hex(original.as_bytes())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn app_config_serialization_does_not_contain_plaintext_password() {
         let mut account = Account::new(" user@example.com ");
         account.id = "account-1".to_string();
@@ -4070,7 +4256,7 @@ mod tests {
             return;
         }
 
-        backup_invalid_file(&config_path).unwrap();
+        backup_invalid_config_file(&config_path, &anyhow::anyhow!("invalid config")).unwrap();
         quarantine_pending_storage_operation_file(&pending_path).unwrap();
 
         let backed_up = std::fs::read_dir(&root)

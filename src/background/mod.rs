@@ -243,6 +243,14 @@ fn prune_recent_prompt_attempts(
 #[cfg_attr(not(test), allow(dead_code))]
 fn fill_attempt_should_suppress_same_prompt_retry(report: &FillAttemptReport) -> bool {
     report.success
+        || report_bool_field(report, "password_loaded")
+        || report_bool_field(report, "fill_attempted")
+        || report_bool_field(report, "submit_attempted")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn report_bool_field(report: &FillAttemptReport, field: &str) -> bool {
+    report.field(field) == Some("true")
 }
 
 fn record_prompt_retry_suppression(
@@ -1334,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_attempt_suppression_requires_success() {
+    fn fill_attempt_suppression_requires_success_or_secret_bearing_attempt() {
         assert!(fill_attempt_should_suppress_same_prompt_retry(
             &fill_report(true, &[])
         ));
@@ -1345,19 +1353,46 @@ mod tests {
         assert!(!fill_attempt_should_suppress_same_prompt_retry(
             &fill_report(false, &[("password_load_attempted", "true")])
         ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(false, &[("submit_attempted", "true")])
+        assert!(fill_attempt_should_suppress_same_prompt_retry(
+            &fill_report(
+                false,
+                &[
+                    ("password_load_attempted", "true"),
+                    ("password_loaded", "true")
+                ]
+            )
         ));
         assert!(!fill_attempt_should_suppress_same_prompt_retry(
+            &fill_report_with_failure(
+                false,
+                &[("password_load_attempted", "true")],
+                Some("password_load_failed_for_selected_account")
+            )
+        ));
+        assert!(fill_attempt_should_suppress_same_prompt_retry(
+            &fill_report(false, &[("submit_attempted", "true")])
+        ));
+        assert!(fill_attempt_should_suppress_same_prompt_retry(
             &fill_report(false, &[("fill_attempted", "true"), ("fill_status", "ok")])
         ));
         assert!(!fill_attempt_should_suppress_same_prompt_retry(
             &fill_report_with_failure(false, &[], Some("fill_failed"))
         ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report_with_failure(false, &[], Some("fill_script_failed"))
+        assert!(fill_attempt_should_suppress_same_prompt_retry(
+            &fill_report_with_failure(
+                false,
+                &[("password_loaded", "true")],
+                Some("fill_script_failed")
+            )
         ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
+        assert!(fill_attempt_should_suppress_same_prompt_retry(
+            &fill_report_with_failure(
+                false,
+                &[("password_loaded", "true")],
+                Some("attempt_cancelled_after_password_load_accounts_settings_changed")
+            )
+        ));
+        assert!(fill_attempt_should_suppress_same_prompt_retry(
             &fill_report(
                 false,
                 &[("fill_attempted", "true"), ("fill_status", "not_found")]
@@ -1381,6 +1416,23 @@ mod tests {
             &fill_report(false, &[("password_load_attempted", "true")]),
         );
         assert!(attempts.lock().unwrap().is_empty());
+
+        record_prompt_retry_suppression(
+            Some(PromptRetrySuppression {
+                recent_prompt_attempts: attempts.clone(),
+                prompt_key: prompt_key.clone(),
+            }),
+            &fill_report(
+                false,
+                &[
+                    ("password_load_attempted", "true"),
+                    ("password_loaded", "true"),
+                ],
+            ),
+        );
+
+        assert!(attempts.lock().unwrap().contains_key(&prompt_key));
+        attempts.lock().unwrap().clear();
 
         record_prompt_retry_suppression(
             Some(PromptRetrySuppression {

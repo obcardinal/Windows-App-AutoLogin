@@ -131,7 +131,7 @@ impl FillAttemptReport {
         let result = if self.success { "success" } else { "failed" };
         let failure = self.failure_reason.as_deref().unwrap_or("");
         format!(
-            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_load_skip_reason={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} failure_reason={}",
+            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_loaded={} password_load_skip_reason={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} failure_reason={}",
             result,
             self.field("prompt_context_source").unwrap_or("live_scan"),
             self.field("prompt_context_age_ms").unwrap_or("0"),
@@ -143,6 +143,7 @@ impl FillAttemptReport {
             self.field("account_match_count").unwrap_or("0"),
             self.field("selected_account_id").unwrap_or(""),
             self.field("password_load_attempted").unwrap_or("false"),
+            self.field("password_loaded").unwrap_or("false"),
             self.field("password_load_skip_reason").unwrap_or(""),
             self.field("password_load_ms").unwrap_or("0"),
             self.field("fill_method").unwrap_or("none"),
@@ -243,6 +244,7 @@ impl DebugLog {
             ("account_saved_email_match_count", "0".to_string()),
             ("selected_account_id", String::new()),
             ("password_load_attempted", "false".to_string()),
+            ("password_loaded", "false".to_string()),
             ("password_load_skip_reason", String::new()),
             ("password_load_ms", "0".to_string()),
             ("storage_lookup_start_ms", "0".to_string()),
@@ -267,9 +269,11 @@ impl DebugLog {
             ("submit_button_ready_after_fill", "false".to_string()),
             ("fill_method", "none".to_string()),
             ("fill_attempted", "false".to_string()),
+            ("fill_status", "not_attempted".to_string()),
             ("fill_duration_ms", "0".to_string()),
             ("submit_method", "none".to_string()),
             ("submit_attempted", "false".to_string()),
+            ("submit_status", "not_attempted".to_string()),
             ("axpress_attempted", "false".to_string()),
             ("axpress_result", "not_found".to_string()),
             ("enter_fallback_attempted", "false".to_string()),
@@ -519,6 +523,7 @@ fn fill_current_prompt_once_macos(
     };
     let password = match password_result {
         Ok(result) => {
+            log.set("password_loaded", "true");
             log.set(
                 "storage_lookup_start_ms",
                 result.timing.storage_lookup_start_ms.to_string(),
@@ -1089,6 +1094,7 @@ fn fill_current_prompt_once_windows(
     let password = match storage::load_password_with_timing(selected_account, settings.use_keyring)
     {
         Ok(result) => {
+            log.set("password_loaded", "true");
             log.set(
                 "storage_lookup_start_ms",
                 result.timing.storage_lookup_start_ms.to_string(),
@@ -1784,7 +1790,9 @@ fn post_check_state(
 #[cfg(target_os = "macos")]
 fn macos_fill_method(method: FillMethod) -> crate::macos_ax::MacosFillMethod {
     match method {
-        FillMethod::Keyboard => crate::macos_ax::MacosFillMethod::Keyboard,
+        // Keep the legacy debug-fill option name for compatibility; macOS password
+        // insertion itself is target-bound AXValue only.
+        FillMethod::Keyboard => crate::macos_ax::MacosFillMethod::DirectAxValue,
     }
 }
 
@@ -2178,7 +2186,24 @@ mod tests {
         let report = log.fail("password_load_failed_for_selected_account");
 
         assert_eq!(report.field("password_load_attempted").unwrap(), "true");
+        assert_eq!(report.field("password_loaded").unwrap(), "false");
         assert_eq!(report.field("password_load_skip_reason").unwrap(), "");
+    }
+
+    #[test]
+    fn post_password_load_failure_preserves_loaded_marker() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set("password_load_attempted", "true");
+        log.set("password_loaded", "true");
+
+        let report = log.fail("fill_script_failed_password_field_not_ready");
+
+        assert!(!report.success);
+        assert_eq!(report.field("password_load_attempted").unwrap(), "true");
+        assert_eq!(report.field("password_loaded").unwrap(), "true");
+        assert_eq!(report.field("password_load_skip_reason").unwrap(), "");
+        assert_eq!(report.failure_reason.as_deref(), Some("fill_script_failed"));
+        assert!(report.summary_line().contains("password_loaded=true"));
     }
 
     #[test]

@@ -10,19 +10,14 @@ use std::ffi::c_void;
 use std::fmt;
 use std::thread;
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
 
 const MAX_ELEMENT_COUNT: usize = 900;
 const AX_SEARCH_DEPTH: usize = 12;
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 0.15;
 const FOCUS_SETTLE_MS: u64 = 50;
 const FOCUS_POLL_INTERVAL_MS: u64 = 10;
-const KEY_EVENT_SETTLE_MS: u64 = 20;
 #[cfg_attr(not(test), allow(dead_code))]
 const DIRECT_AXVALUE_READY_MS: u64 = 40;
-const PRESS_FOCUS_SETTLE_MS: u64 = 60;
-#[cfg_attr(not(test), allow(dead_code))]
-const POST_FILL_SETTLE_MS: u64 = 20;
 const FAST_SUBMIT_READY_TIMEOUT_MS: u64 = 60;
 const SUBMIT_SETTLE_MS: u64 = 0;
 
@@ -51,11 +46,6 @@ const AX_TEXT_FIELD_ROLE: &str = "AXTextField";
 const AX_SECURE_TEXT_FIELD_ROLE: &str = "AXSecureTextField";
 const AX_STATIC_TEXT_ROLE: &str = "AXStaticText";
 const AX_SHEET_ROLE: &str = "AXSheet";
-
-const KEYCODE_A: u16 = 0;
-const KEYCODE_DELETE: u16 = 51;
-const CG_HID_EVENT_TAP: u32 = 0;
-const CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MacosInspection {
@@ -142,15 +132,7 @@ impl MacosPrompt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MacosFillMethod {
-    Keyboard,
-}
-
-impl MacosFillMethod {
-    fn label(self) -> &'static str {
-        match self {
-            MacosFillMethod::Keyboard => "keyboard",
-        }
-    }
+    DirectAxValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,60 +880,17 @@ pub(crate) fn fill_verified_password(
     let prompt = verified_prompt.prompt;
     let password_field_role = prompt.password_field_role.clone();
     let password_field_description_present = !prompt.password_field_description.trim().is_empty();
-    let keyboard_method_label = method.label();
 
     let submit_button_ready_after_fill = false;
-    let mut password_field_focused = false;
+    let password_field_focused = false;
     let method_used = match method {
-        MacosFillMethod::Keyboard => {
+        MacosFillMethod::DirectAxValue => {
             if set_password_value(&prepared.password_field, password) {
                 "axvalue"
             } else {
-                focus_password_field_in_prompt(&prompt, app_name, expected_process_id)?;
-                password_field_focused = true;
-                guard()?;
-                if !send_key_with_flags(KEYCODE_A, CG_EVENT_FLAG_MASK_COMMAND) {
-                    anyhow::bail!("password field clear shortcut event creation failed");
-                }
-                thread::sleep(Duration::from_millis(KEY_EVENT_SETTLE_MS));
-                if !send_key(KEYCODE_DELETE) {
-                    anyhow::bail!("password field clear event creation failed");
-                }
-                thread::sleep(Duration::from_millis(KEY_EVENT_SETTLE_MS));
-
-                guard()?;
-                let password_field = if prompt.password_field.bool_attr(AX_FOCUSED).unwrap_or(false)
-                {
-                    verified_password_field_in_prompt(&prompt, app_name, expected_process_id)?
-                } else {
-                    focus_password_field_in_prompt(&prompt, app_name, expected_process_id)?
-                };
-                guard()?;
-                ensure_prompt_identity_text_still_matches(
-                    &prompt,
-                    expected_process_id,
-                    expected_email,
-                    expected_window_title,
-                    prompt.origin,
-                    "keyboard password insertion",
-                )?;
-                let trusted_process = current_trusted_process_info(app_name, expected_process_id)?;
-                ensure_trusted_process_matches(
-                    &trusted_process,
-                    &prepared.trusted_process,
-                    "credential prompt process identity changed before keyboard password insertion",
-                )?;
-                if !password_field.bool_attr(AX_FOCUSED).unwrap_or(false) {
-                    anyhow::bail!(
-                        "password field focus changed before keyboard password insertion"
-                    );
-                }
-                if send_text(password) {
-                    thread::sleep(Duration::from_millis(POST_FILL_SETTLE_MS));
-                    keyboard_method_label
-                } else {
-                    anyhow::bail!("password insertion event creation failed");
-                }
+                anyhow::bail!(
+                    "direct AXValue password insertion failed; keyboard fallback disabled for password security"
+                );
             }
         }
     };
@@ -1583,44 +1522,6 @@ fn prompt_text_snapshots_match(
     )
 }
 
-fn focus_password_field_in_prompt(
-    prompt: &MacosPrompt,
-    app_name: &str,
-    expected_process_id: i32,
-) -> anyhow::Result<AxElement> {
-    verified_password_field_in_prompt(prompt, app_name, expected_process_id)?;
-    raise_prompt(prompt);
-    focus_password_field(
-        &prompt.password_field,
-        expected_process_id,
-        &prompt.prompt_root,
-    )
-    .then_some(prompt.password_field.clone())
-    .context("password field focus is not verified immediately before target-bound input")
-}
-
-fn verified_password_field_in_prompt(
-    prompt: &MacosPrompt,
-    app_name: &str,
-    expected_process_id: i32,
-) -> anyhow::Result<AxElement> {
-    ensure_trusted_process_current(app_name, expected_process_id)?;
-    ensure_element_belongs_to_process(
-        &prompt.password_field,
-        expected_process_id,
-        "password field",
-    )?;
-    ensure_element_within_prompt_root(
-        &prompt.password_field,
-        &prompt.prompt_root,
-        "password field",
-    )?;
-    if !is_secure_password_insertion_field(&prompt.password_field) {
-        anyhow::bail!("credential prompt password field is not a secure text field");
-    }
-    Ok(prompt.password_field.clone())
-}
-
 fn raise_prompt(prompt: &MacosPrompt) {
     if let Some(app) = AxElement::application(prompt.target.process_id) {
         let _ = app.set_bool_attr(AX_FRONTMOST, true);
@@ -1628,10 +1529,6 @@ fn raise_prompt(prompt: &MacosPrompt) {
     let _ = prompt.target_window.perform_action(AX_RAISE);
     let _ = prompt.target_window.set_bool_attr(AX_MAIN, true);
     let _ = prompt.prompt_root.perform_action(AX_RAISE);
-}
-
-fn ensure_trusted_process_current(app_name: &str, expected_process_id: i32) -> anyhow::Result<()> {
-    current_trusted_process_info(app_name, expected_process_id).map(|_| ())
 }
 
 fn current_trusted_process_info(
@@ -1678,57 +1575,6 @@ fn element_has_ancestor(element: &AxElement, ancestor: &AxElement) -> bool {
         current = element.parent();
     }
     false
-}
-
-fn focus_password_field(
-    field: &AxElement,
-    expected_process_id: i32,
-    prompt_root: &AxElement,
-) -> bool {
-    if field.bool_attr(AX_FOCUSED).unwrap_or(false) {
-        return true;
-    }
-    let _ = field.set_bool_attr(AX_FOCUSED, true);
-    if wait_for_bool_attr(
-        field,
-        AX_FOCUSED,
-        true,
-        Duration::from_millis(FOCUS_SETTLE_MS),
-    ) {
-        return true;
-    }
-
-    if ensure_element_belongs_to_process(field, expected_process_id, "password field").is_err()
-        || ensure_element_within_prompt_root(field, prompt_root, "password field").is_err()
-    {
-        return false;
-    }
-    let _ = field.perform_action(AX_PRESS);
-    wait_for_bool_attr(
-        field,
-        AX_FOCUSED,
-        true,
-        Duration::from_millis(PRESS_FOCUS_SETTLE_MS),
-    )
-}
-
-fn wait_for_bool_attr(
-    element: &AxElement,
-    attr: &'static str,
-    expected: bool,
-    timeout: Duration,
-) -> bool {
-    let started = Instant::now();
-    loop {
-        if element.bool_attr(attr).unwrap_or(false) == expected {
-            return true;
-        }
-        if started.elapsed() >= timeout {
-            return false;
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        thread::sleep(remaining.min(Duration::from_millis(FOCUS_POLL_INTERVAL_MS)));
-    }
 }
 
 fn wait_for_prompt_submit_button_enabled(prompt: &MacosPrompt, timeout: Duration) -> bool {
@@ -2450,56 +2296,6 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
     false
 }
 
-fn send_text(text: &str) -> bool {
-    let utf16 = Zeroizing::new(text.encode_utf16().collect::<Vec<_>>());
-    if utf16.is_empty() {
-        return true;
-    }
-    unsafe {
-        let down = CGEventCreateKeyboardEvent(std::ptr::null(), 0, true);
-        if down.is_null() {
-            return false;
-        }
-        let up = CGEventCreateKeyboardEvent(std::ptr::null(), 0, false);
-        if up.is_null() {
-            CFRelease(down.cast());
-            return false;
-        }
-        CGEventKeyboardSetUnicodeString(down, utf16.len(), utf16.as_ptr());
-        CGEventKeyboardSetUnicodeString(up, utf16.len(), utf16.as_ptr());
-        CGEventPost(CG_HID_EVENT_TAP, down);
-        CGEventPost(CG_HID_EVENT_TAP, up);
-        CFRelease(down.cast());
-        CFRelease(up.cast());
-    }
-    true
-}
-
-fn send_key(keycode: u16) -> bool {
-    send_key_with_flags(keycode, 0)
-}
-
-fn send_key_with_flags(keycode: u16, flags: u64) -> bool {
-    unsafe {
-        let down = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, true);
-        if down.is_null() {
-            return false;
-        }
-        let up = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, false);
-        if up.is_null() {
-            CFRelease(down.cast());
-            return false;
-        }
-        CGEventSetFlags(down, flags);
-        CGEventSetFlags(up, flags);
-        CGEventPost(CG_HID_EVENT_TAP, down);
-        CGEventPost(CG_HID_EVENT_TAP, up);
-        CFRelease(down.cast());
-        CFRelease(up.cast());
-    }
-    true
-}
-
 const LOGIN_TITLE_KEYWORDS: &[&str] = &[
     "Sign in",
     "Authentication",
@@ -2598,8 +2394,6 @@ const PASSWORD_CUES: &[&str] = &[
 
 type AXUIElementRef = *const c_void;
 type AXError = i32;
-type CGEventRef = *const c_void;
-
 const K_AX_ERROR_SUCCESS: AXError = 0;
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -2624,19 +2418,6 @@ unsafe extern "C" {
     ) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
     fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut libc::pid_t) -> AXError;
-
-    fn CGEventCreateKeyboardEvent(
-        source: *const c_void,
-        virtual_key: u16,
-        key_down: bool,
-    ) -> CGEventRef;
-    fn CGEventKeyboardSetUnicodeString(
-        event: CGEventRef,
-        string_length: usize,
-        unicode_string: *const u16,
-    );
-    fn CGEventSetFlags(event: CGEventRef, flags: u64);
-    fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
 #[cfg(test)]
@@ -2645,9 +2426,8 @@ mod tests {
         credential_prompt_text_like, extract_email_like, normalized_submit_label,
         prompt_identity_verified, prompt_text_element_should_contribute,
         prompt_window_title_matches, select_submit_label_for_test, submit_label_rank,
-        text_contains_password_cue, MacosFillMethod, PromptOrigin, DIRECT_AXVALUE_READY_MS,
-        FOCUS_POLL_INTERVAL_MS, FOCUS_SETTLE_MS, KEY_EVENT_SETTLE_MS, POST_FILL_SETTLE_MS,
-        PRESS_FOCUS_SETTLE_MS, SUBMIT_SETTLE_MS,
+        text_contains_password_cue, PromptOrigin, DIRECT_AXVALUE_READY_MS, FOCUS_POLL_INTERVAL_MS,
+        SUBMIT_SETTLE_MS,
     };
     use std::time::Duration;
 
@@ -2689,11 +2469,6 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_fill_method_reports_keyboard_path() {
-        assert_eq!(MacosFillMethod::Keyboard.label(), "keyboard");
-    }
-
-    #[test]
     fn password_insertion_implementation_has_no_global_clipboard_api() {
         let implementation = include_str!("macos_ax.rs")
             .split("#[cfg(test)]")
@@ -2709,6 +2484,36 @@ mod tests {
             assert!(
                 !implementation.contains(forbidden),
                 "password insertion implementation must not use global clipboard API: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_insertion_implementation_has_no_global_keyboard_secret_fallback() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let fill_verified_password = implementation
+            .split("pub(crate) fn fill_verified_password")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn submit_filled_prompt").next())
+            .unwrap();
+
+        assert!(fill_verified_password
+            .contains("set_password_value(&prepared.password_field, password)"));
+        assert!(fill_verified_password.contains("keyboard fallback disabled for password security"));
+        for forbidden in [
+            "send_text",
+            "send_key",
+            "CGEventPost",
+            "CGEventKeyboardSetUnicodeString",
+            "KEYCODE_A",
+            "KEYCODE_DELETE",
+        ] {
+            assert!(
+                !fill_verified_password.contains(forbidden),
+                "password insertion must not use global keyboard fallback: {forbidden}"
             );
         }
     }
@@ -2755,9 +2560,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_axvalue_ready_wait_is_shorter_than_focus_press_fallback() {
-        assert!(DIRECT_AXVALUE_READY_MS < PRESS_FOCUS_SETTLE_MS);
+    fn direct_axvalue_ready_wait_is_short() {
         assert!(DIRECT_AXVALUE_READY_MS >= FOCUS_POLL_INTERVAL_MS);
+        assert!(Duration::from_millis(DIRECT_AXVALUE_READY_MS) < Duration::from_millis(450));
     }
 
     #[test]
@@ -2812,11 +2617,8 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_settle_delays_keep_bounded_fallbacks() {
-        assert_eq!(KEY_EVENT_SETTLE_MS, 20);
-        assert_eq!(POST_FILL_SETTLE_MS, 20);
+    fn fast_path_settle_delays_keep_bounded() {
         assert_eq!(SUBMIT_SETTLE_MS, 0);
-        assert!(PRESS_FOCUS_SETTLE_MS >= FOCUS_SETTLE_MS);
         assert!(Duration::from_millis(SUBMIT_SETTLE_MS) < Duration::from_millis(450));
     }
 
