@@ -17,7 +17,6 @@ compile_error!(
 
 mod app;
 mod app_identity;
-#[allow(dead_code)]
 mod autologin;
 mod autostart;
 mod background;
@@ -366,15 +365,10 @@ impl LightweightSupervisor {
         };
 
         match command {
-            single_instance::SupervisorFileCommand::Monitor(command) => match command {
-                single_instance::MonitorControlCommand::Start => {
-                    self.start_monitor_from_control_command()
-                }
-                single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
-            },
-            single_instance::SupervisorFileCommand::ReloadConfig => {
-                self.reload_config_after_settings()
+            single_instance::MonitorControlCommand::Start => {
+                self.start_monitor_from_control_command()
             }
+            single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
         }
     }
 
@@ -542,10 +536,6 @@ impl LightweightSupervisor {
 
     fn start_monitor_after_accessibility_grant(&mut self) {
         if self.worker_status != models::WorkerStatus::Idle {
-            return;
-        }
-        if self.settings_child.is_some() {
-            self.resume_monitor_after_settings = true;
             return;
         }
         let _ = self.worker_tx.try_send(background::WorkerCommand::Start);
@@ -1221,8 +1211,8 @@ mod tests {
     }
 
     #[test]
-    fn accessibility_grant_defers_monitor_start_while_settings_child_is_open() {
-        let (worker_tx, worker_rx) = tokio_channel(8);
+    fn accessibility_grant_starts_monitor_while_settings_child_is_open() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
         let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
         let (tray_tx, tray_rx) = std_channel();
         let mut supervisor = LightweightSupervisor::new(
@@ -1242,8 +1232,11 @@ mod tests {
         supervisor.apply_accessibility_trust_state(true);
 
         assert!(supervisor.accessibility_trusted);
-        assert!(supervisor.resume_monitor_after_settings);
-        assert!(worker_rx.is_empty());
+        assert!(!supervisor.resume_monitor_after_settings);
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Start => {}
+            other => panic!("expected Start, got {other:?}"),
+        }
         let _ = supervisor.settings_child.take().unwrap().kill();
     }
 

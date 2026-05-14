@@ -2,25 +2,15 @@ use std::path::PathBuf;
 
 const APP_DIR_NAME: &str = "WindowsAppAutoLogin";
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn cache_dir() -> anyhow::Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(canonical_home_dir()?
-            .join("Library")
-            .join("Caches")
-            .join(APP_DIR_NAME));
+    if let Some(cache_dir) = dirs::cache_dir() {
+        return Ok(cache_dir.join(APP_DIR_NAME));
     }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Some(cache_dir) = dirs::cache_dir() {
-            return Ok(cache_dir.join(APP_DIR_NAME));
-        }
-        if let Some(home) = dirs::home_dir() {
-            return Ok(home.join("Library").join("Caches").join(APP_DIR_NAME));
-        }
-        anyhow::bail!("unable to resolve a private cache directory")
+    if let Some(home) = dirs::home_dir() {
+        return Ok(home.join("Library").join("Caches").join(APP_DIR_NAME));
     }
+    anyhow::bail!("unable to resolve a private cache directory")
 }
 
 pub(crate) fn runtime_dir() -> anyhow::Result<PathBuf> {

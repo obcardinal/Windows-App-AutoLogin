@@ -28,8 +28,6 @@ const MONITOR_STATUS_FILE_NAME: &str = "monitor-status";
 const LOCK_OWNER_FILE_NAME: &str = "owner";
 const MONITOR_COMMAND_START: &str = "start_monitor";
 const MONITOR_COMMAND_STOP: &str = "stop_monitor";
-#[cfg(not(target_os = "macos"))]
-const MONITOR_COMMAND_RELOAD_CONFIG: &str = "config_reload";
 const ALREADY_RUNNING_MESSAGE: &str = "Windows App AutoLogin is already running";
 #[cfg(target_os = "macos")]
 const FULL_UI_ALREADY_RUNNING_MESSAGE: &str = "Windows App AutoLogin window is already open";
@@ -118,13 +116,6 @@ pub(crate) enum MonitorControlCommand {
     Stop,
 }
 
-#[cfg(not(target_os = "macos"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SupervisorFileCommand {
-    Monitor(MonitorControlCommand),
-    ReloadConfig,
-}
-
 impl MonitorControlCommand {
     fn as_str(self) -> &'static str {
         match self {
@@ -134,24 +125,6 @@ impl MonitorControlCommand {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn from_request(value: &str) -> Option<Self> {
-        match SupervisorFileCommand::from_request(value)? {
-            SupervisorFileCommand::Monitor(command) => Some(command),
-            SupervisorFileCommand::ReloadConfig => None,
-        }
-    }
-
-    fn from_command_name(command: &str) -> Option<Self> {
-        match command {
-            MONITOR_COMMAND_START => Some(Self::Start),
-            MONITOR_COMMAND_STOP => Some(Self::Stop),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl SupervisorFileCommand {
     fn from_request(value: &str) -> Option<Self> {
         if value.len() > MAX_MONITOR_COMMAND_BYTES as usize {
             return None;
@@ -166,10 +139,15 @@ impl SupervisorFileCommand {
         if !process_looks_like_this_app(pid) {
             return None;
         }
-        if command == MONITOR_COMMAND_RELOAD_CONFIG {
-            return Some(Self::ReloadConfig);
+        Self::from_command_name(command)
+    }
+
+    fn from_command_name(command: &str) -> Option<Self> {
+        match command {
+            MONITOR_COMMAND_START => Some(Self::Start),
+            MONITOR_COMMAND_STOP => Some(Self::Stop),
+            _ => None,
         }
-        MonitorControlCommand::from_command_name(command).map(Self::Monitor)
     }
 }
 
@@ -436,15 +414,7 @@ pub(crate) fn request_config_reload() -> anyhow::Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let body = format!(
-            "{MONITOR_COMMAND_RELOAD_CONFIG}:{}:{nonce}\n",
-            std::process::id()
-        );
-        write_private_text(&monitor_command_path()?, &body)
+        Ok(())
     }
 }
 
@@ -485,7 +455,7 @@ impl MonitorCommandWatcher {
         Self { path, last_content }
     }
 
-    pub(crate) fn consume_command(&mut self) -> Option<SupervisorFileCommand> {
+    pub(crate) fn consume_command(&mut self) -> Option<MonitorControlCommand> {
         let path = self.path.as_deref()?;
         let content = read_private_text_limited(path, MAX_MONITOR_COMMAND_BYTES)
             .ok()
@@ -495,7 +465,7 @@ impl MonitorCommandWatcher {
         }
 
         self.last_content = Some(content.clone());
-        SupervisorFileCommand::from_request(&content)
+        MonitorControlCommand::from_request(&content)
     }
 
     #[cfg(test)]
@@ -1850,10 +1820,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn lock_root_uses_runtime_dir_not_cache_dir() {
+        use std::ffi::OsStr;
+
         let root = lock_root().unwrap();
 
         assert_eq!(root, crate::user_paths::runtime_dir().unwrap());
-        assert_ne!(root, crate::user_paths::cache_dir().unwrap());
+        assert!(!root
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new("Caches")));
     }
 
     #[cfg(all(unix, not(target_os = "windows")))]
@@ -2406,21 +2380,12 @@ mod tests {
         write_test_private_text(&path, format!("start_monitor:{}:1", std::process::id())).unwrap();
         assert_eq!(
             watcher.consume_command(),
-            Some(SupervisorFileCommand::Monitor(MonitorControlCommand::Start))
+            Some(MonitorControlCommand::Start)
         );
         assert_eq!(watcher.consume_command(), None);
 
         write_test_private_text(&path, format!("stop_monitor:{}:2", std::process::id())).unwrap();
-        assert_eq!(
-            watcher.consume_command(),
-            Some(SupervisorFileCommand::Monitor(MonitorControlCommand::Stop))
-        );
-
-        write_test_private_text(&path, format!("config_reload:{}:3", std::process::id())).unwrap();
-        assert_eq!(
-            watcher.consume_command(),
-            Some(SupervisorFileCommand::ReloadConfig)
-        );
+        assert_eq!(watcher.consume_command(), Some(MonitorControlCommand::Stop));
 
         write_test_private_text(&path, "start_monitor:99999999:3").unwrap();
         assert_eq!(watcher.consume_command(), None);

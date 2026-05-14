@@ -355,8 +355,11 @@ pub fn run_for_app(app_name: &str) -> anyhow::Result<DiagnosticReport> {
 fn run_macos(app_name: &str) -> anyhow::Result<DiagnosticReport> {
     info!("Starting macOS UI diagnostic...");
 
-    let trusted_target_pids = crate::macos_identity::trusted_process_ids(app_name)
-        .map_err(|_| anyhow::anyhow!("failed to verify diagnostic target identity"))?;
+    let trusted_target_pids = crate::macos_identity::trusted_process_infos(app_name)
+        .map_err(|_| anyhow::anyhow!("failed to verify diagnostic target identity"))?
+        .into_iter()
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
     let script = build_applescript(app_name, &trusted_target_pids);
     debug!("AppleScript length: {} chars", script.len());
 
@@ -460,8 +463,7 @@ fn cap_raw_diagnostic_protocol_output(
 #[cfg(target_os = "macos")]
 fn build_applescript(app_name: &str, trusted_target_pids: &[i32]) -> String {
     let app_name = applescript_string_literal(app_name);
-    let trusted_target_pids =
-        crate::macos_identity::applescript_pid_list_literal(trusted_target_pids);
+    let trusted_target_pids = applescript_pid_list_literal(trusted_target_pids);
     format!(
         r#"
 	property secureTraversalCount : 0
@@ -970,6 +972,16 @@ tell application "System Events"
 }
 
 #[cfg(target_os = "macos")]
+fn applescript_pid_list_literal(pids: &[i32]) -> String {
+    let values = pids
+        .iter()
+        .map(|pid| format!("\"{}\"", pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{values}}}")
+}
+
+#[cfg(target_os = "macos")]
 fn applescript_string_literal(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
@@ -1086,13 +1098,6 @@ fn join_pipe_reader(
     reader
         .join()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "pipe reader panicked"))?
-}
-
-#[cfg(target_os = "macos")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn parse_output(text: &str, app_name: &str) -> (Vec<ProcessInfo>, Vec<ProcessInfo>) {
-    let (target_processes, system_dialogs, _) = parse_output_with_truncation(text, app_name, None);
-    (target_processes, system_dialogs)
 }
 
 #[cfg(target_os = "macos")]
@@ -1478,6 +1483,12 @@ fn redact_value(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn parse_output_for_test(text: &str, app_name: &str) -> (Vec<ProcessInfo>, Vec<ProcessInfo>) {
+        let (target_processes, system_dialogs, _) =
+            parse_output_with_truncation(text, app_name, None);
+        (target_processes, system_dialogs)
+    }
+
     #[test]
     fn parse_output_redacts_names_titles_and_values() {
         let text = "\
@@ -1491,7 +1502,7 @@ WINDOW:OTP token prompt
 ELEMENT:static text|name=123456 token
 ";
 
-        let (target_processes, system_dialogs) = parse_output(text, "Windows App");
+        let (target_processes, system_dialogs) = parse_output_for_test(text, "Windows App");
 
         let target_window = &target_processes[0].windows[0];
         assert_eq!(target_window.title, "[redacted title]");
@@ -1522,7 +1533,7 @@ ELEMENT:text_field|name=Passcode|value=123456
 ELEMENT:button|name=Continue|enabled=true
 ";
 
-        let (target_processes, _) = parse_output(text, "Windows App");
+        let (target_processes, _) = parse_output_for_test(text, "Windows App");
         let rendered = serde_json::to_string(&target_processes).unwrap();
 
         assert!(!rendered.contains("super-secret"));
@@ -1545,7 +1556,7 @@ WINDOW:secret-system-window
 ELEMENT:static text|name=secret-token
 ";
 
-        let (target_processes, system_dialogs) = parse_output(text, "Windows App");
+        let (target_processes, system_dialogs) = parse_output_for_test(text, "Windows App");
         let rendered = serde_json::to_string(&(target_processes, system_dialogs)).unwrap();
 
         assert!(!rendered.contains("Sensitive Tenant"));
@@ -1564,7 +1575,7 @@ ELEMENT:button|name=Continue
 ELEMENT:api-token-12345|name=x
 ";
 
-        let (target_processes, system_dialogs) = parse_output(text, "Windows App");
+        let (target_processes, system_dialogs) = parse_output_for_test(text, "Windows App");
         let rendered =
             serde_json::to_string(&(target_processes.clone(), system_dialogs.clone())).unwrap();
         let plaintext = DiagnosticReport {
@@ -1588,7 +1599,7 @@ WINDOW:Sign%7CIn%0AUser
 ELEMENT:text_field|name=user%3Dname%7Csecret@example.com|value=plain%25secret
 ";
 
-        let (target_processes, _) = parse_output(text, "Windows App");
+        let (target_processes, _) = parse_output_for_test(text, "Windows App");
         let rendered = serde_json::to_string(&target_processes).unwrap();
 
         assert!(!rendered.contains("user=name"));
@@ -1618,7 +1629,7 @@ ELEMENT:text_field|name=user%3Dname%7Csecret@example.com|value=plain%25secret
             "PROCESS:{app_name}|pid=123\nWINDOW:Sign in\u{7}\nELEMENT:button\u{0}|name=Continue|enabled=true\n"
         );
 
-        let (target_processes, system_dialogs) = parse_output(&text, app_name);
+        let (target_processes, system_dialogs) = parse_output_for_test(&text, app_name);
         let report = DiagnosticReport {
             timestamp: "now".to_string(),
             target_processes,
@@ -1711,7 +1722,7 @@ WINDOW:Sign in
 ELEMENT:button|name=Continue
 ";
 
-        let (target_processes, system_dialogs) = parse_output(text, "Windows App");
+        let (target_processes, system_dialogs) = parse_output_for_test(text, "Windows App");
         let rendered = serde_json::to_string(&(target_processes, system_dialogs)).unwrap();
 
         assert!(!rendered.contains("secret-window"));

@@ -66,12 +66,6 @@ pub(crate) struct TrustedProcessInfo {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn trusted_process_ids(app_name: &str) -> anyhow::Result<Vec<i32>> {
-    let processes = enumerate_processes(app_name)?;
-    trusted_process_ids_from_identities(app_name, &processes, verify_trusted_live_process)
-}
-
-#[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn trusted_process_infos(app_name: &str) -> anyhow::Result<Vec<TrustedProcessInfo>> {
     let processes = enumerate_processes(app_name)?;
@@ -108,22 +102,6 @@ pub(crate) fn trusted_process_info_for_pid(
 }
 
 #[cfg(target_os = "macos")]
-fn trusted_process_ids_from_identities(
-    app_name: &str,
-    processes: &[ProcessIdentity],
-    mut verify_process: impl FnMut(i32, &Path, TrustedIdentity) -> anyhow::Result<bool>,
-) -> anyhow::Result<Vec<i32>> {
-    Ok(
-        trusted_process_infos_from_identities(app_name, processes, |pid, path, identity| {
-            verify_process(pid, path, identity)
-        })?
-        .into_iter()
-        .map(|process| process.pid)
-        .collect(),
-    )
-}
-
-#[cfg(target_os = "macos")]
 fn trusted_process_infos_from_identities(
     app_name: &str,
     processes: &[ProcessIdentity],
@@ -152,26 +130,6 @@ fn trusted_process_infos_from_identities(
     }
 
     Ok(trusted_processes)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn applescript_pid_list_literal(pids: &[i32]) -> String {
-    let values = pids
-        .iter()
-        .map(|pid| format!("\"{}\"", pid))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{values}}}")
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-pub(crate) fn applescript_string_literal(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace(['\r', '\n'], " ");
-    format!("\"{}\"", escaped)
 }
 
 #[cfg(target_os = "macos")]
@@ -338,9 +296,13 @@ fn verify_trusted_live_process(
     }
 
     with_code_sign_requirement(identity.bundle_id, identity.team_id, |requirement| {
-        Ok(code
+        if code
             .check_validity(code_validation_flags(), requirement)
-            .is_ok())
+            .is_ok()
+        {
+            return Ok(true);
+        }
+        static_code_matches_requirement(bundle_path, requirement)
     })
 }
 
@@ -451,7 +413,6 @@ fn static_code_has_valid_internal_signature(code: &SecStaticCode) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 fn static_code_matches_requirement(
     path: &Path,
     requirement: &SecRequirement,
@@ -482,7 +443,6 @@ fn code_validation_flags() -> CodeSignFlags {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 extern "C" {
     static kSecCodeInfoUnique: CFStringRef;
 
@@ -491,8 +451,6 @@ extern "C" {
         flags: u32,
         information: *mut CFDictionaryRef,
     ) -> i32;
-
-    fn SecCodeCheckValidity(code: *const c_void, flags: u32, requirement: *const c_void) -> i32;
 
     fn SecStaticCodeCheckValidity(
         code: *const c_void,
@@ -692,8 +650,8 @@ fn run_command_with_timeout(
 mod tests {
     use super::{
         code_sign_requirement_source, path_has_symlink_component, proc_pidpath_buffer_to_path,
-        signature_cache_key, trusted_process_ids_from_identities,
-        trusted_process_infos_from_identities, valid_team_id, ProcessIdentity, TrustedIdentity,
+        signature_cache_key, trusted_process_infos_from_identities, valid_team_id, ProcessIdentity,
+        TrustedIdentity,
     };
     use std::path::PathBuf;
 
@@ -706,7 +664,7 @@ mod tests {
         }];
         let mut verifier_called = false;
 
-        let trusted = trusted_process_ids_from_identities(
+        let trusted = trusted_process_infos_from_identities(
             "Windows App",
             &processes,
             |_pid, _path, _identity| {
@@ -722,11 +680,12 @@ mod tests {
 
     #[test]
     fn unsupported_app_identity_is_rejected() {
-        let error =
-            trusted_process_ids_from_identities("Lookalike App", &[], |_pid, _path, _identity| {
-                Ok(true)
-            })
-            .unwrap_err();
+        let error = trusted_process_infos_from_identities(
+            "Lookalike App",
+            &[],
+            |_pid, _path, _identity| Ok(true),
+        )
+        .unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -736,7 +695,7 @@ mod tests {
 
     #[test]
     fn microsoft_remote_desktop_identity_is_rejected() {
-        let error = trusted_process_ids_from_identities(
+        let error = trusted_process_infos_from_identities(
             "Microsoft Remote Desktop",
             &[],
             |_pid, _path, _identity| Ok(true),
@@ -757,7 +716,7 @@ mod tests {
             bundle_path: PathBuf::from("/Applications/Windows App.app"),
         }];
 
-        let trusted = trusted_process_ids_from_identities(
+        let trusted = trusted_process_infos_from_identities(
             "Windows App",
             &processes,
             |pid, path, identity| {
@@ -818,12 +777,16 @@ mod tests {
             },
         ];
 
-        let trusted = trusted_process_ids_from_identities(
+        let trusted = trusted_process_infos_from_identities(
             "Windows App",
             &processes,
             |pid, _path, _identity| Ok(pid == 2222),
         )
         .unwrap();
+        let trusted = trusted
+            .into_iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
 
         assert_eq!(trusted, vec![2222]);
     }
@@ -836,7 +799,7 @@ mod tests {
             bundle_path: PathBuf::from("/Applications/Windows App.app"),
         }];
 
-        let error = trusted_process_ids_from_identities(
+        let error = trusted_process_infos_from_identities(
             "Windows App",
             &processes,
             |_pid, _path, _identity| anyhow::bail!("verifier unavailable"),

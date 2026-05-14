@@ -667,7 +667,7 @@ pub(crate) fn spawn(
             );
 
             #[cfg(target_os = "macos")]
-            let mut status_allows_macos_probe = matches!(status, MonitorStatus::Unknown);
+            let mut status_allows_macos_probe = !matches!(status, MonitorStatus::ProcessNotFound);
             #[cfg(target_os = "macos")]
             let mut force_macos_prompt_probe = false;
             #[cfg(target_os = "macos")]
@@ -903,29 +903,25 @@ pub(crate) fn spawn(
                             }
                         }
                         Ok(None) => {
-                            if force_macos_prompt_probe {
-                                emit_pre_password_skip_report(
-                                    &event_tx,
-                                    "visible_credential_prompt_not_detected",
-                                    &[(
-                                        "prompt_context_source",
-                                        "macos_fallback_preflight".to_string(),
-                                    )],
-                                );
-                            }
+                            emit_pre_password_skip_report(
+                                &event_tx,
+                                "visible_credential_prompt_not_detected",
+                                &[(
+                                    "prompt_context_source",
+                                    "macos_fallback_preflight".to_string(),
+                                )],
+                            );
                         }
                         Err(reason) => {
                             debug!(reason = %reason, "macOS fallback prompt preflight skipped");
-                            if force_macos_prompt_probe {
-                                emit_pre_password_skip_report(
-                                    &event_tx,
-                                    reason,
-                                    &[(
-                                        "prompt_context_source",
-                                        "macos_fallback_preflight".to_string(),
-                                    )],
-                                );
-                            }
+                            emit_pre_password_skip_report(
+                                &event_tx,
+                                reason,
+                                &[(
+                                    "prompt_context_source",
+                                    "macos_fallback_preflight".to_string(),
+                                )],
+                            );
                         }
                     }
                 }

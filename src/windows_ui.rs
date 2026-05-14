@@ -1,4 +1,4 @@
-use crate::config::{Config, CredentialsConfig};
+use crate::config::Config;
 use crate::monitor::MonitorStatus;
 use std::path::Path;
 use std::thread;
@@ -21,7 +21,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
-use zeroize::Zeroizing;
 
 const MAX_ELEMENT_COUNT: usize = 900;
 const UIA_SEARCH_DEPTH: u32 = 12;
@@ -114,59 +113,6 @@ pub(crate) fn check_status(config: &Config) -> MonitorStatus {
             tracing::debug!(error = %e, "Unable to inspect Windows UI Automation tree");
             MonitorStatus::Unknown
         }
-    }
-}
-
-pub(crate) fn verify_prompt_without_password(
-    target_app_name: &str,
-    credentials: &CredentialsConfig,
-    guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    ensure_fixed_target_app(target_app_name)?;
-    guard()?;
-    let prompt = detect_matching_prompt(
-        target_app_name,
-        &credentials.username,
-        credentials.prompt_window_title.as_deref(),
-        credentials.prompt_process_id,
-    )?;
-    let Some(_prompt) = prompt else {
-        anyhow::bail!("Credential prompt was not detected; password was not loaded");
-    };
-    guard()
-}
-
-pub(crate) fn perform_login_with_password_guarded(
-    target_app_name: &str,
-    credentials: &CredentialsConfig,
-    password: Zeroizing<String>,
-    guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<crate::autologin::AutoLoginResult> {
-    ensure_fixed_target_app(target_app_name)?;
-    guard()?;
-    let Some(prompt) = detect_matching_prompt(
-        target_app_name,
-        &credentials.username,
-        credentials.prompt_window_title.as_deref(),
-        credentials.prompt_process_id,
-    )?
-    else {
-        anyhow::bail!("Credential prompt has no visible email; password was not loaded");
-    };
-
-    fill_password(
-        target_app_name,
-        &prompt,
-        &password,
-        WindowsFillStrategy::Keyboard,
-        guard,
-    )?;
-    guard()?;
-    let submit = submit_prompt(target_app_name, &prompt, guard)?;
-    if submit.submit_status == "ok" {
-        Ok(crate::autologin::AutoLoginResult::Submitted)
-    } else {
-        Ok(crate::autologin::AutoLoginResult::PasswordTouchedWithoutSubmit)
     }
 }
 
@@ -533,33 +479,6 @@ fn classify_post_submit_state(
         return Some("authenticated");
     }
     None
-}
-
-fn detect_matching_prompt(
-    target_app_name: &str,
-    username: &str,
-    expected_window_title: Option<&str>,
-    expected_process_id: Option<i32>,
-) -> anyhow::Result<Option<WindowsPrompt>> {
-    let inspection = inspect(target_app_name)?;
-    let Some(prompt) = inspection.prompt else {
-        return Ok(None);
-    };
-
-    if let Some(expected_process_id) = expected_process_id {
-        if prompt.target.process_id != expected_process_id {
-            anyhow::bail!("Previously detected login prompt process is no longer trusted");
-        }
-    }
-    if !prompt_window_title_matches(&prompt.target.window_title, expected_window_title) {
-        anyhow::bail!("Previously detected login prompt window title changed");
-    }
-    match prompt.email.as_deref() {
-        Some(email) if usernames_match(email, username) => {}
-        Some(_) => anyhow::bail!("Credential prompt email does not match this account"),
-        None => anyhow::bail!("Credential prompt has no visible email; password was not loaded"),
-    }
-    Ok(Some(prompt))
 }
 
 fn revalidate_prompt(
@@ -1402,17 +1321,6 @@ fn text_contains_password_cue(text: &str) -> bool {
     PASSWORD_CUES
         .iter()
         .any(|cue| text.to_lowercase().contains(cue))
-}
-
-fn prompt_window_title_matches(current_title: &str, expected_window_title: Option<&str>) -> bool {
-    let Some(expected_window_title) = expected_window_title
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-    else {
-        return true;
-    };
-
-    current_title.eq_ignore_ascii_case(expected_window_title)
 }
 
 fn usernames_match(prompt_email: &str, account_username: &str) -> bool {

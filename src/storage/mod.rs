@@ -1,5 +1,4 @@
 use crate::models::{Account, AccountId, AppConfig, FIXED_POLL_INTERVAL_SECS};
-use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -1004,9 +1003,7 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
         Ok(encoded) => {
             let encoded = Zeroizing::new(encoded);
             let key = decode_fallback_encryption_key(encoded.trim())?;
-            if let Err(e) = cleanup_stale_fallback_key_file_if_present() {
-                warn!(error = %e, "stale fallback key file cleanup failed after secure fallback key load");
-            }
+            cleanup_stale_fallback_key_file_if_present()?;
             return Ok(key);
         }
         Err(keyring::Error::NoEntry) => {}
@@ -1024,9 +1021,7 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
                 native_secure_storage_name()
             )
         })?;
-        if let Err(e) = cleanup_legacy_fallback_key_file(&legacy_key_path) {
-            warn!(error = %e, "fallback key was migrated to secure storage, but stale key file cleanup will retry later");
-        }
+        cleanup_legacy_fallback_key_file(&legacy_key_path)?;
         return Ok(legacy_key);
     }
 
@@ -1793,11 +1788,12 @@ where
     }
 
     if let Some(before_account) = operation.before_account.as_ref() {
-        let before_account = before_account.clone();
-        if before_account.has_saved_password {
-            load_password_op(&before_account, operation.use_keyring).with_context(|| {
-                "pending account config recovery could not verify previous password; keeping recovery journal for retry"
-            })?;
+        let mut before_account = before_account.clone();
+        if before_account.has_saved_password
+            && load_password_op(&before_account, operation.use_keyring).is_err()
+        {
+            before_account.has_saved_password = false;
+            before_account.enabled = false;
         }
         upsert_recovered_account(config, before_account);
         save_config_op(config)?;

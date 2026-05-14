@@ -1,5 +1,6 @@
 use crate::macos_identity;
 use anyhow::Context;
+use arboard::{Clipboard, SetExtApple};
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{
     CFEqual, CFIndexConvertible, CFRelease, CFRetain, CFType, CFTypeRef, TCFType,
@@ -53,6 +54,7 @@ const AX_STATIC_TEXT_ROLE: &str = "AXStaticText";
 const AX_SHEET_ROLE: &str = "AXSheet";
 
 const KEYCODE_A: u16 = 0;
+const KEYCODE_V: u16 = 9;
 const KEYCODE_DELETE: u16 = 51;
 const CG_HID_EVENT_TAP: u32 = 0;
 const CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
@@ -922,7 +924,9 @@ pub(crate) fn fill_verified_password(
                     } else {
                         focus_password_field_in_prompt(&prompt, app_name, expected_process_id)?
                     };
-                if send_text(password) {
+                if paste_text_into_focused_field(password) {
+                    "pasteboard"
+                } else if send_text(password) {
                     keyboard_method_label
                 } else {
                     anyhow::bail!("password insertion event creation failed");
@@ -1227,12 +1231,10 @@ fn classify_post_submit_inspection(
     });
     let has_session_for_expected_process = submitted_prompt.is_some_and(|submitted_prompt| {
         submitted_prompt_matches_expected(submitted_prompt, expected_process_id, expected_email)
-            && (inspection.session_windows.iter().any(|session| {
+            && inspection.session_windows.iter().any(|session| {
                 session.process_id == expected_process_id
                     && submitted_prompt_matches_session_window(submitted_prompt, session)
-            }) || inspection.window_titles.iter().any(|window| {
-                submitted_prompt_matches_surviving_target_window(submitted_prompt, window)
-            }))
+            })
     });
     if let Some(prompt_state) = classify_post_submit_prompt_candidates(
         &inspection.prompts,
@@ -1324,23 +1326,6 @@ fn submitted_prompt_matches_session_window(
         .window
         .as_ref()
         .is_some_and(|window| !window.same_element(&submitted_prompt.target_window))
-}
-
-fn submitted_prompt_matches_surviving_target_window(
-    submitted_prompt: &MacosSubmittedPrompt,
-    window: &MacosWindowTitle,
-) -> bool {
-    submitted_prompt.origin == PromptOrigin::Sheet
-        && submitted_prompt.process_id == window.process_id
-        && is_probable_session_window_title(&window.title)
-        && window
-            .title
-            .trim()
-            .eq_ignore_ascii_case(submitted_prompt.window_title.trim())
-        && window
-            .window
-            .as_ref()
-            .is_some_and(|window| window.same_element(&submitted_prompt.target_window))
 }
 
 fn session_window_was_present_before_submit(
@@ -2467,6 +2452,36 @@ fn send_text(text: &str) -> bool {
         }
     }
     sent
+}
+
+fn paste_text_into_focused_field(text: &str) -> bool {
+    let mut clipboard = match Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(_) => return false,
+    };
+    let previous_text = clipboard.get().text().ok();
+    if clipboard
+        .set()
+        .exclude_from_history()
+        .text(text.to_string())
+        .is_err()
+    {
+        return false;
+    }
+
+    let pasted = send_key_with_flags(KEYCODE_V, CG_EVENT_FLAG_MASK_COMMAND);
+    thread::sleep(Duration::from_millis(PASTE_SETTLE_MS));
+
+    match previous_text {
+        Some(previous_text) => {
+            let _ = clipboard.set().text(previous_text);
+        }
+        None => {
+            let _ = clipboard.clear();
+        }
+    }
+
+    pasted
 }
 
 fn send_key(keycode: u16) -> bool {
