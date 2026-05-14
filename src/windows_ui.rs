@@ -31,7 +31,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const MAX_ELEMENT_COUNT: usize = 900;
 const UIA_SEARCH_DEPTH: u32 = 12;
 const KEYBOARD_INTERVAL_MS: u64 = 10;
-const KEYBOARD_CLEAR_SETTLE_MS: u64 = 15;
 const FOCUS_SETTLE_MS: u64 = 50;
 const SUBMIT_SETTLE_MS: u64 = 700;
 const SUBMIT_READY_TIMEOUT_MS: u64 = 1500;
@@ -300,41 +299,10 @@ pub(crate) fn fill_password(
             WindowsFillStrategy::DirectSetValue.label(),
         ),
         WindowsFillStrategy::Keyboard => {
-            if target_is_system_credential_prompt(&prompt.target) {
-                if let Ok(result) = set_password_value(&prompt, password, "direct_uia_value_system")
-                {
-                    return Ok(result);
-                }
-            }
-
-            let focus = focus_password_field(&prompt)?;
-            if !focus.verified {
-                if let Ok(result) =
-                    set_password_value(&prompt, password, "direct_uia_value_focus_fallback")
-                {
-                    return Ok(result);
-                }
-                anyhow::bail!("password field focus is not verified");
-            }
-
-            let keyboard = Keyboard::new().interval(KEYBOARD_INTERVAL_MS);
-            keyboard
-                .send_keys("{ctrl}a")
-                .map_err(|e| anyhow::anyhow!("keyboard clear shortcut failed: {e}"))?;
-            thread::sleep(Duration::from_millis(KEYBOARD_CLEAR_SETTLE_MS));
-            keyboard
-                .send_keys("{backspace}")
-                .map_err(|e| anyhow::anyhow!("keyboard clear failed: {e}"))?;
-            thread::sleep(Duration::from_millis(KEYBOARD_CLEAR_SETTLE_MS));
-            guard()?;
-            keyboard
-                .send_text(password)
-                .map_err(|e| anyhow::anyhow!("keyboard password input failed: {e}"))?;
-            thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
-            Ok(WindowsFillResult {
-                fill_method: WindowsFillStrategy::Keyboard.label(),
-                fill_status: "ok",
-                password_field_focused: focus.verified,
+            set_password_value(&prompt, password, "direct_uia_value_keyboard_safe").map_err(|e| {
+                anyhow::anyhow!(
+                    "keyboard password input is disabled on Windows; direct UIA password fill failed: {e}"
+                )
             })
         }
     }
@@ -349,7 +317,10 @@ fn set_password_value(
         .password_field
         .get_pattern::<UIValuePattern>()
         .map_err(|e| anyhow::anyhow!("password field does not expose ValuePattern: {e}"))?;
-    if value.is_readonly().unwrap_or(false) {
+    if value
+        .is_readonly()
+        .map_err(|e| anyhow::anyhow!("password field read-only state unavailable: {e}"))?
+    {
         anyhow::bail!("password field is read-only");
     }
     value
@@ -417,6 +388,8 @@ pub(crate) fn submit_prompt(
         anyhow::bail!("submit fallback refused because password field focus is not verified");
     }
     let keyboard = Keyboard::new().interval(KEYBOARD_INTERVAL_MS);
+    guard()?;
+    ensure_keyboard_input_still_targets_prompt(&prompt, "keyboard submit")?;
     keyboard
         .send_keys("{enter}")
         .map_err(|e| anyhow::anyhow!("keyboard enter failed: {e}"))?;
@@ -988,12 +961,53 @@ fn foreground_process_id() -> Option<i32> {
 }
 
 fn target_accepts_keyboard_input(target: &WindowsTarget) -> bool {
+    target_accepts_keyboard_input_with_state(
+        target,
+        window_handle_is_foreground(target.window_handle),
+        foreground_process_id(),
+    )
+}
+
+fn target_accepts_keyboard_input_with_state(
+    target: &WindowsTarget,
+    target_window_is_foreground: bool,
+    foreground_process_id: Option<i32>,
+) -> bool {
     if target_is_system_credential_prompt(target) {
-        return window_handle_is_foreground(target.window_handle);
+        return target_window_is_foreground;
     }
 
-    window_handle_is_foreground(target.window_handle)
-        || foreground_process_id().is_some_and(|process_id| process_id == target.process_id)
+    target_window_is_foreground
+        || foreground_process_id.is_some_and(|process_id| process_id == target.process_id)
+}
+
+fn password_keyboard_input_ready_with_state(
+    _target: &WindowsTarget,
+    password_field_has_keyboard_focus: bool,
+    target_window_is_foreground: bool,
+    _foreground_process_id: Option<i32>,
+) -> bool {
+    password_field_has_keyboard_focus && target_window_is_foreground
+}
+
+fn keyboard_input_still_targets_prompt(prompt: &WindowsPrompt) -> bool {
+    password_keyboard_input_ready_with_state(
+        &prompt.target,
+        prompt.password_field.has_keyboard_focus().unwrap_or(false),
+        window_handle_is_foreground(prompt.target.window_handle),
+        foreground_process_id(),
+    )
+}
+
+fn ensure_keyboard_input_still_targets_prompt(
+    prompt: &WindowsPrompt,
+    action: &str,
+) -> anyhow::Result<()> {
+    if keyboard_input_still_targets_prompt(prompt) {
+        Ok(())
+    } else {
+        anyhow::bail!("{action} refused because password field focus changed")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2001,6 +2015,33 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_input_ready_requires_password_field_focus() {
+        let target = windows_target("msrdc", program_files_path(r"Remote Desktop\msrdc.exe"));
+
+        assert!(super::password_keyboard_input_ready_with_state(
+            &target, true, true, None
+        ));
+        assert!(!super::password_keyboard_input_ready_with_state(
+            &target,
+            false,
+            true,
+            Some(target.process_id)
+        ));
+        assert!(!super::password_keyboard_input_ready_with_state(
+            &target,
+            true,
+            false,
+            Some(target.process_id)
+        ));
+        assert!(!super::password_keyboard_input_ready_with_state(
+            &target,
+            true,
+            false,
+            Some(target.process_id + 1)
+        ));
+    }
+
+    #[test]
     fn helper_text_matching_keeps_email_and_password_rules() {
         assert_eq!(normalized_identifier("Windows App"), "windowsapp");
         assert!(contains_keyword("Windows Security - Sign in", "Sign in"));
@@ -2164,6 +2205,27 @@ mod tests {
         let target = trusted_windows_security_target();
 
         assert!(super::target_is_system_credential_prompt(&target));
+    }
+
+    #[test]
+    fn system_credential_keyboard_input_requires_exact_foreground_window() {
+        let target = trusted_windows_security_target();
+
+        assert!(super::password_keyboard_input_ready_with_state(
+            &target,
+            true,
+            true,
+            Some(target.process_id + 1)
+        ));
+        assert!(!super::password_keyboard_input_ready_with_state(
+            &target,
+            true,
+            false,
+            Some(target.process_id)
+        ));
+        assert!(!super::password_keyboard_input_ready_with_state(
+            &target, false, true, None
+        ));
     }
 
     #[test]
