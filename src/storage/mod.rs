@@ -15,8 +15,14 @@ const PENDING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.jso
 const RECOVERING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.recovering.json";
 const PASSWORD_ENVELOPE_PREFIX: &str = "waa1:";
 const PASSWORD_ENVELOPE_V2_PREFIX: &str = "waa2:";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_APP_BOUND_SECRET_PREFIX: &str = "waab1:";
 const PASSWORD_ENVELOPE_VERSION: u8 = 1;
 const PASSWORD_ENVELOPE_V2_VERSION: u8 = 2;
+const SECURE_STORAGE_PASSWORD_PURPOSE: &str = "account-password";
+const SECURE_STORAGE_FALLBACK_KEY_PURPOSE: &str = "fallback-encryption-key";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_APP_BOUND_STORAGE_VERSION: &str = "WAAL_WINDOWS_APP_BOUND_STORAGE_V1";
 const PENDING_STORAGE_TEMP_FILE_PREFIXES: &[&str] = &[
     "pending-storage-operation.json.tmp.",
     "pending-storage-operation.recovering.json.tmp.",
@@ -829,6 +835,11 @@ enum StoredPasswordFormat {
     LegacyRaw,
 }
 
+struct SecureStorageSecret {
+    plaintext: Zeroizing<String>,
+    needs_migration: bool,
+}
+
 fn canonical_username(username: &str) -> String {
     username.trim().to_lowercase()
 }
@@ -870,6 +881,224 @@ fn encode_bound_password(account: &Account, password: &str) -> anyhow::Result<Ze
     payload.push_str(PASSWORD_ENVELOPE_PREFIX);
     payload.push_str(json.as_str());
     Ok(payload)
+}
+
+fn encode_keyring_password(account: &Account, password: &str) -> anyhow::Result<Zeroizing<String>> {
+    let payload = encode_bound_password(account, password)?;
+    encode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, payload.as_str())
+}
+
+fn decode_keyring_password(
+    account: &Account,
+    stored: &str,
+) -> anyhow::Result<(Zeroizing<String>, StoredPasswordFormat, bool)> {
+    let secret = decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, stored)?;
+    let (password, format) = decode_bound_password(account, secret.plaintext.as_str())?;
+    Ok((password, format, secret.needs_migration))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn encode_secure_storage_secret(
+    _purpose: &str,
+    plaintext: &str,
+) -> anyhow::Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(plaintext.to_string()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decode_secure_storage_secret(
+    _purpose: &str,
+    stored: &str,
+) -> anyhow::Result<SecureStorageSecret> {
+    Ok(SecureStorageSecret {
+        plaintext: Zeroizing::new(stored.to_string()),
+        needs_migration: false,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn encode_secure_storage_secret(
+    purpose: &str,
+    plaintext: &str,
+) -> anyhow::Result<Zeroizing<String>> {
+    if plaintext.is_empty() {
+        anyhow::bail!("app-bound secure storage payload is empty");
+    }
+    let protected = windows_app_bound_protect(purpose, plaintext.as_bytes())?;
+    let encoded = STANDARD.encode(&*protected);
+    let mut payload = Zeroizing::new(String::with_capacity(
+        WINDOWS_APP_BOUND_SECRET_PREFIX.len() + encoded.len(),
+    ));
+    payload.push_str(WINDOWS_APP_BOUND_SECRET_PREFIX);
+    payload.push_str(&encoded);
+    Ok(payload)
+}
+
+#[cfg(target_os = "windows")]
+fn decode_secure_storage_secret(
+    purpose: &str,
+    stored: &str,
+) -> anyhow::Result<SecureStorageSecret> {
+    if let Some(encoded) = stored.strip_prefix(WINDOWS_APP_BOUND_SECRET_PREFIX) {
+        let protected = STANDARD.decode(encoded)?;
+        let plaintext_bytes = windows_app_bound_unprotect(purpose, &protected)?;
+        let plaintext = String::from_utf8(plaintext_bytes.as_slice().to_vec())?;
+        return Ok(SecureStorageSecret {
+            plaintext: Zeroizing::new(plaintext),
+            needs_migration: false,
+        });
+    }
+    if stored.is_empty() {
+        anyhow::bail!("secure storage payload is empty");
+    }
+    Ok(SecureStorageSecret {
+        plaintext: Zeroizing::new(stored.to_string()),
+        needs_migration: true,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_app_bound_protect(
+    purpose: &str,
+    plaintext: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let mut input = Zeroizing::new(plaintext.to_vec());
+    let mut entropy = Zeroizing::new(windows_current_app_bound_entropy(purpose)?.to_vec());
+    let input_blob = windows_data_blob(&mut input)?;
+    let entropy_blob = windows_data_blob(&mut entropy)?;
+    let mut output_blob = CRYPT_INTEGER_BLOB::default();
+
+    unsafe {
+        CryptProtectData(
+            &input_blob,
+            windows::core::PCWSTR::null(),
+            Some(&entropy_blob as *const _),
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output_blob,
+        )
+        .map_err(|e| anyhow::anyhow!("Windows app-bound Credential Manager protect failed: {e}"))?;
+
+        let output = windows_blob_to_zeroizing_vec(&output_blob);
+        let _ = LocalFree(Some(HLOCAL(output_blob.pbData.cast())));
+        output
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_app_bound_unprotect(
+    purpose: &str,
+    protected: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let mut input = Zeroizing::new(protected.to_vec());
+    let mut entropy = Zeroizing::new(windows_current_app_bound_entropy(purpose)?.to_vec());
+    let input_blob = windows_data_blob(&mut input)?;
+    let entropy_blob = windows_data_blob(&mut entropy)?;
+    let mut output_blob = CRYPT_INTEGER_BLOB::default();
+
+    unsafe {
+        CryptUnprotectData(
+            &input_blob,
+            None,
+            Some(&entropy_blob as *const _),
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output_blob,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Windows app-bound Credential Manager unprotect failed: {e}")
+        })?;
+
+        let output = windows_blob_to_zeroizing_vec(&output_blob);
+        let _ = LocalFree(Some(HLOCAL(output_blob.pbData.cast())));
+        output
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_data_blob(
+    bytes: &mut [u8],
+) -> anyhow::Result<windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB> {
+    if bytes.is_empty() {
+        anyhow::bail!("Windows app-bound storage blob is empty");
+    }
+    let cb_data = u32::try_from(bytes.len())
+        .map_err(|_| anyhow::anyhow!("Windows app-bound storage blob is too large"))?;
+    Ok(windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB {
+        cbData: cb_data,
+        pbData: bytes.as_mut_ptr(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn windows_blob_to_zeroizing_vec(
+    blob: &windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    if blob.pbData.is_null() || blob.cbData == 0 {
+        anyhow::bail!("Windows app-bound storage returned an empty blob");
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) };
+    Ok(Zeroizing::new(bytes.to_vec()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_current_app_bound_entropy(purpose: &str) -> anyhow::Result<[u8; 32]> {
+    let current_exe = std::env::current_exe().map_err(|e| {
+        anyhow::anyhow!("current executable unavailable for app-bound storage: {e}")
+    })?;
+    let canonical_exe = current_exe.canonicalize().map_err(|e| {
+        anyhow::anyhow!("current executable path unavailable for app-bound storage: {e}")
+    })?;
+    Ok(windows_app_bound_entropy_for_path(purpose, &canonical_exe))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_app_bound_entropy_for_path(purpose: &str, path: &Path) -> [u8; 32] {
+    let normalized_path = windows_app_bound_path(path);
+    let mut material = Vec::new();
+    material.extend_from_slice(WINDOWS_APP_BOUND_STORAGE_VERSION.as_bytes());
+    material.push(0);
+    material.extend_from_slice(crate::app_identity::APP_NAME.as_bytes());
+    material.push(0);
+    material.extend_from_slice(SERVICE_NAME.as_bytes());
+    material.push(0);
+    material.extend_from_slice(purpose.as_bytes());
+    material.push(0);
+    material.extend_from_slice(normalized_path.as_bytes());
+
+    let digest = Sha256::digest(&material);
+    let mut entropy = [0u8; 32];
+    entropy.copy_from_slice(&digest);
+    entropy
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_app_bound_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('/', r"\");
+    let normalized = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path
+    };
+    let mut normalized = normalized.trim().to_lowercase();
+    while normalized.ends_with('\\') && normalized.len() > 3 {
+        normalized.pop();
+    }
+    normalized
 }
 
 fn decode_bound_password(
@@ -1232,7 +1461,20 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
     match entry.get_password() {
         Ok(encoded) => {
             let encoded = Zeroizing::new(encoded);
-            let key = decode_fallback_encryption_key(encoded.trim())?;
+            let decoded =
+                decode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.trim())?;
+            let key = decode_fallback_encryption_key(decoded.plaintext.trim())?;
+            if decoded.needs_migration {
+                let payload = encode_secure_storage_secret(
+                    SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
+                    decoded.plaintext.trim(),
+                )?;
+                if let Err(e) = entry.set_password(payload.as_str()) {
+                    warn!(error = %e, "Fallback key loaded from legacy Credential Manager format, but app-bound migration failed");
+                } else {
+                    info!("Migrated fallback key to Windows app-bound Credential Manager storage");
+                }
+            }
             cleanup_stale_fallback_key_file_if_present()?;
             return Ok(key);
         }
@@ -1245,7 +1487,9 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
 
     if let Some((legacy_key_path, legacy_key)) = load_legacy_fallback_key_from_file()? {
         let encoded = Zeroizing::new(STANDARD.encode(*legacy_key));
-        entry.set_password(encoded.as_str()).map_err(|e| {
+        let payload =
+            encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
+        entry.set_password(payload.as_str()).map_err(|e| {
             anyhow::anyhow!(
                 "{} refused to migrate fallback key: {e}",
                 native_secure_storage_name()
@@ -1258,7 +1502,9 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::thread_rng().fill(&mut *key);
     let encoded = Zeroizing::new(STANDARD.encode(*key));
-    entry.set_password(encoded.as_str()).map_err(|e| {
+    let payload =
+        encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
+    entry.set_password(payload.as_str()).map_err(|e| {
         anyhow::anyhow!(
             "{} refused to save fallback key: {e}",
             native_secure_storage_name()
@@ -1634,7 +1880,7 @@ fn save_password_to_backend(
     if use_keyring {
         let entry = keyring::Entry::new(SERVICE_NAME, &account.id)
             .map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", native_secure_storage_name()))?;
-        let payload = encode_bound_password(account, password)?;
+        let payload = encode_keyring_password(account, password)?;
         match entry.set_password(payload.as_str()) {
             Ok(()) => {
                 let stale_cleanup_warning = cleanup_stale_backend_after_successful_save(
@@ -2615,14 +2861,15 @@ fn load_from_keyring_timed(account: &Account) -> anyhow::Result<LoadedStoredPass
     let entry = keyring::Entry::new(SERVICE_NAME, &account.id)?;
     let stored = Zeroizing::new(entry.get_password()?);
     let zeroizing_start = std::time::Instant::now();
-    let (password, format) = decode_bound_password(account, stored.as_str())?;
+    let (password, format, secure_storage_needs_migration) =
+        decode_keyring_password(account, stored.as_str())?;
     let zeroizing_wrap_ms = zeroizing_start.elapsed().as_millis();
-    if format == StoredPasswordFormat::LegacyRaw {
-        let payload = encode_bound_password(account, password.as_str())?;
+    if secure_storage_needs_migration || format == StoredPasswordFormat::LegacyRaw {
+        let payload = encode_keyring_password(account, password.as_str())?;
         if let Err(e) = entry.set_password(payload.as_str()) {
-            warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy keychain format, but migration to bound storage failed");
+            warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy keychain format, but migration to app-bound storage failed");
         } else {
-            info!(account_id = %redacted_account_id(&account.id), "Migrated legacy keychain password to bound storage");
+            info!(account_id = %redacted_account_id(&account.id), "Migrated legacy keychain password to app-bound storage");
         }
     }
     debug!(account_id = %redacted_account_id(&account.id), "Password loaded from secure storage");
@@ -2758,9 +3005,11 @@ mod tests {
         backup_invalid_config_file, cleanup_fallback_key_if_password_file_empty,
         cleanup_legacy_fallback_key_residue_files_in_dir,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
-        clear_pending_storage_operation_paths, decode_bound_password, decrypt_password_with_key,
-        delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
-        encode_bound_password, ensure_no_pending_storage_operation,
+        clear_pending_storage_operation_paths, decode_bound_password,
+        decode_fallback_encryption_key, decode_keyring_password, decode_secure_storage_secret,
+        decrypt_password_with_key, delete_fallback_key_material_with_ops,
+        delete_sensitive_private_file_if_present, encode_bound_password, encode_keyring_password,
+        encode_secure_storage_secret, ensure_no_pending_storage_operation,
         is_pending_storage_operation_in_progress, legacy_account_id_for_migrated_config,
         legacy_migration_target_cleanup_id, legacy_password_migration_ready_to_persist,
         load_config_file, load_pending_storage_operation_record_or_quarantine_from_paths,
@@ -2775,12 +3024,15 @@ mod tests {
         write_private_file_atomic, write_private_file_create_new_atomic, LegacyConfig,
         LegacyCredentialsConfig, LegacyPasswordMigration, PasswordFile, PasswordStorageBackend,
         PendingStorageOperation, StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES,
-        MAX_PASSWORD_FILE_BYTES, PASSWORD_ENVELOPE_V2_PREFIX, PASSWORD_ENVELOPE_V2_VERSION,
-        PENDING_STORAGE_OPERATION_VERSION, SERVICE_NAME,
+        MAX_PASSWORD_FILE_BYTES, PASSWORD_ENVELOPE_PREFIX, PASSWORD_ENVELOPE_V2_PREFIX,
+        PASSWORD_ENVELOPE_V2_VERSION, PENDING_STORAGE_OPERATION_VERSION,
+        SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE, SERVICE_NAME,
+        STANDARD, WINDOWS_APP_BOUND_SECRET_PREFIX,
     };
     #[cfg(unix)]
     use super::{validate_private_dir, validate_private_file_for_read};
     use crate::models::{Account, AppConfig, FIXED_POLL_INTERVAL_SECS};
+    use base64::Engine as _;
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -3770,6 +4022,112 @@ mod tests {
         let mut different_id = account.clone();
         different_id.id = "account-2".to_string();
         assert!(decode_bound_password(&different_id, &encoded).is_err());
+    }
+
+    #[test]
+    fn windows_app_bound_entropy_depends_on_purpose_and_path() {
+        let path = std::path::Path::new(
+            r"\\?\C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+        );
+        let same_path =
+            std::path::Path::new(r"C:/Program Files/Windows App AutoLogin/WindowsAppAutoLogin.exe");
+        let other_path = std::path::Path::new(
+            r"C:\Users\me\AppData\Local\Programs\WindowsAppAutoLogin\WindowsAppAutoLogin.exe",
+        );
+
+        assert_eq!(
+            super::windows_app_bound_path(path),
+            r"c:\program files\windows app autologin\windowsappautologin.exe"
+        );
+        assert_eq!(
+            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, path),
+            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, same_path)
+        );
+        assert_ne!(
+            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, path),
+            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, path)
+        );
+        assert_ne!(
+            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, path),
+            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, other_path)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_secure_storage_secret_is_app_bound() {
+        let encoded =
+            encode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, "super-secret-password")
+                .unwrap();
+
+        assert!(encoded.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX));
+        assert!(!encoded.contains("super-secret-password"));
+
+        let decoded =
+            decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, encoded.as_str())
+                .unwrap();
+        assert_eq!(decoded.plaintext.as_str(), "super-secret-password");
+        assert!(!decoded.needs_migration);
+        assert!(decode_secure_storage_secret(
+            SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
+            encoded.as_str()
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_secure_storage_secret_is_marked_for_migration() {
+        let decoded =
+            decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, "legacy-plaintext")
+                .unwrap();
+
+        assert_eq!(decoded.plaintext.as_str(), "legacy-plaintext");
+        assert!(decoded.needs_migration);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn keyring_password_payload_hides_bound_envelope_and_decodes_legacy_plaintext() {
+        let mut account = Account::new(" User@Example.com ");
+        account.id = "account-1".to_string();
+
+        let encoded = encode_keyring_password(&account, "super-secret-password").unwrap();
+        assert!(encoded.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX));
+        assert!(!encoded.contains("super-secret-password"));
+        assert!(!encoded.contains(PASSWORD_ENVELOPE_PREFIX));
+
+        let (decoded, format, needs_migration) =
+            decode_keyring_password(&account, encoded.as_str()).unwrap();
+        assert_eq!(decoded.as_str(), "super-secret-password");
+        assert_eq!(format, StoredPasswordFormat::BoundV1);
+        assert!(!needs_migration);
+
+        let (legacy_decoded, legacy_format, legacy_needs_migration) =
+            decode_keyring_password(&account, "legacy-secret").unwrap();
+        assert_eq!(legacy_decoded.as_str(), "legacy-secret");
+        assert_eq!(legacy_format, StoredPasswordFormat::LegacyRaw);
+        assert!(legacy_needs_migration);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fallback_key_payload_is_app_bound() {
+        let encoded_key = STANDARD.encode([7u8; 32]);
+        let protected =
+            encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, &encoded_key)
+                .unwrap();
+
+        assert!(protected.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX));
+        assert!(!protected.contains(&encoded_key));
+
+        let decoded =
+            decode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, protected.as_str())
+                .unwrap();
+        let key = decode_fallback_encryption_key(decoded.plaintext.trim()).unwrap();
+
+        assert_eq!(*key, [7u8; 32]);
+        assert!(!decoded.needs_migration);
     }
 
     #[test]
