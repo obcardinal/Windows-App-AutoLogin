@@ -1947,22 +1947,26 @@ fn current_signing_info(exe_path: &Path) -> CurrentSigningInfo {
             team_id: String::new(),
         };
     };
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut identity = if stderr.contains("Signature=adhoc") {
-        "adhoc".to_string()
+    parse_current_signing_info(&String::from_utf8_lossy(&output.stderr))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_current_signing_info(codesign_stderr: &str) -> CurrentSigningInfo {
+    let mut identity = if codesign_stderr.contains("Signature=adhoc") {
+        "ad_hoc".to_string()
     } else {
         "unknown".to_string()
     };
     let mut identifier = String::new();
     let mut team_id = String::new();
-    for line in stderr.lines() {
+    for line in codesign_stderr.lines() {
         let line = line.trim();
         if let Some(authority) = line.strip_prefix("Authority=") {
-            identity = authority.trim().to_string();
+            identity = coarse_signing_identity(authority);
         } else if let Some(value) = line.strip_prefix("Identifier=") {
-            identifier = value.trim().to_string();
+            identifier = diagnostic_presence(value);
         } else if let Some(value) = line.strip_prefix("TeamIdentifier=") {
-            team_id = value.trim().to_string();
+            team_id = diagnostic_presence(value);
         }
     }
     CurrentSigningInfo {
@@ -1971,6 +1975,52 @@ fn current_signing_info(exe_path: &Path) -> CurrentSigningInfo {
         team_id,
     }
 }
+
+fn coarse_signing_identity(value: &str) -> String {
+    let value = sanitize_log_value(value);
+    if value.is_empty() {
+        return String::new();
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower == "adhoc" || lower == "ad_hoc" || lower.contains("signature=adhoc") {
+        return "ad_hoc".to_string();
+    }
+    if lower.starts_with("developer id application:") {
+        return "developer_id_application".to_string();
+    }
+    if lower.starts_with("developer id installer:") {
+        return "developer_id_installer".to_string();
+    }
+    if lower.starts_with("apple development:") {
+        return "apple_development".to_string();
+    }
+    if lower.starts_with("apple distribution:") {
+        return "apple_distribution".to_string();
+    }
+    if lower.starts_with("mac developer:") {
+        return "mac_developer".to_string();
+    }
+    if lower.starts_with("3rd party mac developer application:") {
+        return "app_store_distribution".to_string();
+    }
+    if lower == "unknown" {
+        return "unknown".to_string();
+    }
+    "signed".to_string()
+}
+
+fn diagnostic_presence(value: &str) -> String {
+    let value = sanitize_log_value(value);
+    if value.is_empty() {
+        return String::new();
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower == "not set" || lower == "none" || lower == "unknown" {
+        return lower.replace(' ', "_");
+    }
+    "present".to_string()
+}
+
 pub(crate) fn redacted_email(email: &str) -> String {
     let _ = email;
     "[email]".to_string()
@@ -1987,6 +2037,13 @@ fn make_attempt_id() -> String {
 fn sanitize_log_field(key: &str, value: &str) -> String {
     match key {
         "selected_account_id" | "keychain_account_key" => redacted_account_presence(value),
+        "current_signing_identity" => coarse_signing_identity(value),
+        "current_bundle_id" | "keychain_process_bundle_id" => diagnostic_presence(value),
+        "current_signing_identifier"
+        | "current_team_id"
+        | "windows_app_team_id"
+        | "keychain_process_signing_identifier"
+        | "keychain_process_team_id" => diagnostic_presence(value),
         "current_process_path"
         | "app_bundle_path"
         | "executable_path"
@@ -2139,6 +2196,68 @@ mod tests {
         assert!(!value.contains("/Users/alice"));
         assert!(!value.contains("private"));
         assert!(!value.contains("project"));
+    }
+
+    #[test]
+    fn signing_fields_are_redacted_before_diagnostic_output() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set(
+            "current_signing_identity",
+            "Developer ID Application: Jane Doe (ABCDE12345)",
+        );
+        log.set("current_bundle_id", "com.jane.secret.autologin");
+        log.set("current_signing_identifier", "com.jane.secret.autologin");
+        log.set("current_team_id", "ABCDE12345");
+        log.set("keychain_process_bundle_id", "com.jane.secret.autologin");
+        log.set(
+            "keychain_process_signing_identifier",
+            "com.jane.secret.autologin",
+        );
+        log.set("keychain_process_team_id", "ABCDE12345");
+        log.set("windows_app_team_id", "UBF8T346G9");
+
+        let report = log.finish(None);
+        let serialized = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(
+            report.field("current_signing_identity").unwrap(),
+            "developer_id_application"
+        );
+        assert_eq!(report.field("current_bundle_id").unwrap(), "present");
+        assert_eq!(
+            report.field("current_signing_identifier").unwrap(),
+            "present"
+        );
+        assert_eq!(report.field("current_team_id").unwrap(), "present");
+        assert_eq!(
+            report.field("keychain_process_bundle_id").unwrap(),
+            "present"
+        );
+        assert_eq!(
+            report.field("keychain_process_signing_identifier").unwrap(),
+            "present"
+        );
+        assert_eq!(report.field("keychain_process_team_id").unwrap(), "present");
+        assert_eq!(report.field("windows_app_team_id").unwrap(), "present");
+        assert!(!serialized.contains("Jane Doe"));
+        assert!(!serialized.contains("ABCDE12345"));
+        assert!(!serialized.contains("com.jane.secret.autologin"));
+        assert!(!serialized.contains("UBF8T346G9"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codesign_parser_keeps_only_coarse_signing_status() {
+        let info = super::parse_current_signing_info(
+            "Executable=/private/app\nIdentifier=com.jane.secret.autologin\nAuthority=Developer ID Application: Jane Doe (ABCDE12345)\nTeamIdentifier=ABCDE12345\n",
+        );
+
+        assert_eq!(info.identity, "developer_id_application");
+        assert_eq!(info.identifier, "present");
+        assert_eq!(info.team_id, "present");
+        assert!(!info.identity.contains("Jane"));
+        assert!(!info.identifier.contains("com.jane"));
+        assert!(!info.team_id.contains("ABCDE12345"));
     }
 
     #[cfg(all(

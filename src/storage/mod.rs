@@ -17,6 +17,12 @@ const PASSWORD_ENVELOPE_PREFIX: &str = "waa1:";
 const PASSWORD_ENVELOPE_V2_PREFIX: &str = "waa2:";
 const PASSWORD_ENVELOPE_VERSION: u8 = 1;
 const PASSWORD_ENVELOPE_V2_VERSION: u8 = 2;
+const PENDING_STORAGE_TEMP_FILE_PREFIXES: &[&str] = &[
+    "pending-storage-operation.json.tmp.",
+    "pending-storage-operation.recovering.json.tmp.",
+];
+const LEGACY_FALLBACK_KEY_RESIDUE_PREFIXES: &[&str] =
+    &["fallback.json.invalid.", "fallback.key.invalid."];
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PASSWORD_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_FALLBACK_KEY_FILE_BYTES: u64 = 128;
@@ -585,6 +591,51 @@ fn backup_invalid_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn delete_sensitive_private_file_if_present(path: &Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        std::fs::remove_file(path)?;
+        return sync_parent_dir(path);
+    }
+    if !metadata.file_type().is_file() {
+        return Ok(());
+    }
+    validate_private_file_for_read(path)?;
+    overwrite_private_file_contents(path, metadata.len())?;
+    std::fs::remove_file(path)?;
+    sync_parent_dir(path)
+}
+
+fn overwrite_private_file_contents(path: &Path, len: u64) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+
+    let mut file = options.open(path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let zeroes = [0u8; 4096];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk_len = remaining.min(zeroes.len() as u64) as usize;
+        file.write_all(&zeroes[..chunk_len])?;
+        remaining -= chunk_len as u64;
+    }
+    file.sync_all()?;
+    file.set_len(0)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -818,16 +869,18 @@ fn validate_pending_storage_operation(operation: &PendingStorageOperation) -> an
             }
         }
         "account_delete" => {
-            let Some(before_account) = &operation.before_account else {
-                anyhow::bail!("account delete journal is missing source account");
-            };
             if operation.after_account.is_some() {
                 anyhow::bail!("account delete journal must not contain target account");
             }
-            if operation.account_ids.len() != 1
-                || operation.account_ids[0] != before_account.id.as_str()
-            {
-                anyhow::bail!("account delete journal account id does not match source account");
+            if operation.account_ids.len() != 1 {
+                anyhow::bail!("account delete journal must contain one account id");
+            }
+            if let Some(before_account) = &operation.before_account {
+                if operation.account_ids[0] != before_account.id.as_str() {
+                    anyhow::bail!(
+                        "account delete journal account id does not match source account"
+                    );
+                }
             }
         }
         _ => anyhow::bail!("pending storage operation has unsupported kind"),
@@ -1015,7 +1068,19 @@ fn write_private_file_create_new_atomic(
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
-    let _ = std::fs::remove_file(&temp_path);
+    if let Err(e) = std::fs::remove_file(&temp_path) {
+        warn!(
+            path = %redacted_path(&temp_path),
+            error = %e,
+            "private create-new temp file cleanup failed after commit"
+        );
+    } else if let Err(e) = sync_parent_dir(&temp_path) {
+        warn!(
+            path = %redacted_path(&temp_path),
+            error = %e,
+            "private create-new temp file cleanup committed, but parent directory sync failed"
+        );
+    }
     Ok(())
 }
 
@@ -1024,7 +1089,7 @@ fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_dir(parent)?;
     Ok(())
 }
 
@@ -1033,8 +1098,25 @@ fn sync_parent_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
     ensure_config_dir()?;
+    if let Err(e) = cleanup_legacy_fallback_key_residue_files_if_present() {
+        warn!(
+            error = %e,
+            "Legacy fallback key residue cleanup failed; continuing"
+        );
+    }
 
     let entry =
         keyring::Entry::new(FALLBACK_KEY_SERVICE_NAME, FALLBACK_KEY_ACCOUNT).map_err(|e| {
@@ -1090,9 +1172,14 @@ fn load_legacy_fallback_key_from_file() -> anyhow::Result<Option<(PathBuf, Zeroi
     let key = match read_fallback_encryption_key(&path) {
         Ok(key) => key,
         Err(e) => {
-            warn!(path = %redacted_path(&path), error = %e, "Fallback key file is invalid; backing it up");
-            backup_invalid_file(&path).ok();
-            std::fs::remove_file(&path).ok();
+            warn!(path = %redacted_path(&path), error = %e, "Fallback key file is invalid; deleting it without backup");
+            if let Err(cleanup_error) = delete_sensitive_private_file_if_present(&path) {
+                warn!(
+                    path = %redacted_path(&path),
+                    error = %cleanup_error,
+                    "Invalid fallback key file cleanup failed"
+                );
+            }
             return Ok(None);
         }
     };
@@ -1102,28 +1189,18 @@ fn load_legacy_fallback_key_from_file() -> anyhow::Result<Option<(PathBuf, Zeroi
 
 fn cleanup_stale_fallback_key_file_if_present() -> anyhow::Result<()> {
     let path = fallback_key_file_path()?;
-    if path.exists() {
-        cleanup_legacy_fallback_key_file(&path)?;
-    }
+    cleanup_legacy_fallback_key_file(&path)?;
     Ok(())
 }
 
 fn cleanup_legacy_fallback_key_file(path: &Path) -> anyhow::Result<()> {
-    if let Err(e) = std::fs::remove_file(path) {
+    if let Err(e) = delete_sensitive_private_file_if_present(path) {
         warn!(
             path = %redacted_path(path),
             error = %e,
             "fallback key was migrated to Keychain, but stale key file cleanup failed"
         );
         return Err(e.into());
-    }
-    if let Err(e) = sync_parent_dir(path) {
-        warn!(
-            path = %redacted_path(path),
-            error = %e,
-            "fallback key file was removed, but parent directory sync failed"
-        );
-        return Err(e);
     }
     Ok(())
 }
@@ -1195,11 +1272,45 @@ fn delete_fallback_key_from_keyring() -> anyhow::Result<()> {
 }
 
 fn delete_legacy_fallback_key_file_if_present() -> anyhow::Result<()> {
+    cleanup_legacy_fallback_key_residue_files_if_present()?;
     let path = fallback_key_file_path()?;
-    if path.exists() {
-        cleanup_legacy_fallback_key_file(&path)?;
-    }
+    cleanup_legacy_fallback_key_file(&path)?;
+    cleanup_legacy_fallback_key_residue_files_if_present()?;
     Ok(())
+}
+
+fn cleanup_legacy_fallback_key_residue_files_if_present() -> anyhow::Result<usize> {
+    let dir = config_dir()?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    cleanup_legacy_fallback_key_residue_files_in_dir(&dir)
+}
+
+fn cleanup_legacy_fallback_key_residue_files_in_dir(dir: &Path) -> anyhow::Result<usize> {
+    validate_private_dir(dir)?;
+
+    let mut cleaned = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !LEGACY_FALLBACK_KEY_RESIDUE_PREFIXES
+            .iter()
+            .any(|prefix| file_name.starts_with(prefix))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+            continue;
+        }
+        delete_sensitive_private_file_if_present(&path)?;
+        cleaned += 1;
+    }
+    Ok(cleaned)
 }
 
 fn read_fallback_encryption_key(path: &Path) -> anyhow::Result<Zeroizing<[u8; 32]>> {
@@ -1671,7 +1782,7 @@ pub(crate) fn begin_account_delete_journal(
         from_use_keyring: false,
         to_use_keyring: false,
         use_keyring,
-        before_account: Some(before_account.clone()),
+        before_account: None,
         after_account: None,
     };
     validate_pending_storage_operation(&operation)?;
@@ -1693,6 +1804,11 @@ fn clear_pending_storage_operation_paths(
         errors.push(e.to_string());
     }
     if let Err(e) = remove_pending_storage_operation_file(recovering_path) {
+        errors.push(e.to_string());
+    }
+    if let Err(e) =
+        cleanup_pending_storage_operation_temp_files_for_paths(pending_path, recovering_path)
+    {
         errors.push(e.to_string());
     }
     if errors.is_empty() {
@@ -1873,17 +1989,17 @@ fn reconcile_account_delete_operation_with_ops<D>(
 where
     D: FnMut(&AccountId) -> anyhow::Result<()>,
 {
-    let Some(before_account) = operation.before_account.as_ref() else {
+    let Some(account_id) = operation.account_ids.first() else {
         return Ok(());
     };
     if config
         .accounts
         .iter()
-        .any(|account| account.id == before_account.id)
+        .any(|account| account.id == *account_id)
     {
         return Ok(());
     }
-    delete_account_op(&before_account.id)
+    delete_account_op(account_id)
 }
 
 fn upsert_recovered_account(config: &mut AppConfig, account: Account) {
@@ -1933,6 +2049,12 @@ fn save_pending_storage_operation_to_paths(
     path: &Path,
     recovering_path: &Path,
 ) -> anyhow::Result<()> {
+    if let Err(e) = cleanup_pending_storage_operation_temp_files_for_paths(path, recovering_path) {
+        warn!(
+            error = %e,
+            "Failed to clean stale pending storage operation temp files before save"
+        );
+    }
     ensure_no_pending_storage_operation(path, recovering_path)?;
     let content = serde_json::to_string_pretty(operation)?;
     write_private_file_create_new_atomic(path, "json.tmp", content.as_bytes())
@@ -1969,6 +2091,14 @@ fn load_pending_storage_operation_record_or_quarantine_from_paths(
     recovering_path: &Path,
     pending_path: &Path,
 ) -> anyhow::Result<Option<PendingStorageOperationRecord>> {
+    if let Err(e) =
+        cleanup_pending_storage_operation_temp_files_for_paths(pending_path, recovering_path)
+    {
+        warn!(
+            error = %e,
+            "Failed to clean stale pending storage operation temp files before recovery"
+        );
+    }
     if let Some(record) = load_pending_storage_operation_record_from_path_or_quarantine(
         recovering_path,
         "recovering",
@@ -2073,6 +2203,58 @@ fn invalid_pending_storage_operation_path(path: &Path) -> PathBuf {
         std::process::id(),
         nonce
     ))
+}
+
+fn cleanup_pending_storage_operation_temp_files_for_paths(
+    pending_path: &Path,
+    recovering_path: &Path,
+) -> anyhow::Result<usize> {
+    let mut cleaned = 0;
+    if let Some(parent) = pending_path.parent() {
+        cleaned += cleanup_storage_temp_files_in_dir(parent, PENDING_STORAGE_TEMP_FILE_PREFIXES)?;
+    }
+    if recovering_path.parent() != pending_path.parent() {
+        if let Some(parent) = recovering_path.parent() {
+            cleaned +=
+                cleanup_storage_temp_files_in_dir(parent, PENDING_STORAGE_TEMP_FILE_PREFIXES)?;
+        }
+    }
+    Ok(cleaned)
+}
+
+fn cleanup_storage_temp_files_in_dir(
+    dir: &Path,
+    file_name_prefixes: &[&str],
+) -> anyhow::Result<usize> {
+    validate_private_dir(dir)?;
+
+    let mut cleaned = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name_prefixes
+            .iter()
+            .any(|prefix| file_name.starts_with(prefix))
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
+            continue;
+        }
+        std::fs::remove_file(&path)?;
+        cleaned += 1;
+    }
+
+    if cleaned > 0 {
+        sync_dir(dir)?;
+    }
+    Ok(cleaned)
 }
 
 fn pending_storage_backend_to_cleanup(
@@ -2471,9 +2653,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::backup_invalid_file;
     use super::{
-        cleanup_fallback_key_if_password_file_empty, cleanup_stale_backend_after_successful_save,
-        cleanup_storage_backend_with_ops, clear_pending_storage_operation_paths,
-        decode_bound_password, decrypt_password_with_key, delete_fallback_key_material_with_ops,
+        cleanup_fallback_key_if_password_file_empty,
+        cleanup_legacy_fallback_key_residue_files_in_dir,
+        cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
+        clear_pending_storage_operation_paths, decode_bound_password, decrypt_password_with_key,
+        delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
         encode_bound_password, ensure_no_pending_storage_operation,
         is_pending_storage_operation_in_progress, legacy_account_id_for_migrated_config,
         legacy_migration_target_cleanup_id, legacy_password_migration_ready_to_persist,
@@ -2841,9 +3025,10 @@ mod tests {
     fn pending_account_delete_recovery_skips_cleanup_when_account_still_configured() {
         let mut config = AppConfig::default();
         let operation = account_delete_pending_operation();
-        config
-            .accounts
-            .push(operation.before_account.as_ref().unwrap().clone());
+        let mut account = Account::new("user@example.com");
+        account.id = operation.account_ids[0].clone();
+        account.has_saved_password = true;
+        config.accounts.push(account);
 
         reconcile_account_delete_operation_with_ops(&config, &operation, |_| {
             panic!("delete cleanup must wait until account removal is committed")
@@ -2963,6 +3148,19 @@ mod tests {
 
     #[test]
     fn account_delete_journal_contains_no_password_material() {
+        let operation = account_delete_pending_operation();
+
+        validate_pending_storage_operation(&operation).unwrap();
+        let serialized = serde_json::to_string(&operation).unwrap();
+        assert!(!serialized.contains("super-secret-password"));
+        assert!(!serialized.contains("encrypted_password"));
+        assert!(!serialized.contains("user@example.com"));
+        assert!(!serialized.contains("\"username\""));
+        assert!(!serialized.contains("before_account"));
+    }
+
+    #[test]
+    fn legacy_account_delete_journal_with_snapshot_still_validates() {
         let mut before_account = Account::new("user@example.com");
         before_account.id = "account-1".to_string();
         before_account.has_saved_password = true;
@@ -2978,9 +3176,6 @@ mod tests {
         };
 
         validate_pending_storage_operation(&operation).unwrap();
-        let serialized = serde_json::to_string(&operation).unwrap();
-        assert!(!serialized.contains("super-secret-password"));
-        assert!(!serialized.contains("encrypted_password"));
     }
 
     #[test]
@@ -3020,7 +3215,7 @@ mod tests {
             from_use_keyring: false,
             to_use_keyring: false,
             use_keyring: true,
-            before_account: Some(account),
+            before_account: None,
             after_account: None,
         };
 
@@ -3059,6 +3254,10 @@ mod tests {
 
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
+        assert!(
+            invalid_storage_operation_entries(&root, "pending-storage-operation.json.tmp.")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3195,6 +3394,45 @@ mod tests {
     }
 
     #[test]
+    fn pending_storage_operation_clear_removes_temp_journal_files() {
+        let root = temp_storage_test_dir("pending-clear-temp");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let pending_temp_path = root.join("pending-storage-operation.json.tmp.123.456");
+        let recovering_temp_path =
+            root.join("pending-storage-operation.recovering.json.tmp.123.456");
+        std::fs::write(&pending_path, "pending").unwrap();
+        std::fs::hard_link(&pending_path, &pending_temp_path).unwrap();
+        std::fs::write(&recovering_temp_path, "recovering-user@example.com").unwrap();
+
+        clear_pending_storage_operation_paths(&pending_path, &recovering_path).unwrap();
+
+        assert!(!pending_path.exists());
+        assert!(!pending_temp_path.exists());
+        assert!(!recovering_temp_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_storage_operation_recovery_removes_temp_only_journal_files() {
+        let root = temp_storage_test_dir("pending-recovery-temp-only");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let pending_temp_path = root.join("pending-storage-operation.json.tmp.123.456");
+        std::fs::write(&pending_temp_path, "pending-user@example.com").unwrap();
+
+        let record = load_pending_storage_operation_record_or_quarantine_from_paths(
+            &recovering_path,
+            &pending_path,
+        )
+        .unwrap();
+
+        assert!(record.is_none());
+        assert!(!pending_temp_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recovering_directory_does_not_mask_valid_pending_journal() {
         let root = temp_storage_test_dir("recovering-dir-with-valid-pending");
         let pending_path = root.join("pending-storage-operation.json");
@@ -3290,7 +3528,7 @@ mod tests {
             from_use_keyring: false,
             to_use_keyring: false,
             use_keyring: true,
-            before_account: Some(account),
+            before_account: None,
             after_account: None,
         }
     }
@@ -3566,6 +3804,60 @@ mod tests {
         );
         assert!(error.contains("secure storage key cleanup failed"));
         assert!(error.contains("legacy key file cleanup failed"));
+    }
+
+    #[test]
+    fn sensitive_fallback_key_delete_does_not_create_invalid_backup() {
+        let root = temp_storage_test_dir("fallback-key-no-backup");
+        let key_path = root.join("fallback.key");
+        write_test_private_text(&key_path, "invalid fallback key for token=super-secret");
+
+        delete_sensitive_private_file_if_present(&key_path).unwrap();
+
+        assert!(!key_path.exists());
+        assert!(invalid_storage_operation_entries(&root, "fallback.json.invalid.").is_empty());
+        assert!(invalid_storage_operation_entries(&root, "fallback.key.invalid.").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_fallback_key_residue_cleanup_removes_only_fallback_backups() {
+        let root = temp_storage_test_dir("fallback-key-residue");
+        let fallback_json_backup = root.join("fallback.json.invalid.20260514120000");
+        let fallback_key_backup = root.join("fallback.key.invalid.20260514120000");
+        let config_backup = root.join("config.json.invalid.20260514120000");
+        write_test_private_text(&fallback_json_backup, "old-fallback-key");
+        write_test_private_text(&fallback_key_backup, "old-fallback-key");
+        write_test_private_text(&config_backup, "recoverable-config");
+
+        let cleaned = cleanup_legacy_fallback_key_residue_files_in_dir(&root).unwrap();
+
+        assert_eq!(cleaned, 2);
+        assert!(!fallback_json_backup.exists());
+        assert!(!fallback_key_backup.exists());
+        assert_eq!(
+            std::fs::read_to_string(config_backup).unwrap(),
+            "recoverable-config"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sensitive_fallback_key_delete_removes_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_storage_test_dir("fallback-key-symlink");
+        let target = root.join("target-secret");
+        let link = root.join("fallback.key");
+        write_test_private_text(&target, "do-not-touch");
+        symlink(&target, &link).unwrap();
+
+        delete_sensitive_private_file_if_present(&link).unwrap();
+
+        assert!(!link.exists());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "do-not-touch");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

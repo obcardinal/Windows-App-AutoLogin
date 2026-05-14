@@ -255,7 +255,7 @@ The diagnostic binary prints JSON describing visible target processes, windows, 
 
 Diagnostic target discovery uses the same trusted-target constraints as autofill: supported Microsoft identity, expected install path, signing identity, and verified live PID. App names, process names, and window titles are treated only as report labels; they are not enough to select or traverse an arbitrary process.
 
-`release-diagnostics` is reserved for intentional support artifacts, not general releases. Diagnostic output is redacted and capped, but it can still include process IDs, bundle/signing identifiers, and timing data; review it before sharing with support.
+`release-diagnostics` is reserved for intentional support artifacts, not general releases. Diagnostic output is redacted and capped; signing identities, signing identifiers, Team IDs, and app bundle IDs are reduced to coarse status values before display or export. It can still include process IDs and timing data; review it before sharing with support.
 
 Run one guarded fill attempt from a development build compiled with `debug-fill` or `dev-tools` and launched from the trusted app bundle:
 
