@@ -552,18 +552,24 @@ on elementRoleText(elem)
     return roleText
 end elementRoleText
 
-on elementIsSecureTextField(elem)
+on elementIsNativeSecureTextField(elem)
     set roleText to my elementRoleText(elem)
-    set labelText to my elementLabelText(elem)
     ignoring case
         if roleText contains "AXSecureTextField" then return true
         if roleText contains "secure text field" then return true
         if roleText contains "securetextfield" then return true
-        if (roleText contains "AXTextField") and (roleText contains "secure") then return true
+    end ignoring
+    return false
+end elementIsNativeSecureTextField
+
+on elementIsPasswordLikePlainTextField(elem)
+    set roleText to my elementRoleText(elem)
+    set labelText to my elementLabelText(elem)
+    ignoring case
         if my roleLooksLikeTextField(roleText) and my textContainsPasswordCue(labelText) then return true
     end ignoring
     return false
-end elementIsSecureTextField
+end elementIsPasswordLikePlainTextField
 
 on elementIsHidden(elem)
     tell application "System Events"
@@ -641,7 +647,7 @@ on appendSecureTextFields(containerRef, currentOutput, currentDepth)
                 end if
                 if not my elementIsHidden(elem) then
                     set secureTraversalCount to secureTraversalCount + 1
-                    if my elementIsSecureTextField(elem) then
+                    if my elementIsNativeSecureTextField(elem) then
                         if not my reserveDiagnosticElement() then exit repeat
                         try
                             set n to name of elem as string
@@ -649,6 +655,20 @@ on appendSecureTextFields(containerRef, currentOutput, currentDepth)
                             set n to ""
                         end try
                         set outputText to outputText & "ELEMENT:secure_text_field|name=" & my diagnosticValue(n)
+                        try
+                            set e to enabled of elem as string
+                            set outputText to outputText & "|enabled=" & e
+                        end try
+                        set outputText to outputText & "\n"
+                        set secureFieldCount to secureFieldCount + 1
+                    else if my elementIsPasswordLikePlainTextField(elem) then
+                        if not my reserveDiagnosticElement() then exit repeat
+                        try
+                            set n to name of elem as string
+                        on error
+                            set n to ""
+                        end try
+                        set outputText to outputText & "ELEMENT:password_like_text_field|name=" & my diagnosticValue(n)
                         try
                             set e to enabled of elem as string
                             set outputText to outputText & "|enabled=" & e
@@ -1438,8 +1458,14 @@ fn redact_element_type(value: &str) -> String {
         return String::new();
     }
     match value.as_str() {
-        "text_field" | "secure_text_field" | "button" | "static_text" | "pop_up_button"
-        | "check_box" | "radio_button" => value,
+        "text_field"
+        | "secure_text_field"
+        | "password_like_text_field"
+        | "button"
+        | "static_text"
+        | "pop_up_button"
+        | "check_box"
+        | "radio_button" => value,
         _ => "[redacted type]".to_string(),
     }
 }
@@ -1535,6 +1561,7 @@ ELEMENT:static text|name=123456 token
 PROCESS:Windows App|pid=123
 WINDOW:Sign in
 ELEMENT:text_field|name=Password|value=super-secret
+ELEMENT:password_like_text_field|name=Password|value=also-secret
 ELEMENT:text_field|name=Passcode|value=123456
 ELEMENT:button|name=Continue|enabled=true
 ";
@@ -1543,9 +1570,21 @@ ELEMENT:button|name=Continue|enabled=true
         let rendered = serde_json::to_string(&target_processes).unwrap();
 
         assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("also-secret"));
         assert!(!rendered.contains("123456"));
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("Continue"));
+    }
+
+    #[test]
+    fn diagnostic_script_separates_native_secure_and_password_like_plain_text_fields() {
+        let script = build_applescript("Windows App", &[123]);
+
+        assert!(script.contains("on elementIsNativeSecureTextField(elem)"));
+        assert!(script.contains("on elementIsPasswordLikePlainTextField(elem)"));
+        assert!(script.contains("ELEMENT:secure_text_field"));
+        assert!(script.contains("ELEMENT:password_like_text_field"));
+        assert!(!script.contains("roleLooksLikeTextField(roleText) and my textContainsPasswordCue(labelText) then return true\n    end ignoring\n    return false\nend elementIsNativeSecureTextField"));
     }
 
     #[test]

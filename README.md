@@ -16,7 +16,7 @@ This project is not affiliated with Microsoft.
 - Stores passwords in the system secure store by default: macOS Keychain on macOS, Windows Credential Manager on Windows.
 - Detects Windows App credential prompts.
 - Auto-fills password prompts only after a visible email matches exactly one enabled account.
-- Handles native secure/password fields and password-like text fields only inside a verified credential prompt.
+- Handles native secure password fields only inside a verified credential prompt.
 - Keeps internal diagnostic logs bounded and redacted.
 - Provides a standalone sanitized macOS UI diagnostic tool for development.
 
@@ -241,7 +241,7 @@ At a high level:
 12. Submit only with a bounded `AXPress` action on the verified submit button.
 13. Post-check whether the app reached an authenticated/normal state, still shows the prompt, or ended in an unknown state.
 
-Windows App may expose its password box as `AXTextField` rather than `AXSecureTextField`. The app treats password-like `AXTextField` controls as password fields only inside a verified credential prompt context.
+For password insertion on macOS, the app requires a native secure password field. Password-like plain `AXTextField` controls are not accepted as insertion targets, even inside a verified Windows App prompt.
 
 ## Diagnostics
 
@@ -382,6 +382,7 @@ The app fails closed if:
 - multiple enabled accounts match;
 - the target app is not frontmost;
 - the target PID/window changed;
+- macOS exposes the password box only as a non-secure plain `AXTextField`;
 - the password field cannot be verified or focused;
 - Accessibility returns an error or times out.
 

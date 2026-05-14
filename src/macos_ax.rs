@@ -1488,6 +1488,9 @@ fn revalidate_prepared_prompt_for_fill(
     {
         anyhow::bail!("credential prompt hidden before password insertion");
     }
+    if !is_secure_password_insertion_field(&prompt.password_field) {
+        anyhow::bail!("credential prompt password field is not a secure text field");
+    }
     ensure_prompt_identity_text_still_matches(
         prompt,
         expected_process_id,
@@ -1612,6 +1615,9 @@ fn verified_password_field_in_prompt(
         &prompt.prompt_root,
         "password field",
     )?;
+    if !is_secure_password_insertion_field(&prompt.password_field) {
+        anyhow::bail!("credential prompt password field is not a secure text field");
+    }
     Ok(prompt.password_field.clone())
 }
 
@@ -1903,20 +1909,10 @@ fn scoped_prompt_matches(
 }
 
 fn password_field_candidates(elements: &[AxElement]) -> Vec<AxElement> {
-    let native_fields = elements
-        .iter()
-        .filter(|element| is_native_password_field(element))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if !native_fields.is_empty() {
-        return dedupe_elements(native_fields);
-    }
-
     dedupe_elements(
         elements
             .iter()
-            .filter(|element| is_password_like_text_field(element))
+            .filter(|element| is_native_password_field(element))
             .cloned()
             .collect::<Vec<_>>(),
     )
@@ -2172,14 +2168,18 @@ fn is_text_or_static_text(element: &AxElement) -> bool {
 }
 
 fn is_native_password_field(element: &AxElement) -> bool {
-    let role_text = element_role_text(element);
-    let normalized_role = normalized_identifier(&role_text);
+    is_secure_password_insertion_field(element)
+}
+
+fn is_secure_password_insertion_field(element: &AxElement) -> bool {
     !is_hidden(element)
         && element_enabled(element)
-        && (role_matches(element, AX_SECURE_TEXT_FIELD_ROLE)
-            || normalized_role.contains("securetextfield")
-            || (role_matches(element, AX_TEXT_FIELD_ROLE)
-                && contains_keyword(&role_text, "secure")))
+        && [AX_ROLE, AX_SUBROLE].iter().any(|attr| {
+            element.string_attr(attr).is_some_and(|value| {
+                value.eq_ignore_ascii_case(AX_SECURE_TEXT_FIELD_ROLE)
+                    || normalized_identifier(&value) == "securetextfield"
+            })
+        })
 }
 
 fn is_password_like_text_field(element: &AxElement) -> bool {
@@ -2711,6 +2711,47 @@ mod tests {
                 "password insertion implementation must not use global clipboard API: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn password_field_candidates_do_not_fall_back_to_plain_text_fields() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let candidate_selector = implementation
+            .split("fn password_field_candidates")
+            .nth(1)
+            .and_then(|tail| tail.split("fn dedupe_elements").next())
+            .unwrap();
+
+        assert!(candidate_selector.contains("is_native_password_field"));
+        assert!(
+            !candidate_selector.contains("is_password_like_text_field"),
+            "password insertion must not choose password-like plain AXTextField candidates"
+        );
+    }
+
+    #[test]
+    fn native_password_field_detection_requires_secure_role() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let detector = implementation
+            .split("fn is_secure_password_insertion_field")
+            .nth(1)
+            .and_then(|tail| tail.split("fn is_password_like_text_field").next())
+            .unwrap();
+
+        assert!(detector.contains("AX_SECURE_TEXT_FIELD_ROLE"));
+        assert!(detector.contains("securetextfield"));
+        assert!(detector.contains("[AX_ROLE, AX_SUBROLE]"));
+        assert!(!detector.contains("element_label_text"));
+        assert!(
+            !detector.contains("contains_keyword(&role_text, \"secure\")"),
+            "plain AXTextField must not become a password target from loose role description text"
+        );
     }
 
     #[test]
