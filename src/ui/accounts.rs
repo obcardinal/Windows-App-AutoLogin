@@ -439,6 +439,18 @@ fn clear_temp_password(app: &mut AutoLoginApp) {
     app.temp_password = Zeroizing::new(String::new());
 }
 
+fn suppress_password_clipboard_output(ctx: &egui::Context, password_field_has_focus: bool) {
+    if !password_field_has_focus {
+        return;
+    }
+
+    ctx.output_mut(|output| {
+        output
+            .commands
+            .retain(|command| !matches!(command, egui::OutputCommand::CopyText(_)));
+    });
+}
+
 fn show_delete_confirmation(
     ui: &mut egui::Ui,
     app: &mut AutoLoginApp,
@@ -538,7 +550,12 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                                     "Password"
                                 })
                                 .password(!app.show_password);
-                            ui.add_sized([ACCOUNT_EDITOR_PASSWORD_WIDTH, 24.0], password_edit);
+                            let password_response =
+                                ui.add_sized([ACCOUNT_EDITOR_PASSWORD_WIDTH, 24.0], password_edit);
+                            suppress_password_clipboard_output(
+                                ui.ctx(),
+                                password_response.has_focus(),
+                            );
                             let tooltip = if app.show_password {
                                 "Hide password"
                             } else {
@@ -993,10 +1010,11 @@ mod tests {
     use super::enabled_account_conflicts_with_candidate;
     use super::{
         account_saved_status, clear_account_journal_after_terminal_result_with,
-        delete_account_transaction,
+        delete_account_transaction, suppress_password_clipboard_output,
     };
     use crate::models::{Account, AppConfig};
     use crate::storage::{PasswordStorageBackend, StaleBackendCleanupWarning};
+    use eframe::egui;
     use std::cell::RefCell;
 
     #[test]
@@ -1241,6 +1259,31 @@ mod tests {
             &existing,
             "user@example.com"
         ));
+    }
+
+    #[test]
+    fn focused_password_editor_suppresses_copy_text_output() {
+        let ctx = egui::Context::default();
+        ctx.copy_text("secret".to_string());
+
+        suppress_password_clipboard_output(&ctx, true);
+
+        assert!(ctx.output(|output| output
+            .commands
+            .iter()
+            .all(|command| !matches!(command, egui::OutputCommand::CopyText(_)))));
+    }
+
+    #[test]
+    fn unfocused_password_editor_leaves_copy_text_output_alone() {
+        let ctx = egui::Context::default();
+        ctx.copy_text("diagnostic text".to_string());
+
+        suppress_password_clipboard_output(&ctx, false);
+
+        assert!(ctx.output(|output| output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == "diagnostic text")
+        )));
     }
 
     fn config_with_account(has_saved_password: bool) -> AppConfig {

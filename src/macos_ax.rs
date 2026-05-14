@@ -1,6 +1,5 @@
 use crate::macos_identity;
 use anyhow::Context;
-use arboard::{Clipboard, SetExtApple};
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{
     CFEqual, CFIndexConvertible, CFRelease, CFRetain, CFType, CFTypeRef, TCFType,
@@ -21,7 +20,7 @@ const FOCUS_POLL_INTERVAL_MS: u64 = 10;
 const KEY_EVENT_SETTLE_MS: u64 = 20;
 #[cfg_attr(not(test), allow(dead_code))]
 const DIRECT_AXVALUE_READY_MS: u64 = 40;
-const PASTE_SETTLE_MS: u64 = 60;
+const PRESS_FOCUS_SETTLE_MS: u64 = 60;
 #[cfg_attr(not(test), allow(dead_code))]
 const POST_FILL_SETTLE_MS: u64 = 20;
 const FAST_SUBMIT_READY_TIMEOUT_MS: u64 = 60;
@@ -54,7 +53,6 @@ const AX_STATIC_TEXT_ROLE: &str = "AXStaticText";
 const AX_SHEET_ROLE: &str = "AXSheet";
 
 const KEYCODE_A: u16 = 0;
-const KEYCODE_V: u16 = 9;
 const KEYCODE_DELETE: u16 = 51;
 const CG_HID_EVENT_TAP: u32 = 0;
 const CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
@@ -912,21 +910,44 @@ pub(crate) fn fill_verified_password(
                 focus_password_field_in_prompt(&prompt, app_name, expected_process_id)?;
                 password_field_focused = true;
                 guard()?;
-                send_key_with_flags(KEYCODE_A, CG_EVENT_FLAG_MASK_COMMAND);
+                if !send_key_with_flags(KEYCODE_A, CG_EVENT_FLAG_MASK_COMMAND) {
+                    anyhow::bail!("password field clear shortcut event creation failed");
+                }
                 thread::sleep(Duration::from_millis(KEY_EVENT_SETTLE_MS));
-                send_key(KEYCODE_DELETE);
+                if !send_key(KEYCODE_DELETE) {
+                    anyhow::bail!("password field clear event creation failed");
+                }
                 thread::sleep(Duration::from_millis(KEY_EVENT_SETTLE_MS));
 
                 guard()?;
-                let _password_field =
-                    if prompt.password_field.bool_attr(AX_FOCUSED).unwrap_or(false) {
-                        verified_password_field_in_prompt(&prompt, app_name, expected_process_id)?
-                    } else {
-                        focus_password_field_in_prompt(&prompt, app_name, expected_process_id)?
-                    };
-                if paste_text_into_focused_field(password) {
-                    "pasteboard"
-                } else if send_text(password) {
+                let password_field = if prompt.password_field.bool_attr(AX_FOCUSED).unwrap_or(false)
+                {
+                    verified_password_field_in_prompt(&prompt, app_name, expected_process_id)?
+                } else {
+                    focus_password_field_in_prompt(&prompt, app_name, expected_process_id)?
+                };
+                guard()?;
+                ensure_prompt_identity_text_still_matches(
+                    &prompt,
+                    expected_process_id,
+                    expected_email,
+                    expected_window_title,
+                    prompt.origin,
+                    "keyboard password insertion",
+                )?;
+                let trusted_process = current_trusted_process_info(app_name, expected_process_id)?;
+                ensure_trusted_process_matches(
+                    &trusted_process,
+                    &prepared.trusted_process,
+                    "credential prompt process identity changed before keyboard password insertion",
+                )?;
+                if !password_field.bool_attr(AX_FOCUSED).unwrap_or(false) {
+                    anyhow::bail!(
+                        "password field focus changed before keyboard password insertion"
+                    );
+                }
+                if send_text(password) {
+                    thread::sleep(Duration::from_millis(POST_FILL_SETTLE_MS));
                     keyboard_method_label
                 } else {
                     anyhow::bail!("password insertion event creation failed");
@@ -1681,7 +1702,7 @@ fn focus_password_field(
         field,
         AX_FOCUSED,
         true,
-        Duration::from_millis(PASTE_SETTLE_MS),
+        Duration::from_millis(PRESS_FOCUS_SETTLE_MS),
     )
 }
 
@@ -2434,54 +2455,24 @@ fn send_text(text: &str) -> bool {
     if utf16.is_empty() {
         return true;
     }
-    let mut sent = false;
     unsafe {
         let down = CGEventCreateKeyboardEvent(std::ptr::null(), 0, true);
-        if !down.is_null() {
-            CGEventKeyboardSetUnicodeString(down, utf16.len(), utf16.as_ptr());
-            CGEventPost(CG_HID_EVENT_TAP, down);
-            CFRelease(down.cast());
-            sent = true;
+        if down.is_null() {
+            return false;
         }
         let up = CGEventCreateKeyboardEvent(std::ptr::null(), 0, false);
-        if !up.is_null() {
-            CGEventKeyboardSetUnicodeString(up, utf16.len(), utf16.as_ptr());
-            CGEventPost(CG_HID_EVENT_TAP, up);
-            CFRelease(up.cast());
-            sent = true;
+        if up.is_null() {
+            CFRelease(down.cast());
+            return false;
         }
+        CGEventKeyboardSetUnicodeString(down, utf16.len(), utf16.as_ptr());
+        CGEventKeyboardSetUnicodeString(up, utf16.len(), utf16.as_ptr());
+        CGEventPost(CG_HID_EVENT_TAP, down);
+        CGEventPost(CG_HID_EVENT_TAP, up);
+        CFRelease(down.cast());
+        CFRelease(up.cast());
     }
-    sent
-}
-
-fn paste_text_into_focused_field(text: &str) -> bool {
-    let mut clipboard = match Clipboard::new() {
-        Ok(clipboard) => clipboard,
-        Err(_) => return false,
-    };
-    let previous_text = clipboard.get().text().ok();
-    if clipboard
-        .set()
-        .exclude_from_history()
-        .text(text.to_string())
-        .is_err()
-    {
-        return false;
-    }
-
-    let pasted = send_key_with_flags(KEYCODE_V, CG_EVENT_FLAG_MASK_COMMAND);
-    thread::sleep(Duration::from_millis(PASTE_SETTLE_MS));
-
-    match previous_text {
-        Some(previous_text) => {
-            let _ = clipboard.set().text(previous_text);
-        }
-        None => {
-            let _ = clipboard.clear();
-        }
-    }
-
-    pasted
+    true
 }
 
 fn send_key(keycode: u16) -> bool {
@@ -2489,24 +2480,24 @@ fn send_key(keycode: u16) -> bool {
 }
 
 fn send_key_with_flags(keycode: u16, flags: u64) -> bool {
-    let mut sent = false;
     unsafe {
         let down = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, true);
-        if !down.is_null() {
-            CGEventSetFlags(down, flags);
-            CGEventPost(CG_HID_EVENT_TAP, down);
-            CFRelease(down.cast());
-            sent = true;
+        if down.is_null() {
+            return false;
         }
         let up = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, false);
-        if !up.is_null() {
-            CGEventSetFlags(up, flags);
-            CGEventPost(CG_HID_EVENT_TAP, up);
-            CFRelease(up.cast());
-            sent = true;
+        if up.is_null() {
+            CFRelease(down.cast());
+            return false;
         }
+        CGEventSetFlags(down, flags);
+        CGEventSetFlags(up, flags);
+        CGEventPost(CG_HID_EVENT_TAP, down);
+        CGEventPost(CG_HID_EVENT_TAP, up);
+        CFRelease(down.cast());
+        CFRelease(up.cast());
     }
-    sent
+    true
 }
 
 const LOGIN_TITLE_KEYWORDS: &[&str] = &[
@@ -2655,8 +2646,8 @@ mod tests {
         prompt_identity_verified, prompt_text_element_should_contribute,
         prompt_window_title_matches, select_submit_label_for_test, submit_label_rank,
         text_contains_password_cue, MacosFillMethod, PromptOrigin, DIRECT_AXVALUE_READY_MS,
-        FOCUS_POLL_INTERVAL_MS, FOCUS_SETTLE_MS, KEY_EVENT_SETTLE_MS, PASTE_SETTLE_MS,
-        POST_FILL_SETTLE_MS, SUBMIT_SETTLE_MS,
+        FOCUS_POLL_INTERVAL_MS, FOCUS_SETTLE_MS, KEY_EVENT_SETTLE_MS, POST_FILL_SETTLE_MS,
+        PRESS_FOCUS_SETTLE_MS, SUBMIT_SETTLE_MS,
     };
     use std::time::Duration;
 
@@ -2703,8 +2694,28 @@ mod tests {
     }
 
     #[test]
-    fn direct_axvalue_ready_wait_is_shorter_than_pasteboard_fallback() {
-        assert!(DIRECT_AXVALUE_READY_MS < PASTE_SETTLE_MS);
+    fn password_insertion_implementation_has_no_global_clipboard_api() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            concat!("Clip", "board"),
+            concat!("SetExt", "Apple"),
+            concat!("paste_text", "_into_focused_field"),
+            concat!("KEYCODE", "_V"),
+            concat!("\"paste", "board\""),
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "password insertion implementation must not use global clipboard API: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_axvalue_ready_wait_is_shorter_than_focus_press_fallback() {
+        assert!(DIRECT_AXVALUE_READY_MS < PRESS_FOCUS_SETTLE_MS);
         assert!(DIRECT_AXVALUE_READY_MS >= FOCUS_POLL_INTERVAL_MS);
     }
 
@@ -2764,7 +2775,7 @@ mod tests {
         assert_eq!(KEY_EVENT_SETTLE_MS, 20);
         assert_eq!(POST_FILL_SETTLE_MS, 20);
         assert_eq!(SUBMIT_SETTLE_MS, 0);
-        assert!(PASTE_SETTLE_MS >= FOCUS_SETTLE_MS);
+        assert!(PRESS_FOCUS_SETTLE_MS >= FOCUS_SETTLE_MS);
         assert!(Duration::from_millis(SUBMIT_SETTLE_MS) < Duration::from_millis(450));
     }
 
