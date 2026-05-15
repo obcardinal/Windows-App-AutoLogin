@@ -246,6 +246,12 @@ impl DebugLog {
             ("password_load_attempted", "false".to_string()),
             ("password_loaded", "false".to_string()),
             ("password_load_skip_reason", String::new()),
+            ("pre_password_revalidation_attempted", "false".to_string()),
+            (
+                "pre_password_revalidation_result",
+                "not_attempted".to_string(),
+            ),
+            ("pre_password_revalidation_ms", "0".to_string()),
             ("password_load_ms", "0".to_string()),
             ("storage_lookup_start_ms", "0".to_string()),
             ("account_id_lookup_ms", "0".to_string()),
@@ -488,6 +494,46 @@ fn fill_current_prompt_once_macos(
             Err(reason) => return log.fail(reason),
         };
 
+    if let Err(e) = guard() {
+        return log.fail(format!("attempt_cancelled_{e}"));
+    }
+    log.set("pre_password_revalidation_attempted", "true");
+    let pre_password_revalidation_start = Instant::now();
+    let verified_prompt = match crate::macos_ax::preflight_password_load_prompt(
+        &app_name,
+        prompt.verified_prompt.as_ref(),
+        prompt.process_id,
+        &prompt.window_title,
+        &prompt.prompt_origin,
+        &prompt_email,
+    ) {
+        Ok(verified_prompt) => {
+            log.set("pre_password_revalidation_result", "ok");
+            log.set(
+                "pre_password_revalidation_ms",
+                pre_password_revalidation_start
+                    .elapsed()
+                    .as_millis()
+                    .to_string(),
+            );
+            verified_prompt
+        }
+        Err(_) => {
+            log.set("pre_password_revalidation_result", "failed");
+            log.set(
+                "pre_password_revalidation_ms",
+                pre_password_revalidation_start
+                    .elapsed()
+                    .as_millis()
+                    .to_string(),
+            );
+            return log.fail("pre_password_revalidation_failed");
+        }
+    };
+    if let Err(e) = guard() {
+        return log.fail(format!("attempt_cancelled_{e}"));
+    }
+
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
     log.set("keychain_account_key", selected_account.id.clone());
@@ -594,31 +640,17 @@ fn fill_current_prompt_once_macos(
     }
 
     let fill_start = Instant::now();
-    let prepared_prompt = prompt.verified_prompt.clone();
-    let fill_result = match if let Some(verified_prompt) = prepared_prompt {
-        crate::macos_ax::fill_verified_password(
-            &app_name,
-            verified_prompt,
-            prompt.process_id,
-            &prompt.window_title,
-            &prompt.prompt_origin,
-            &prompt_email,
-            password.as_str(),
-            macos_fill_method(method),
-            guard,
-        )
-    } else {
-        crate::macos_ax::fill_password(
-            &app_name,
-            prompt.process_id,
-            &prompt.window_title,
-            &prompt.prompt_origin,
-            &prompt_email,
-            password.as_str(),
-            macos_fill_method(method),
-            guard,
-        )
-    } {
+    let fill_result = match crate::macos_ax::fill_verified_password(
+        &app_name,
+        verified_prompt,
+        prompt.process_id,
+        &prompt.window_title,
+        &prompt.prompt_origin,
+        &prompt_email,
+        password.as_str(),
+        macos_fill_method(method),
+        guard,
+    ) {
         Ok(result) => result,
         Err(e) => {
             log.set(
@@ -848,12 +880,17 @@ fn select_prompt_and_account<'a>(
     };
     log.set("selected_account_id", selected_account.id.clone());
 
+    let process_id = native_prompt.target.process_id;
+    let window_title = native_prompt.target.window_title.clone();
+    let prompt_origin = native_prompt.origin.as_str().to_string();
+    let verified_prompt = crate::macos_ax::MacosVerifiedPrompt::from_detected_prompt(native_prompt);
+
     Ok((
         PromptInfo {
-            process_id: native_prompt.target.process_id,
-            window_title: native_prompt.target.window_title.clone(),
-            prompt_origin: native_prompt.origin.as_str().to_string(),
-            verified_prompt: None,
+            process_id,
+            window_title,
+            prompt_origin,
+            verified_prompt: Some(verified_prompt),
         },
         prompt_email,
         *selected_account,
@@ -2165,6 +2202,48 @@ mod tests {
         assert!(report
             .summary_line()
             .contains("password_load_skip_reason=visible_prompt_email_missing"));
+    }
+
+    #[test]
+    fn pre_password_revalidation_failure_records_skip_reason() {
+        let report =
+            super::DebugLog::new("test".to_string()).fail("pre_password_revalidation_failed");
+
+        assert_eq!(report.field("password_load_attempted").unwrap(), "false");
+        assert_eq!(report.field("password_loaded").unwrap(), "false");
+        assert_eq!(
+            report.field("password_load_skip_reason").unwrap(),
+            "pre_password_revalidation_failed"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pre_password_revalidation_stays_before_keychain_load() {
+        let implementation = include_str!("debug_fill.rs")
+            .split("fn fill_current_prompt_once_macos")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(
+                    "\n#[cfg(target_os = \"macos\")]\nfn detect_current_prompt_context_macos",
+                )
+                .next()
+            })
+            .unwrap();
+
+        let preflight = implementation
+            .find("preflight_password_load_prompt")
+            .unwrap();
+        let password_load_marker = implementation.find("password_load_attempted").unwrap();
+        let keychain_load = implementation
+            .find("storage::load_password_for_prompt_with_timing")
+            .unwrap();
+        let final_fill = implementation.find("fill_verified_password").unwrap();
+
+        assert!(preflight < password_load_marker);
+        assert!(password_load_marker < keychain_load);
+        assert!(keychain_load < final_fill);
+        assert!(!implementation.contains("crate::macos_ax::fill_password("));
     }
 
     #[test]

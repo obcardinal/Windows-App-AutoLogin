@@ -1401,6 +1401,16 @@ mod tests {
         assert!(!fill_attempt_should_suppress_same_prompt_retry(
             &fill_report(false, &[("prompt_context_revalidation_result", "stale")])
         ));
+        assert!(!fill_attempt_should_suppress_same_prompt_retry(
+            &fill_report_with_failure(
+                false,
+                &[
+                    ("pre_password_revalidation_attempted", "true"),
+                    ("pre_password_revalidation_result", "failed")
+                ],
+                Some("pre_password_revalidation_failed")
+            )
+        ));
     }
 
     #[test]

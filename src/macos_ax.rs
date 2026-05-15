@@ -263,6 +263,14 @@ impl fmt::Debug for MacosVerifiedPrompt {
 }
 
 impl MacosVerifiedPrompt {
+    pub(crate) fn from_detected_prompt(prompt: MacosPrompt) -> Self {
+        let trusted_process = prompt.trusted_process.clone();
+        Self {
+            prompt,
+            trusted_process,
+        }
+    }
+
     fn matches_expected(
         &self,
         expected_process_id: i32,
@@ -812,37 +820,41 @@ fn normalized_prompt_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-pub(crate) fn fill_password(
+pub(crate) fn preflight_password_load_prompt(
     app_name: &str,
+    verified_prompt: Option<&MacosVerifiedPrompt>,
     expected_process_id: i32,
     expected_window_title: &str,
     expected_prompt_origin: &str,
     expected_email: &str,
-    password: &str,
-    method: MacosFillMethod,
-    guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<MacosFillResult> {
-    guard()?;
+) -> anyhow::Result<MacosVerifiedPrompt> {
+    let verified_prompt = match verified_prompt {
+        Some(verified_prompt) => verified_prompt.clone(),
+        None => revalidate_prompt(
+            app_name,
+            expected_process_id,
+            expected_window_title,
+            expected_prompt_origin,
+            expected_email,
+        )?,
+    };
 
-    let verified_prompt = revalidate_prompt(
-        app_name,
+    ensure_verified_prompt_matches_fill_target(
+        &verified_prompt,
         expected_process_id,
         expected_window_title,
         expected_prompt_origin,
         expected_email,
     )?;
-
-    fill_verified_password(
+    let _prepared = revalidate_prepared_prompt_for_fill(
         app_name,
-        verified_prompt,
+        &verified_prompt,
         expected_process_id,
         expected_window_title,
-        expected_prompt_origin,
         expected_email,
-        password,
-        method,
-        guard,
-    )
+    )?;
+
+    Ok(verified_prompt)
 }
 
 pub(crate) fn fill_verified_password(
@@ -857,19 +869,13 @@ pub(crate) fn fill_verified_password(
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<MacosFillResult> {
     guard()?;
-    if !verified_prompt.matches_expected(
+    ensure_verified_prompt_matches_fill_target(
+        &verified_prompt,
         expected_process_id,
         expected_window_title,
         expected_prompt_origin,
         expected_email,
-    ) {
-        anyhow::bail!("prepared credential prompt no longer matches expected automation target");
-    }
-    if !verified_prompt.identity_text_matches(expected_email, expected_window_title) {
-        anyhow::bail!(
-            "prepared credential prompt content no longer matches expected automation target"
-        );
-    }
+    )?;
     let prepared = revalidate_prepared_prompt_for_fill(
         app_name,
         &verified_prompt,
@@ -909,6 +915,29 @@ pub(crate) fn fill_verified_password(
             submit_button_ready_after_fill,
         }),
     })
+}
+
+fn ensure_verified_prompt_matches_fill_target(
+    verified_prompt: &MacosVerifiedPrompt,
+    expected_process_id: i32,
+    expected_window_title: &str,
+    expected_prompt_origin: &str,
+    expected_email: &str,
+) -> anyhow::Result<()> {
+    if !verified_prompt.matches_expected(
+        expected_process_id,
+        expected_window_title,
+        expected_prompt_origin,
+        expected_email,
+    ) {
+        anyhow::bail!("prepared credential prompt no longer matches expected automation target");
+    }
+    if !verified_prompt.identity_text_matches(expected_email, expected_window_title) {
+        anyhow::bail!(
+            "prepared credential prompt content no longer matches expected automation target"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn submit_filled_prompt(
@@ -2516,6 +2545,54 @@ mod tests {
                 "password insertion must not use global keyboard fallback: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn password_load_preflight_does_not_receive_or_write_password() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let preflight = implementation
+            .split("pub(crate) fn preflight_password_load_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn fill_verified_password").next())
+            .unwrap();
+
+        assert!(preflight.contains("revalidate_prepared_prompt_for_fill"));
+        for forbidden in [
+            "password:",
+            "set_password_value",
+            "AX_PRESS",
+            "perform_action",
+        ] {
+            assert!(
+                !preflight.contains(forbidden),
+                "pre-password-load validation must not receive secrets or mutate UI: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_password_fill_revalidates_before_direct_write() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let fill_verified_password = implementation
+            .split("pub(crate) fn fill_verified_password")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn submit_filled_prompt").next())
+            .unwrap();
+
+        let revalidation = fill_verified_password
+            .find("revalidate_prepared_prompt_for_fill")
+            .unwrap();
+        let write = fill_verified_password
+            .find("set_password_value(&prepared.password_field, password)")
+            .unwrap();
+
+        assert!(revalidation < write);
     }
 
     #[test]
