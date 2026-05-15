@@ -243,6 +243,7 @@ impl DebugLog {
             ),
             ("credential_prompt_activation_error_kind", String::new()),
             ("prompt_detected", "false".to_string()),
+            ("windows_prompt_trust", String::new()),
             ("detected_email_redacted", String::new()),
             ("account_match_count", "0".to_string()),
             ("account_enabled_email_match_count", "0".to_string()),
@@ -1516,6 +1517,7 @@ fn runtime_status_report_windows(
         return log.finish(None);
     };
     log.set("prompt_detected", "true");
+    log.set("windows_prompt_trust", prompt.trust_label());
     log.set("password_field_detected", "true");
     log.set("password_field_role", prompt.password_field_role.clone());
     log.set(
@@ -1974,6 +1976,7 @@ fn apply_windows_target_fields(log: &mut DebugLog, target: &crate::windows_ui::W
 fn apply_windows_prompt_fields(log: &mut DebugLog, prompt: &crate::windows_ui::WindowsPrompt) {
     log.set("windows_app_frontmost", prompt.target.frontmost.to_string());
     log.set("prompt_detected", "true");
+    log.set("windows_prompt_trust", prompt.trust_label());
     log.set("password_field_detected", "true");
     log.set("password_field_role", prompt.password_field_role.clone());
     log.set(

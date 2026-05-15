@@ -130,8 +130,30 @@ pub(crate) struct WindowsPrompt {
     pub(crate) email: Option<String>,
     pub(crate) password_field_description: String,
     pub(crate) password_field_role: String,
+    trust: WindowsPromptTrust,
     password_field: UIElement,
     submit_button: Option<UIElement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsPromptTrust {
+    TrustedTargetProcess,
+    CredentialBrokerBoundToTarget,
+}
+
+impl WindowsPromptTrust {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TrustedTargetProcess => "trusted_target_process",
+            Self::CredentialBrokerBoundToTarget => "credential_broker_bound_to_target",
+        }
+    }
+}
+
+impl WindowsPrompt {
+    pub(crate) fn trust_label(&self) -> &'static str {
+        self.trust.label()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -207,8 +229,7 @@ pub(crate) fn check_status(config: &Config) -> MonitorStatus {
 pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection> {
     ensure_fixed_target_app(target_app_name)?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
-    let allow_system_credential_dialogs = is_builtin_target_name(target_app_name);
-    let trusted_running_target = allow_system_credential_dialogs
+    let trusted_running_target = is_builtin_target_name(target_app_name)
         .then(|| running_target_process(target_app_name))
         .flatten();
 
@@ -248,9 +269,12 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
                 else {
                     continue;
                 };
-                if let Some(prompt) =
-                    prompt_from_window(&automation, candidate.target.clone(), window)?
-                {
+                if let Some(prompt) = prompt_from_window(
+                    &automation,
+                    candidate.target.clone(),
+                    WindowsPromptTrust::TrustedTargetProcess,
+                    window,
+                )? {
                     if prompt.target.frontmost {
                         inspection.prompt = Some(prompt);
                         return Ok(inspection);
@@ -265,20 +289,22 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
             continue;
         }
 
-        if allow_system_credential_dialogs {
-            if !(system_credential_dialog_matches(&candidate.target, &candidate.class_name)
-                && system_credential_prompt_owned_by_target(
-                    target_app_name,
-                    candidate.window_handle,
-                ))
-            {
-                continue;
-            }
+        if system_credential_prompt_matches_target(
+            target_app_name,
+            &candidate.target,
+            &candidate.class_name,
+            candidate.window_handle,
+        ) {
             let Ok(window) = automation.element_from_handle(Handle::from(candidate.window_handle))
             else {
                 continue;
             };
-            if let Some(prompt) = prompt_from_window(&automation, candidate.target, window)? {
+            if let Some(prompt) = prompt_from_window(
+                &automation,
+                candidate.target,
+                WindowsPromptTrust::CredentialBrokerBoundToTarget,
+                window,
+            )? {
                 if window_handle_is_foreground(prompt.target.window_handle) {
                     inspection.prompt = Some(prompt);
                     return Ok(inspection);
@@ -303,31 +329,22 @@ pub(crate) fn inspect_prompt_snapshot(
 ) -> anyhow::Result<Option<WindowsPrompt>> {
     ensure_fixed_target_app(target_app_name)?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
-    let allow_system_credential_dialogs = is_builtin_target_name(target_app_name);
 
     for candidate in native_prompt_snapshot_candidates(process_id, window_title) {
-        let target_matches = target_app_matches_with_class(
+        let Some(trust) = prompt_candidate_trust(
             target_app_name,
             &candidate.target,
             &candidate.class_name,
-        ) && target_window_should_be_scanned_for_prompt(
-            target_app_name,
-            &candidate.target,
-            &candidate.class_name,
-        );
-        let system_prompt_matches = allow_system_credential_dialogs
-            && system_credential_dialog_matches(&candidate.target, &candidate.class_name)
-            && system_credential_prompt_owned_by_target(target_app_name, candidate.window_handle);
-
-        if !target_matches && !system_prompt_matches {
+            candidate.window_handle,
+        ) else {
             continue;
-        }
+        };
 
         let Ok(window) = automation.element_from_handle(Handle::from(candidate.window_handle))
         else {
             continue;
         };
-        let Some(prompt) = prompt_from_window(&automation, candidate.target, window)? else {
+        let Some(prompt) = prompt_from_window(&automation, candidate.target, trust, window)? else {
             continue;
         };
         if prompt_matches_snapshot(&prompt, process_id, window_title, prompt_email) {
@@ -741,7 +758,25 @@ fn ensure_same_revalidated_prompt(
     {
         anyhow::bail!("credential prompt email changed before automation");
     }
+    let mut prompt = prompt;
+    prompt.trust = compatible_revalidated_prompt_trust(prompt.trust, expected.trust)?;
     Ok(prompt)
+}
+
+fn compatible_revalidated_prompt_trust(
+    current: WindowsPromptTrust,
+    expected: WindowsPromptTrust,
+) -> anyhow::Result<WindowsPromptTrust> {
+    match (current, expected) {
+        (WindowsPromptTrust::TrustedTargetProcess, WindowsPromptTrust::TrustedTargetProcess) => {
+            Ok(WindowsPromptTrust::TrustedTargetProcess)
+        }
+        (
+            WindowsPromptTrust::CredentialBrokerBoundToTarget,
+            WindowsPromptTrust::CredentialBrokerBoundToTarget,
+        ) => Ok(WindowsPromptTrust::CredentialBrokerBoundToTarget),
+        _ => anyhow::bail!("credential prompt trust changed before automation"),
+    }
 }
 
 fn revalidate_prompt_for_direct_set_value(
@@ -784,6 +819,7 @@ fn ensure_direct_set_value_target_ready(
         &current_target,
         &class_name,
         prompt.target.window_handle,
+        prompt.trust,
     )?;
 
     if !password_field_ready_for_direct_set_value(&prompt.password_field) {
@@ -814,17 +850,28 @@ fn ensure_direct_set_value_target_is_trusted(
     target: &WindowsTarget,
     class_name: &str,
     window_handle: isize,
+    trust: WindowsPromptTrust,
 ) -> anyhow::Result<()> {
-    let trusted_target = target_app_matches_with_class(target_app_name, target, class_name)
-        && target_window_should_be_scanned_for_prompt(target_app_name, target, class_name);
-    let trusted_system_prompt = is_builtin_target_name(target_app_name)
-        && system_credential_dialog_matches(target, class_name)
-        && system_credential_prompt_owned_by_target(target_app_name, window_handle);
-
-    if trusted_target || trusted_system_prompt {
-        Ok(())
-    } else {
-        anyhow::bail!("credential prompt target is not trusted before password insertion")
+    match trust {
+        WindowsPromptTrust::TrustedTargetProcess => {
+            if prompt_candidate_is_trusted_autofill_target(target_app_name, target, class_name) {
+                Ok(())
+            } else {
+                anyhow::bail!("credential prompt target is not trusted before password insertion")
+            }
+        }
+        WindowsPromptTrust::CredentialBrokerBoundToTarget => {
+            if system_credential_prompt_matches_target(
+                target_app_name,
+                target,
+                class_name,
+                window_handle,
+            ) {
+                Ok(())
+            } else {
+                anyhow::bail!("credential broker prompt is not trusted before password insertion")
+            }
+        }
     }
 }
 
@@ -849,6 +896,7 @@ fn password_field_ready_for_direct_set_value_with_state(
 fn prompt_from_window(
     automation: &UIAutomation,
     target: WindowsTarget,
+    trust: WindowsPromptTrust,
     window: UIElement,
 ) -> anyhow::Result<Option<WindowsPrompt>> {
     if !is_usable_window(&window) {
@@ -878,6 +926,7 @@ fn prompt_from_window(
         email: prompt_candidate.email,
         password_field_description,
         password_field_role,
+        trust,
         password_field: prompt_candidate.password_field,
         submit_button: prompt_candidate.submit_button,
     }))
@@ -893,18 +942,51 @@ fn target_window_should_be_scanned_for_prompt(
         || credential_dialog_class_like(class_name)
 }
 
+fn prompt_candidate_is_trusted_autofill_target(
+    target_app_name: &str,
+    target: &WindowsTarget,
+    class_name: &str,
+) -> bool {
+    target_app_matches_with_class(target_app_name, target, class_name)
+        && target_window_should_be_scanned_for_prompt(target_app_name, target, class_name)
+}
+
+fn prompt_candidate_trust(
+    target_app_name: &str,
+    target: &WindowsTarget,
+    class_name: &str,
+    window_handle: isize,
+) -> Option<WindowsPromptTrust> {
+    if prompt_candidate_is_trusted_autofill_target(target_app_name, target, class_name) {
+        return Some(WindowsPromptTrust::TrustedTargetProcess);
+    }
+
+    system_credential_prompt_matches_target(target_app_name, target, class_name, window_handle)
+        .then_some(WindowsPromptTrust::CredentialBrokerBoundToTarget)
+}
+
 fn fast_system_credential_prompt(
     automation: &UIAutomation,
     target_app_name: &str,
 ) -> anyhow::Result<Option<WindowsPrompt>> {
     for (target, window_handle) in native_system_credential_windows() {
-        if !system_credential_prompt_owned_by_target(target_app_name, window_handle) {
+        if !system_credential_prompt_matches_target(
+            target_app_name,
+            &target,
+            "Credential Dialog Xaml Host",
+            window_handle,
+        ) {
             continue;
         }
         let Ok(window) = automation.element_from_handle(Handle::from(window_handle)) else {
             continue;
         };
-        if let Some(prompt) = prompt_from_window(automation, target, window)? {
+        if let Some(prompt) = prompt_from_window(
+            automation,
+            target,
+            WindowsPromptTrust::CredentialBrokerBoundToTarget,
+            window,
+        )? {
             return Ok(Some(prompt));
         }
     }
@@ -1088,6 +1170,18 @@ fn target_details_from_hwnd(hwnd: HWND) -> Option<(WindowsTarget, String)> {
     Some((target, native_window_class(hwnd)))
 }
 
+fn system_credential_prompt_matches_target(
+    target_app_name: &str,
+    target: &WindowsTarget,
+    class_name: &str,
+    window_handle: isize,
+) -> bool {
+    is_builtin_target_name(target_app_name)
+        && running_target_process(target_app_name).is_some()
+        && system_credential_dialog_matches(target, class_name)
+        && system_credential_prompt_owned_by_target(target_app_name, window_handle)
+}
+
 fn system_credential_prompt_owned_by_target(target_app_name: &str, window_handle: isize) -> bool {
     let hwnd = hwnd_from_handle(window_handle);
     let owner = unsafe { GetWindow(hwnd, GW_OWNER).ok() };
@@ -1118,15 +1212,7 @@ fn native_system_credential_windows() -> Vec<(WindowsTarget, isize)> {
 unsafe extern "system" fn enum_native_system_credential_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let candidates = unsafe { &mut *(lparam.0 as *mut Vec<(WindowsTarget, isize)>) };
 
-    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        return true.into();
-    }
-
-    let mut rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err()
-        || rect.right - rect.left <= 20
-        || rect.bottom - rect.top <= 20
-    {
+    if !native_window_is_visible_and_sized(hwnd) {
         return true.into();
     }
 
@@ -1241,10 +1327,6 @@ fn target_accepts_keyboard_input_with_state(
     target_window_is_foreground: bool,
     foreground_process_id: Option<i32>,
 ) -> bool {
-    if target_is_system_credential_prompt(target) {
-        return target_window_is_foreground;
-    }
-
     target_window_is_foreground
         || foreground_process_id.is_some_and(|process_id| process_id == target.process_id)
 }
@@ -2139,10 +2221,6 @@ fn system_credential_dialog_matches(target: &WindowsTarget, class_name: &str) ->
         && credential_dialog_class_like(class_name)
 }
 
-pub(crate) fn target_is_system_credential_prompt(target: &WindowsTarget) -> bool {
-    credential_dialog_title_like(&target.window_title) && trusted_windows_credential_broker(target)
-}
-
 fn credential_dialog_title_like(title: &str) -> bool {
     contains_keyword(title, "Windows Security") || contains_keyword(title, "Enter your credentials")
 }
@@ -2586,10 +2664,9 @@ const SUBMIT_LABELS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_keyword, credential_dialog_title_like, ensure_fixed_target_app,
-        extract_email_like, is_preferred_submit_label, is_probable_session_window_title,
-        login_title_like, normalized_identifier, prompt_text_rect_related_to_password,
-        submit_rect_related_to_password, system_credential_dialog_matches, target_aliases,
+        contains_keyword, ensure_fixed_target_app, extract_email_like, is_preferred_submit_label,
+        is_probable_session_window_title, login_title_like, normalized_identifier,
+        prompt_text_rect_related_to_password, submit_rect_related_to_password, target_aliases,
         target_app_matches_with_class, text_contains_password_cue, trusted_microsoft_rdp_path_hint,
         window_title_matches, ElementRect, WindowsTarget,
     };
@@ -2627,13 +2704,6 @@ mod tests {
         format!(r"{dir}\{file_name}")
     }
 
-    fn syswow64_path(file_name: &str) -> Option<String> {
-        super::trusted_windows_system_directories()
-            .into_iter()
-            .find(|path| path.ends_with(r"\syswow64"))
-            .map(|dir| format!(r"{dir}\{file_name}"))
-    }
-
     fn windows_target(process_name: &str, process_path: impl Into<String>) -> WindowsTarget {
         WindowsTarget {
             process_id: 42,
@@ -2643,6 +2713,12 @@ mod tests {
             window_handle: 7,
             frontmost: true,
         }
+    }
+
+    fn trusted_remote_desktop_prompt_target() -> WindowsTarget {
+        let mut target = windows_target("msrdc", program_files_path(r"Remote Desktop\msrdc.exe"));
+        target.window_title = "Windows Security - Sign in".to_string();
+        target
     }
 
     fn reject_all_windows_target_identities(
@@ -2971,28 +3047,21 @@ mod tests {
 
     #[test]
     fn prompt_snapshot_match_requires_same_pid_title_and_email() {
-        let target = WindowsTarget {
-            process_id: 42,
-            process_name: "CredentialUIBroker".to_string(),
-            process_path: r"C:\Windows\System32\CredentialUIBroker.exe".to_string(),
-            window_title: "Windows Security".to_string(),
-            window_handle: 7,
-            frontmost: true,
-        };
+        let target = trusted_remote_desktop_prompt_target();
         let email = Some("USER@example.com");
 
         assert!(super::prompt_metadata_matches_snapshot(
             &target,
             email,
             42,
-            "windows security",
+            "windows security - sign in",
             Some("user@example.com")
         ));
         assert!(!super::prompt_metadata_matches_snapshot(
             &target,
             email,
             43,
-            "windows security",
+            "windows security - sign in",
             Some("user@example.com")
         ));
         assert!(!super::prompt_metadata_matches_snapshot(
@@ -3006,28 +3075,21 @@ mod tests {
             &target,
             email,
             42,
-            "windows security",
+            "windows security - sign in",
             Some("other@example.com")
         ));
         assert!(!super::prompt_metadata_matches_snapshot(
             &target,
             None,
             42,
-            "windows security",
+            "windows security - sign in",
             Some("user@example.com")
         ));
     }
 
     #[test]
     fn direct_setvalue_target_validation_requires_same_window_identity() {
-        let expected = WindowsTarget {
-            process_id: 42,
-            process_name: "CredentialUIBroker".to_string(),
-            process_path: system32_path("CredentialUIBroker.exe"),
-            window_title: "Windows Security".to_string(),
-            window_handle: 7,
-            frontmost: true,
-        };
+        let expected = trusted_remote_desktop_prompt_target();
         assert!(
             super::ensure_direct_set_value_target_matches_expected(&expected, &expected).is_ok()
         );
@@ -3082,59 +3144,60 @@ mod tests {
     }
 
     #[test]
-    fn system_windows_security_credential_dialog_is_trusted_prompt_host() {
-        let target = trusted_windows_security_target();
+    fn trusted_windows_app_prompt_is_autofill_target() {
+        let target = trusted_remote_desktop_prompt_target();
 
-        assert!(system_credential_dialog_matches(
+        assert!(super::prompt_candidate_is_trusted_autofill_target(
+            "Windows App",
             &target,
             "Credential Dialog Xaml Host"
         ));
-        assert!(system_credential_dialog_matches(
+        assert!(super::ensure_direct_set_value_target_is_trusted(
+            "Windows App",
+            &target,
+            "Credential Dialog Xaml Host",
+            target.window_handle,
+            super::WindowsPromptTrust::TrustedTargetProcess
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn credential_broker_prompt_is_not_plain_autofill_target() {
+        let target = trusted_windows_security_target();
+
+        assert!(!super::prompt_candidate_is_trusted_autofill_target(
+            "Windows App",
+            &target,
+            "Credential Dialog Xaml Host"
+        ));
+        assert!(!super::prompt_candidate_is_trusted_autofill_target(
+            "Windows App",
             &target,
             "Windows.UI.Core.CoreWindow"
         ));
-    }
-
-    #[test]
-    fn target_is_system_credential_prompt_accepts_trusted_windows_security_broker() {
-        let target = trusted_windows_security_target();
-
-        assert!(super::target_is_system_credential_prompt(&target));
-    }
-
-    #[test]
-    fn system_credential_keyboard_input_requires_exact_foreground_window() {
-        let target = trusted_windows_security_target();
-
-        assert!(super::password_keyboard_input_ready_with_state(
+        assert!(super::system_credential_dialog_matches(
             &target,
-            true,
-            true,
-            Some(target.process_id + 1)
-        ));
-        assert!(!super::password_keyboard_input_ready_with_state(
-            &target,
-            true,
-            false,
-            Some(target.process_id)
-        ));
-        assert!(!super::password_keyboard_input_ready_with_state(
-            &target, false, true, None
-        ));
-    }
-
-    #[test]
-    fn system_windows_security_dialog_requires_system_broker_path() {
-        let _guard =
-            super::set_windows_target_identity_override(reject_all_windows_target_identities);
-        let trusted_path_target = trusted_windows_security_target();
-        assert!(!system_credential_dialog_matches(
-            &trusted_path_target,
             "Credential Dialog Xaml Host"
         ));
+    }
 
-        drop(_guard);
+    #[test]
+    fn credential_broker_prompt_requires_owner_binding_before_direct_setvalue() {
+        let target = trusted_windows_security_target();
 
+        assert!(super::ensure_direct_set_value_target_is_trusted(
+            "Windows App",
+            &target,
+            "Credential Dialog Xaml Host",
+            target.window_handle,
+            super::WindowsPromptTrust::CredentialBrokerBoundToTarget
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn credential_broker_prompt_is_rejected_even_with_user_path_spoof() {
         let target = WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBroker".to_string(),
@@ -3144,14 +3207,14 @@ mod tests {
             frontmost: true,
         };
 
-        assert!(!system_credential_dialog_matches(
+        assert!(!super::system_credential_dialog_matches(
             &target,
             "Credential Dialog Xaml Host"
         ));
     }
 
     #[test]
-    fn system_windows_security_dialog_rejects_nested_system32_suffix_spoof() {
+    fn credential_broker_prompt_is_rejected_even_with_nested_system32_suffix_spoof() {
         let target = WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBroker".to_string(),
@@ -3161,15 +3224,14 @@ mod tests {
             frontmost: true,
         };
 
-        assert!(!system_credential_dialog_matches(
+        assert!(!super::system_credential_dialog_matches(
             &target,
             "Credential Dialog Xaml Host"
         ));
-        assert!(!super::target_is_system_credential_prompt(&target));
     }
 
     #[test]
-    fn system_windows_security_dialog_rejects_empty_path_process_name_fallback() {
+    fn credential_broker_prompt_is_rejected_with_empty_path_process_name_fallback() {
         let target = WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBroker".to_string(),
@@ -3179,15 +3241,14 @@ mod tests {
             frontmost: true,
         };
 
-        assert!(!system_credential_dialog_matches(
+        assert!(!super::system_credential_dialog_matches(
             &target,
             "Credential Dialog Xaml Host"
         ));
-        assert!(!super::target_is_system_credential_prompt(&target));
     }
 
     #[test]
-    fn system_windows_security_dialog_requires_broker_process_name() {
+    fn credential_broker_prompt_is_rejected_even_with_process_name_spoof() {
         let target = WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBrokerSpoof".to_string(),
@@ -3197,58 +3258,16 @@ mod tests {
             frontmost: true,
         };
 
-        assert!(!system_credential_dialog_matches(
+        assert!(!super::system_credential_dialog_matches(
             &target,
             "Credential Dialog Xaml Host"
         ));
-        assert!(!super::target_is_system_credential_prompt(&target));
     }
 
     #[test]
     fn windows_security_title_is_login_prompt_not_session() {
-        assert!(credential_dialog_title_like("Windows Security"));
-        assert!(credential_dialog_title_like("Windows Security - Sign in"));
-        assert!(credential_dialog_title_like("Enter your credentials"));
-        assert!(!credential_dialog_title_like("Other Security"));
         assert!(login_title_like("Windows Security"));
         assert!(login_title_like("Windows Security - Sign in"));
         assert!(!is_probable_session_window_title("Windows Security"));
-    }
-
-    #[test]
-    fn system_windows_security_dialog_accepts_syswow64_broker_path() {
-        let Some(process_path) = syswow64_path("CredentialUIBroker.exe") else {
-            return;
-        };
-        let target = WindowsTarget {
-            process_id: 42,
-            process_name: "CredentialUIBroker".to_string(),
-            process_path,
-            window_title: "Windows Security".to_string(),
-            window_handle: 7,
-            frontmost: true,
-        };
-
-        assert!(system_credential_dialog_matches(
-            &target,
-            "Credential Dialog Xaml Host"
-        ));
-    }
-
-    #[test]
-    fn system_windows_security_dialog_requires_windows_security_title() {
-        let target = WindowsTarget {
-            process_id: 42,
-            process_name: "CredentialUIBroker".to_string(),
-            process_path: r"C:\Windows\System32\CredentialUIBroker.exe".to_string(),
-            window_title: "Other Security".to_string(),
-            window_handle: 7,
-            frontmost: true,
-        };
-
-        assert!(!system_credential_dialog_matches(
-            &target,
-            "Credential Dialog Xaml Host"
-        ));
     }
 }
