@@ -244,6 +244,8 @@ impl DebugLog {
             ("credential_prompt_activation_error_kind", String::new()),
             ("prompt_detected", "false".to_string()),
             ("windows_prompt_trust", String::new()),
+            ("password_like_plain_edit_rejected", "false".to_string()),
+            ("password_field_reject_reason", String::new()),
             ("detected_email_redacted", String::new()),
             ("account_match_count", "0".to_string()),
             ("account_enabled_email_match_count", "0".to_string()),
@@ -1058,6 +1060,7 @@ fn fill_current_prompt_once_windows(
         return log.fail("trusted_windows_app_not_running");
     };
     apply_windows_target_fields(&mut log, &target);
+    apply_windows_inspection_rejection_fields(&mut log, &inspection);
 
     let Some(mut prompt) = inspection.prompt else {
         return log.fail("visible_credential_prompt_not_detected");
@@ -1365,6 +1368,7 @@ fn inspect_windows_prompt_for_fill(
                 target,
                 prompt: Some(prompt),
                 has_session: false,
+                password_like_plain_edit_rejected: false,
             })
         }
         Ok(None) => {
@@ -1512,6 +1516,7 @@ fn runtime_status_report_windows(
         return log.fail("trusted_windows_app_not_running");
     };
     apply_windows_target_fields(&mut log, &target);
+    apply_windows_inspection_rejection_fields(&mut log, &inspection);
 
     let Some(prompt) = inspection.prompt else {
         return log.finish(None);
@@ -1983,6 +1988,20 @@ fn apply_windows_prompt_fields(log: &mut DebugLog, prompt: &crate::windows_ui::W
         "password_field_description_redacted",
         prompt.password_field_description.clone(),
     );
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_inspection_rejection_fields(
+    log: &mut DebugLog,
+    inspection: &crate::windows_ui::WindowsInspection,
+) {
+    if inspection.password_like_plain_edit_rejected {
+        log.set("password_like_plain_edit_rejected", "true");
+        log.set(
+            "password_field_reject_reason",
+            "password_like_plain_edit_not_native",
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]

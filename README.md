@@ -241,7 +241,7 @@ At a high level:
 12. Submit only with a bounded `AXPress` action on the verified submit button.
 13. Post-check whether the app reached an authenticated/normal state, still shows the prompt, or ended in an unknown state.
 
-For password insertion on macOS, the app requires a native secure password field. Password-like plain `AXTextField` controls are not accepted as insertion targets, even inside a verified Windows App prompt.
+For password insertion, the app requires a native secure password field: macOS `AXSecureTextField` or Windows UI Automation `IsPassword`. Password-like plain text controls such as macOS `AXTextField` or Windows plain `Edit` are not accepted as insertion targets, even inside a verified Windows App prompt.
 
 ## Diagnostics
 
@@ -382,7 +382,7 @@ The app fails closed if:
 - multiple enabled accounts match;
 - the target app is not frontmost;
 - the target PID/window changed;
-- macOS exposes the password box only as a non-secure plain `AXTextField`;
+- the platform exposes the password box only as a non-secure plain text field;
 - the password field cannot be verified or focused;
 - Accessibility returns an error or times out.
 

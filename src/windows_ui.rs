@@ -161,6 +161,7 @@ pub(crate) struct WindowsInspection {
     pub(crate) target: Option<WindowsTarget>,
     pub(crate) prompt: Option<WindowsPrompt>,
     pub(crate) has_session: bool,
+    pub(crate) password_like_plain_edit_rejected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +240,7 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
                 target: trusted_running_target.clone(),
                 prompt: Some(prompt),
                 has_session: false,
+                password_like_plain_edit_rejected: false,
             });
         }
     }
@@ -269,12 +271,15 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
                 else {
                     continue;
                 };
-                if let Some(prompt) = prompt_from_window(
+                let prompt_window = inspect_prompt_window(
                     &automation,
                     candidate.target.clone(),
                     WindowsPromptTrust::TrustedTargetProcess,
                     window,
-                )? {
+                )?;
+                inspection.password_like_plain_edit_rejected |=
+                    prompt_window.password_like_plain_edit_rejected;
+                if let Some(prompt) = prompt_window.prompt {
                     if prompt.target.frontmost {
                         inspection.prompt = Some(prompt);
                         return Ok(inspection);
@@ -299,12 +304,15 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
             else {
                 continue;
             };
-            if let Some(prompt) = prompt_from_window(
+            let prompt_window = inspect_prompt_window(
                 &automation,
                 candidate.target,
                 WindowsPromptTrust::CredentialBrokerBoundToTarget,
                 window,
-            )? {
+            )?;
+            inspection.password_like_plain_edit_rejected |=
+                prompt_window.password_like_plain_edit_rejected;
+            if let Some(prompt) = prompt_window.prompt {
                 if window_handle_is_foreground(prompt.target.window_handle) {
                     inspection.prompt = Some(prompt);
                     return Ok(inspection);
@@ -880,7 +888,7 @@ fn password_field_ready_for_direct_set_value(element: &UIElement) -> bool {
         element.is_offscreen().unwrap_or(true),
         element.is_enabled().unwrap_or(false),
         prompt_element_rect(element),
-        is_native_password_field(element) || is_password_like_edit(element),
+        is_native_password_field(element),
     )
 }
 
@@ -888,9 +896,14 @@ fn password_field_ready_for_direct_set_value_with_state(
     is_offscreen: bool,
     is_enabled: bool,
     rect: Option<ElementRect>,
-    password_identity_matches: bool,
+    native_password_identity_matches: bool,
 ) -> bool {
-    !is_offscreen && is_enabled && rect.is_some() && password_identity_matches
+    !is_offscreen && is_enabled && rect.is_some() && native_password_identity_matches
+}
+
+struct PromptWindowInspection {
+    prompt: Option<WindowsPrompt>,
+    password_like_plain_edit_rejected: bool,
 }
 
 fn prompt_from_window(
@@ -899,8 +912,20 @@ fn prompt_from_window(
     trust: WindowsPromptTrust,
     window: UIElement,
 ) -> anyhow::Result<Option<WindowsPrompt>> {
+    Ok(inspect_prompt_window(automation, target, trust, window)?.prompt)
+}
+
+fn inspect_prompt_window(
+    automation: &UIAutomation,
+    target: WindowsTarget,
+    trust: WindowsPromptTrust,
+    window: UIElement,
+) -> anyhow::Result<PromptWindowInspection> {
     if !is_usable_window(&window) {
-        return Ok(None);
+        return Ok(PromptWindowInspection {
+            prompt: None,
+            password_like_plain_edit_rejected: false,
+        });
     }
 
     let mut elements = automation
@@ -916,20 +941,34 @@ fn prompt_from_window(
     }
 
     let Some(prompt_candidate) = select_prompt_candidate(&target.window_title, &elements) else {
-        return Ok(None);
+        return Ok(PromptWindowInspection {
+            prompt: None,
+            password_like_plain_edit_rejected: has_password_like_plain_edit(&elements),
+        });
     };
 
     let password_field_description = redacted_element_description(&prompt_candidate.password_field);
     let password_field_role = element_role_text(&prompt_candidate.password_field);
-    Ok(Some(WindowsPrompt {
-        target,
-        email: prompt_candidate.email,
-        password_field_description,
-        password_field_role,
-        trust,
-        password_field: prompt_candidate.password_field,
-        submit_button: prompt_candidate.submit_button,
-    }))
+    Ok(PromptWindowInspection {
+        prompt: Some(WindowsPrompt {
+            target,
+            email: prompt_candidate.email,
+            password_field_description,
+            password_field_role,
+            trust,
+            password_field: prompt_candidate.password_field,
+            submit_button: prompt_candidate.submit_button,
+        }),
+        password_like_plain_edit_rejected: false,
+    })
+}
+
+fn has_password_like_plain_edit(elements: &[UIElement]) -> bool {
+    elements.iter().any(|element| {
+        !is_native_password_field(element)
+            && is_password_like_edit(element)
+            && prompt_element_rect(element).is_some()
+    })
 }
 
 fn target_window_should_be_scanned_for_prompt(
@@ -1425,20 +1464,12 @@ struct PromptCandidate {
     email: Option<String>,
     password_field: UIElement,
     submit_button: Option<UIElement>,
-    password_kind: PasswordFieldKind,
 }
 
 #[derive(Clone)]
 struct PasswordFieldCandidate {
     element: UIElement,
     rect: ElementRect,
-    kind: PasswordFieldKind,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PasswordFieldKind {
-    Native,
-    PasswordLikeEdit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1496,9 +1527,6 @@ fn select_prompt_candidate(window_title: &str, elements: &[UIElement]) -> Option
 
     for candidate in password_field_candidates(elements) {
         let submit_button = select_submit_button_for_password(elements, candidate.rect);
-        if candidate.kind == PasswordFieldKind::PasswordLikeEdit && submit_button.is_none() {
-            continue;
-        }
         let submit_rect = submit_button.as_ref().and_then(prompt_element_rect);
         let prompt_text = collect_prompt_text(elements, candidate.rect, submit_rect);
         let prompt_email = extract_email_like(&prompt_text);
@@ -1510,7 +1538,6 @@ fn select_prompt_candidate(window_title: &str, elements: &[UIElement]) -> Option
             email: prompt_email,
             password_field: candidate.element,
             submit_button,
-            password_kind: candidate.kind,
         };
         if selected
             .as_ref()
@@ -1540,9 +1567,7 @@ fn prompt_candidate_preferred(candidate: &PromptCandidate, current: &PromptCandi
 }
 
 fn prompt_candidate_score(candidate: &PromptCandidate) -> u8 {
-    u8::from(candidate.email.is_some()) * 4
-        + u8::from(candidate.password_kind == PasswordFieldKind::Native) * 2
-        + u8::from(candidate.submit_button.is_some())
+    u8::from(candidate.email.is_some()) * 4 + u8::from(candidate.submit_button.is_some())
 }
 
 fn password_field_candidates(elements: &[UIElement]) -> Vec<PasswordFieldCandidate> {
@@ -1555,19 +1580,6 @@ fn password_field_candidates(elements: &[UIElement]) -> Vec<PasswordFieldCandida
             candidates.push(PasswordFieldCandidate {
                 element: element.clone(),
                 rect,
-                kind: PasswordFieldKind::Native,
-            });
-        }
-    }
-    for element in elements {
-        if is_native_password_field(element) || !is_password_like_edit(element) {
-            continue;
-        }
-        if let Some(rect) = prompt_element_rect(element) {
-            candidates.push(PasswordFieldCandidate {
-                element: element.clone(),
-                rect,
-                kind: PasswordFieldKind::PasswordLikeEdit,
             });
         }
     }
@@ -3110,10 +3122,10 @@ mod tests {
     }
 
     #[test]
-    fn direct_setvalue_password_field_requires_visible_enabled_bounds_and_identity() {
+    fn direct_setvalue_password_field_requires_visible_enabled_bounds_and_native_identity() {
         let rect = ElementRect::new(10, 10, 110, 40);
 
-        for (is_offscreen, is_enabled, bounds, identity_matches, expected) in [
+        for (is_offscreen, is_enabled, bounds, native_password_identity_matches, expected) in [
             (false, true, rect, true, true),
             (true, true, rect, true, false),
             (false, false, rect, true, false),
@@ -3125,11 +3137,71 @@ mod tests {
                     is_offscreen,
                     is_enabled,
                     bounds,
-                    identity_matches,
+                    native_password_identity_matches,
                 ),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn direct_setvalue_readiness_requires_native_is_password() {
+        let implementation = include_str!("windows_ui.rs");
+        let readiness = source_between(
+            implementation,
+            "fn password_field_ready_for_direct_set_value(",
+            "fn password_field_ready_for_direct_set_value_with_state(",
+        );
+        assert!(
+            readiness.contains("is_native_password_field(element)"),
+            "direct SetValue readiness must require native UIA password identity"
+        );
+        assert!(
+            !readiness.contains("is_password_like_edit"),
+            "direct SetValue readiness must not accept password-like plain Edit controls"
+        );
+    }
+
+    #[test]
+    fn password_field_candidates_do_not_fall_back_to_password_like_plain_edits() {
+        let implementation = include_str!("windows_ui.rs");
+        let candidates = source_between(
+            implementation,
+            "fn password_field_candidates(",
+            "fn select_submit_button_for_password(",
+        );
+        assert!(
+            !candidates.contains("is_password_like_edit"),
+            "autofill candidates must not include password-like plain Edit controls"
+        );
+    }
+
+    #[test]
+    fn native_password_field_detection_requires_uia_is_password() {
+        let implementation = include_str!("windows_ui.rs");
+        let native_detection = source_between(
+            implementation,
+            "fn is_native_password_field(",
+            "fn is_password_like_edit(",
+        );
+        assert!(
+            native_detection.contains("element.is_password().unwrap_or(false)"),
+            "native password detection must require the UIA IsPassword property"
+        );
+        assert!(
+            !native_detection.contains("text_contains_password_cue")
+                && !native_detection.contains("element_label_text"),
+            "native password detection must not use label-based password cues"
+        );
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_index = source.find(start).expect("source start marker");
+        let end_index = source[start_index..]
+            .find(end)
+            .map(|offset| start_index + offset)
+            .expect("source end marker");
+        &source[start_index..end_index]
     }
 
     fn trusted_windows_security_target() -> WindowsTarget {
