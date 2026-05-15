@@ -758,43 +758,104 @@ fn has_path_segment(path: &str, segment: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn windows_trusted_autostart_path(app_path: &str) -> bool {
-    let path = std::path::Path::new(app_path);
-    if !path.is_file() {
-        return false;
-    }
-    let Ok(canonical_path) = path.canonicalize() else {
-        return false;
-    };
-    windows_trusted_autostart_path_for_roots(
-        &canonical_path.to_string_lossy(),
-        &windows_protected_autostart_roots(),
-    )
+    validate_windows_autostart_install_chain(std::path::Path::new(app_path)).is_ok()
 }
 
 #[cfg(target_os = "windows")]
 fn windows_protected_autostart_roots() -> Vec<String> {
     let mut roots: Vec<String> = Vec::new();
-    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
-        let Some(root) = std::env::var_os(var) else {
-            continue;
-        };
-        let root = root.to_string_lossy().to_string();
-        if root.trim().is_empty() {
-            continue;
-        }
-        if !roots
-            .iter()
-            .any(|existing| windows_paths_equal(existing, &root))
-        {
-            roots.push(root);
-        }
+    for root in windows_known_program_files_roots() {
+        windows_push_unique_root(&mut roots, root);
     }
     roots
+}
+
+#[cfg(target_os = "windows")]
+fn windows_known_program_files_roots() -> Vec<String> {
+    use windows::core::GUID;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86,
+        SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+
+    fn known_folder_path(folder_id: &GUID) -> Option<String> {
+        let path = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None).ok()? };
+        if path.is_null() {
+            return None;
+        }
+
+        let text = unsafe { path.to_string().ok() };
+        unsafe {
+            CoTaskMemFree(Some(path.as_ptr().cast()));
+        }
+        text
+    }
+
+    [
+        &FOLDERID_ProgramFiles,
+        &FOLDERID_ProgramFilesX64,
+        &FOLDERID_ProgramFilesX86,
+    ]
+    .into_iter()
+    .filter_map(known_folder_path)
+    .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_push_unique_root(roots: &mut Vec<String>, root: String) {
+    let mut root = windows_registry_path(root.trim()).replace('/', r"\");
+    while root.ends_with('\\') && root.len() > 3 {
+        root.pop();
+    }
+    if root.is_empty() || windows_path_has_unsafe_component_spelling(&root) {
+        return;
+    }
+    if !roots
+        .iter()
+        .any(|existing| windows_paths_equal(existing, &root))
+    {
+        roots.push(root);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_autostart_install_chain(path: &std::path::Path) -> anyhow::Result<()> {
+    let app_path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Windows autostart path must be valid Unicode"))?;
+    let protected_roots = windows_protected_autostart_roots();
+    if protected_roots.is_empty() {
+        anyhow::bail!("Windows Program Files known folders are unavailable");
+    }
+    if !windows_trusted_autostart_path_for_roots(app_path, &protected_roots) {
+        anyhow::bail!("Windows autostart path is outside trusted Program Files roots");
+    }
+
+    let prefixes = windows_local_drive_path_prefixes(app_path)?;
+    let root_index = prefixes
+        .iter()
+        .position(|(prefix, _)| {
+            protected_roots
+                .iter()
+                .any(|root| windows_paths_equal(prefix, root))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Windows autostart path root was not matched"))?;
+
+    for (prefix, kind) in prefixes.into_iter().skip(root_index) {
+        let handle = open_windows_autostart_path_no_reparse(std::path::Path::new(&prefix), kind)?;
+        reject_windows_autostart_untrusted_write_acl(handle.0)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(any(target_os = "windows", test))]
 fn windows_trusted_autostart_path_for_roots(app_path: &str, protected_roots: &[String]) -> bool {
     if is_transient_path_for_platform(app_path, AutostartPlatform::Windows) {
+        return false;
+    }
+    if windows_path_has_unsafe_component_spelling(app_path) {
         return false;
     }
     if !windows_autostart_executable_name_is_trusted(app_path) {
@@ -815,9 +876,568 @@ fn windows_autostart_executable_name_is_trusted(app_path: &str) -> bool {
 #[cfg(any(target_os = "windows", test))]
 fn windows_path_is_under_root(normalized_path: &str, root: &str) -> bool {
     let root = normalize_windows_path_for_compare(root);
+    if windows_path_has_unsafe_component_spelling(&root) {
+        return false;
+    }
     normalized_path
         .strip_prefix(&root)
         .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_path_has_unsafe_component_spelling(path: &str) -> bool {
+    let path = windows_registry_path(path.trim()).replace('/', r"\");
+    if path.starts_with(r"\\") {
+        return true;
+    }
+    if path.len() < 3
+        || path.as_bytes().get(1) != Some(&b':')
+        || path.as_bytes().get(2) != Some(&b'\\')
+    {
+        return true;
+    }
+    path[3..]
+        .split('\\')
+        .any(|component| component.is_empty() || component == "." || component == "..")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_local_drive_path_prefixes(
+    path: &str,
+) -> anyhow::Result<Vec<(String, WindowsAutostartPathKind)>> {
+    let path = windows_registry_path(path.trim()).replace('/', r"\");
+    if windows_path_has_unsafe_component_spelling(&path) {
+        anyhow::bail!("Windows autostart path must be an absolute local drive path");
+    }
+
+    let parts = path[3..].split('\\').collect::<Vec<_>>();
+    let mut prefixes = Vec::with_capacity(parts.len() + 1);
+    let mut current = path[..3].to_string();
+    for (index, part) in parts.iter().enumerate() {
+        if !current.ends_with('\\') {
+            current.push('\\');
+        }
+        current.push_str(part);
+        let kind = if index + 1 == parts.len() {
+            WindowsAutostartPathKind::File
+        } else {
+            WindowsAutostartPathKind::Directory
+        };
+        prefixes.push((current.clone(), kind));
+    }
+    if prefixes.is_empty() {
+        anyhow::bail!("Windows autostart path has no executable component");
+    }
+    Ok(prefixes)
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_autostart_path_no_reparse(
+    path: &std::path::Path,
+    kind: WindowsAutostartPathKind,
+) -> anyhow::Result<WindowsAutostartHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        READ_CONTROL,
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if wide[..wide.len().saturating_sub(1)].contains(&0) {
+        anyhow::bail!("Windows autostart path contains an interior NUL byte");
+    }
+
+    let flags = match kind {
+        WindowsAutostartPathKind::Directory => {
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+        }
+        WindowsAutostartPathKind::File => {
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAGS_AND_ATTRIBUTES(0)
+        }
+    };
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to open Windows autostart path safely: {error}"))?;
+    let handle = WindowsAutostartHandle(handle);
+
+    let info = windows_autostart_file_attribute_tag_info(handle.0)?;
+    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        anyhow::bail!("Windows autostart install path must not contain reparse points");
+    }
+
+    let is_dir = info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    match (kind, is_dir) {
+        (WindowsAutostartPathKind::Directory, true) | (WindowsAutostartPathKind::File, false) => {}
+        (WindowsAutostartPathKind::Directory, false) => {
+            anyhow::bail!("Windows autostart install chain component must be a directory");
+        }
+        (WindowsAutostartPathKind::File, true) => {
+            anyhow::bail!("Windows autostart executable path must be a regular file");
+        }
+    }
+
+    Ok(handle)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_file_attribute_tag_info(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> anyhow::Result<windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO> {
+    use windows::Win32::Storage::FileSystem::{
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_TAG_INFO,
+    };
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to inspect Windows autostart path: {error}"))?;
+    Ok(info)
+}
+
+#[cfg(target_os = "windows")]
+fn reject_windows_autostart_untrusted_write_acl(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    let mut owner = windows::Win32::Security::PSID::default();
+    let mut dacl = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut sd),
+        )
+    };
+    if status != ERROR_SUCCESS || sd.is_invalid() || owner.is_invalid() || dacl.is_null() {
+        anyhow::bail!("failed to inspect Windows autostart path DACL");
+    }
+    let _sd = WindowsAutostartSecurityDescriptor(sd);
+
+    if !windows_autostart_owner_is_trusted(owner)? {
+        anyhow::bail!("Windows autostart install path owner is not trusted");
+    }
+
+    reject_windows_autostart_untrusted_allow_aces(dacl)?;
+
+    let untrusted_sids = windows_untrusted_autostart_write_sids()?;
+    for sid in untrusted_sids {
+        if windows_acl_grants_mutating_rights(dacl, sid.psid())? {
+            anyhow::bail!("Windows autostart install path is writable by an untrusted principal");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn reject_windows_autostart_untrusted_allow_aces(
+    dacl: *mut windows::Win32::Security::ACL,
+) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Security::Authorization::{
+        GetExplicitEntriesFromAclW, GRANT_ACCESS, SET_ACCESS, TRUSTEE_IS_SID,
+    };
+    use windows::Win32::Security::INHERIT_ONLY_ACE;
+    use windows::Win32::Security::PSID;
+
+    let mut count = 0u32;
+    let mut entries = std::ptr::null_mut();
+    let status = unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("failed to enumerate Windows autostart path DACL");
+    }
+    let _entries = WindowsAutostartExplicitEntries(entries);
+    if entries.is_null() {
+        return Ok(());
+    }
+
+    let entries = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+    for entry in entries {
+        if entry.grfInheritance.contains(INHERIT_ONLY_ACE) {
+            continue;
+        }
+        if entry.grfAccessMode != GRANT_ACCESS && entry.grfAccessMode != SET_ACCESS {
+            continue;
+        }
+        if entry.grfAccessPermissions & windows_autostart_mutating_rights() == 0 {
+            continue;
+        }
+        if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID {
+            anyhow::bail!("Windows autostart path grants mutating rights to an unknown trustee");
+        }
+        let sid = PSID(entry.Trustee.ptstrName.as_ptr().cast());
+        if !windows_autostart_privileged_sid_is_trusted(sid)? {
+            anyhow::bail!("Windows autostart path grants mutating rights to an untrusted trustee");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_owner_is_trusted(
+    owner: windows::Win32::Security::PSID,
+) -> anyhow::Result<bool> {
+    windows_autostart_privileged_sid_is_trusted(owner)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_privileged_sid_is_trusted(
+    sid: windows::Win32::Security::PSID,
+) -> anyhow::Result<bool> {
+    use windows::Win32::Security::{WinBuiltinAdministratorsSid, WinLocalSystemSid};
+
+    let trusted_sids = [
+        windows_well_known_sid(WinLocalSystemSid)?,
+        windows_well_known_sid(WinBuiltinAdministratorsSid)?,
+        windows_trustedinstaller_sid()?,
+    ];
+    Ok(trusted_sids
+        .iter()
+        .any(|trusted| windows_sids_equal(sid, trusted.psid())))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sids_equal(
+    left: windows::Win32::Security::PSID,
+    right: windows::Win32::Security::PSID,
+) -> bool {
+    if left.is_invalid() || right.is_invalid() {
+        return false;
+    }
+    unsafe { windows::Win32::Security::EqualSid(left, right).is_ok() }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_trustedinstaller_sid() -> anyhow::Result<WindowsAutostartSid> {
+    windows_sid_from_string("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sid_from_string(sid: &str) -> anyhow::Result<WindowsAutostartSid> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::Win32::Security::PSID;
+
+    let wide = sid
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut raw_sid = PSID::default();
+    unsafe { ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut raw_sid) }
+        .map_err(|error| anyhow::anyhow!("failed to parse Windows SID: {error}"))?;
+    let raw_sid = WindowsAutostartLocalSid(raw_sid);
+    windows_copy_sid(raw_sid.0)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_untrusted_autostart_write_sids() -> anyhow::Result<Vec<WindowsAutostartSid>> {
+    use windows::Win32::Security::{
+        WinAuthenticatedUserSid, WinBuiltinPowerUsersSid, WinBuiltinUsersSid, WinInteractiveSid,
+        WinWorldSid,
+    };
+
+    let mut sids = vec![
+        windows_current_user_sid()?,
+        windows_well_known_sid(WinWorldSid)?,
+        windows_well_known_sid(WinAuthenticatedUserSid)?,
+        windows_well_known_sid(WinInteractiveSid)?,
+        windows_well_known_sid(WinBuiltinUsersSid)?,
+        windows_well_known_sid(WinBuiltinPowerUsersSid)?,
+    ];
+    sids.extend(windows_current_token_untrusted_group_sids()?);
+    Ok(sids)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_current_user_sid() -> anyhow::Result<WindowsAutostartSid> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|error| anyhow::anyhow!("failed to open Windows process token: {error}"))?;
+    let token = WindowsAutostartHandle(token);
+
+    let mut required = 0;
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut required) };
+    if required == 0 {
+        anyhow::bail!("failed to query Windows token user size");
+    }
+
+    let mut buffer = vec![0u8; required as usize];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to query Windows token user: {error}"))?;
+
+    let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    if token_user.User.Sid.is_invalid() {
+        anyhow::bail!("Windows token user SID is invalid");
+    }
+    windows_copy_sid(token_user.User.Sid)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_current_token_untrusted_group_sids() -> anyhow::Result<Vec<WindowsAutostartSid>> {
+    use windows::Win32::Security::{GetTokenInformation, TokenGroups, TOKEN_GROUPS, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+    const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
+
+    let mut token = windows::Win32::Foundation::HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|error| anyhow::anyhow!("failed to open Windows process token: {error}"))?;
+    let token = WindowsAutostartHandle(token);
+
+    let mut required = 0;
+    let _ = unsafe { GetTokenInformation(token.0, TokenGroups, None, 0, &mut required) };
+    if required == 0 {
+        anyhow::bail!("failed to query Windows token group size");
+    }
+
+    let mut buffer = vec![0u8; required as usize];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenGroups,
+            Some(buffer.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to query Windows token groups: {error}"))?;
+
+    let token_groups = unsafe { &*(buffer.as_ptr().cast::<TOKEN_GROUPS>()) };
+    let groups = token_groups.Groups.as_ptr();
+    let mut sids = Vec::new();
+    for index in 0..token_groups.GroupCount as usize {
+        let group = unsafe { *groups.add(index) };
+        if group.Attributes & SE_GROUP_ENABLED == 0 {
+            continue;
+        }
+        if group.Attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 {
+            continue;
+        }
+        if windows_autostart_group_sid_is_trusted_admin(group.Sid) {
+            continue;
+        }
+        sids.push(windows_copy_sid(group.Sid)?);
+    }
+    Ok(sids)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_group_sid_is_trusted_admin(sid: windows::Win32::Security::PSID) -> bool {
+    use windows::Win32::Security::{IsWellKnownSid, WinBuiltinAdministratorsSid};
+
+    unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool() }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_copy_sid(sid: windows::Win32::Security::PSID) -> anyhow::Result<WindowsAutostartSid> {
+    use windows::Win32::Security::{CopySid, GetLengthSid, PSID};
+
+    if sid.is_invalid() {
+        anyhow::bail!("Windows SID is invalid");
+    }
+    let size = unsafe { GetLengthSid(sid) };
+    if size == 0 {
+        anyhow::bail!("Windows SID length is invalid");
+    }
+    let mut buffer = vec![0u8; size as usize];
+    unsafe { CopySid(size, PSID(buffer.as_mut_ptr().cast()), sid) }
+        .map_err(|error| anyhow::anyhow!("failed to copy Windows SID: {error}"))?;
+    Ok(WindowsAutostartSid { buffer })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_well_known_sid(
+    kind: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+) -> anyhow::Result<WindowsAutostartSid> {
+    use windows::Win32::Security::{CreateWellKnownSid, PSID, SECURITY_MAX_SID_SIZE};
+
+    let mut buffer = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut size = buffer.len() as u32;
+    unsafe {
+        CreateWellKnownSid(
+            kind,
+            None,
+            Some(PSID(buffer.as_mut_ptr().cast())),
+            &mut size,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to build Windows well-known SID: {error}"))?;
+    buffer.truncate(size as usize);
+    Ok(WindowsAutostartSid { buffer })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_acl_grants_mutating_rights(
+    dacl: *mut windows::Win32::Security::ACL,
+    sid: windows::Win32::Security::PSID,
+) -> anyhow::Result<bool> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, NO_MULTIPLE_TRUSTEE, TRUSTEE_IS_SID,
+        TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+
+    let mut trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: windows::core::PWSTR::null(),
+    };
+    unsafe { BuildTrusteeWithSidW(&mut trustee, Some(sid)) };
+
+    let mut rights = 0u32;
+    let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("failed to evaluate Windows autostart path DACL");
+    }
+
+    Ok(rights & windows_autostart_mutating_rights() != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_mutating_rights() -> u32 {
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_DELETE_CHILD,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    };
+
+    GENERIC_WRITE.0
+        | GENERIC_ALL.0
+        | FILE_WRITE_DATA.0
+        | FILE_APPEND_DATA.0
+        | FILE_ADD_FILE.0
+        | FILE_ADD_SUBDIRECTORY.0
+        | FILE_WRITE_EA.0
+        | FILE_WRITE_ATTRIBUTES.0
+        | FILE_DELETE_CHILD.0
+        | DELETE.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum WindowsAutostartPathKind {
+    Directory,
+    File,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsAutostartHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsAutostartHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsAutostartSecurityDescriptor(windows::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsAutostartSecurityDescriptor {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+                self.0 .0,
+            )))
+        };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsAutostartExplicitEntries(
+    *mut windows::Win32::Security::Authorization::EXPLICIT_ACCESS_W,
+);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsAutostartExplicitEntries {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        let _ = unsafe {
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+                self.0.cast(),
+            )))
+        };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsAutostartLocalSid(windows::Win32::Security::PSID);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsAutostartLocalSid {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+                self.0 .0,
+            )))
+        };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsAutostartSid {
+    buffer: Vec<u8>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsAutostartSid {
+    fn psid(&self) -> windows::Win32::Security::PSID {
+        windows::Win32::Security::PSID(self.buffer.as_ptr().cast_mut().cast())
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1157,9 +1777,177 @@ mod tests {
             &protected_roots
         ));
         assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files2\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files Evil\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files\..\Users\me\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"\\server\share\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
             r"C:\Program Files\Windows App AutoLogin\Other.exe",
             &protected_roots
         ));
+    }
+
+    #[test]
+    fn windows_autostart_roots_are_deduped_and_safely_spelled() {
+        let mut roots = Vec::new();
+        windows_push_unique_root(&mut roots, r"C:\Program Files".to_string());
+        windows_push_unique_root(&mut roots, r"C:\Program Files\".to_string());
+        windows_push_unique_root(&mut roots, r"C:\Users\me\..\Program Files".to_string());
+        windows_push_unique_root(&mut roots, r"\\server\share\Program Files".to_string());
+        windows_push_unique_root(&mut roots, " ".to_string());
+
+        assert_eq!(roots, vec![r"C:\Program Files".to_string()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_protected_autostart_roots_ignore_programfiles_environment() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = [
+            ("ProgramW6432", std::env::var_os("ProgramW6432")),
+            ("ProgramFiles", std::env::var_os("ProgramFiles")),
+            ("ProgramFiles(x86)", std::env::var_os("ProgramFiles(x86)")),
+        ];
+        let spoofed_root = r"C:\Users\me\AppData\Local\Programs";
+        for (name, _) in &saved {
+            std::env::set_var(name, spoofed_root);
+        }
+
+        let roots = windows_protected_autostart_roots();
+
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        assert!(!roots.is_empty());
+        assert!(!roots
+            .iter()
+            .any(|root| windows_paths_equal(root, spoofed_root)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_autostart_no_reparse_open_rejects_links() {
+        let root = windows_temp_test_root("windows-autostart-reparse");
+        let real_dir = root.join("real");
+        let link_dir = root.join("link");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        if std::os::windows::fs::symlink_dir(&real_dir, &link_dir).is_err() {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        assert!(open_windows_autostart_path_no_reparse(
+            &link_dir,
+            WindowsAutostartPathKind::Directory
+        )
+        .is_err());
+
+        let real_exe = real_dir.join("WindowsAppAutoLogin.exe");
+        let link_exe = root.join("WindowsAppAutoLogin.exe");
+        std::fs::write(&real_exe, b"exe").unwrap();
+        if std::os::windows::fs::symlink_file(&real_exe, &link_exe).is_ok() {
+            assert!(open_windows_autostart_path_no_reparse(
+                &link_exe,
+                WindowsAutostartPathKind::File
+            )
+            .is_err());
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_autostart_acl_detects_untrusted_write_rights() {
+        use windows::Win32::Security::{
+            WinBuiltinAdministratorsSid, WinLocalSystemSid, WinWorldSid,
+        };
+
+        let world = windows_well_known_sid(WinWorldSid).unwrap();
+        let (_sd, dacl) = windows_test_dacl_from_sddl("D:(A;;FA;;;WD)");
+        assert!(windows_acl_grants_mutating_rights(dacl, world.psid()).unwrap());
+        assert!(reject_windows_autostart_untrusted_allow_aces(dacl).is_err());
+
+        let (_sd, dacl) = windows_test_dacl_from_sddl("D:(A;;GR;;;WD)");
+        assert!(!windows_acl_grants_mutating_rights(dacl, world.psid()).unwrap());
+        assert!(reject_windows_autostart_untrusted_allow_aces(dacl).is_ok());
+
+        let (_sd, dacl) = windows_test_dacl_from_sddl("D:(A;;FA;;;SY)");
+        assert!(reject_windows_autostart_untrusted_allow_aces(dacl).is_ok());
+
+        let (_sd, dacl) = windows_test_dacl_from_sddl("D:(A;IO;FA;;;CO)");
+        assert!(reject_windows_autostart_untrusted_allow_aces(dacl).is_ok());
+
+        let system = windows_well_known_sid(WinLocalSystemSid).unwrap();
+        let admins = windows_well_known_sid(WinBuiltinAdministratorsSid).unwrap();
+        let trustedinstaller = windows_trustedinstaller_sid().unwrap();
+        assert!(windows_autostart_owner_is_trusted(system.psid()).unwrap());
+        assert!(windows_autostart_owner_is_trusted(admins.psid()).unwrap());
+        assert!(windows_autostart_owner_is_trusted(trustedinstaller.psid()).unwrap());
+        assert!(!windows_autostart_owner_is_trusted(world.psid()).unwrap());
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_test_dacl_from_sddl(
+        sddl: &str,
+    ) -> (
+        WindowsAutostartSecurityDescriptor,
+        *mut windows::Win32::Security::ACL,
+    ) {
+        use windows::core::PCWSTR;
+        use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows::Win32::Security::{GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR};
+
+        let wide = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide.as_ptr()),
+                1,
+                &mut sd,
+                None,
+            )
+        }
+        .unwrap();
+
+        let mut present = windows::core::BOOL(0);
+        let mut defaulted = windows::core::BOOL(0);
+        let mut dacl = std::ptr::null_mut();
+        unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }.unwrap();
+        assert!(present.as_bool());
+        assert!(!dacl.is_null());
+        (WindowsAutostartSecurityDescriptor(sd), dacl)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_temp_test_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "windows-app-autologin-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
