@@ -345,7 +345,7 @@ script/package_macos.sh --release-diagnostics-artifact
 
 The app bundle sets `LSUIElement=true`, so it behaves like a menu-bar utility rather than a Dock-first application.
 
-On macOS, Open at Login is trusted only for the exact canonical bundle path `/Applications/WindowsAppAutoLogin.app` with the expected bundle identifier; the app intentionally refuses autostart from other bundle locations, including transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`. On Windows, Open at Login is trusted only from a protected Program Files install chain: the app checks the drive root, Program Files root, app directory, and executable for reparse points, trusted ownership, and trusted write ACLs. Portable `dist/`, per-user app folders, `target/`, temporary folders, and replaceable parent chains are rejected for Startup registration.
+On macOS, Open at Login is trusted only for the exact canonical bundle path `/Applications/WindowsAppAutoLogin.app` with the expected bundle identifier; the app intentionally refuses autostart from other bundle locations, including transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`. On Windows, Open at Login registers the current executable path wherever the user runs it from; the app still requires the saved Startup command to exactly match the command it generated, with no extra arguments.
 
 ## Troubleshooting
 
