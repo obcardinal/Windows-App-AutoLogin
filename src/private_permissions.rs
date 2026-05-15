@@ -151,6 +151,7 @@ pub(crate) fn validate_windows_private_file_handle(file: &std::fs::File) -> anyh
     if info.FileAttributes & windows_dir_attribute_mask() != 0 {
         anyhow::bail!("private app data path must be a regular file");
     }
+    validate_windows_private_path_owner(handle)?;
     Ok(())
 }
 
@@ -219,6 +220,7 @@ fn open_windows_private_path(
             anyhow::bail!("private app data path must be a regular file");
         }
     }
+    validate_windows_private_path_owner(handle.0)?;
 
     Ok(handle)
 }
@@ -298,8 +300,20 @@ fn windows_private_sddl(kind: WindowsPrivatePathKind) -> anyhow::Result<String> 
 #[cfg(target_os = "windows")]
 fn current_windows_user_sid_string() -> anyhow::Result<String> {
     use windows::core::PWSTR;
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    let user_sid = current_windows_user_sid()?;
+
+    let mut sid = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(user_sid.psid(), &mut sid) }
+        .map_err(|error| anyhow::anyhow!("failed to stringify Windows user SID: {error}"))?;
+    let sid = LocalWideString(sid);
+    unsafe { sid.0.to_string() }.map_err(|_| anyhow::anyhow!("failed to decode Windows user SID"))
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_user_sid() -> anyhow::Result<WindowsSid> {
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -327,11 +341,84 @@ fn current_windows_user_sid_string() -> anyhow::Result<String> {
     .map_err(|error| anyhow::anyhow!("failed to query Windows token user: {error}"))?;
 
     let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
-    let mut sid = PWSTR::null();
-    unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid) }
-        .map_err(|error| anyhow::anyhow!("failed to stringify Windows user SID: {error}"))?;
-    let sid = LocalWideString(sid);
-    unsafe { sid.0.to_string() }.map_err(|_| anyhow::anyhow!("failed to decode Windows user SID"))
+    windows_copy_sid(token_user.User.Sid)
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_private_path_owner(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> anyhow::Result<()> {
+    if windows_private_path_owner_is_current_user(handle)? {
+        Ok(())
+    } else {
+        anyhow::bail!("private app data path must be owned by the current user");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_private_path_owner_is_current_user(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> anyhow::Result<bool> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+
+    let mut owner = PSID::default();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        )
+    };
+    if status != ERROR_SUCCESS || sd.is_invalid() || owner.is_invalid() {
+        anyhow::bail!("failed to inspect private Windows path owner");
+    }
+    let _sd = LocalSecurityDescriptor(sd);
+
+    windows_private_owner_sid_is_current_user(owner)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_private_owner_sid_is_current_user(
+    owner: windows::Win32::Security::PSID,
+) -> anyhow::Result<bool> {
+    let current_user = current_windows_user_sid()?;
+    Ok(windows_sids_equal(owner, current_user.psid()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sids_equal(
+    left: windows::Win32::Security::PSID,
+    right: windows::Win32::Security::PSID,
+) -> bool {
+    if left.is_invalid() || right.is_invalid() {
+        return false;
+    }
+    unsafe { windows::Win32::Security::EqualSid(left, right).is_ok() }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_copy_sid(sid: windows::Win32::Security::PSID) -> anyhow::Result<WindowsSid> {
+    use windows::Win32::Security::{CopySid, GetLengthSid, PSID};
+
+    if sid.is_invalid() {
+        anyhow::bail!("Windows SID is invalid");
+    }
+    let size = unsafe { GetLengthSid(sid) };
+    if size == 0 {
+        anyhow::bail!("Windows SID length is invalid");
+    }
+    let mut buffer = vec![0u8; size as usize];
+    unsafe { CopySid(size, PSID(buffer.as_mut_ptr().cast()), sid) }
+        .map_err(|error| anyhow::anyhow!("failed to copy Windows SID: {error}"))?;
+    Ok(WindowsSid { buffer })
 }
 
 #[cfg(target_os = "windows")]
@@ -412,6 +499,51 @@ impl Drop for LocalWideString {
                 self.0.as_ptr().cast(),
             )))
         };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsSid {
+    buffer: Vec<u8>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsSid {
+    fn psid(&self) -> windows::Win32::Security::PSID {
+        windows::Win32::Security::PSID(self.buffer.as_ptr().cast_mut().cast())
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::{
+        current_windows_user_sid, windows_copy_sid, windows_private_owner_sid_is_current_user,
+    };
+    use windows::Win32::Security::{CreateWellKnownSid, WinWorldSid, PSID, SECURITY_MAX_SID_SIZE};
+
+    fn well_known_world_sid() -> super::WindowsSid {
+        let mut buffer = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = buffer.len() as u32;
+        unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                None,
+                Some(PSID(buffer.as_mut_ptr().cast())),
+                &mut size,
+            )
+        }
+        .expect("world SID should be created");
+        buffer.truncate(size as usize);
+        windows_copy_sid(PSID(buffer.as_mut_ptr().cast())).unwrap()
+    }
+
+    #[test]
+    fn windows_private_owner_sid_must_be_current_user() {
+        let current = current_windows_user_sid().unwrap();
+        assert!(windows_private_owner_sid_is_current_user(current.psid()).unwrap());
+
+        let world = well_known_world_sid();
+        assert!(!windows_private_owner_sid_is_current_user(world.psid()).unwrap());
     }
 }
 
