@@ -213,7 +213,7 @@ That fallback uses AES-256-GCM. Its encryption key is still stored in the system
 - Service: `WindowsAppAutoLoginFallbackKey`
 - Account: `fallback-encryption-key`
 
-The fallback file is not independent of Keychain or Credential Manager: if the fallback key cannot be created or read from the system secure store, fallback password save/load will fail. New fallback records are bound to the app service, account ID, and normalized email hash; manual metadata edits fail closed.
+The fallback file is not independent of Keychain or Credential Manager: if the fallback key cannot be created or read from the current user's system secure store, fallback password save/load will fail. On Windows, that key is stored in Credential Manager and protected by user-bound DPAPI. The service name, account ID, purpose, and normalized email hash are validation and routing metadata, not a guarantee that only this executable can decrypt it. Manual metadata edits fail closed.
 
 Recent builds migrate saved passwords when switching storage mode. The app copies and verifies passwords in the new storage before saving the setting, then attempts to remove old copies from the previous backend. If copying or verification fails, the setting is left unchanged. If only old-copy cleanup fails after a save or migration succeeds, passwords remain available in the selected storage and cleanup remains pending for the next launch instead of being forgotten.
 

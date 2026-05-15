@@ -16,13 +16,17 @@ const RECOVERING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.
 const PASSWORD_ENVELOPE_PREFIX: &str = "waa1:";
 const PASSWORD_ENVELOPE_V2_PREFIX: &str = "waa2:";
 #[cfg(any(target_os = "windows", test))]
-const WINDOWS_APP_BOUND_SECRET_PREFIX: &str = "waab:";
+const WINDOWS_USER_BOUND_SECRET_PREFIX: &str = "waub:";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_LEGACY_WAAB_SECRET_PREFIX: &str = "waab:";
 const PASSWORD_ENVELOPE_VERSION: u8 = 1;
 const PASSWORD_ENVELOPE_V2_VERSION: u8 = 2;
 const SECURE_STORAGE_PASSWORD_PURPOSE: &str = "account-password";
 const SECURE_STORAGE_FALLBACK_KEY_PURPOSE: &str = "fallback-encryption-key";
 #[cfg(any(target_os = "windows", test))]
-const WINDOWS_APP_BOUND_STORAGE_VERSION: &str = "WAAL_WINDOWS_APP_BOUND_STORAGE";
+const WINDOWS_USER_BOUND_STORAGE_VERSION: &str = "WAAL_WINDOWS_USER_BOUND_STORAGE";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_LEGACY_WAAB_STORAGE_VERSION: &str = "WAAL_WINDOWS_APP_BOUND_STORAGE";
 const PENDING_STORAGE_TEMP_FILE_PREFIXES: &[&str] = &[
     "pending-storage-operation.json.tmp.",
     "pending-storage-operation.recovering.json.tmp.",
@@ -956,14 +960,14 @@ fn encode_secure_storage_secret(
     plaintext: &str,
 ) -> anyhow::Result<Zeroizing<String>> {
     if plaintext.is_empty() {
-        anyhow::bail!("app-bound secure storage payload is empty");
+        anyhow::bail!("user-bound secure storage payload is empty");
     }
-    let protected = windows_app_bound_protect(purpose, plaintext.as_bytes())?;
+    let protected = windows_user_bound_protect(purpose, plaintext.as_bytes())?;
     let encoded = STANDARD.encode(&*protected);
     let mut payload = Zeroizing::new(String::with_capacity(
-        WINDOWS_APP_BOUND_SECRET_PREFIX.len() + encoded.len(),
+        WINDOWS_USER_BOUND_SECRET_PREFIX.len() + encoded.len(),
     ));
-    payload.push_str(WINDOWS_APP_BOUND_SECRET_PREFIX);
+    payload.push_str(WINDOWS_USER_BOUND_SECRET_PREFIX);
     payload.push_str(&encoded);
     Ok(payload)
 }
@@ -973,17 +977,26 @@ fn decode_secure_storage_secret(
     purpose: &str,
     stored: &str,
 ) -> anyhow::Result<SecureStorageSecret> {
-    if let Some(encoded) = stored.strip_prefix(WINDOWS_APP_BOUND_SECRET_PREFIX) {
+    if let Some(encoded) = stored.strip_prefix(WINDOWS_USER_BOUND_SECRET_PREFIX) {
         let protected = STANDARD.decode(encoded)?;
-        let plaintext_bytes = windows_app_bound_unprotect(purpose, &protected)?;
+        let plaintext_bytes = windows_user_bound_unprotect(purpose, &protected)?;
         let plaintext = String::from_utf8(plaintext_bytes.as_slice().to_vec())?;
         return Ok(SecureStorageSecret {
             plaintext: Zeroizing::new(plaintext),
             needs_migration: false,
         });
     }
-    if has_unsupported_windows_app_bound_prefix(stored) {
-        anyhow::bail!("unsupported Windows app-bound secure storage payload version");
+    if let Some(encoded) = stored.strip_prefix(WINDOWS_LEGACY_WAAB_SECRET_PREFIX) {
+        let protected = STANDARD.decode(encoded)?;
+        let plaintext_bytes = windows_legacy_waab_unprotect(purpose, &protected)?;
+        let plaintext = String::from_utf8(plaintext_bytes.as_slice().to_vec())?;
+        return Ok(SecureStorageSecret {
+            plaintext: Zeroizing::new(plaintext),
+            needs_migration: true,
+        });
+    }
+    if has_unsupported_windows_bound_prefix(stored) {
+        anyhow::bail!("unsupported Windows user-bound secure storage payload version");
     }
     if stored.is_empty() {
         anyhow::bail!("secure storage payload is empty");
@@ -995,28 +1008,39 @@ fn decode_secure_storage_secret(
 }
 
 #[cfg(target_os = "windows")]
-fn has_unsupported_windows_app_bound_prefix(stored: &str) -> bool {
-    stored.starts_with("waab") && !stored.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX)
+fn has_unsupported_windows_bound_prefix(stored: &str) -> bool {
+    (stored.starts_with("waub") && !stored.starts_with(WINDOWS_USER_BOUND_SECRET_PREFIX))
+        || (stored.starts_with("waab") && !stored.starts_with(WINDOWS_LEGACY_WAAB_SECRET_PREFIX))
 }
 
 #[cfg(target_os = "windows")]
-fn windows_app_bound_protect(
+fn windows_user_bound_protect(
     purpose: &str,
     plaintext: &[u8],
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let entropy = windows_app_bound_entropy(purpose);
+    let entropy = windows_user_bound_entropy(purpose);
     windows_protect_data_with_entropy(plaintext, &entropy)
-        .map_err(|e| anyhow::anyhow!("Windows app-bound Credential Manager protect failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("Windows user-bound DPAPI protect failed: {e}"))
 }
 
 #[cfg(target_os = "windows")]
-fn windows_app_bound_unprotect(
+fn windows_user_bound_unprotect(
     purpose: &str,
     protected: &[u8],
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let entropy = windows_app_bound_entropy(purpose);
+    let entropy = windows_user_bound_entropy(purpose);
     windows_unprotect_data_with_entropy(protected, &entropy)
-        .map_err(|e| anyhow::anyhow!("Windows app-bound Credential Manager unprotect failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("Windows user-bound DPAPI unprotect failed: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_legacy_waab_unprotect(
+    purpose: &str,
+    protected: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let entropy = windows_legacy_waab_entropy(purpose);
+    windows_unprotect_data_with_entropy(protected, &entropy)
+        .map_err(|e| anyhow::anyhow!("Windows legacy user-bound DPAPI unprotect failed: {e}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -1092,10 +1116,10 @@ fn windows_data_blob(
     bytes: &mut [u8],
 ) -> anyhow::Result<windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB> {
     if bytes.is_empty() {
-        anyhow::bail!("Windows app-bound storage blob is empty");
+        anyhow::bail!("Windows user-bound DPAPI blob is empty");
     }
     let cb_data = u32::try_from(bytes.len())
-        .map_err(|_| anyhow::anyhow!("Windows app-bound storage blob is too large"))?;
+        .map_err(|_| anyhow::anyhow!("Windows user-bound DPAPI blob is too large"))?;
     Ok(windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB {
         cbData: cb_data,
         pbData: bytes.as_mut_ptr(),
@@ -1107,16 +1131,26 @@ unsafe fn windows_blob_to_zeroizing_vec(
     blob: &windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if blob.pbData.is_null() || blob.cbData == 0 {
-        anyhow::bail!("Windows app-bound storage returned an empty blob");
+        anyhow::bail!("Windows user-bound DPAPI returned an empty blob");
     }
     let bytes = unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) };
     Ok(Zeroizing::new(bytes.to_vec()))
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_app_bound_entropy(purpose: &str) -> [u8; 32] {
+fn windows_user_bound_entropy(purpose: &str) -> [u8; 32] {
+    windows_bound_entropy(WINDOWS_USER_BOUND_STORAGE_VERSION, purpose)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_legacy_waab_entropy(purpose: &str) -> [u8; 32] {
+    windows_bound_entropy(WINDOWS_LEGACY_WAAB_STORAGE_VERSION, purpose)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_bound_entropy(storage_version: &str, purpose: &str) -> [u8; 32] {
     let mut material = Vec::new();
-    material.extend_from_slice(WINDOWS_APP_BOUND_STORAGE_VERSION.as_bytes());
+    material.extend_from_slice(storage_version.as_bytes());
     material.push(0);
     material.extend_from_slice(crate::app_identity::APP_NAME.as_bytes());
     material.push(0);
@@ -1517,9 +1551,9 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
                     decoded.plaintext.trim(),
                 )?;
                 if let Err(e) = entry.set_password(payload.as_str()) {
-                    warn!(error = %e, "Fallback key loaded from legacy Credential Manager format, but app-bound migration failed");
+                    warn!(error = %e, "Fallback key loaded from legacy Credential Manager format, but user-bound DPAPI migration failed");
                 } else {
-                    info!("Migrated fallback key to Windows app-bound Credential Manager storage");
+                    info!("Migrated fallback key to Windows user-bound DPAPI Credential Manager storage");
                 }
             }
             cleanup_stale_fallback_key_file_if_present()?;
@@ -2914,9 +2948,9 @@ fn load_from_keyring_timed(account: &Account) -> anyhow::Result<LoadedStoredPass
     if secure_storage_needs_migration || format == StoredPasswordFormat::LegacyRaw {
         let payload = encode_keyring_password(account, password.as_str())?;
         if let Err(e) = entry.set_password(payload.as_str()) {
-            warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy keychain format, but migration to app-bound storage failed");
+            warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy keychain format, but migration to user-bound DPAPI storage failed");
         } else {
-            info!(account_id = %redacted_account_id(&account.id), "Migrated legacy keychain password to app-bound storage");
+            info!(account_id = %redacted_account_id(&account.id), "Migrated legacy keychain password to user-bound DPAPI storage");
         }
     }
     debug!(account_id = %redacted_account_id(&account.id), "Password loaded from secure storage");
@@ -2966,8 +3000,8 @@ fn storage_error_kind(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
     if message.contains("not found") || message.contains("NoEntry") {
         "not_found"
-    } else if message.contains("app-bound Credential Manager unprotect failed") {
-        "app_bound_unprotect_failed"
+    } else if message.contains("user-bound DPAPI unprotect failed") {
+        "user_bound_dpapi_unprotect_failed"
     } else if message.contains("decrypt")
         || message.contains("ciphertext")
         || message.contains("invalid fallback key")
@@ -3072,7 +3106,8 @@ mod tests {
         LegacyPasswordMigration, PasswordFile, PasswordStorageBackend, PendingStorageOperation,
         StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
         PENDING_STORAGE_OPERATION_VERSION, SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
-        SECURE_STORAGE_PASSWORD_PURPOSE, WINDOWS_APP_BOUND_SECRET_PREFIX,
+        SECURE_STORAGE_PASSWORD_PURPOSE, WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
+        WINDOWS_USER_BOUND_SECRET_PREFIX,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -4032,26 +4067,31 @@ mod tests {
     }
 
     #[test]
-    fn windows_app_bound_entropy_is_stable_and_purpose_bound() {
-        assert_eq!(WINDOWS_APP_BOUND_SECRET_PREFIX, "waab:");
+    fn windows_user_bound_entropy_is_stable_and_purpose_bound() {
+        assert_eq!(WINDOWS_USER_BOUND_SECRET_PREFIX, "waub:");
+        assert_eq!(WINDOWS_LEGACY_WAAB_SECRET_PREFIX, "waab:");
         assert_eq!(
-            super::windows_app_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
-            super::windows_app_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE)
+            super::windows_user_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
+            super::windows_user_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE)
         );
         assert_ne!(
-            super::windows_app_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
-            super::windows_app_bound_entropy(SECURE_STORAGE_FALLBACK_KEY_PURPOSE)
+            super::windows_user_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
+            super::windows_user_bound_entropy(SECURE_STORAGE_FALLBACK_KEY_PURPOSE)
+        );
+        assert_ne!(
+            super::windows_user_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
+            super::windows_legacy_waab_entropy(SECURE_STORAGE_PASSWORD_PURPOSE)
         );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_secure_storage_secret_is_app_bound() {
+    fn windows_secure_storage_secret_is_user_bound() {
         let encoded =
             encode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, "super-secret-password")
                 .unwrap();
 
-        assert!(encoded.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX));
+        assert!(encoded.starts_with(WINDOWS_USER_BOUND_SECRET_PREFIX));
         assert!(!encoded.contains("super-secret-password"));
 
         let decoded =
@@ -4068,12 +4108,44 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn legacy_windows_waab_secret_decodes_and_requests_migration() {
+        let protected = super::windows_protect_data_with_entropy(
+            b"legacy-secret",
+            &super::windows_legacy_waab_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
+        )
+        .unwrap();
+        let encoded = format!(
+            "{}{}",
+            WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
+            STANDARD.encode(&*protected)
+        );
+
+        let decoded =
+            decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, encoded.as_str())
+                .unwrap();
+        assert_eq!(decoded.plaintext.as_str(), "legacy-secret");
+        assert!(decoded.needs_migration);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reserved_windows_bound_prefixes_fail_closed() {
+        for stored in ["waub2:future", "waubfuture", "waab2:future", "waabfuture"] {
+            assert!(
+                decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, stored).is_err(),
+                "{stored} should not fall back to legacy plaintext"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn keyring_password_payload_hides_bound_envelope_and_decodes_legacy_plaintext() {
         let mut account = Account::new(" User@Example.com ");
         account.id = "account-1".to_string();
 
         let encoded = encode_keyring_password(&account, "super-secret-password").unwrap();
-        assert!(encoded.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX));
+        assert!(encoded.starts_with(WINDOWS_USER_BOUND_SECRET_PREFIX));
         assert!(!encoded.contains("super-secret-password"));
         assert!(!encoded.contains(PASSWORD_ENVELOPE_PREFIX));
 
@@ -4092,13 +4164,13 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn fallback_key_payload_is_app_bound() {
+    fn fallback_key_payload_is_user_bound() {
         let encoded_key = STANDARD.encode([7u8; 32]);
         let protected =
             encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, &encoded_key)
                 .unwrap();
 
-        assert!(protected.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX));
+        assert!(protected.starts_with(WINDOWS_USER_BOUND_SECRET_PREFIX));
         assert!(!protected.contains(&encoded_key));
 
         let decoded =
@@ -4681,9 +4753,9 @@ mod tests {
         );
         assert_eq!(
             storage_error_kind(&anyhow::anyhow!(
-                "Windows app-bound Credential Manager unprotect failed: redacted"
+                "Windows user-bound DPAPI unprotect failed: redacted"
             )),
-            "app_bound_unprotect_failed"
+            "user_bound_dpapi_unprotect_failed"
         );
         assert_eq!(
             storage_error_kind(&anyhow::anyhow!("NoEntry for secret=super-secret")),
