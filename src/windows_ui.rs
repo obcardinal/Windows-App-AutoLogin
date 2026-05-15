@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::monitor::MonitorStatus;
+use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,8 +10,22 @@ use uiautomation::inputs::Keyboard;
 use uiautomation::patterns::{UIInvokePattern, UIValuePattern};
 use uiautomation::types::{ControlType, Handle};
 use uiautomation::{UIAutomation, UIElement};
-use windows::core::{BOOL, GUID, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::core::{BOOL, GUID, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, HWND,
+    LPARAM, RECT,
+};
+use windows::Win32::Security::Cryptography::{
+    CertGetNameStringW, CERT_CONTEXT, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+};
+use windows::Win32::Security::WinTrust::{
+    WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData,
+    WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+    WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4,
+    WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_REVOKE_WHOLECHAIN, WTD_SAFER_FLAG,
+    WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UICONTEXT_EXECUTE, WTD_UI_NONE,
+};
+use windows::Win32::Storage::Packaging::Appx::GetPackageFullName;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -46,6 +62,66 @@ pub(crate) struct WindowsTarget {
     pub(crate) window_title: String,
     pub(crate) window_handle: isize,
     pub(crate) frontmost: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsMicrosoftTargetKind {
+    SystemMstsc,
+    RemoteDesktopInstall,
+    WindowsAppsPackage,
+    CredentialBroker,
+}
+
+#[cfg(test)]
+type TestWindowsTargetIdentityOverride = fn(&WindowsTarget, WindowsMicrosoftTargetKind) -> bool;
+
+#[cfg(test)]
+thread_local! {
+    static WINDOWS_TARGET_IDENTITY_OVERRIDE: std::cell::RefCell<Option<TestWindowsTargetIdentityOverride>> =
+        std::cell::RefCell::new(Some(default_test_windows_target_identity));
+}
+
+#[cfg(test)]
+fn default_test_windows_target_identity(
+    _target: &WindowsTarget,
+    _kind: WindowsMicrosoftTargetKind,
+) -> bool {
+    true
+}
+
+#[cfg(test)]
+fn windows_target_identity_override_result(
+    target: &WindowsTarget,
+    kind: WindowsMicrosoftTargetKind,
+) -> Option<bool> {
+    WINDOWS_TARGET_IDENTITY_OVERRIDE.with(|override_fn| {
+        override_fn
+            .borrow()
+            .map(|override_fn| override_fn(target, kind))
+    })
+}
+
+#[cfg(test)]
+struct WindowsTargetIdentityOverrideGuard(Option<TestWindowsTargetIdentityOverride>);
+
+#[cfg(test)]
+impl Drop for WindowsTargetIdentityOverrideGuard {
+    fn drop(&mut self) {
+        let previous = self.0;
+        WINDOWS_TARGET_IDENTITY_OVERRIDE.with(|override_fn| {
+            *override_fn.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+fn set_windows_target_identity_override(
+    override_fn: TestWindowsTargetIdentityOverride,
+) -> WindowsTargetIdentityOverrideGuard {
+    WINDOWS_TARGET_IDENTITY_OVERRIDE.with(|current| {
+        let previous = current.replace(Some(override_fn));
+        WindowsTargetIdentityOverrideGuard(previous)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -617,6 +693,27 @@ fn revalidate_prompt(
         anyhow::bail!("credential prompt disappeared before automation");
     };
     ensure_same_revalidated_prompt(prompt, expected)
+}
+
+pub(crate) fn preflight_password_load_prompt(
+    target_app_name: &str,
+    expected: &WindowsPrompt,
+    expected_email: &str,
+) -> anyhow::Result<WindowsPrompt> {
+    let Some(prompt) = inspect_prompt_snapshot(
+        target_app_name,
+        expected.target.process_id,
+        &expected.target.window_title,
+        Some(expected_email),
+    )?
+    else {
+        anyhow::bail!("credential prompt disappeared before password load");
+    };
+    let prompt = ensure_same_revalidated_prompt(prompt, expected)?;
+    if !prompt.target.frontmost {
+        anyhow::bail!("credential prompt is not foreground before password load");
+    }
+    Ok(prompt)
 }
 
 fn ensure_same_revalidated_prompt(
@@ -1625,6 +1722,44 @@ fn process_image_path(process_id: u32) -> Option<String> {
     }
 }
 
+fn process_package_full_name(process_id: i32) -> Option<String> {
+    if process_id <= 0 {
+        return None;
+    }
+
+    unsafe {
+        let handle =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id as u32).ok()?;
+        let result = process_package_full_name_from_handle(handle);
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
+unsafe fn process_package_full_name_from_handle(handle: HANDLE) -> Option<String> {
+    let mut len = 0_u32;
+    let first = unsafe { GetPackageFullName(handle, &mut len, None) };
+    if first == APPMODEL_ERROR_NO_PACKAGE || len == 0 {
+        return None;
+    }
+    if first != ERROR_INSUFFICIENT_BUFFER && first != ERROR_SUCCESS {
+        return None;
+    }
+
+    let mut buffer = vec![0_u16; len as usize];
+    let second = unsafe { GetPackageFullName(handle, &mut len, Some(PWSTR(buffer.as_mut_ptr()))) };
+    if second != ERROR_SUCCESS || len == 0 {
+        return None;
+    }
+
+    let len = buffer
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(len as usize)
+        .min(buffer.len());
+    Some(wide_buffer_to_string(&buffer, len))
+}
+
 fn process_name_from_path(path: &str) -> String {
     Path::new(path)
         .file_stem()
@@ -1745,7 +1880,7 @@ fn target_app_matches_with_class(
         return aliases
             .iter()
             .any(|alias| !alias.is_empty() && process_name == *alias)
-            && trusted_microsoft_rdp_target_path(&target.process_name, &target.process_path);
+            && trusted_microsoft_rdp_target(target);
     }
 
     let title = target.window_title.to_lowercase();
@@ -1955,31 +2090,47 @@ fn trusted_windowsapps_microsoft_package_path(path: &str, process_name: &str) ->
     })
 }
 
-fn trusted_microsoft_rdp_target_path(process_name: &str, path: &str) -> bool {
+fn microsoft_rdp_target_kind(process_name: &str, path: &str) -> Option<WindowsMicrosoftTargetKind> {
     if path.trim().is_empty() {
-        return false;
+        return None;
     }
 
     let process_name = normalized_identifier(process_name);
     match process_name.as_str() {
-        "mstsc" => trusted_windows_system_exe_path(path, "mstsc.exe"),
+        "mstsc" if trusted_windows_system_exe_path(path, "mstsc.exe") => {
+            Some(WindowsMicrosoftTargetKind::SystemMstsc)
+        }
         "msrdc" | "msrdcw" => {
-            trusted_remote_desktop_install_path(path, &process_name)
-                || trusted_windowsapps_microsoft_package_path(path, &process_name)
+            if trusted_remote_desktop_install_path(path, &process_name) {
+                Some(WindowsMicrosoftTargetKind::RemoteDesktopInstall)
+            } else if trusted_windowsapps_microsoft_package_path(path, &process_name) {
+                Some(WindowsMicrosoftTargetKind::WindowsAppsPackage)
+            } else {
+                None
+            }
         }
         "rdclientwinstore" | "windows365" | "windowsapp" => {
             trusted_windowsapps_microsoft_package_path(path, &process_name)
+                .then_some(WindowsMicrosoftTargetKind::WindowsAppsPackage)
         }
-        _ => false,
+        _ => None,
     }
 }
 
 #[cfg(test)]
 fn trusted_microsoft_rdp_path_hint(path: &str) -> bool {
-    trusted_microsoft_rdp_target_path(
+    microsoft_rdp_target_kind(
         &normalized_windows_file_stem(path).unwrap_or_default(),
         path,
     )
+    .is_some()
+}
+
+fn trusted_microsoft_rdp_target(target: &WindowsTarget) -> bool {
+    let Some(kind) = microsoft_rdp_target_kind(&target.process_name, &target.process_path) else {
+        return false;
+    };
+    windows_target_identity_is_trusted(target, kind)
 }
 
 fn system_credential_dialog_matches(target: &WindowsTarget, class_name: &str) -> bool {
@@ -2011,6 +2162,190 @@ fn trusted_windows_credential_broker_path(path: &str) -> bool {
 fn trusted_windows_credential_broker(target: &WindowsTarget) -> bool {
     normalized_identifier(&target.process_name) == "credentialuibroker"
         && trusted_windows_credential_broker_path(&target.process_path)
+        && windows_target_identity_is_trusted(target, WindowsMicrosoftTargetKind::CredentialBroker)
+}
+
+fn windows_target_identity_is_trusted(
+    target: &WindowsTarget,
+    kind: WindowsMicrosoftTargetKind,
+) -> bool {
+    #[cfg(test)]
+    if let Some(result) = windows_target_identity_override_result(target, kind) {
+        return result;
+    }
+
+    if target.process_id <= 0 || target.process_path.trim().is_empty() {
+        return false;
+    }
+    if !windows_executable_is_microsoft_signed(&target.process_path) {
+        return false;
+    }
+    if kind == WindowsMicrosoftTargetKind::WindowsAppsPackage {
+        return process_package_full_name(target.process_id)
+            .as_deref()
+            .is_some_and(trusted_windowsapps_microsoft_package_full_name);
+    }
+
+    true
+}
+
+fn trusted_windowsapps_microsoft_package_full_name(package_full_name: &str) -> bool {
+    let normalized = package_full_name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let Some(publisher_id) = normalized.rsplit('_').next() else {
+        return false;
+    };
+    if publisher_id != "8wekyb3d8bbwe" {
+        return false;
+    }
+
+    [
+        "microsoft.remotedesktop_",
+        "microsoft.remotedesktoppreview_",
+        "microsoftcorporationii.windows365_",
+        "microsoftcorporationii.windowsapp_",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn windows_executable_is_microsoft_signed(path: &str) -> bool {
+    unsafe { winverifytrust_microsoft_publisher(path) }
+}
+
+unsafe fn winverifytrust_microsoft_publisher(path: &str) -> bool {
+    let mut path_wide = Path::new(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if path_wide.len() <= 1 {
+        return false;
+    }
+
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(path_wide.as_mut_ptr()),
+        ..Default::default()
+    };
+    let mut trust_data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_SAFER_FLAG | WTD_DISABLE_MD2_MD4 | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+        dwUIContext: WTD_UICONTEXT_EXECUTE,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    let status = unsafe {
+        WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            (&mut trust_data as *mut WINTRUST_DATA).cast::<c_void>(),
+        )
+    };
+    let verified = status == 0 && unsafe { wintrust_state_has_microsoft_signer(&trust_data) };
+
+    trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+    let _ = unsafe {
+        WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            (&mut trust_data as *mut WINTRUST_DATA).cast::<c_void>(),
+        )
+    };
+
+    verified
+}
+
+unsafe fn wintrust_state_has_microsoft_signer(trust_data: &WINTRUST_DATA) -> bool {
+    let provider = unsafe { WTHelperProvDataFromStateData(trust_data.hWVTStateData) };
+    if provider.is_null() {
+        return false;
+    }
+    let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) };
+    if signer.is_null() {
+        return false;
+    }
+
+    let Some(leaf_name) = (unsafe { signer_certificate_name(signer, 0) }) else {
+        return false;
+    };
+    if !microsoft_signing_leaf_name_is_allowed(&leaf_name) {
+        return false;
+    }
+
+    let chain_len = unsafe { (*signer).csCertChain };
+    if chain_len <= 1 {
+        return true;
+    }
+
+    (1..chain_len).any(|index| {
+        unsafe { signer_certificate_name(signer, index) }
+            .as_deref()
+            .is_some_and(microsoft_chain_name_is_allowed)
+    })
+}
+
+unsafe fn signer_certificate_name(
+    signer: *mut windows::Win32::Security::WinTrust::CRYPT_PROVIDER_SGNR,
+    index: u32,
+) -> Option<String> {
+    let cert = unsafe { WTHelperGetProvCertFromChain(signer, index) };
+    if cert.is_null() {
+        return None;
+    }
+    let cert_context = unsafe { (*cert).pCert };
+    if cert_context.is_null() {
+        return None;
+    }
+    unsafe { certificate_simple_display_name(cert_context) }
+}
+
+unsafe fn certificate_simple_display_name(cert: *const CERT_CONTEXT) -> Option<String> {
+    let needed = unsafe { CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None) };
+    if needed <= 1 {
+        return None;
+    }
+
+    let mut buffer = vec![0_u16; needed as usize];
+    let written = unsafe {
+        CertGetNameStringW(
+            cert,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            None,
+            Some(&mut buffer),
+        )
+    };
+    if written <= 1 {
+        return None;
+    }
+
+    Some(wide_buffer_to_string(&buffer, (written - 1) as usize))
+}
+
+fn microsoft_signing_leaf_name_is_allowed(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "microsoft corporation" | "microsoft windows" | "microsoft windows publisher"
+    )
+}
+
+fn microsoft_chain_name_is_allowed(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name == "microsoft corporation"
+        || name.starts_with("microsoft ")
+        || name.contains(" microsoft ")
 }
 
 fn normalized_identifier(value: &str) -> String {
@@ -2310,6 +2645,20 @@ mod tests {
         }
     }
 
+    fn reject_all_windows_target_identities(
+        _target: &WindowsTarget,
+        _kind: super::WindowsMicrosoftTargetKind,
+    ) -> bool {
+        false
+    }
+
+    fn accept_only_remote_desktop_install_identity(
+        _target: &WindowsTarget,
+        kind: super::WindowsMicrosoftTargetKind,
+    ) -> bool {
+        kind == super::WindowsMicrosoftTargetKind::RemoteDesktopInstall
+    }
+
     #[test]
     fn builtin_windows_target_requires_trusted_process_path() {
         let remote_desktop =
@@ -2357,6 +2706,73 @@ mod tests {
             "Windows App",
             &user_windowsapps_spoof,
             ""
+        ));
+    }
+
+    #[test]
+    fn builtin_windows_target_requires_verified_microsoft_identity() {
+        let _guard =
+            super::set_windows_target_identity_override(reject_all_windows_target_identities);
+        let remote_desktop =
+            windows_target("msrdc", program_files_path(r"Remote Desktop\msrdc.exe"));
+        let packaged_windows_app = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &remote_desktop,
+            ""
+        ));
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &packaged_windows_app,
+            ""
+        ));
+    }
+
+    #[test]
+    fn builtin_windows_target_identity_policy_tracks_target_kind() {
+        let _guard = super::set_windows_target_identity_override(
+            accept_only_remote_desktop_install_identity,
+        );
+        let remote_desktop =
+            windows_target("msrdc", program_files_path(r"Remote Desktop\msrdc.exe"));
+        let packaged_windows_app = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+
+        assert!(target_app_matches_with_class(
+            "Windows App",
+            &remote_desktop,
+            ""
+        ));
+        assert!(!target_app_matches_with_class(
+            "Windows App",
+            &packaged_windows_app,
+            ""
+        ));
+    }
+
+    #[test]
+    fn windowsapps_package_identity_requires_pinned_microsoft_publisher_id() {
+        assert!(super::trusted_windowsapps_microsoft_package_full_name(
+            "MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(super::trusted_windowsapps_microsoft_package_full_name(
+            "Microsoft.RemoteDesktop_10.2.0.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(!super::trusted_windowsapps_microsoft_package_full_name(
+            "MicrosoftCorporationII.Windows365_1.0.0.0_x64__badpublisher"
+        ));
+        assert!(!super::trusted_windowsapps_microsoft_package_full_name(
+            "Contoso.Windows365_1.0.0.0_x64__8wekyb3d8bbwe"
         ));
     }
 
@@ -2709,6 +3125,16 @@ mod tests {
 
     #[test]
     fn system_windows_security_dialog_requires_system_broker_path() {
+        let _guard =
+            super::set_windows_target_identity_override(reject_all_windows_target_identities);
+        let trusted_path_target = trusted_windows_security_target();
+        assert!(!system_credential_dialog_matches(
+            &trusted_path_target,
+            "Credential Dialog Xaml Host"
+        ));
+
+        drop(_guard);
+
         let target = WindowsTarget {
             process_id: 42,
             process_name: "CredentialUIBroker".to_string(),

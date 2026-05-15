@@ -1121,6 +1121,42 @@ fn fill_current_prompt_once_windows(
     log.set("selected_account_id", selected_account.id.clone());
     let expected_email = prompt_email.as_str();
 
+    log.set("pre_password_revalidation_attempted", "true");
+    let pre_password_revalidation_start = Instant::now();
+    prompt = match crate::windows_ui::preflight_password_load_prompt(
+        app_name,
+        &prompt,
+        expected_email,
+    ) {
+        Ok(prompt) => {
+            log.set("pre_password_revalidation_result", "ok");
+            log.set(
+                "pre_password_revalidation_ms",
+                pre_password_revalidation_start
+                    .elapsed()
+                    .as_millis()
+                    .to_string(),
+            );
+            prompt
+        }
+        Err(e) => {
+            log.set("pre_password_revalidation_result", "failed");
+            log.set(
+                "pre_password_revalidation_ms",
+                pre_password_revalidation_start
+                    .elapsed()
+                    .as_millis()
+                    .to_string(),
+            );
+            tracing::debug!(error = %e, "Windows pre-password prompt revalidation failed");
+            return log.fail("pre_password_revalidation_failed");
+        }
+    };
+    apply_windows_prompt_fields(&mut log, &prompt);
+    if let Err(e) = guard() {
+        return log.fail(format!("attempt_cancelled_{e}"));
+    }
+
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
     log.set("keychain_account_key", selected_account.id.clone());
