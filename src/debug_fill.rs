@@ -1037,8 +1037,7 @@ fn fill_current_prompt_once_windows(
 
     let app_name = crate::config::TARGET_APP_NAME;
     let inspect_start = Instant::now();
-    let mut inspection = match inspect_windows_prompt_for_fill(app_name, verified_prompt, &mut log)
-    {
+    let inspection = match inspect_windows_prompt_for_fill(app_name, verified_prompt, &mut log) {
         Ok(inspection) => {
             log.set(
                 "windows_prompt_inspect_ms",
@@ -1071,6 +1070,7 @@ fn fill_current_prompt_once_windows(
     );
     apply_windows_prompt_fields(&mut log, &prompt);
     if !prompt.target.frontmost {
+        let activation_prompt = prompt.clone();
         if let Err(e) = crate::windows_ui::activate_window(prompt.target.window_handle) {
             log.set(
                 "credential_prompt_activation_error_kind",
@@ -1078,14 +1078,17 @@ fn fill_current_prompt_once_windows(
             );
             return log.fail(format!("credential_prompt_activation_failed_{e}"));
         }
-        inspection = match crate::windows_ui::inspect(app_name) {
-            Ok(inspection) => inspection,
-            Err(e) => return log.fail(format!("windows_uia_reinspection_failed_{e}")),
+        prompt = match crate::windows_ui::revalidate_prompt_after_activation(
+            app_name,
+            &activation_prompt,
+        ) {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                return log.fail(format!(
+                    "visible_credential_prompt_revalidation_failed_after_activation_{e}"
+                ))
+            }
         };
-        let Some(next_prompt) = inspection.prompt else {
-            return log.fail("visible_credential_prompt_not_detected_after_activation");
-        };
-        prompt = next_prompt;
         apply_windows_prompt_fields(&mut log, &prompt);
     }
     if !prompt.target.frontmost {
@@ -2199,6 +2202,7 @@ fn sanitize_failure_reason(value: &str) -> String {
         "prompt_context_live_revalidation_failed_",
         "submit_failed_",
         "submit_script_failed_",
+        "visible_credential_prompt_revalidation_failed_after_activation_",
         "windows_uia_inspection_failed_",
         "windows_uia_reinspection_failed_",
     ];
@@ -2340,6 +2344,26 @@ mod tests {
     }
 
     #[test]
+    fn windows_activation_revalidates_original_prompt_without_broad_rescan() {
+        let implementation = include_str!("debug_fill.rs");
+        let activation_block = source_between(
+            implementation,
+            "if !prompt.target.frontmost {\n        let activation_prompt = prompt.clone();",
+            "    if !prompt.target.frontmost {\n        return log.fail(\"windows_app_not_frontmost\");",
+        );
+
+        assert!(
+            activation_block.contains("revalidate_prompt_after_activation"),
+            "post-activation flow must revalidate the originally selected prompt"
+        );
+        assert!(
+            !activation_block.contains("crate::windows_ui::inspect(app_name)")
+                && !activation_block.contains("inspection.prompt"),
+            "post-activation flow must not replace the selected prompt with a broad re-scan result"
+        );
+    }
+
+    #[test]
     fn post_password_load_failure_preserves_loaded_marker() {
         let mut log = super::DebugLog::new("test".to_string());
         log.set("password_load_attempted", "true");
@@ -2417,6 +2441,15 @@ mod tests {
         assert!(!serialized.contains("ABCDE12345"));
         assert!(!serialized.contains("com.jane.secret.autologin"));
         assert!(!serialized.contains("UBF8T346G9"));
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_index = source.find(start).expect("source start marker");
+        let end_index = source[start_index..]
+            .find(end)
+            .map(|offset| start_index + offset)
+            .expect("source end marker");
+        &source[start_index..end_index]
     }
 
     #[cfg(target_os = "macos")]

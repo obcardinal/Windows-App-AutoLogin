@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "macos")]
 use std::{
@@ -11,22 +13,48 @@ use std::{
     sync::OnceLock,
 };
 #[cfg(target_os = "windows")]
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
+    ERROR_LOCK_VIOLATION, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_LISTENING, ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+#[cfg(target_os = "windows")]
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, LockFileEx, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS, OPEN_EXISTING,
+    PIPE_ACCESS_INBOUND,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::System::IO::OVERLAPPED;
 
 #[cfg(not(target_os = "windows"))]
 const LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.lock";
 #[cfg(target_os = "macos")]
 const FULL_UI_LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.full-ui.lock";
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 const ACTIVATION_FILE_NAME: &str = "activate";
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 const MONITOR_COMMAND_FILE_NAME: &str = "monitor-command";
 const MONITOR_STATUS_FILE_NAME: &str = "monitor-status";
 #[cfg(not(target_os = "windows"))]
@@ -43,24 +71,28 @@ const MAX_LOCK_OWNER_BYTES: u64 = 256;
 #[cfg(not(target_os = "windows"))]
 const MAX_LOCK_PID_BYTES: u64 = 32;
 const MAX_MONITOR_STATUS_BYTES: u64 = 32;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 const MAX_MONITOR_COMMAND_BYTES: u64 = 256;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 const MAX_ACTIVATION_REQUEST_BYTES: u64 = 4096;
 #[cfg(target_os = "windows")]
-pub(crate) const MONITOR_CONTROL_TOKEN_ENV: &str = "WAAL_MONITOR_CONTROL_TOKEN";
+const WINDOWS_LOCAL_IPC_PIPE_PREFIX: &str = r"\\.\pipe\WindowsAppAutoLogin.LocalIpc.";
+#[cfg(target_os = "windows")]
+const WINDOWS_LOCAL_IPC_MAX_BYTES: usize = 128;
+#[cfg(target_os = "windows")]
+const WINDOWS_LOCAL_IPC_CONNECT_TIMEOUT_MS: u32 = 750;
 #[cfg(target_os = "macos")]
 const IPC_SOCKET_FILE_NAME: &str = "ipc.sock";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const MAX_IPC_COMMANDS_PER_TICK: usize = 16;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_ACTIVATE: &str = "activate";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_MONITOR_PREFIX: &str = "monitor:";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_RELOAD_CONFIG: &str = "config:reload";
 #[cfg(target_os = "windows")]
-const WINDOWS_SINGLE_INSTANCE_MUTEX: &str = "Local\\WindowsAppAutoLogin.SingleInstance";
+const WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME: &str = "single-instance.lock";
 #[cfg(target_os = "macos")]
 static CURRENT_EXECUTABLE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 #[cfg(target_os = "macos")]
@@ -68,7 +100,9 @@ static CURRENT_CODE_UNIQUE_IDENTIFIER: OnceLock<Option<Vec<u8>>> = OnceLock::new
 
 pub(crate) struct SingleInstanceGuard {
     #[cfg(target_os = "windows")]
-    mutex: HANDLE,
+    ipc_server: Option<LocalIpcServer>,
+    #[cfg(target_os = "windows")]
+    _lock_file: std::fs::File,
     #[cfg(not(target_os = "windows"))]
     lock_dir: PathBuf,
     #[cfg(not(target_os = "windows"))]
@@ -86,14 +120,22 @@ pub(crate) struct FullUiInstanceGuard {
     _lock_file: std::fs::File,
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) struct LocalIpcServer {
+    #[cfg(target_os = "macos")]
     listener: UnixListener,
+    #[cfg(target_os = "macos")]
     path: PathBuf,
+    #[cfg(target_os = "macos")]
     socket_identity: LocalIpcSocketIdentity,
+    #[cfg(target_os = "windows")]
+    pipe_name: String,
+    #[cfg(target_os = "windows")]
+    pipe: Option<WindowsPipeHandle>,
+    #[cfg(target_os = "windows")]
+    connected: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalIpcCommand {
     Activate,
@@ -101,7 +143,7 @@ pub(crate) enum LocalIpcCommand {
     Monitor(MonitorControlCommand),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PeerLocalIpcCommand {
     pub(crate) peer_pid: u32,
@@ -114,6 +156,26 @@ struct LocalIpcSocketIdentity {
     dev: u64,
     ino: u64,
     uid: u32,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsPipeHandle(HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsPipeHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+#[cfg(target_os = "windows")]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.0 .0))) };
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -137,21 +199,9 @@ impl MonitorControlCommand {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn from_request(value: &str) -> Option<Self> {
-        #[cfg(target_os = "windows")]
-        {
-            return Self::from_request_with_token(
-                value,
-                monitor_control_token_from_env()?.as_str(),
-            );
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            Self::from_legacy_request(value)
-        }
+        Self::from_legacy_request(value)
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -172,12 +222,6 @@ impl MonitorControlCommand {
         Self::from_command_name(command)
     }
 
-    #[cfg(target_os = "windows")]
-    fn from_request_with_token(value: &str, auth_token: &str) -> Option<Self> {
-        verified_monitor_command_request_with_token(value, auth_token)
-            .map(|request| request.command)
-    }
-
     fn from_command_name(command: &str) -> Option<Self> {
         match command {
             MONITOR_COMMAND_START => Some(Self::Start),
@@ -189,67 +233,10 @@ impl MonitorControlCommand {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn verified_monitor_command_request_with_token(
-    value: &str,
-    auth_token: &str,
-) -> Option<VerifiedMonitorCommandRequest> {
-    if value.len() > MAX_MONITOR_COMMAND_BYTES as usize {
-        return None;
-    }
-    if parse_nonce_field(auth_token).is_none() {
-        return None;
-    }
-
-    let mut parts = value.trim().split(':');
-    let command = parts.next()?.trim();
-    let pid = parts.next().and_then(|pid| parse_pid_field(pid.trim()))?;
-    let nonce = parts.next()?.trim();
-    parse_nonce_field(nonce)?;
-    let signature = parts.next()?.trim();
-    if parts.next().is_some() {
-        return None;
-    }
-    if !process_looks_like_this_app(pid) {
-        return None;
-    }
-    if !monitor_command_signature_matches(auth_token, command, pid, nonce, signature) {
-        return None;
-    }
-    Some(VerifiedMonitorCommandRequest {
-        command: MonitorControlCommand::from_command_name(command)?,
-        pid,
-        nonce: nonce.to_string(),
-        signature: signature.to_string(),
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) struct MonitorCommandWatcher {
     path: Option<PathBuf>,
     last_content: Option<String>,
-    #[cfg(target_os = "windows")]
-    auth_token: String,
-    #[cfg(target_os = "windows")]
-    consumed_nonces: std::collections::HashSet<String>,
-    #[cfg(target_os = "windows")]
-    consumed_signatures: std::collections::HashSet<String>,
-}
-
-#[cfg(target_os = "windows")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifiedMonitorCommandRequest {
-    command: MonitorControlCommand,
-    pid: u32,
-    nonce: String,
-    signature: String,
-}
-
-#[cfg(target_os = "windows")]
-impl VerifiedMonitorCommandRequest {
-    fn consumed_signature_key(&self) -> String {
-        format!("{}:{}", self.nonce, self.signature)
-    }
 }
 
 pub(crate) fn is_already_running_error(error: &anyhow::Error) -> bool {
@@ -270,14 +257,14 @@ impl SingleInstanceGuard {
     pub(crate) fn acquire() -> anyhow::Result<Self> {
         #[cfg(target_os = "windows")]
         {
-            acquire_windows_single_instance(WINDOWS_SINGLE_INSTANCE_MUTEX)
+            acquire_windows_single_instance()
         }
 
         #[cfg(not(target_os = "windows"))]
         acquire_lock_dir()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn take_ipc_server(&mut self) -> Option<LocalIpcServer> {
         self.ipc_server.take()
     }
@@ -403,7 +390,6 @@ fn acquire_lock_dir_in_root(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn prepare_lock_root(root: &Path) -> std::io::Result<()> {
     secure_lock_root_parent_if_app_runtime(root)?;
     match std::fs::symlink_metadata(root) {
@@ -424,7 +410,7 @@ fn prepare_lock_root(root: &Path) -> std::io::Result<()> {
     secure_dir_permissions(root)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn secure_lock_root_parent_if_app_runtime(root: &Path) -> std::io::Result<()> {
     if crate::user_paths::runtime_dir().ok().as_deref() != Some(root) {
         return Ok(());
@@ -442,15 +428,87 @@ fn secure_lock_root_parent_if_app_runtime(_root: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn acquire_windows_single_instance(name: &str) -> anyhow::Result<SingleInstanceGuard> {
-    let name = wide_null(name);
-    let mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr()))? };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let _ = unsafe { CloseHandle(mutex) };
-        anyhow::bail!("{}", ALREADY_RUNNING_MESSAGE);
+fn acquire_windows_single_instance() -> anyhow::Result<SingleInstanceGuard> {
+    let root = lock_root()?;
+    prepare_lock_root(&root)?;
+    let lock_file = acquire_windows_single_instance_file_lock(&root)?;
+
+    let ipc_server = match LocalIpcServer::bind() {
+        Ok(server) => server,
+        Err(error) => return Err(error),
+    };
+
+    Ok(SingleInstanceGuard {
+        ipc_server: Some(ipc_server),
+        _lock_file: lock_file,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn acquire_windows_single_instance_file_lock(root: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    let path = root.join(WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME);
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if wide_path[..wide_path.len().saturating_sub(1)].contains(&0) {
+        anyhow::bail!("Windows single-instance lock path contains an interior NUL byte");
     }
 
-    Ok(SingleInstanceGuard { mutex })
+    let security_descriptor = windows_local_ipc_security_descriptor()?;
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor.0 .0,
+        bInheritHandle: BOOL(0),
+    };
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            Some(std::ptr::addr_of!(security_attributes)),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|error| {
+        anyhow::anyhow!("failed to open Windows single-instance lock file: {error}")
+    })?;
+    let file = unsafe { std::fs::File::from_raw_handle(handle.0) };
+
+    secure_file_permissions(&path, 0o600)?;
+    crate::private_permissions::validate_windows_private_file_handle(&file).map_err(|error| {
+        anyhow::anyhow!("Windows single-instance lock file is not private: {error}")
+    })?;
+
+    let mut overlapped = OVERLAPPED::default();
+    let lock_result = unsafe {
+        LockFileEx(
+            HANDLE(file.as_raw_handle()),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            None,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    match lock_result {
+        Ok(()) => Ok(file),
+        Err(error) => {
+            let last_error = unsafe { GetLastError() };
+            if last_error == ERROR_LOCK_VIOLATION || last_error == ERROR_SHARING_VIOLATION {
+                anyhow::bail!("{}", ALREADY_RUNNING_MESSAGE);
+            }
+            Err(anyhow::anyhow!(
+                "failed to lock Windows single-instance file: {error}"
+            ))
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -459,12 +517,12 @@ fn wide_null(value: &str) -> Vec<u16> {
 }
 
 pub(crate) fn request_activation() -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         return send_local_ipc_command(IPC_COMMAND_ACTIVATE);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let path = activation_request_path()?;
         let current_exe = std::env::current_exe()
@@ -482,26 +540,12 @@ pub(crate) fn request_activation() -> anyhow::Result<()> {
 }
 
 pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         return send_local_ipc_command(&format!(
             "{IPC_COMMAND_MONITOR_PREFIX}{}",
             command.as_str()
         ));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let token = monitor_control_token_from_env()
-            .ok_or_else(|| anyhow::anyhow!("monitor control token is unavailable"))?;
-        let nonce = random_nonce();
-        let body = signed_monitor_command_request(
-            command.as_str(),
-            std::process::id(),
-            &nonce,
-            token.as_str(),
-        );
-        write_private_text(&monitor_command_path()?, &body)
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -516,12 +560,12 @@ pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow:
 }
 
 pub(crate) fn request_config_reload() -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         return send_local_ipc_command(IPC_COMMAND_RELOAD_CONFIG);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         request_monitor_command(MonitorControlCommand::ReloadConfig)
     }
@@ -552,7 +596,7 @@ fn parse_monitor_status(status: &str) -> Option<bool> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 impl MonitorCommandWatcher {
     pub(crate) fn new() -> Self {
         let path = monitor_command_path().ok();
@@ -561,19 +605,9 @@ impl MonitorCommandWatcher {
             .and_then(|path| read_private_text_limited(path, MAX_MONITOR_COMMAND_BYTES).ok())
             .flatten();
 
-        Self {
-            path,
-            last_content,
-            #[cfg(target_os = "windows")]
-            auth_token: random_nonce(),
-            #[cfg(target_os = "windows")]
-            consumed_nonces: std::collections::HashSet::new(),
-            #[cfg(target_os = "windows")]
-            consumed_signatures: std::collections::HashSet::new(),
-        }
+        Self { path, last_content }
     }
 
-    #[cfg(not(target_os = "windows"))]
     pub(crate) fn consume_command(&mut self) -> Option<MonitorControlCommand> {
         let path = self.path.as_deref()?;
         let content = read_private_text_limited(path, MAX_MONITOR_COMMAND_BYTES)
@@ -587,40 +621,6 @@ impl MonitorCommandWatcher {
         MonitorControlCommand::from_request(&content)
     }
 
-    #[cfg(target_os = "windows")]
-    pub(crate) fn consume_command_from_settings_child(
-        &mut self,
-        settings_child_pid: Option<u32>,
-    ) -> Option<MonitorControlCommand> {
-        let path = self.path.as_deref()?;
-        let content = read_private_text_limited(path, MAX_MONITOR_COMMAND_BYTES)
-            .ok()
-            .flatten()?;
-        if self.last_content.as_deref() == Some(content.as_str()) {
-            return None;
-        }
-
-        self.last_content = Some(content.clone());
-        let request = verified_monitor_command_request_with_token(&content, &self.auth_token)?;
-        let signature_key = request.consumed_signature_key();
-        if self.consumed_nonces.contains(&request.nonce)
-            || self.consumed_signatures.contains(&signature_key)
-        {
-            return None;
-        }
-        self.consumed_nonces.insert(request.nonce.clone());
-        self.consumed_signatures.insert(signature_key);
-        if Some(request.pid) != settings_child_pid {
-            return None;
-        }
-        Some(request.command)
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(crate) fn control_token(&self) -> &str {
-        &self.auth_token
-    }
-
     #[cfg(test)]
     fn for_path(path: PathBuf) -> Self {
         let last_content = read_private_text_limited(&path, MAX_MONITOR_COMMAND_BYTES)
@@ -629,38 +629,18 @@ impl MonitorCommandWatcher {
         Self {
             path: Some(path),
             last_content,
-            #[cfg(target_os = "windows")]
-            auth_token: random_nonce(),
-            #[cfg(target_os = "windows")]
-            consumed_nonces: std::collections::HashSet::new(),
-            #[cfg(target_os = "windows")]
-            consumed_signatures: std::collections::HashSet::new(),
-        }
-    }
-
-    #[cfg(all(test, target_os = "windows"))]
-    fn for_path_with_token(path: PathBuf, auth_token: String) -> Self {
-        let last_content = read_private_text_limited(&path, MAX_MONITOR_COMMAND_BYTES)
-            .ok()
-            .flatten();
-        Self {
-            path: Some(path),
-            last_content,
-            auth_token,
-            consumed_nonces: std::collections::HashSet::new(),
-            consumed_signatures: std::collections::HashSet::new(),
         }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) struct ActivationWatcher {
     path: Option<PathBuf>,
     last_modified: Option<SystemTime>,
     last_content: Option<String>,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 impl ActivationWatcher {
     pub(crate) fn new() -> Self {
         let path = activation_request_path().ok();
@@ -759,12 +739,207 @@ impl Drop for LocalIpcServer {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl LocalIpcServer {
+    fn bind() -> anyhow::Result<Self> {
+        let pipe_name = windows_local_ipc_pipe_name()?;
+        let pipe = create_windows_local_ipc_pipe(&pipe_name)?;
+        Ok(Self {
+            pipe_name,
+            pipe: Some(pipe),
+            connected: false,
+        })
+    }
+
+    pub(crate) fn consume_commands(&mut self) -> Vec<PeerLocalIpcCommand> {
+        let mut commands = Vec::new();
+        for _ in 0..MAX_IPC_COMMANDS_PER_TICK {
+            match self.consume_one_command() {
+                Ok(Some(command)) => commands.push(command),
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, "Windows local IPC command read failed");
+                    self.reset_pipe();
+                    break;
+                }
+            }
+        }
+        commands
+    }
+
+    fn consume_one_command(&mut self) -> anyhow::Result<Option<PeerLocalIpcCommand>> {
+        if self.pipe.is_none() {
+            self.pipe = Some(create_windows_local_ipc_pipe(&self.pipe_name)?);
+            self.connected = false;
+        }
+
+        let Some(pipe) = self.pipe.as_ref() else {
+            return Ok(None);
+        };
+        if !self.connected {
+            match connect_windows_local_ipc_pipe(pipe.0)? {
+                WindowsPipeConnectState::Connected => {
+                    self.connected = true;
+                }
+                WindowsPipeConnectState::Listening => return Ok(None),
+            }
+        }
+
+        let peer_pid = match windows_named_pipe_client_pid(pipe.0) {
+            Ok(peer_pid) => peer_pid,
+            Err(_) => {
+                self.reset_pipe();
+                return Ok(None);
+            }
+        };
+        if !process_looks_like_this_app(peer_pid) {
+            self.reset_pipe();
+            return Ok(None);
+        }
+
+        match read_windows_local_ipc_message(pipe.0)? {
+            WindowsPipeReadState::Pending => Ok(None),
+            WindowsPipeReadState::Closed => {
+                self.reset_pipe();
+                Ok(None)
+            }
+            WindowsPipeReadState::Message(message) => {
+                self.reset_pipe();
+                Ok(parse_local_ipc_command(&message)
+                    .map(|command| PeerLocalIpcCommand { peer_pid, command }))
+            }
+        }
+    }
+
+    fn reset_pipe(&mut self) {
+        if let Some(pipe) = self.pipe.take() {
+            let _ = unsafe { DisconnectNamedPipe(pipe.0) };
+            drop(pipe);
+        }
+        self.connected = false;
+        self.pipe = create_windows_local_ipc_pipe(&self.pipe_name).ok();
+    }
+}
+
+#[cfg(target_os = "windows")]
+enum WindowsPipeConnectState {
+    Connected,
+    Listening,
+}
+
+#[cfg(target_os = "windows")]
+enum WindowsPipeReadState {
+    Message(String),
+    Pending,
+    Closed,
+}
+
+#[cfg(target_os = "windows")]
+fn create_windows_local_ipc_pipe(pipe_name: &str) -> anyhow::Result<WindowsPipeHandle> {
+    let name = wide_null(pipe_name);
+    let security_descriptor = windows_local_ipc_security_descriptor()?;
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor.0 .0,
+        bInheritHandle: BOOL(0),
+    };
+    let open_mode = PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE;
+    let pipe_mode =
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            open_mode,
+            pipe_mode,
+            1,
+            WINDOWS_LOCAL_IPC_MAX_BYTES as u32,
+            WINDOWS_LOCAL_IPC_MAX_BYTES as u32,
+            WINDOWS_LOCAL_IPC_CONNECT_TIMEOUT_MS,
+            Some(std::ptr::addr_of!(security_attributes)),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        anyhow::bail!(
+            "failed to create Windows local IPC named pipe: {}",
+            unsafe { GetLastError() }.0
+        );
+    }
+    Ok(WindowsPipeHandle(handle))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_local_ipc_security_descriptor() -> anyhow::Result<LocalSecurityDescriptor> {
+    let user_sid = crate::private_permissions::current_windows_user_sid_string()?;
+    let sddl = format!("O:{user_sid}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{user_sid})");
+    let sddl = wide_null(&sddl);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| {
+        anyhow::anyhow!("failed to create Windows local IPC security descriptor: {error}")
+    })?;
+    Ok(LocalSecurityDescriptor(descriptor))
+}
+
+#[cfg(target_os = "windows")]
+fn connect_windows_local_ipc_pipe(pipe: HANDLE) -> anyhow::Result<WindowsPipeConnectState> {
+    if unsafe { ConnectNamedPipe(pipe, None) }.is_ok() {
+        return Ok(WindowsPipeConnectState::Connected);
+    }
+
+    match unsafe { GetLastError() } {
+        ERROR_PIPE_CONNECTED | ERROR_NO_DATA => Ok(WindowsPipeConnectState::Connected),
+        ERROR_PIPE_LISTENING => Ok(WindowsPipeConnectState::Listening),
+        error => Err(anyhow::anyhow!(
+            "failed to connect Windows local IPC named pipe: {}",
+            error.0
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_named_pipe_client_pid(pipe: HANDLE) -> anyhow::Result<u32> {
+    let mut peer_pid = 0_u32;
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut peer_pid) }.map_err(|error| {
+        anyhow::anyhow!("failed to read Windows local IPC peer process id: {error}")
+    })?;
+    if peer_pid == 0 {
+        anyhow::bail!("Windows local IPC peer process id is unavailable");
+    }
+    Ok(peer_pid)
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_local_ipc_message(pipe: HANDLE) -> anyhow::Result<WindowsPipeReadState> {
+    let mut buffer = [0_u8; WINDOWS_LOCAL_IPC_MAX_BYTES];
+    let mut bytes_read = 0_u32;
+    if unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut bytes_read), None) }.is_err() {
+        return match unsafe { GetLastError() } {
+            ERROR_NO_DATA | ERROR_PIPE_LISTENING => Ok(WindowsPipeReadState::Pending),
+            ERROR_BROKEN_PIPE => Ok(WindowsPipeReadState::Closed),
+            error => Err(anyhow::anyhow!(
+                "failed to read Windows local IPC command: {}",
+                error.0
+            )),
+        };
+    }
+
+    if bytes_read == 0 {
+        return Ok(WindowsPipeReadState::Closed);
+    }
+    Ok(WindowsPipeReadState::Message(
+        String::from_utf8_lossy(&buffer[..bytes_read as usize]).to_string(),
+    ))
+}
+
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = unsafe { CloseHandle(self.mutex) };
-        }
         #[cfg(not(target_os = "windows"))]
         {
             remove_current_process_lock(&self.lock_dir, &self.lock_nonce);
@@ -836,16 +1011,16 @@ fn remove_stale_lock_dir(lock_dir: &Path) -> std::io::Result<()> {
 }
 
 fn lock_root() -> anyhow::Result<PathBuf> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         return crate::user_paths::runtime_dir();
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     crate::user_paths::cache_dir()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn monitor_command_path() -> anyhow::Result<PathBuf> {
     Ok(lock_root()?.join(MONITOR_COMMAND_FILE_NAME))
 }
@@ -854,7 +1029,7 @@ fn monitor_status_path() -> anyhow::Result<PathBuf> {
     Ok(lock_root()?.join(MONITOR_STATUS_FILE_NAME))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn activation_request_path() -> anyhow::Result<PathBuf> {
     Ok(lock_root()?.join(ACTIVATION_FILE_NAME))
 }
@@ -862,6 +1037,22 @@ fn activation_request_path() -> anyhow::Result<PathBuf> {
 #[cfg(target_os = "macos")]
 fn ipc_socket_path() -> anyhow::Result<PathBuf> {
     Ok(lock_root()?.join(IPC_SOCKET_FILE_NAME))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_local_ipc_pipe_name() -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let root = lock_root()?;
+    let mut hasher = Sha256::new();
+    hasher.update(root.to_string_lossy().as_bytes());
+    hasher.update(b"\0WindowsAppAutoLogin.LocalIpc");
+    let digest = hasher.finalize();
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{WINDOWS_LOCAL_IPC_PIPE_PREFIX}{suffix}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -877,6 +1068,86 @@ fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
     let challenge = read_local_ipc_challenge(&mut stream)?;
     stream.write_all(format!("{}:{}\n", challenge, command.trim()).as_bytes())?;
     let _ = stream.shutdown(Shutdown::Write);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
+    let command = format!("{}\n", command.trim());
+    if command.len() > WINDOWS_LOCAL_IPC_MAX_BYTES {
+        anyhow::bail!("Windows local IPC command is too large");
+    }
+
+    let pipe_name = windows_local_ipc_pipe_name()?;
+    let pipe = open_windows_local_ipc_pipe(&pipe_name)?;
+    validate_windows_local_ipc_server(pipe.0)?;
+
+    let mut bytes_written = 0_u32;
+    unsafe {
+        WriteFile(
+            pipe.0,
+            Some(command.as_bytes()),
+            Some(&mut bytes_written),
+            None,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("failed to write Windows local IPC command: {error}"))?;
+
+    if bytes_written as usize != command.len() {
+        anyhow::bail!("Windows local IPC command was only partially written");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_local_ipc_pipe(pipe_name: &str) -> anyhow::Result<WindowsPipeHandle> {
+    let pipe_name = wide_null(pipe_name);
+    let started = Instant::now();
+    loop {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(pipe_name.as_ptr()),
+                GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        if let Ok(handle) = handle {
+            return Ok(WindowsPipeHandle(handle));
+        }
+
+        let error = unsafe { GetLastError() };
+        if error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND
+            || started.elapsed()
+                >= Duration::from_millis(WINDOWS_LOCAL_IPC_CONNECT_TIMEOUT_MS as u64)
+        {
+            anyhow::bail!("failed to open Windows local IPC named pipe: {}", error.0);
+        }
+
+        if error == ERROR_PIPE_BUSY {
+            let _ = unsafe {
+                WaitNamedPipeW(
+                    PCWSTR(pipe_name.as_ptr()),
+                    WINDOWS_LOCAL_IPC_CONNECT_TIMEOUT_MS.min(100),
+                )
+            };
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_local_ipc_server(pipe: HANDLE) -> anyhow::Result<()> {
+    let mut server_pid = 0_u32;
+    unsafe { GetNamedPipeServerProcessId(pipe, &mut server_pid) }.map_err(|error| {
+        anyhow::anyhow!("failed to read Windows local IPC server process id: {error}")
+    })?;
+    if server_pid == 0 || !process_looks_like_this_app(server_pid) {
+        anyhow::bail!("Windows local IPC server is not the trusted app process");
+    }
     Ok(())
 }
 
@@ -1011,7 +1282,7 @@ fn parse_local_ipc_challenge_response(
     parse_local_ipc_command(command)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn parse_local_ipc_command(message: &str) -> Option<LocalIpcCommand> {
     let message = message.trim();
     if message == IPC_COMMAND_ACTIVATE {
@@ -1074,7 +1345,7 @@ fn local_ipc_socket_identity(path: &Path) -> anyhow::Result<LocalIpcSocketIdenti
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn file_modified_time(path: &Path) -> Option<SystemTime> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
     metadata.file_type().is_file().then_some(())?;
@@ -1384,6 +1655,7 @@ fn lock_owner(lock_dir: &Path) -> Option<LockOwner> {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn random_nonce() -> String {
     use rand::RngCore;
 
@@ -1392,93 +1664,7 @@ fn random_nonce() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(target_os = "windows")]
-fn monitor_control_token_from_env() -> Option<String> {
-    let token = std::env::var(MONITOR_CONTROL_TOKEN_ENV).ok()?;
-    parse_nonce_field(&token).map(str::to_string)
-}
-
-#[cfg(target_os = "windows")]
-fn signed_monitor_command_request(
-    command: &str,
-    pid: u32,
-    nonce: &str,
-    auth_token: &str,
-) -> String {
-    let signature = monitor_command_signature(auth_token, command, pid, nonce);
-    format!("{command}:{pid}:{nonce}:{signature}\n")
-}
-
-#[cfg(target_os = "windows")]
-fn monitor_command_signature(auth_token: &str, command: &str, pid: u32, nonce: &str) -> String {
-    let message = format!("{command}:{pid}:{nonce}");
-    hmac_sha256_hex(auth_token.as_bytes(), message.as_bytes())
-}
-
-#[cfg(target_os = "windows")]
-fn monitor_command_signature_matches(
-    auth_token: &str,
-    command: &str,
-    pid: u32,
-    nonce: &str,
-    actual_signature: &str,
-) -> bool {
-    if actual_signature.len() != 64
-        || !actual_signature
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    let expected = monitor_command_signature(auth_token, command, pid, nonce);
-    constant_time_eq(expected.as_bytes(), actual_signature.as_bytes())
-}
-
-#[cfg(target_os = "windows")]
-fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-
-    const BLOCK_SIZE: usize = 64;
-    let mut key_block = [0_u8; BLOCK_SIZE];
-    if key.len() > BLOCK_SIZE {
-        key_block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut inner_pad = [0x36_u8; BLOCK_SIZE];
-    let mut outer_pad = [0x5c_u8; BLOCK_SIZE];
-    for index in 0..BLOCK_SIZE {
-        inner_pad[index] ^= key_block[index];
-        outer_pad[index] ^= key_block[index];
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(message);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner_hash);
-    outer
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[cfg(target_os = "windows")]
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
-        == 0
-}
-
+#[cfg(not(target_os = "windows"))]
 fn parse_pid_field(value: &str) -> Option<u32> {
     if value.is_empty() || value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -1487,11 +1673,12 @@ fn parse_pid_field(value: &str) -> Option<u32> {
     (pid > 0).then_some(pid)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_nonce_field(value: &str) -> Option<&str> {
     (value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(value)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn parse_request_nonce(value: &str) -> Option<&str> {
     (value.len() <= 64 && !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
         .then_some(value)
@@ -1830,7 +2017,7 @@ fn no_follow_open_error(_error: &std::io::Error) -> bool {
     false
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn activation_request_is_valid(content: &str) -> bool {
     if content.len() > MAX_ACTIVATION_REQUEST_BYTES as usize {
         return false;
@@ -1906,22 +2093,50 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_named_mutex_blocks_second_acquire() {
-        let name = format!(
-            "Local\\WindowsAppAutoLogin.SingleInstance.Test.{}",
-            std::process::id()
+    fn windows_single_instance_uses_private_file_lock_not_fixed_mutex() {
+        let implementation = include_str!("single_instance.rs");
+        let acquire = source_between(
+            implementation,
+            "#[cfg(target_os = \"windows\")]\nfn acquire_windows_single_instance(",
+            "#[cfg(target_os = \"windows\")]\nfn wide_null(",
         );
-        let guard = acquire_windows_single_instance(&name).unwrap();
-        let Err(error) = acquire_windows_single_instance(&name) else {
-            panic!("second named mutex acquire succeeded");
+
+        assert!(!implementation.contains(concat!("WINDOWS_SINGLE", "_INSTANCE_MUTEX")));
+        assert!(
+            !implementation.contains(concat!("Local\\\\", "WindowsAppAutoLogin.SingleInstance"))
+        );
+        assert!(!implementation.contains(concat!("Create", "MutexW")));
+        assert!(acquire.contains("acquire_windows_single_instance_file_lock"));
+        assert!(implementation.contains("LockFileEx"));
+        assert!(implementation.contains("WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_file_lock_blocks_second_acquire_until_guard_drops() {
+        let root = temp_test_root("windows-file-single-instance");
+        prepare_lock_root(&root).unwrap();
+        let guard = acquire_windows_single_instance_file_lock(&root).unwrap();
+        let Err(error) = acquire_windows_single_instance_file_lock(&root) else {
+            panic!("second Windows file lock acquire succeeded");
         };
 
         assert!(error.to_string().contains("already running"));
         drop(guard);
-        assert!(acquire_windows_single_instance(&name).is_ok());
+        assert!(acquire_windows_single_instance_file_lock(&root).is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_lock_root_uses_runtime_dir_not_cache_dir() {
+        let root = lock_root().unwrap();
+
+        assert_eq!(root, crate::user_paths::runtime_dir().unwrap());
+        assert_ne!(root, crate::user_paths::cache_dir().unwrap());
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn activation_watcher_consumes_new_request_once() {
         let path = std::env::temp_dir().join(format!(
@@ -2635,60 +2850,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn monitor_command_request_for_test(
         command: MonitorControlCommand,
         nonce: &str,
         auth_token: &str,
     ) -> String {
-        #[cfg(target_os = "windows")]
-        {
-            let nonce = format!("{nonce:0>32}");
-            signed_monitor_command_request(command.as_str(), std::process::id(), &nonce, auth_token)
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = auth_token;
-            format!("{}:{}:{nonce}", command.as_str(), std::process::id())
-        }
+        let _ = auth_token;
+        format!("{}:{}:{nonce}", command.as_str(), std::process::id())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn forged_monitor_command_request_for_test(auth_token: &str) -> String {
-        #[cfg(target_os = "windows")]
-        {
-            signed_monitor_command_request(
-                MONITOR_COMMAND_START,
-                99_999_999,
-                &random_nonce(),
-                auth_token,
-            )
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = auth_token;
-            "start_monitor:99999999:4".to_string()
-        }
+        let _ = auth_token;
+        "start_monitor:99999999:4".to_string()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn consume_monitor_command_for_test(
         watcher: &mut MonitorCommandWatcher,
     ) -> Option<MonitorControlCommand> {
-        #[cfg(target_os = "windows")]
-        {
-            watcher.consume_command_from_settings_child(Some(std::process::id()))
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            watcher.consume_command()
-        }
+        watcher.consume_command()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn monitor_command_watcher_consumes_new_commands_once() {
         let path = std::env::temp_dir().join(format!(
@@ -2697,15 +2882,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        #[cfg(target_os = "windows")]
-        let auth_token = random_nonce();
-        #[cfg(not(target_os = "windows"))]
         let auth_token = String::new();
 
-        #[cfg(target_os = "windows")]
-        let mut watcher =
-            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
-        #[cfg(not(target_os = "windows"))]
         let mut watcher = MonitorCommandWatcher::for_path(path.clone());
 
         assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
@@ -2747,7 +2925,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn monitor_command_requires_pid_and_nonce() {
         assert_eq!(MonitorControlCommand::from_request("start_monitor"), None);
@@ -2777,244 +2955,77 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn monitor_command_requires_windows_auth_signature() {
-        let auth_token = random_nonce();
-        let nonce = random_nonce();
-        let valid = signed_monitor_command_request(
-            MONITOR_COMMAND_START,
-            std::process::id(),
-            &nonce,
-            &auth_token,
+    fn windows_monitor_control_uses_peer_bound_local_ipc_without_env_token() {
+        let implementation = include_str!("single_instance.rs");
+        let request_monitor = source_between(
+            implementation,
+            "pub(crate) fn request_monitor_command(",
+            "pub(crate) fn request_config_reload()",
+        );
+        let windows_server = source_between(
+            implementation,
+            "#[cfg(target_os = \"windows\")]\nimpl LocalIpcServer",
+            "impl Drop for SingleInstanceGuard",
         );
 
+        assert!(request_monitor.contains("send_local_ipc_command"));
+        assert!(!request_monitor.contains("write_private_text(&monitor_command_path()?"));
+        assert!(!implementation.contains(concat!("monitor_", "control_token_from_env")));
+        assert!(!implementation.contains(concat!("signed_", "monitor_command_request")));
+        assert!(windows_server.contains("GetNamedPipeClientProcessId"));
+        assert!(windows_server.contains("process_looks_like_this_app(peer_pid)"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_local_ipc_rejects_legacy_monitor_file_payloads() {
         assert_eq!(
-            MonitorControlCommand::from_request_with_token(&valid, &auth_token),
-            Some(MonitorControlCommand::Start)
+            parse_local_ipc_command("monitor:start_monitor"),
+            Some(LocalIpcCommand::Monitor(MonitorControlCommand::Start))
         );
         assert_eq!(
-            MonitorControlCommand::from_request_with_token(
-                &format!("{}:{}:{}", MONITOR_COMMAND_START, std::process::id(), nonce),
-                &auth_token
-            ),
-            None
+            parse_local_ipc_command("config:reload"),
+            Some(LocalIpcCommand::ReloadConfig)
         );
+        assert_eq!(parse_local_ipc_command("start_monitor:123:1"), None);
         assert_eq!(
-            MonitorControlCommand::from_request_with_token(
-                &signed_monitor_command_request(
-                    MONITOR_COMMAND_START,
-                    std::process::id(),
-                    &nonce,
-                    &random_nonce(),
-                ),
-                &auth_token,
-            ),
-            None
-        );
-        assert_eq!(
-            MonitorControlCommand::from_request_with_token(
-                &valid.replacen(MONITOR_COMMAND_START, MONITOR_COMMAND_STOP, 1),
-                &auth_token,
-            ),
+            parse_local_ipc_command("monitor:start_monitor:old-token"),
             None
         );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn monitor_command_watcher_rejects_raw_spoofed_file_with_supervisor_pid() {
-        let path = std::env::temp_dir().join(format!(
-            "windows-app-autologin-monitor-command-spoof-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let auth_token = random_nonce();
-        let mut watcher =
-            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
-
-        write_test_private_text(
-            &path,
-            format!("{}:{}:1", MONITOR_COMMAND_START, std::process::id()),
-        )
-        .unwrap();
-        assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_START,
-                std::process::id(),
-                &random_nonce(),
-                &random_nonce(),
-            ),
-        )
-        .unwrap();
-        assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_START,
-                std::process::id(),
-                &random_nonce(),
-                &auth_token,
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            consume_monitor_command_for_test(&mut watcher),
-            Some(MonitorControlCommand::Start)
+    fn windows_activation_uses_peer_bound_local_ipc_without_file_fallback() {
+        let implementation = include_str!("single_instance.rs");
+        let main_source = include_str!("main.rs");
+        let request_activation = source_between(
+            implementation,
+            "pub(crate) fn request_activation()",
+            "pub(crate) fn request_monitor_command(",
         );
+        let about_to_wait = source_between(main_source, "fn about_to_wait", "fn exiting");
 
-        let _ = std::fs::remove_file(path);
+        assert!(request_activation
+            .contains("#[cfg(any(target_os = \"macos\", target_os = \"windows\"))]"));
+        assert!(request_activation.contains("send_local_ipc_command(IPC_COMMAND_ACTIVATE)"));
+        assert!(request_activation
+            .contains("#[cfg(all(not(target_os = \"macos\"), not(target_os = \"windows\")))]"));
+        assert!(!request_activation.contains("#[cfg(not(target_os = \"macos\"))]"));
+        assert!(implementation.contains(
+            "#[cfg(all(not(target_os = \"macos\"), not(target_os = \"windows\")))]\npub(crate) struct ActivationWatcher"
+        ));
+        assert!(!implementation
+            .contains("#[cfg(not(target_os = \"macos\"))]\npub(crate) struct ActivationWatcher"));
+        assert!(about_to_wait.contains("self.process_local_ipc_commands();"));
+        assert!(about_to_wait
+            .contains("#[cfg(all(not(target_os = \"macos\"), not(target_os = \"windows\")))]"));
+        assert!(!about_to_wait.contains(
+            "#[cfg(target_os = \"windows\")]\n        self.process_activation_requests();"
+        ));
     }
 
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn monitor_command_watcher_rejects_replayed_signed_request() {
-        let path = std::env::temp_dir().join(format!(
-            "windows-app-autologin-monitor-command-replay-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let auth_token = random_nonce();
-        let mut watcher =
-            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
-        let start = signed_monitor_command_request(
-            MONITOR_COMMAND_START,
-            std::process::id(),
-            &random_nonce(),
-            &auth_token,
-        );
-        let stop = signed_monitor_command_request(
-            MONITOR_COMMAND_STOP,
-            std::process::id(),
-            &random_nonce(),
-            &auth_token,
-        );
-
-        write_test_private_text(&path, &start).unwrap();
-        assert_eq!(
-            consume_monitor_command_for_test(&mut watcher),
-            Some(MonitorControlCommand::Start)
-        );
-
-        write_test_private_text(&path, "invalid").unwrap();
-        assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
-        write_test_private_text(&path, &start).unwrap();
-        assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
-
-        write_test_private_text(&path, &stop).unwrap();
-        assert_eq!(
-            consume_monitor_command_for_test(&mut watcher),
-            Some(MonitorControlCommand::Stop)
-        );
-        write_test_private_text(&path, &start).unwrap();
-        assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn monitor_command_watcher_rejects_reused_nonce_with_new_signature() {
-        let path = std::env::temp_dir().join(format!(
-            "windows-app-autologin-monitor-command-nonce-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let auth_token = random_nonce();
-        let nonce = random_nonce();
-        let mut watcher =
-            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_START,
-                std::process::id(),
-                &nonce,
-                &auth_token,
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            consume_monitor_command_for_test(&mut watcher),
-            Some(MonitorControlCommand::Start)
-        );
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_STOP,
-                std::process::id(),
-                &nonce,
-                &auth_token,
-            ),
-        )
-        .unwrap();
-        assert_eq!(consume_monitor_command_for_test(&mut watcher), None);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn monitor_command_watcher_requires_current_settings_child_pid() {
-        let path = std::env::temp_dir().join(format!(
-            "windows-app-autologin-monitor-command-child-pid-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let auth_token = random_nonce();
-        let mut watcher =
-            MonitorCommandWatcher::for_path_with_token(path.clone(), auth_token.clone());
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_START,
-                std::process::id(),
-                &random_nonce(),
-                &auth_token,
-            ),
-        )
-        .unwrap();
-        assert_eq!(watcher.consume_command_from_settings_child(None), None);
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_STOP,
-                std::process::id(),
-                &random_nonce(),
-                &auth_token,
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            watcher.consume_command_from_settings_child(Some(std::process::id() + 1)),
-            None
-        );
-
-        write_test_private_text(
-            &path,
-            signed_monitor_command_request(
-                MONITOR_COMMAND_RELOAD_CONFIG,
-                std::process::id(),
-                &random_nonce(),
-                &auth_token,
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            watcher.consume_command_from_settings_child(Some(std::process::id())),
-            Some(MonitorControlCommand::ReloadConfig)
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn monitor_command_watcher_ignores_oversized_content() {
         let path = std::env::temp_dir().join(format!(
@@ -3031,7 +3042,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn activation_watcher_ignores_oversized_content() {
         let path = std::env::temp_dir().join(format!(
@@ -3051,7 +3062,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn activation_request_requires_valid_pid_nonce_and_path() {
         assert!(!activation_request_is_valid("0:1:/tmp/app"));
@@ -3145,7 +3156,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn local_ipc_parses_monitor_and_activation_commands() {
         assert_eq!(
@@ -3234,6 +3245,16 @@ mod tests {
             local_ipc_command_from_validated_stream(server_stream, std::process::id()).unwrap(),
             None
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_index = source.find(start).expect("source start marker");
+        let end_index = source[start_index..]
+            .find(end)
+            .map(|offset| start_index + offset)
+            .expect("source end marker");
+        &source[start_index..end_index]
     }
 
     fn temp_test_root(name: &str) -> PathBuf {

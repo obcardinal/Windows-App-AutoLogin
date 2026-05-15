@@ -87,7 +87,7 @@ fn enable() -> anyhow::Result<()> {
         windows_enable_current_user(&app_path)?;
         if !windows_registered_command_matches_path(&app_path) {
             anyhow::bail!(
-                "Open at Login was written, but Windows Startup does not point to this app."
+                "Open at Login was written, but Windows Startup entry was not written exactly as expected."
             );
         }
         if !windows_startup_approved_enabled() {
@@ -1511,6 +1511,17 @@ fn windows_command_executable_path(command: &str) -> Option<String> {
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn windows_exact_startup_command_app_path(command: &str) -> Option<String> {
+    let app_path = windows_command_executable_path(command)?;
+    (command == windows_startup_command(&app_path)).then_some(app_path)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_startup_command_exactly_matches_path(command: &str, app_path: &str) -> bool {
+    command == windows_startup_command(app_path)
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn windows_paths_equal(left: &str, right: &str) -> bool {
     normalize_windows_path_for_compare(left) == normalize_windows_path_for_compare(right)
 }
@@ -1585,7 +1596,7 @@ fn windows_cleanup_stale() -> anyhow::Result<()> {
     let Some(command) = windows_registered_command() else {
         return Ok(());
     };
-    let Some(app_path) = windows_command_executable_path(&command) else {
+    let Some(app_path) = windows_exact_startup_command_app_path(&command) else {
         windows_disable_current_user()?;
         return Ok(());
     };
@@ -1601,8 +1612,7 @@ fn windows_cleanup_stale() -> anyhow::Result<()> {
 fn windows_registered_command_matches_path(app_path: &str) -> bool {
     windows_registered_command()
         .as_deref()
-        .and_then(windows_command_executable_path)
-        .is_some_and(|registered_path| windows_paths_equal(&registered_path, app_path))
+        .is_some_and(|command| windows_startup_command_exactly_matches_path(command, app_path))
 }
 
 #[cfg(target_os = "windows")]
@@ -2466,6 +2476,38 @@ mod tests {
     }
 
     #[test]
+    fn windows_startup_trust_requires_exact_generated_command() {
+        let app_path = r"C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe";
+        let command = windows_startup_command(app_path);
+
+        assert!(windows_startup_command_exactly_matches_path(
+            &command, app_path
+        ));
+        assert_eq!(
+            windows_exact_startup_command_app_path(&command).as_deref(),
+            Some(app_path)
+        );
+
+        for candidate in [
+            format!("{command} --full-ui"),
+            format!("{command} /background"),
+            format!(r#"{command} "C:\Users\me\payload.txt""#),
+            format!("{command} "),
+            format!(" {command}"),
+            format!(r#"{command}garbage"#),
+            format!(r#"{command}""#),
+            format!(r#"{command} "unterminated"#),
+            r#""C:/Program Files/Windows App AutoLogin/WindowsAppAutoLogin.exe""#.to_string(),
+        ] {
+            assert!(
+                !windows_startup_command_exactly_matches_path(&candidate, app_path),
+                "{candidate}"
+            );
+            assert_eq!(windows_exact_startup_command_app_path(&candidate), None);
+        }
+    }
+
+    #[test]
     fn windows_path_compare_normalizes_slashes_and_case() {
         assert!(windows_paths_equal(
             r"C:\Apps\WindowsAppAutoLogin.exe",
@@ -2481,6 +2523,12 @@ mod tests {
             )
             .as_deref(),
             Some(r"C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe")
+        );
+        assert_eq!(
+            windows_exact_startup_command_app_path(
+                r#""C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe" --full-ui"#
+            ),
+            None
         );
         assert_eq!(
             windows_command_executable_path(

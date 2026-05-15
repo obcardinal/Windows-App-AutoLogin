@@ -56,6 +56,8 @@ const _ICON_ASSET_FINGERPRINT: &str = env!("WAAL_ICON_ASSET_FINGERPRINT");
 const SUPERVISOR_TICK: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const LEGACY_IPC_TOKEN_ENV: &str = "WAAL_IPC_TOKEN";
+#[cfg(target_os = "windows")]
+const LEGACY_MONITOR_CONTROL_TOKEN_ENV: &str = "WAAL_MONITOR_CONTROL_TOKEN";
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -91,13 +93,13 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (_single_instance, ipc_server) = {
         let mut single_instance = single_instance;
         let ipc_server = single_instance.take_ipc_server();
         (single_instance, ipc_server)
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let _single_instance = single_instance;
 
     let rt = Runtime::new()?;
@@ -131,7 +133,7 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
         tray_rx,
         worker_invalidator,
         config,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         ipc_server,
     );
     event_loop.run_app(&mut supervisor)?;
@@ -250,14 +252,14 @@ struct LightweightSupervisor {
     worker_status: models::WorkerStatus,
     accessibility_trusted: bool,
     last_accessibility_check: Instant,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     monitor_command_watcher: single_instance::MonitorCommandWatcher,
     settings_child: Option<Child>,
     resume_monitor_after_settings: bool,
     exit_requested: bool,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     activation_watcher: single_instance::ActivationWatcher,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     ipc_server: Option<single_instance::LocalIpcServer>,
 }
 
@@ -269,7 +271,9 @@ impl LightweightSupervisor {
         tray_rx: StdReceiver<tray::TrayCommand>,
         worker_invalidator: background::WorkerInvalidator,
         config: models::AppConfig,
-        #[cfg(target_os = "macos")] ipc_server: Option<single_instance::LocalIpcServer>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] ipc_server: Option<
+            single_instance::LocalIpcServer,
+        >,
     ) -> Self {
         Self {
             worker_tx,
@@ -282,14 +286,14 @@ impl LightweightSupervisor {
             worker_status: models::WorkerStatus::Idle,
             accessibility_trusted: autologin::accessibility_is_trusted(),
             last_accessibility_check: Instant::now(),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             monitor_command_watcher: single_instance::MonitorCommandWatcher::new(),
             settings_child: None,
             resume_monitor_after_settings: false,
             exit_requested: false,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             activation_watcher: single_instance::ActivationWatcher::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             ipc_server,
         }
     }
@@ -358,15 +362,8 @@ impl LightweightSupervisor {
         self.close_settings_child_for_exit();
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn process_monitor_commands(&mut self) {
-        #[cfg(target_os = "windows")]
-        let command = {
-            let settings_child_pid = self.settings_child_pid_for_monitor_command();
-            self.monitor_command_watcher
-                .consume_command_from_settings_child(settings_child_pid)
-        };
-        #[cfg(not(target_os = "windows"))]
         let command = self.monitor_command_watcher.consume_command();
         let Some(command) = command else {
             return;
@@ -403,17 +400,17 @@ impl LightweightSupervisor {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn process_activation_requests(&mut self) {
         if self.activation_watcher.consume_activation_request() {
             self.open_settings_window();
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn process_local_ipc_commands(&mut self) {
         let settings_child_pid = self.settings_child_pid_for_local_ipc();
-        let Some(ipc_server) = &self.ipc_server else {
+        let Some(ipc_server) = self.ipc_server.as_mut() else {
             return;
         };
         let commands = ipc_server.consume_commands();
@@ -434,7 +431,7 @@ impl LightweightSupervisor {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn handle_authorized_local_ipc_command(&mut self, command: single_instance::LocalIpcCommand) {
         match command {
             single_instance::LocalIpcCommand::Activate => self.handle_activation_request(),
@@ -444,11 +441,15 @@ impl LightweightSupervisor {
                     self.start_monitor_from_control_command()
                 }
                 single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
+                #[cfg(target_os = "windows")]
+                single_instance::MonitorControlCommand::ReloadConfig => {
+                    self.reload_config_after_settings()
+                }
             },
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn handle_activation_request(&mut self) {
         self.poll_settings_window();
         if self.settings_child.is_none() {
@@ -456,14 +457,8 @@ impl LightweightSupervisor {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn settings_child_pid_for_local_ipc(&mut self) -> Option<u32> {
-        self.poll_settings_window();
-        self.settings_child.as_ref().map(|child| child.id())
-    }
-
-    #[cfg(target_os = "windows")]
-    fn settings_child_pid_for_monitor_command(&mut self) -> Option<u32> {
         self.poll_settings_window();
         self.settings_child.as_ref().map(|child| child.id())
     }
@@ -596,7 +591,7 @@ impl LightweightSupervisor {
         self.open_full_ui_window(models::Tab::Accounts);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn open_accounts_window_without_stopping_monitor(&mut self) {
         self.open_full_ui_window_with_monitor_policy(models::Tab::Accounts, false);
     }
@@ -625,16 +620,7 @@ impl LightweightSupervisor {
             let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
         }
 
-        #[cfg(target_os = "windows")]
-        let monitor_control_token = Some(self.monitor_command_watcher.control_token());
-        #[cfg(not(target_os = "windows"))]
-        let monitor_control_token = None;
-
-        match spawn_full_ui_window(
-            initial_tab,
-            self.privileged_ipc_available(),
-            monitor_control_token,
-        ) {
+        match spawn_full_ui_window(initial_tab, self.privileged_ipc_available()) {
             Ok(child) => {
                 self.settings_child = Some(child);
             }
@@ -745,12 +731,12 @@ impl LightweightSupervisor {
         tray.set_monitor_running(running);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn privileged_ipc_available(&self) -> bool {
         self.ipc_server.is_some()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn privileged_ipc_available(&self) -> bool {
         false
     }
@@ -779,9 +765,9 @@ impl ApplicationHandler for LightweightSupervisor {
             return;
         }
         self.process_worker_events();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.process_local_ipc_commands();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             self.process_monitor_commands();
             self.process_activation_requests();
@@ -796,7 +782,7 @@ impl ApplicationHandler for LightweightSupervisor {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn local_ipc_command_authorized(
     command: single_instance::LocalIpcCommand,
     peer_pid: u32,
@@ -835,13 +821,11 @@ fn initial_tab_arg(initial_tab: models::Tab) -> &'static str {
 fn spawn_full_ui_window(
     initial_tab: models::Tab,
     privileged_ipc_available: bool,
-    monitor_control_token: Option<&str>,
 ) -> anyhow::Result<Child> {
     Ok(full_ui_command(
         std::env::current_exe()?,
         initial_tab,
         privileged_ipc_available,
-        monitor_control_token,
     )
     .spawn()?)
 }
@@ -850,28 +834,21 @@ fn full_ui_command(
     current_exe: impl AsRef<std::ffi::OsStr>,
     initial_tab: models::Tab,
     privileged_ipc_available: bool,
-    monitor_control_token: Option<&str>,
 ) -> Command {
     let mut command = Command::new(current_exe);
     command.arg("--full-ui").arg(initial_tab_arg(initial_tab));
     #[cfg(target_os = "windows")]
     {
         let _ = privileged_ipc_available;
-        if let Some(token) = monitor_control_token {
-            command.env(single_instance::MONITOR_CONTROL_TOKEN_ENV, token);
-        } else {
-            command.env_remove(single_instance::MONITOR_CONTROL_TOKEN_ENV);
-        }
+        command.env_remove(LEGACY_MONITOR_CONTROL_TOKEN_ENV);
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let _ = privileged_ipc_available;
-        let _ = monitor_control_token;
     }
     #[cfg(target_os = "macos")]
     {
         let _ = privileged_ipc_available;
-        let _ = monitor_control_token;
         command.env_remove(LEGACY_IPC_TOKEN_ENV);
     }
     command
@@ -1019,7 +996,6 @@ mod tests {
             "/tmp/windows-app-autologin",
             crate::models::Tab::Accounts,
             false,
-            None,
         );
 
         let args = command
@@ -1038,24 +1014,22 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn full_ui_command_passes_monitor_control_token_env() {
-        let token = "0123456789abcdef0123456789abcdef";
+    fn full_ui_command_removes_legacy_monitor_control_token_env() {
         let command = full_ui_command(
             "/tmp/windows-app-autologin",
             crate::models::Tab::Settings,
             false,
-            Some(token),
         );
 
         let token_env = command
             .get_envs()
-            .find(|(key, _)| *key == crate::single_instance::MONITOR_CONTROL_TOKEN_ENV);
+            .find(|(key, _)| *key == super::LEGACY_MONITOR_CONTROL_TOKEN_ENV);
 
         assert_eq!(
             token_env,
             Some((
-                std::ffi::OsStr::new(crate::single_instance::MONITOR_CONTROL_TOKEN_ENV),
-                Some(std::ffi::OsStr::new(token))
+                std::ffi::OsStr::new(super::LEGACY_MONITOR_CONTROL_TOKEN_ENV),
+                None
             ))
         );
     }
@@ -1105,7 +1079,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
 
@@ -1149,7 +1123,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             original_config.clone(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
@@ -1164,7 +1138,7 @@ mod tests {
         assert_eq!(worker_rx.capacity(), 0);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn local_ipc_authorization_requires_settings_child_for_privileged_commands() {
         use super::single_instance::{LocalIpcCommand, MonitorControlCommand};
@@ -1191,7 +1165,7 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn activate_ipc_does_not_stop_running_monitor() {
         use super::single_instance::LocalIpcCommand;
@@ -1236,7 +1210,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
@@ -1268,7 +1242,7 @@ mod tests {
                 tray_rx,
                 WorkerInvalidator::new(),
                 AppConfig::default(),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 None,
             );
             supervisor.accessibility_trusted = false;
@@ -1303,7 +1277,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.accessibility_trusted = false;
@@ -1327,7 +1301,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.accessibility_trusted = true;
@@ -1354,7 +1328,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
@@ -1400,7 +1374,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
@@ -1431,7 +1405,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.accessibility_trusted = true;
@@ -1509,7 +1483,7 @@ mod tests {
             tray_rx,
             WorkerInvalidator::new(),
             AppConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             None,
         );
         supervisor.accessibility_trusted = true;
@@ -1552,7 +1526,7 @@ mod tests {
         assert!(!supervisor.resume_monitor_after_settings);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn exited_settings_child_is_cleared_before_ipc_authorization() {
         use super::single_instance::LocalIpcCommand;

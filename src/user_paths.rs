@@ -3,6 +3,7 @@ use std::path::PathBuf;
 const APP_DIR_NAME: &str = "WindowsAppAutoLogin";
 
 #[cfg(not(target_os = "macos"))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) fn cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(cache_dir) = dirs::cache_dir() {
         return Ok(cache_dir.join(APP_DIR_NAME));

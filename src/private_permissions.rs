@@ -298,7 +298,7 @@ fn windows_private_sddl(kind: WindowsPrivatePathKind) -> anyhow::Result<String> 
 }
 
 #[cfg(target_os = "windows")]
-fn current_windows_user_sid_string() -> anyhow::Result<String> {
+pub(crate) fn current_windows_user_sid_string() -> anyhow::Result<String> {
     use windows::core::PWSTR;
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 

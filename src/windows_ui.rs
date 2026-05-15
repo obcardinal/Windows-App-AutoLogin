@@ -741,6 +741,26 @@ pub(crate) fn preflight_password_load_prompt(
     Ok(prompt)
 }
 
+pub(crate) fn revalidate_prompt_after_activation(
+    target_app_name: &str,
+    expected: &WindowsPrompt,
+) -> anyhow::Result<WindowsPrompt> {
+    let Some(prompt) = inspect_prompt_snapshot(
+        target_app_name,
+        expected.target.process_id,
+        &expected.target.window_title,
+        expected.email.as_deref(),
+    )?
+    else {
+        anyhow::bail!("credential prompt disappeared after activation");
+    };
+    let prompt = ensure_same_revalidated_prompt(prompt, expected)?;
+    if !prompt.target.frontmost || !window_handle_is_foreground(prompt.target.window_handle) {
+        anyhow::bail!("credential prompt is not foreground after activation");
+    }
+    Ok(prompt)
+}
+
 fn ensure_same_revalidated_prompt(
     prompt: WindowsPrompt,
     expected: &WindowsPrompt,
