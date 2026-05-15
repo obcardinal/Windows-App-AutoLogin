@@ -616,7 +616,7 @@ fn stable_autostart_path_message() -> &'static str {
     }
     #[cfg(target_os = "windows")]
     {
-        "Open at Login can only be enabled from a protected install folder such as Program Files."
+        "Open at Login can only be enabled from a protected Program Files install chain with trusted ownership, ACLs, and no reparse points."
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -833,16 +833,11 @@ fn validate_windows_autostart_install_chain(path: &std::path::Path) -> anyhow::R
     }
 
     let prefixes = windows_local_drive_path_prefixes(app_path)?;
-    let root_index = prefixes
-        .iter()
-        .position(|(prefix, _)| {
-            protected_roots
-                .iter()
-                .any(|root| windows_paths_equal(prefix, root))
-        })
-        .ok_or_else(|| anyhow::anyhow!("Windows autostart path root was not matched"))?;
+    if !windows_autostart_chain_contains_protected_root(&prefixes, &protected_roots) {
+        anyhow::bail!("Windows autostart path root was not matched");
+    }
 
-    for (prefix, kind) in prefixes.into_iter().skip(root_index) {
+    for (prefix, kind) in prefixes {
         let handle = open_windows_autostart_path_no_reparse(std::path::Path::new(&prefix), kind)?;
         reject_windows_autostart_untrusted_write_acl(handle.0)?;
     }
@@ -896,12 +891,29 @@ fn windows_path_has_unsafe_component_spelling(path: &str) -> bool {
     {
         return true;
     }
-    path[3..]
-        .split('\\')
-        .any(|component| component.is_empty() || component == "." || component == "..")
+    path[3..].split('\\').any(|component| {
+        component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.ends_with('.')
+            || component.ends_with(' ')
+    })
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
+fn windows_autostart_chain_contains_protected_root(
+    prefixes: &[(String, WindowsAutostartPathKind)],
+    protected_roots: &[String],
+) -> bool {
+    prefixes.iter().any(|(prefix, kind)| {
+        *kind == WindowsAutostartPathKind::Directory
+            && protected_roots
+                .iter()
+                .any(|root| windows_paths_equal(prefix, root))
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn windows_local_drive_path_prefixes(
     path: &str,
 ) -> anyhow::Result<Vec<(String, WindowsAutostartPathKind)>> {
@@ -913,6 +925,7 @@ fn windows_local_drive_path_prefixes(
     let parts = path[3..].split('\\').collect::<Vec<_>>();
     let mut prefixes = Vec::with_capacity(parts.len() + 1);
     let mut current = path[..3].to_string();
+    prefixes.push((current.clone(), WindowsAutostartPathKind::Directory));
     for (index, part) in parts.iter().enumerate() {
         if !current.ends_with('\\') {
             current.push('\\');
@@ -1364,8 +1377,8 @@ fn windows_autostart_mutating_rights() -> u32 {
         | WRITE_OWNER.0
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy)]
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowsAutostartPathKind {
     Directory,
     File,
@@ -1764,6 +1777,10 @@ mod tests {
             r"C:\Program Files (x86)\Windows App AutoLogin\WindowsAppAutoLogin.exe",
             &protected_roots
         ));
+        assert!(windows_trusted_autostart_path_for_roots(
+            r"\\?\C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
         assert!(!windows_trusted_autostart_path_for_roots(
             r"C:\Users\me\AppData\Local\Programs\WindowsAppAutoLogin\WindowsAppAutoLogin.exe",
             &protected_roots
@@ -1793,8 +1810,51 @@ mod tests {
             &protected_roots
         ));
         assert!(!windows_trusted_autostart_path_for_roots(
+            r"\\?\UNC\server\share\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files \Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
+            r"C:\Program Files.\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+            &protected_roots
+        ));
+        assert!(!windows_trusted_autostart_path_for_roots(
             r"C:\Program Files\Windows App AutoLogin\Other.exe",
             &protected_roots
+        ));
+    }
+
+    #[test]
+    fn windows_autostart_install_chain_starts_at_drive_root() {
+        let prefixes = windows_local_drive_path_prefixes(
+            r"C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefixes,
+            vec![
+                (r"C:\".to_string(), WindowsAutostartPathKind::Directory),
+                (
+                    r"C:\Program Files".to_string(),
+                    WindowsAutostartPathKind::Directory
+                ),
+                (
+                    r"C:\Program Files\Windows App AutoLogin".to_string(),
+                    WindowsAutostartPathKind::Directory
+                ),
+                (
+                    r"C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe".to_string(),
+                    WindowsAutostartPathKind::File
+                ),
+            ]
+        );
+        assert!(windows_autostart_chain_contains_protected_root(
+            &prefixes,
+            &[r"C:\Program Files".to_string()]
         ));
     }
 

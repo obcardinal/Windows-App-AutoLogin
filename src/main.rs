@@ -360,7 +360,15 @@ impl LightweightSupervisor {
 
     #[cfg(not(target_os = "macos"))]
     fn process_monitor_commands(&mut self) {
-        let Some(command) = self.monitor_command_watcher.consume_command() else {
+        #[cfg(target_os = "windows")]
+        let command = {
+            let settings_child_pid = self.settings_child_pid_for_monitor_command();
+            self.monitor_command_watcher
+                .consume_command_from_settings_child(settings_child_pid)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let command = self.monitor_command_watcher.consume_command();
+        let Some(command) = command else {
             return;
         };
 
@@ -450,6 +458,12 @@ impl LightweightSupervisor {
 
     #[cfg(target_os = "macos")]
     fn settings_child_pid_for_local_ipc(&mut self) -> Option<u32> {
+        self.poll_settings_window();
+        self.settings_child.as_ref().map(|child| child.id())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn settings_child_pid_for_monitor_command(&mut self) -> Option<u32> {
         self.poll_settings_window();
         self.settings_child.as_ref().map(|child| child.id())
     }
