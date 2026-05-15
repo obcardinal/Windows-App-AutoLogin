@@ -16,13 +16,13 @@ const RECOVERING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.
 const PASSWORD_ENVELOPE_PREFIX: &str = "waa1:";
 const PASSWORD_ENVELOPE_V2_PREFIX: &str = "waa2:";
 #[cfg(any(target_os = "windows", test))]
-const WINDOWS_APP_BOUND_SECRET_PREFIX: &str = "waab1:";
+const WINDOWS_APP_BOUND_SECRET_PREFIX: &str = "waab:";
 const PASSWORD_ENVELOPE_VERSION: u8 = 1;
 const PASSWORD_ENVELOPE_V2_VERSION: u8 = 2;
 const SECURE_STORAGE_PASSWORD_PURPOSE: &str = "account-password";
 const SECURE_STORAGE_FALLBACK_KEY_PURPOSE: &str = "fallback-encryption-key";
 #[cfg(any(target_os = "windows", test))]
-const WINDOWS_APP_BOUND_STORAGE_VERSION: &str = "WAAL_WINDOWS_APP_BOUND_STORAGE_V1";
+const WINDOWS_APP_BOUND_STORAGE_VERSION: &str = "WAAL_WINDOWS_APP_BOUND_STORAGE";
 const PENDING_STORAGE_TEMP_FILE_PREFIXES: &[&str] = &[
     "pending-storage-operation.json.tmp.",
     "pending-storage-operation.recovering.json.tmp.",
@@ -982,6 +982,9 @@ fn decode_secure_storage_secret(
             needs_migration: false,
         });
     }
+    if has_unsupported_windows_app_bound_prefix(stored) {
+        anyhow::bail!("unsupported Windows app-bound secure storage payload version");
+    }
     if stored.is_empty() {
         anyhow::bail!("secure storage payload is empty");
     }
@@ -992,9 +995,34 @@ fn decode_secure_storage_secret(
 }
 
 #[cfg(target_os = "windows")]
+fn has_unsupported_windows_app_bound_prefix(stored: &str) -> bool {
+    stored.starts_with("waab") && !stored.starts_with(WINDOWS_APP_BOUND_SECRET_PREFIX)
+}
+
+#[cfg(target_os = "windows")]
 fn windows_app_bound_protect(
     purpose: &str,
     plaintext: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let entropy = windows_app_bound_entropy(purpose);
+    windows_protect_data_with_entropy(plaintext, &entropy)
+        .map_err(|e| anyhow::anyhow!("Windows app-bound Credential Manager protect failed: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_app_bound_unprotect(
+    purpose: &str,
+    protected: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let entropy = windows_app_bound_entropy(purpose);
+    windows_unprotect_data_with_entropy(protected, &entropy)
+        .map_err(|e| anyhow::anyhow!("Windows app-bound Credential Manager unprotect failed: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_protect_data_with_entropy(
+    plaintext: &[u8],
+    entropy: &[u8; 32],
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
@@ -1002,7 +1030,7 @@ fn windows_app_bound_protect(
     };
 
     let mut input = Zeroizing::new(plaintext.to_vec());
-    let mut entropy = Zeroizing::new(windows_current_app_bound_entropy(purpose)?.to_vec());
+    let mut entropy = Zeroizing::new(entropy.to_vec());
     let input_blob = windows_data_blob(&mut input)?;
     let entropy_blob = windows_data_blob(&mut entropy)?;
     let mut output_blob = CRYPT_INTEGER_BLOB::default();
@@ -1017,7 +1045,7 @@ fn windows_app_bound_protect(
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut output_blob,
         )
-        .map_err(|e| anyhow::anyhow!("Windows app-bound Credential Manager protect failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let output = windows_blob_to_zeroizing_vec(&output_blob);
         let _ = LocalFree(Some(HLOCAL(output_blob.pbData.cast())));
@@ -1026,9 +1054,9 @@ fn windows_app_bound_protect(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_app_bound_unprotect(
-    purpose: &str,
+fn windows_unprotect_data_with_entropy(
     protected: &[u8],
+    entropy: &[u8; 32],
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
@@ -1036,7 +1064,7 @@ fn windows_app_bound_unprotect(
     };
 
     let mut input = Zeroizing::new(protected.to_vec());
-    let mut entropy = Zeroizing::new(windows_current_app_bound_entropy(purpose)?.to_vec());
+    let mut entropy = Zeroizing::new(entropy.to_vec());
     let input_blob = windows_data_blob(&mut input)?;
     let entropy_blob = windows_data_blob(&mut entropy)?;
     let mut output_blob = CRYPT_INTEGER_BLOB::default();
@@ -1051,9 +1079,7 @@ fn windows_app_bound_unprotect(
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut output_blob,
         )
-        .map_err(|e| {
-            anyhow::anyhow!("Windows app-bound Credential Manager unprotect failed: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let output = windows_blob_to_zeroizing_vec(&output_blob);
         let _ = LocalFree(Some(HLOCAL(output_blob.pbData.cast())));
@@ -1087,20 +1113,8 @@ unsafe fn windows_blob_to_zeroizing_vec(
     Ok(Zeroizing::new(bytes.to_vec()))
 }
 
-#[cfg(target_os = "windows")]
-fn windows_current_app_bound_entropy(purpose: &str) -> anyhow::Result<[u8; 32]> {
-    let current_exe = std::env::current_exe().map_err(|e| {
-        anyhow::anyhow!("current executable unavailable for app-bound storage: {e}")
-    })?;
-    let canonical_exe = current_exe.canonicalize().map_err(|e| {
-        anyhow::anyhow!("current executable path unavailable for app-bound storage: {e}")
-    })?;
-    Ok(windows_app_bound_entropy_for_path(purpose, &canonical_exe))
-}
-
 #[cfg(any(target_os = "windows", test))]
-fn windows_app_bound_entropy_for_path(purpose: &str, path: &Path) -> [u8; 32] {
-    let normalized_path = windows_app_bound_path(path);
+fn windows_app_bound_entropy(purpose: &str) -> [u8; 32] {
     let mut material = Vec::new();
     material.extend_from_slice(WINDOWS_APP_BOUND_STORAGE_VERSION.as_bytes());
     material.push(0);
@@ -1109,30 +1123,11 @@ fn windows_app_bound_entropy_for_path(purpose: &str, path: &Path) -> [u8; 32] {
     material.extend_from_slice(SERVICE_NAME.as_bytes());
     material.push(0);
     material.extend_from_slice(purpose.as_bytes());
-    material.push(0);
-    material.extend_from_slice(normalized_path.as_bytes());
 
     let digest = Sha256::digest(&material);
     let mut entropy = [0u8; 32];
     entropy.copy_from_slice(&digest);
     entropy
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_app_bound_path(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('/', r"\");
-    let normalized = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        path
-    };
-    let mut normalized = normalized.trim().to_lowercase();
-    while normalized.ends_with('\\') && normalized.len() > 3 {
-        normalized.pop();
-    }
-    normalized
 }
 
 fn decode_bound_password(
@@ -2971,6 +2966,8 @@ fn storage_error_kind(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
     if message.contains("not found") || message.contains("NoEntry") {
         "not_found"
+    } else if message.contains("app-bound Credential Manager unprotect failed") {
+        "app_bound_unprotect_failed"
     } else if message.contains("decrypt")
         || message.contains("ciphertext")
         || message.contains("invalid fallback key")
@@ -3057,11 +3054,9 @@ mod tests {
         backup_invalid_config_file, cleanup_fallback_key_if_password_file_empty,
         cleanup_legacy_fallback_key_residue_files_in_dir,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
-        clear_pending_storage_operation_paths, decode_bound_password,
-        decode_fallback_encryption_key, decode_keyring_password, decode_secure_storage_secret,
-        decrypt_password_with_key, delete_fallback_key_material_with_ops,
-        delete_sensitive_private_file_if_present, encode_bound_password, encode_keyring_password,
-        encode_secure_storage_secret, ensure_no_pending_storage_operation,
+        clear_pending_storage_operation_paths, decode_bound_password, decrypt_password_with_key,
+        delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
+        encode_bound_password, ensure_no_pending_storage_operation,
         is_pending_storage_operation_in_progress, legacy_account_id_for_migrated_config,
         legacy_migration_target_cleanup_id, legacy_password_migration_ready_to_persist,
         load_config_file, load_pending_storage_operation_record_or_quarantine_from_paths,
@@ -3071,19 +3066,23 @@ mod tests {
         reconcile_account_config_save_operation_with_ops,
         reconcile_account_delete_operation_with_ops, redact_password_load_error,
         redacted_account_id, save_pending_storage_operation_to_paths, sha256_hex,
-        storage_error_kind, username_binding_hash, validate_password_file_shape,
-        validate_pending_storage_operation, verify_pending_storage_surviving_backend,
-        write_private_file_atomic, write_private_file_create_new_atomic, LegacyConfig,
-        LegacyCredentialsConfig, LegacyPasswordMigration, PasswordFile, PasswordStorageBackend,
-        PendingStorageOperation, StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES,
-        MAX_PASSWORD_FILE_BYTES, PASSWORD_ENVELOPE_PREFIX, PASSWORD_ENVELOPE_V2_PREFIX,
-        PASSWORD_ENVELOPE_V2_VERSION, PENDING_STORAGE_OPERATION_VERSION,
-        SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE, SERVICE_NAME,
-        STANDARD, WINDOWS_APP_BOUND_SECRET_PREFIX,
+        storage_error_kind, validate_password_file_shape, validate_pending_storage_operation,
+        verify_pending_storage_surviving_backend, write_private_file_atomic,
+        write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
+        LegacyPasswordMigration, PasswordFile, PasswordStorageBackend, PendingStorageOperation,
+        StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
+        PENDING_STORAGE_OPERATION_VERSION, SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
+        SECURE_STORAGE_PASSWORD_PURPOSE, WINDOWS_APP_BOUND_SECRET_PREFIX,
+    };
+    #[cfg(target_os = "windows")]
+    use super::{
+        decode_fallback_encryption_key, decode_keyring_password, decode_secure_storage_secret,
+        encode_keyring_password, encode_secure_storage_secret, PASSWORD_ENVELOPE_PREFIX, STANDARD,
     };
     #[cfg(unix)]
     use super::{validate_private_dir, validate_private_file_for_read};
     use crate::models::{Account, AppConfig, FIXED_POLL_INTERVAL_SECS};
+    #[cfg(target_os = "windows")]
     use base64::Engine as _;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -3149,43 +3148,52 @@ mod tests {
     }
 
     #[test]
-    fn legacy_migration_rolls_back_generated_target_after_config_save_failure() {
-        let source_ids = vec!["user@example.com".to_string(), "legacy-id".to_string()];
-        let target_id = "generated-account-id".to_string();
-
-        assert_eq!(
-            legacy_migration_target_cleanup_id(&source_ids, &target_id),
-            Some(&target_id)
-        );
+    fn legacy_migration_target_cleanup_tracks_generated_accounts_only() {
+        for (source_ids, target_id, should_cleanup) in [
+            (
+                vec!["user@example.com".to_string(), "legacy-id".to_string()],
+                "generated-account-id".to_string(),
+                true,
+            ),
+            (
+                vec!["legacy-id".to_string(), "user@example.com".to_string()],
+                "legacy-id".to_string(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                legacy_migration_target_cleanup_id(&source_ids, &target_id).is_some(),
+                should_cleanup
+            );
+        }
     }
 
     #[test]
-    fn legacy_migration_keeps_reused_source_target_after_config_save_failure() {
-        let source_ids = vec!["legacy-id".to_string(), "user@example.com".to_string()];
-        let target_id = "legacy-id".to_string();
-
-        assert_eq!(
-            legacy_migration_target_cleanup_id(&source_ids, &target_id),
-            None
-        );
-    }
-
-    #[test]
-    fn incomplete_legacy_password_migration_is_not_persisted() {
-        let migration = LegacyPasswordMigration {
-            source_ids: vec!["legacy-id".to_string()],
-            target_id: None,
-            cleanup_ids_after_save: Vec::new(),
-        };
-
-        assert!(!legacy_password_migration_ready_to_persist(&migration));
-    }
-
-    #[test]
-    fn legacy_config_without_password_sources_can_be_persisted() {
-        assert!(legacy_password_migration_ready_to_persist(
-            &LegacyPasswordMigration::default()
-        ));
+    fn legacy_password_migration_ready_to_persist_requires_target_for_sources() {
+        for (migration, expected) in [
+            (LegacyPasswordMigration::default(), true),
+            (
+                LegacyPasswordMigration {
+                    source_ids: vec!["legacy-id".to_string()],
+                    target_id: Some("account-1".to_string()),
+                    cleanup_ids_after_save: Vec::new(),
+                },
+                true,
+            ),
+            (
+                LegacyPasswordMigration {
+                    source_ids: vec!["legacy-id".to_string()],
+                    target_id: None,
+                    cleanup_ids_after_save: Vec::new(),
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(
+                legacy_password_migration_ready_to_persist(&migration),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3258,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_storage_recovery_rolls_back_target_when_config_was_not_saved() {
+    fn pending_storage_recovery_cleanup_backend_depends_on_config_save_state() {
         let operation = PendingStorageOperation {
             version: PENDING_STORAGE_OPERATION_VERSION,
             kind: "storage_mode_migration".to_string(),
@@ -3270,29 +3278,12 @@ mod tests {
             after_account: None,
         };
 
-        assert_eq!(
-            pending_storage_backend_to_cleanup(&operation, true),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn pending_storage_recovery_commits_source_cleanup_when_config_was_saved() {
-        let operation = PendingStorageOperation {
-            version: PENDING_STORAGE_OPERATION_VERSION,
-            kind: "storage_mode_migration".to_string(),
-            account_ids: vec!["account-1".to_string()],
-            from_use_keyring: true,
-            to_use_keyring: false,
-            use_keyring: false,
-            before_account: None,
-            after_account: None,
-        };
-
-        assert_eq!(
-            pending_storage_backend_to_cleanup(&operation, false),
-            Some(true)
-        );
+        for (config_not_saved, expected_backend) in [(true, false), (false, true)] {
+            assert_eq!(
+                pending_storage_backend_to_cleanup(&operation, config_not_saved),
+                Some(expected_backend)
+            );
+        }
     }
 
     #[test]
@@ -3411,7 +3402,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_account_delete_recovery_retries_cleanup_when_config_removed_account() {
+    fn pending_account_delete_recovery_cleans_up_only_after_config_removed_account() {
         let config = AppConfig::default();
         let operation = account_delete_pending_operation();
         let attempts = RefCell::new(Vec::new());
@@ -3425,12 +3416,8 @@ mod tests {
 
         assert!(error.to_string().contains("delete failed"));
         assert_eq!(attempts.into_inner(), vec!["account-1".to_string()]);
-    }
 
-    #[test]
-    fn pending_account_delete_recovery_skips_cleanup_when_account_still_configured() {
         let mut config = AppConfig::default();
-        let operation = account_delete_pending_operation();
         let mut account = Account::new("user@example.com");
         account.id = operation.account_ids[0].clone();
         account.has_saved_password = true;
@@ -3531,11 +3518,11 @@ mod tests {
     }
 
     #[test]
-    fn account_config_journal_contains_no_password_material() {
+    fn account_journals_omit_password_material_and_accept_legacy_delete_snapshot() {
         let mut after_account = Account::new("user@example.com");
         after_account.id = "account-1".to_string();
         after_account.has_saved_password = true;
-        let operation = PendingStorageOperation {
+        let account_config_operation = PendingStorageOperation {
             version: PENDING_STORAGE_OPERATION_VERSION,
             kind: "account_config_save".to_string(),
             account_ids: vec![after_account.id.clone()],
@@ -3546,31 +3533,24 @@ mod tests {
             after_account: Some(after_account),
         };
 
-        validate_pending_storage_operation(&operation).unwrap();
-        let serialized = serde_json::to_string(&operation).unwrap();
+        validate_pending_storage_operation(&account_config_operation).unwrap();
+        let serialized = serde_json::to_string(&account_config_operation).unwrap();
         assert!(!serialized.contains("super-secret-password"));
         assert!(!serialized.contains("encrypted_password"));
-    }
 
-    #[test]
-    fn account_delete_journal_contains_no_password_material() {
-        let operation = account_delete_pending_operation();
-
-        validate_pending_storage_operation(&operation).unwrap();
-        let serialized = serde_json::to_string(&operation).unwrap();
+        let account_delete_operation = account_delete_pending_operation();
+        validate_pending_storage_operation(&account_delete_operation).unwrap();
+        let serialized = serde_json::to_string(&account_delete_operation).unwrap();
         assert!(!serialized.contains("super-secret-password"));
         assert!(!serialized.contains("encrypted_password"));
         assert!(!serialized.contains("user@example.com"));
         assert!(!serialized.contains("\"username\""));
         assert!(!serialized.contains("before_account"));
-    }
 
-    #[test]
-    fn legacy_account_delete_journal_with_snapshot_still_validates() {
         let mut before_account = Account::new("user@example.com");
         before_account.id = "account-1".to_string();
         before_account.has_saved_password = true;
-        let operation = PendingStorageOperation {
+        let legacy_delete_operation = PendingStorageOperation {
             version: PENDING_STORAGE_OPERATION_VERSION,
             kind: "account_delete".to_string(),
             account_ids: vec![before_account.id.clone()],
@@ -3581,33 +3561,11 @@ mod tests {
             after_account: None,
         };
 
-        validate_pending_storage_operation(&operation).unwrap();
+        validate_pending_storage_operation(&legacy_delete_operation).unwrap();
     }
 
     #[test]
-    fn pending_storage_operation_refuses_existing_pending_or_recovering_journal() {
-        let root = temp_storage_test_dir("pending-overwrite");
-        let pending_path = root.join("pending-storage-operation.json");
-        let recovering_path = root.join("pending-storage-operation.recovering.json");
-
-        ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap();
-
-        std::fs::write(&pending_path, "{}").unwrap();
-        let pending_error =
-            ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err();
-        assert!(pending_error.to_string().contains("already in progress"));
-
-        std::fs::remove_file(&pending_path).unwrap();
-        std::fs::write(&recovering_path, "{}").unwrap();
-        let recovering_error =
-            ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err();
-        assert!(recovering_error.to_string().contains("already in progress"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pending_storage_operation_save_preserves_existing_journal() {
+    fn pending_storage_operation_save_refuses_to_clobber_existing_journals() {
         let root = temp_storage_test_dir("pending-save-no-clobber");
         let pending_path = root.join("pending-storage-operation.json");
         let recovering_path = root.join("pending-storage-operation.recovering.json");
@@ -3624,6 +3582,8 @@ mod tests {
             before_account: None,
             after_account: None,
         };
+
+        ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap();
 
         std::fs::write(&pending_path, "sentinel-pending").unwrap();
         let pending_error =
@@ -3732,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_storage_operation_quarantine_unpins_and_preserves_directory() {
+    fn pending_storage_operation_quarantine_unpins_pending_and_recovering_directories() {
         let root = temp_storage_test_dir("pending-quarantine-dir");
         let pending_path = root.join("pending-storage-operation.json");
         std::fs::create_dir(&pending_path).unwrap();
@@ -3752,12 +3712,7 @@ mod tests {
             std::fs::read_to_string(invalid_dirs[0].join("keep.txt")).unwrap(),
             "keep"
         );
-        let _ = std::fs::remove_dir_all(root);
-    }
 
-    #[test]
-    fn pending_storage_operation_quarantine_unpins_recovering_directory() {
-        let root = temp_storage_test_dir("recovering-quarantine-dir");
         let recovering_path = root.join("pending-storage-operation.recovering.json");
         std::fs::create_dir(&recovering_path).unwrap();
 
@@ -4077,31 +4032,15 @@ mod tests {
     }
 
     #[test]
-    fn windows_app_bound_entropy_depends_on_purpose_and_path() {
-        let path = std::path::Path::new(
-            r"\\?\C:\Program Files\Windows App AutoLogin\WindowsAppAutoLogin.exe",
-        );
-        let same_path =
-            std::path::Path::new(r"C:/Program Files/Windows App AutoLogin/WindowsAppAutoLogin.exe");
-        let other_path = std::path::Path::new(
-            r"C:\Users\me\AppData\Local\Programs\WindowsAppAutoLogin\WindowsAppAutoLogin.exe",
-        );
-
+    fn windows_app_bound_entropy_is_stable_and_purpose_bound() {
+        assert_eq!(WINDOWS_APP_BOUND_SECRET_PREFIX, "waab:");
         assert_eq!(
-            super::windows_app_bound_path(path),
-            r"c:\program files\windows app autologin\windowsappautologin.exe"
-        );
-        assert_eq!(
-            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, path),
-            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, same_path)
+            super::windows_app_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
+            super::windows_app_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE)
         );
         assert_ne!(
-            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, path),
-            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, path)
-        );
-        assert_ne!(
-            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, path),
-            super::windows_app_bound_entropy_for_path(SECURE_STORAGE_PASSWORD_PURPOSE, other_path)
+            super::windows_app_bound_entropy(SECURE_STORAGE_PASSWORD_PURPOSE),
+            super::windows_app_bound_entropy(SECURE_STORAGE_FALLBACK_KEY_PURPOSE)
         );
     }
 
@@ -4125,17 +4064,6 @@ mod tests {
             encoded.as_str()
         )
         .is_err());
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn legacy_secure_storage_secret_is_marked_for_migration() {
-        let decoded =
-            decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, "legacy-plaintext")
-                .unwrap();
-
-        assert_eq!(decoded.plaintext.as_str(), "legacy-plaintext");
-        assert!(decoded.needs_migration);
     }
 
     #[cfg(target_os = "windows")]
@@ -4183,36 +4111,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_target_bound_password_ignores_target_hash() {
-        let mut account = Account::new(" User@Example.com ");
-        account.id = "account-1".to_string();
-        let legacy_envelope = serde_json::json!({
-            "version": PASSWORD_ENVELOPE_V2_VERSION,
-            "service": SERVICE_NAME,
-            "account_id": account.id.clone(),
-            "username_sha256": username_binding_hash(&account.username),
-            "target_window_title_sha256": sha256_hex(b"legacy-target-hash-is-ignored"),
-            "password": "super-secret-password",
-        });
-        let encoded = format!("{PASSWORD_ENVELOPE_V2_PREFIX}{legacy_envelope}");
-        let (decoded, format) = decode_bound_password(&account, &encoded).unwrap();
-
-        assert_eq!(decoded.as_str(), "super-secret-password");
-        assert_eq!(format, StoredPasswordFormat::BoundV2);
-    }
-
-    #[test]
-    fn legacy_raw_password_entries_load_for_migration() {
-        let mut account = Account::new("user@example.com");
-        account.id = "account-1".to_string();
-
-        let (decoded, format) = decode_bound_password(&account, "super-secret-password").unwrap();
-
-        assert_eq!(decoded.as_str(), "super-secret-password");
-        assert_eq!(format, StoredPasswordFormat::LegacyRaw);
-    }
-
-    #[test]
     fn encrypted_password_rejects_ciphertext_without_auth_tag() {
         let key = [0u8; 32];
         let truncated = vec![0u8; AES_GCM_NONCE_BYTES + AES_GCM_TAG_BYTES - 1];
@@ -4221,57 +4119,46 @@ mod tests {
     }
 
     #[test]
-    fn stale_fallback_cleanup_failure_after_keyring_save_returns_warning() {
+    fn stale_backend_cleanup_failure_after_save_returns_warning() {
         let account_id = "account-1".to_string();
 
-        let warning = cleanup_stale_backend_after_successful_save(
-            &account_id,
-            PasswordStorageBackend::SystemSecureStorage,
-            true,
-            |id| {
-                assert_eq!(id, "account-1");
-                anyhow::bail!("fallback delete failed")
-            },
-            |_| panic!("keyring cleanup should not run after keyring save"),
-        )
-        .unwrap();
+        for (saved_backend, stale_backend, expected_kind) in [
+            (
+                PasswordStorageBackend::SystemSecureStorage,
+                PasswordStorageBackend::EncryptedFallbackFile,
+                "storage_error",
+            ),
+            (
+                PasswordStorageBackend::EncryptedFallbackFile,
+                PasswordStorageBackend::SystemSecureStorage,
+                "secure_storage_unavailable",
+            ),
+        ] {
+            let warning = cleanup_stale_backend_after_successful_save(
+                &account_id,
+                saved_backend,
+                true,
+                |id| {
+                    assert_eq!(id, "account-1");
+                    if saved_backend == PasswordStorageBackend::SystemSecureStorage {
+                        anyhow::bail!("fallback delete failed");
+                    }
+                    panic!("fallback cleanup should not run after fallback save");
+                },
+                |id| {
+                    assert_eq!(id, "account-1");
+                    if saved_backend == PasswordStorageBackend::EncryptedFallbackFile {
+                        anyhow::bail!("keyring delete failed");
+                    }
+                    panic!("keyring cleanup should not run after keyring save");
+                },
+            )
+            .unwrap();
 
-        assert_eq!(
-            warning.saved_backend,
-            PasswordStorageBackend::SystemSecureStorage
-        );
-        assert_eq!(
-            warning.stale_backend,
-            PasswordStorageBackend::EncryptedFallbackFile
-        );
-        assert_eq!(warning.error_kind, "storage_error");
-    }
-
-    #[test]
-    fn stale_keyring_cleanup_failure_after_fallback_save_returns_warning() {
-        let account_id = "account-1".to_string();
-
-        let warning = cleanup_stale_backend_after_successful_save(
-            &account_id,
-            PasswordStorageBackend::EncryptedFallbackFile,
-            true,
-            |_| panic!("fallback cleanup should not run after fallback save"),
-            |id| {
-                assert_eq!(id, "account-1");
-                anyhow::bail!("keyring delete failed")
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            warning.saved_backend,
-            PasswordStorageBackend::EncryptedFallbackFile
-        );
-        assert_eq!(
-            warning.stale_backend,
-            PasswordStorageBackend::SystemSecureStorage
-        );
-        assert_eq!(warning.error_kind, "secure_storage_unavailable");
+            assert_eq!(warning.saved_backend, saved_backend);
+            assert_eq!(warning.stale_backend, stale_backend);
+            assert_eq!(warning.error_kind, expected_kind);
+        }
     }
 
     #[test]
@@ -4290,68 +4177,66 @@ mod tests {
     }
 
     #[test]
-    fn keyring_backend_cleanup_attempts_all_accounts_after_partial_failure() {
+    fn backend_cleanup_attempts_all_accounts_after_partial_failure() {
         let account_ids = vec![
             "account-1".to_string(),
             "account-2".to_string(),
             "account-3".to_string(),
         ];
-        let attempted = RefCell::new(Vec::new());
+        for (use_keyring, failing_account, expected_error) in [
+            (
+                true,
+                "account-1",
+                "stale system secure storage cleanup incomplete",
+            ),
+            (
+                false,
+                "account-2",
+                "stale encrypted fallback file cleanup incomplete",
+            ),
+        ] {
+            let attempted = RefCell::new(Vec::new());
+            let fallback_key_cleanup_calls = RefCell::new(0);
 
-        let error = cleanup_storage_backend_with_ops(
-            &account_ids,
-            true,
-            |_| panic!("fallback cleanup should not run for keyring backend"),
-            |account_id| {
-                attempted.borrow_mut().push(account_id.clone());
-                if account_id == "account-1" {
-                    anyhow::bail!("delete failed")
-                }
-                Ok(())
-            },
-            || panic!("fallback key cleanup should not run for keyring backend"),
-        )
-        .unwrap_err()
-        .to_string();
+            let error = cleanup_storage_backend_with_ops(
+                &account_ids,
+                use_keyring,
+                |account_id| {
+                    if use_keyring {
+                        panic!("fallback cleanup should not run for keyring backend");
+                    }
+                    attempted.borrow_mut().push(account_id.clone());
+                    if account_id == failing_account {
+                        anyhow::bail!("fallback delete failed")
+                    }
+                    Ok(())
+                },
+                |account_id| {
+                    if !use_keyring {
+                        panic!("keyring cleanup should not run for fallback backend");
+                    }
+                    attempted.borrow_mut().push(account_id.clone());
+                    if account_id == failing_account {
+                        anyhow::bail!("delete failed")
+                    }
+                    Ok(())
+                },
+                || {
+                    *fallback_key_cleanup_calls.borrow_mut() += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err()
+            .to_string();
 
-        assert_eq!(attempted.into_inner(), account_ids);
-        assert!(error.contains("stale system secure storage cleanup incomplete"));
-        assert!(error.contains("1 of 3 account cleanup attempts failed"));
-    }
-
-    #[test]
-    fn fallback_backend_cleanup_attempts_all_accounts_after_partial_failure() {
-        let account_ids = vec![
-            "account-1".to_string(),
-            "account-2".to_string(),
-            "account-3".to_string(),
-        ];
-        let attempted = RefCell::new(Vec::new());
-        let fallback_key_cleanup_calls = RefCell::new(0);
-
-        let error = cleanup_storage_backend_with_ops(
-            &account_ids,
-            false,
-            |account_id| {
-                attempted.borrow_mut().push(account_id.clone());
-                if account_id == "account-2" {
-                    anyhow::bail!("fallback delete failed")
-                }
-                Ok(())
-            },
-            |_| panic!("keyring cleanup should not run for fallback backend"),
-            || {
-                *fallback_key_cleanup_calls.borrow_mut() += 1;
-                Ok(())
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert_eq!(attempted.into_inner(), account_ids);
-        assert_eq!(*fallback_key_cleanup_calls.borrow(), 1);
-        assert!(error.contains("stale encrypted fallback file cleanup incomplete"));
-        assert!(error.contains("1 of 3 account cleanup attempts failed"));
+            assert_eq!(attempted.into_inner(), account_ids);
+            assert_eq!(
+                *fallback_key_cleanup_calls.borrow(),
+                usize::from(!use_keyring)
+            );
+            assert!(error.contains(expected_error));
+            assert!(error.contains("1 of 3 account cleanup attempts failed"));
+        }
     }
 
     #[test]
@@ -4457,39 +4342,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_fallback_password_file_triggers_key_cleanup() {
-        let file = PasswordFile::default();
-        let mut cleanup_calls = 0;
+    fn fallback_key_cleanup_runs_only_for_empty_password_files_and_reports_failure() {
+        for (file, expected_calls) in [
+            (PasswordFile::default(), 1),
+            (
+                PasswordFile {
+                    passwords: HashMap::from([("account-1".to_string(), "encrypted".to_string())]),
+                },
+                0,
+            ),
+        ] {
+            let mut cleanup_calls = 0;
+            cleanup_fallback_key_if_password_file_empty(&file, || {
+                cleanup_calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(cleanup_calls, expected_calls);
+        }
 
-        cleanup_fallback_key_if_password_file_empty(&file, || {
-            cleanup_calls += 1;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(cleanup_calls, 1);
-    }
-
-    #[test]
-    fn non_empty_fallback_password_file_keeps_key() {
-        let file = PasswordFile {
-            passwords: HashMap::from([("account-1".to_string(), "encrypted".to_string())]),
-        };
-        let mut cleanup_calls = 0;
-
-        cleanup_fallback_key_if_password_file_empty(&file, || {
-            cleanup_calls += 1;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(cleanup_calls, 0);
-    }
-
-    #[test]
-    fn fallback_key_cleanup_failure_is_reported() {
-        let file = PasswordFile::default();
-        let error = cleanup_fallback_key_if_password_file_empty(&file, || {
+        let error = cleanup_fallback_key_if_password_file_empty(&PasswordFile::default(), || {
             anyhow::bail!("fallback key cleanup failed")
         })
         .unwrap_err()
@@ -4806,6 +4678,12 @@ mod tests {
                 "invalid fallback key for token=super-secret"
             )),
             "decrypt_failed"
+        );
+        assert_eq!(
+            storage_error_kind(&anyhow::anyhow!(
+                "Windows app-bound Credential Manager unprotect failed: redacted"
+            )),
+            "app_bound_unprotect_failed"
         );
         assert_eq!(
             storage_error_kind(&anyhow::anyhow!("NoEntry for secret=super-secret")),

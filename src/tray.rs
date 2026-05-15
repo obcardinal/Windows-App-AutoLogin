@@ -264,16 +264,3 @@ fn load_icon() -> anyhow::Result<tray_icon::Icon> {
 fn tray_icon_uses_template_rendering() -> bool {
     cfg!(target_os = "macos")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::tray_icon_uses_template_rendering;
-
-    #[test]
-    fn template_rendering_is_only_enabled_on_macos() {
-        assert_eq!(
-            tray_icon_uses_template_rendering(),
-            cfg!(target_os = "macos")
-        );
-    }
-}

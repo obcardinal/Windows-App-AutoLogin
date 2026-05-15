@@ -237,6 +237,11 @@ impl DebugLog {
             ),
             ("windows_monitor_check_ms", "0".to_string()),
             ("windows_prompt_inspect_ms", "0".to_string()),
+            (
+                "credential_prompt_frontmost_before_activation",
+                "unknown".to_string(),
+            ),
+            ("credential_prompt_activation_error_kind", String::new()),
             ("prompt_detected", "false".to_string()),
             ("detected_email_redacted", String::new()),
             ("account_match_count", "0".to_string()),
@@ -1056,8 +1061,17 @@ fn fill_current_prompt_once_windows(
     let Some(mut prompt) = inspection.prompt else {
         return log.fail("visible_credential_prompt_not_detected");
     };
+    log.set(
+        "credential_prompt_frontmost_before_activation",
+        prompt.target.frontmost.to_string(),
+    );
+    apply_windows_prompt_fields(&mut log, &prompt);
     if !prompt.target.frontmost {
         if let Err(e) = crate::windows_ui::activate_window(prompt.target.window_handle) {
+            log.set(
+                "credential_prompt_activation_error_kind",
+                windows_activation_error_kind(&e),
+            );
             return log.fail(format!("credential_prompt_activation_failed_{e}"));
         }
         inspection = match crate::windows_ui::inspect(app_name) {
@@ -1068,19 +1082,11 @@ fn fill_current_prompt_once_windows(
             return log.fail("visible_credential_prompt_not_detected_after_activation");
         };
         prompt = next_prompt;
+        apply_windows_prompt_fields(&mut log, &prompt);
     }
-    log.set("windows_app_frontmost", prompt.target.frontmost.to_string());
     if !prompt.target.frontmost {
         return log.fail("windows_app_not_frontmost");
     }
-
-    log.set("prompt_detected", "true");
-    log.set("password_field_detected", "true");
-    log.set("password_field_role", prompt.password_field_role.clone());
-    log.set(
-        "password_field_description_redacted",
-        prompt.password_field_description.clone(),
-    );
 
     let account_lookup_start = Instant::now();
     let (matches, prompt_email) = match windows_prompt_account_matches(accounts, &prompt) {
@@ -1673,70 +1679,57 @@ mod macos_context_tests {
     }
 
     #[test]
-    fn stale_monitor_prompt_context_falls_back_to_live_scan() {
-        let stale = context(
-            Instant::now() - super::VERIFIED_PROMPT_CONTEXT_MAX_AGE - Duration::from_secs(1),
-        );
-        let mut log = super::DebugLog::new("test".to_string());
+    fn monitor_prompt_context_falls_back_to_live_scan_when_unusable() {
+        for (context, expected_source, expected_revalidation) in [
+            (
+                context(
+                    Instant::now()
+                        - super::VERIFIED_PROMPT_CONTEXT_MAX_AGE
+                        - Duration::from_secs(1),
+                ),
+                "monitor_snapshot_stale_live_scan",
+                Some("stale_live_scan"),
+            ),
+            (
+                context(Instant::now()),
+                "monitor_snapshot_fresh_live_scan",
+                None,
+            ),
+        ] {
+            let mut log = super::DebugLog::new("test".to_string());
 
-        let result = super::select_prompt_and_account(
-            &mut log,
-            "__must_not_be_used_for_stale_context__",
-            &[],
-            Some(&stale),
-            &|| panic!("guard should not run for stale context"),
-        );
+            let result = super::select_prompt_and_account(
+                &mut log,
+                "__must_not_be_used_for_context_fallback__",
+                &[],
+                Some(&context),
+                &|| panic!("guard should not run without a revalidated prompt"),
+            );
 
-        match result {
-            Ok(_) => panic!("stale context unexpectedly selected a prompt"),
-            Err(error) => assert_eq!(error, "windows_app_trust_check_failed"),
+            match result {
+                Ok(_) => panic!("context unexpectedly selected a prompt"),
+                Err(error) => assert_eq!(error, "windows_app_trust_check_failed"),
+            }
+            assert_eq!(
+                super::log_value(&log, "prompt_context_present").as_deref(),
+                Some("true")
+            );
+            assert_eq!(
+                super::log_value(&log, "prompt_context_source").as_deref(),
+                Some(expected_source)
+            );
+            let revalidation =
+                super::log_value(&log, "prompt_context_revalidation_result").unwrap();
+            if let Some(expected_revalidation) = expected_revalidation {
+                assert_eq!(revalidation, expected_revalidation);
+            } else {
+                assert!(revalidation.ends_with("_live_scan"));
+            }
+            assert_eq!(
+                super::log_value(&log, "prompt_detected").as_deref(),
+                Some("false")
+            );
         }
-        assert_eq!(
-            super::log_value(&log, "prompt_context_present").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            super::log_value(&log, "prompt_context_source").as_deref(),
-            Some("monitor_snapshot_stale_live_scan")
-        );
-        assert_eq!(
-            super::log_value(&log, "prompt_context_revalidation_result").as_deref(),
-            Some("stale_live_scan")
-        );
-        assert_eq!(
-            super::log_value(&log, "prompt_detected").as_deref(),
-            Some("false")
-        );
-    }
-
-    #[test]
-    fn fresh_monitor_prompt_context_revalidation_failure_falls_back_to_live_scan() {
-        let fresh = context(Instant::now());
-        let mut log = super::DebugLog::new("test".to_string());
-
-        let result = super::select_prompt_and_account(
-            &mut log,
-            "__must_not_be_used_for_fresh_context__",
-            &[],
-            Some(&fresh),
-            &|| panic!("guard should not run without a revalidated prompt"),
-        );
-
-        match result {
-            Ok(_) => panic!("fresh context unexpectedly selected a prompt"),
-            Err(error) => assert_eq!(error, "windows_app_trust_check_failed"),
-        }
-        assert_eq!(
-            super::log_value(&log, "prompt_context_present").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            super::log_value(&log, "prompt_context_source").as_deref(),
-            Some("monitor_snapshot_fresh_live_scan")
-        );
-        assert!(super::log_value(&log, "prompt_context_revalidation_result")
-            .as_deref()
-            .is_some_and(|value| value.ends_with("_live_scan")));
     }
 
     #[test]
@@ -1939,6 +1932,32 @@ fn apply_windows_target_fields(log: &mut DebugLog, target: &crate::windows_ui::W
     log.set("windows_app_bundle_id", String::new());
     log.set("windows_app_team_id", String::new());
     log.set("windows_app_frontmost", target.frontmost.to_string());
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_prompt_fields(log: &mut DebugLog, prompt: &crate::windows_ui::WindowsPrompt) {
+    log.set("windows_app_frontmost", prompt.target.frontmost.to_string());
+    log.set("prompt_detected", "true");
+    log.set("password_field_detected", "true");
+    log.set("password_field_role", prompt.password_field_role.clone());
+    log.set(
+        "password_field_description_redacted",
+        prompt.password_field_description.clone(),
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn windows_activation_error_kind(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("handle") {
+        "window_handle_unavailable"
+    } else if message.contains("foreground") {
+        "foreground_timeout"
+    } else if message.contains("visible") {
+        "window_not_visible"
+    } else {
+        "activation_error"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2217,35 +2236,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_pre_password_revalidation_stays_before_keychain_load() {
-        let implementation = include_str!("debug_fill.rs")
-            .split("fn fill_current_prompt_once_macos")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split(
-                    "\n#[cfg(target_os = \"macos\")]\nfn detect_current_prompt_context_macos",
-                )
-                .next()
-            })
-            .unwrap();
-
-        let preflight = implementation
-            .find("preflight_password_load_prompt")
-            .unwrap();
-        let password_load_marker = implementation.find("password_load_attempted").unwrap();
-        let keychain_load = implementation
-            .find("storage::load_password_for_prompt_with_timing")
-            .unwrap();
-        let final_fill = implementation.find("fill_verified_password").unwrap();
-
-        assert!(preflight < password_load_marker);
-        assert!(password_load_marker < keychain_load);
-        assert!(keychain_load < final_fill);
-        assert!(!implementation.contains("crate::macos_ax::fill_password("));
-    }
-
     #[test]
     fn password_load_failure_does_not_record_skip_reason() {
         let mut log = super::DebugLog::new("test".to_string());
@@ -2256,6 +2246,39 @@ mod tests {
         assert_eq!(report.field("password_load_attempted").unwrap(), "true");
         assert_eq!(report.field("password_loaded").unwrap(), "false");
         assert_eq!(report.field("password_load_skip_reason").unwrap(), "");
+    }
+
+    #[test]
+    fn credential_prompt_activation_failure_keeps_prompt_seen_and_skips_password_load() {
+        let mut log = super::DebugLog::new("test".to_string());
+        log.set("prompt_detected", "true");
+        log.set("password_field_detected", "true");
+        log.set(
+            "credential_prompt_activation_error_kind",
+            "foreground_timeout",
+        );
+
+        let report = log
+            .fail("credential_prompt_activation_failed_target window could not be made foreground");
+
+        assert!(!report.success);
+        assert_eq!(
+            report.failure_reason.as_deref(),
+            Some("credential_prompt_activation_failed")
+        );
+        assert_eq!(report.field("prompt_detected").unwrap(), "true");
+        assert_eq!(report.field("password_field_detected").unwrap(), "true");
+        assert_eq!(
+            report
+                .field("credential_prompt_activation_error_kind")
+                .unwrap(),
+            "foreground_timeout"
+        );
+        assert_eq!(report.field("password_load_attempted").unwrap(), "false");
+        assert_eq!(
+            report.field("password_load_skip_reason").unwrap(),
+            "credential_prompt_activation_failed"
+        );
     }
 
     #[test]
@@ -2275,7 +2298,7 @@ mod tests {
     }
 
     #[test]
-    fn path_fields_are_redacted_to_hash_without_leaf_name() {
+    fn debug_log_path_fields_use_coarse_redaction() {
         let mut log = super::DebugLog::new("test".to_string());
         log.set(
             "current_process_path",

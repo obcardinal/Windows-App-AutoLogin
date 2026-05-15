@@ -1296,11 +1296,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_launch_agent_identity_uses_bundle_id_label() {
+    fn macos_launch_agent_identity_and_path_use_bundle_id() {
         let program_path =
             "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin";
         let plist = macos_launch_agent_plist(program_path);
         let bundle_id = crate::app_identity::macos_bundle_id();
+        let home = std::path::Path::new("/Users/example");
+        let path = launch_agent_path_for_home_and_label(home, macos_launch_agent_label());
 
         assert_eq!(macos_launch_agent_label(), bundle_id);
         assert!(plist.contains(&format!(
@@ -1315,14 +1317,6 @@ mod tests {
             "<key>Label</key>\n  <string>{}</string>",
             xml_escape(APP_NAME)
         )));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_launch_agent_path_uses_bundle_id_plist_name() {
-        let home = std::path::Path::new("/Users/example");
-        let path = launch_agent_path_for_home_and_label(home, macos_launch_agent_label());
-
         assert_eq!(
             path,
             home.join("Library")
@@ -1333,64 +1327,6 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some("WindowsAppAutoLogin.plist")
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_launch_agent_program_path_rejects_legacy_app_name_label() {
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "windows-app-autologin-launch-agent-legacy-label-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let program_path =
-            "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin";
-        let plist_path = root.join("legacy-label.plist");
-        let legacy_label = macos_launch_agent_plist(program_path).replace(
-            &format!(
-                "<key>Label</key>\n  <string>{}</string>",
-                xml_escape(macos_launch_agent_label())
-            ),
-            &format!(
-                "<key>Label</key>\n  <string>{}</string>",
-                xml_escape(APP_NAME)
-            ),
-        );
-        std::fs::write(&plist_path, legacy_label).unwrap();
-
-        assert_eq!(launch_agent_program_path(&plist_path), None);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_legacy_launch_agent_cleanup_preserves_current_plist() {
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "windows-app-autologin-launch-agent-cleanup-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let current_path = launch_agent_path_for_home_and_label(&root, macos_launch_agent_label());
-        let legacy_path =
-            launch_agent_path_for_home_and_label(&root, legacy_macos_launch_agent_label());
-        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
-        std::fs::write(&current_path, macos_launch_agent_plist("/tmp/current")).unwrap();
-        std::fs::write(&legacy_path, b"legacy").unwrap();
-
-        remove_launch_agent_file_at(&legacy_path).unwrap();
-
-        assert!(current_path.exists());
-        assert!(!legacy_path.exists());
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]

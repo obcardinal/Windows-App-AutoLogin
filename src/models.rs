@@ -110,34 +110,18 @@ pub enum LogLevel {
 mod tests {
     use super::{AppConfig, AppSettings};
 
-    #[cfg(not(feature = "diagnostics-ui"))]
-    use super::Tab;
-
-    #[cfg(not(feature = "diagnostics-ui"))]
     #[test]
-    fn production_tabs_include_only_accounts_and_settings() {
-        let tabs = [Tab::Accounts, Tab::Settings];
-
-        assert_eq!(tabs.len(), 2);
-    }
-
-    #[test]
-    fn app_settings_do_not_serialize_fixed_poll_interval() {
+    fn app_config_serialization_omits_fixed_and_removed_settings() {
         let settings = AppSettings {
             poll_interval_secs: 60,
             ..AppSettings::default()
         };
-        let json = serde_json::to_string(&settings).unwrap();
+        let settings_json = serde_json::to_string(&settings).unwrap();
+        let config_json = serde_json::to_string(&AppConfig::default()).unwrap();
 
-        assert!(!json.contains("poll_interval_secs"));
-    }
-
-    #[test]
-    fn app_config_does_not_serialize_target_app_name_setting() {
-        let json = serde_json::to_string(&AppConfig::default()).unwrap();
-
-        assert!(!json.contains("macos_app_name"));
-        assert!(!json.contains("Windows App"));
+        assert!(!settings_json.contains("poll_interval_secs"));
+        assert!(!config_json.contains("macos_app_name"));
+        assert!(!config_json.contains("Windows App"));
     }
 
     #[test]

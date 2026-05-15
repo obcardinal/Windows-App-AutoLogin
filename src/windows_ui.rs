@@ -16,16 +16,17 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWow64DirectoryW};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{
     FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86,
     SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
-    GA_ROOTOWNER, GW_OWNER, SW_RESTORE,
+    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    ShowWindow, GA_ROOTOWNER, GW_OWNER, SW_RESTORE,
 };
 
 const MAX_ELEMENT_COUNT: usize = 900;
@@ -34,6 +35,8 @@ const KEYBOARD_INTERVAL_MS: u64 = 10;
 const FOCUS_SETTLE_MS: u64 = 50;
 const SUBMIT_SETTLE_MS: u64 = 700;
 const SUBMIT_READY_TIMEOUT_MS: u64 = 1500;
+const ACTIVATION_INITIAL_TIMEOUT_MS: u64 = 250;
+const ACTIVATION_ATTACHED_TIMEOUT_MS: u64 = 750;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowsTarget {
@@ -263,15 +266,76 @@ pub(crate) fn activate_window(window_handle: isize) -> anyhow::Result<()> {
     if window_handle == 0 {
         anyhow::bail!("target window handle is unavailable");
     }
+    if window_handle_is_foreground(window_handle) {
+        return Ok(());
+    }
     let hwnd = hwnd_from_handle(window_handle);
+    if !native_window_is_visible_and_sized(hwnd) {
+        anyhow::bail!("target window is not visible");
+    }
+
+    request_foreground_window(hwnd);
+    if wait_for_foreground_window(
+        window_handle,
+        Duration::from_millis(ACTIVATION_INITIAL_TIMEOUT_MS),
+    ) {
+        return Ok(());
+    }
+
+    activate_window_with_attached_input(hwnd);
+    if wait_for_foreground_window(
+        window_handle,
+        Duration::from_millis(ACTIVATION_ATTACHED_TIMEOUT_MS),
+    ) {
+        return Ok(());
+    }
+
+    anyhow::bail!("target window could not be made foreground");
+}
+
+fn request_foreground_window(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
     }
-    if !wait_for_foreground_window(window_handle, Duration::from_millis(500)) {
-        anyhow::bail!("target window could not be made foreground");
+}
+
+fn activate_window_with_attached_input(hwnd: HWND) {
+    let current_thread_id = unsafe { GetCurrentThreadId() };
+    let target_thread_id = window_thread_id(hwnd);
+    let foreground_thread_id = unsafe {
+        let foreground = GetForegroundWindow();
+        window_thread_id(foreground)
+    };
+
+    let target_attached = set_thread_input_attachment(current_thread_id, target_thread_id, true);
+    let foreground_attached = foreground_thread_id != target_thread_id
+        && set_thread_input_attachment(current_thread_id, foreground_thread_id, true);
+
+    request_foreground_window(hwnd);
+
+    if foreground_attached {
+        let _ = set_thread_input_attachment(current_thread_id, foreground_thread_id, false);
     }
-    Ok(())
+    if target_attached {
+        let _ = set_thread_input_attachment(current_thread_id, target_thread_id, false);
+    }
+}
+
+fn window_thread_id(hwnd: HWND) -> u32 {
+    if hwnd.0.addr() == 0 {
+        return 0;
+    }
+    let mut process_id = 0_u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) }
+}
+
+fn set_thread_input_attachment(source_thread_id: u32, target_thread_id: u32, attach: bool) -> bool {
+    if source_thread_id == 0 || target_thread_id == 0 || source_thread_id == target_thread_id {
+        return false;
+    }
+    unsafe { AttachThreadInput(source_thread_id, target_thread_id, attach).as_bool() }
 }
 
 fn hwnd_from_handle(window_handle: isize) -> HWND {
@@ -294,12 +358,19 @@ pub(crate) fn fill_password(
 
     match strategy {
         WindowsFillStrategy::DirectSetValue => set_password_value(
+            target_app_name,
             &prompt,
             password,
             WindowsFillStrategy::DirectSetValue.label(),
         ),
         WindowsFillStrategy::Keyboard => {
-            set_password_value(&prompt, password, "direct_uia_value_keyboard_safe").map_err(|e| {
+            set_password_value(
+                target_app_name,
+                &prompt,
+                password,
+                "direct_uia_value_keyboard_safe",
+            )
+            .map_err(|e| {
                 anyhow::anyhow!(
                     "keyboard password input is disabled on Windows; direct UIA password fill failed: {e}"
                 )
@@ -309,10 +380,27 @@ pub(crate) fn fill_password(
 }
 
 fn set_password_value(
+    target_app_name: &str,
     prompt: &WindowsPrompt,
     password: &str,
     fill_method: &'static str,
 ) -> anyhow::Result<WindowsFillResult> {
+    let (prompt, value) = direct_set_value_pattern_after_final_validation(target_app_name, prompt)?;
+    value
+        .set_value(password)
+        .map_err(|e| anyhow::anyhow!("UIA SetValue failed: {e}"))?;
+    Ok(WindowsFillResult {
+        fill_method,
+        fill_status: "ok",
+        password_field_focused: prompt.password_field.has_keyboard_focus().unwrap_or(false),
+    })
+}
+
+fn direct_set_value_pattern_after_final_validation(
+    target_app_name: &str,
+    expected: &WindowsPrompt,
+) -> anyhow::Result<(WindowsPrompt, UIValuePattern)> {
+    let prompt = revalidate_prompt_for_direct_set_value(target_app_name, expected)?;
     let value = prompt
         .password_field
         .get_pattern::<UIValuePattern>()
@@ -323,14 +411,8 @@ fn set_password_value(
     {
         anyhow::bail!("password field is read-only");
     }
-    value
-        .set_value(password)
-        .map_err(|e| anyhow::anyhow!("UIA SetValue failed: {e}"))?;
-    Ok(WindowsFillResult {
-        fill_method,
-        fill_status: "ok",
-        password_field_focused: prompt.password_field.has_keyboard_focus().unwrap_or(false),
-    })
+    ensure_direct_set_value_target_ready(target_app_name, &prompt)?;
+    Ok((prompt, value))
 }
 
 pub(crate) fn submit_prompt(
@@ -563,6 +645,108 @@ fn ensure_same_revalidated_prompt(
         anyhow::bail!("credential prompt email changed before automation");
     }
     Ok(prompt)
+}
+
+fn revalidate_prompt_for_direct_set_value(
+    target_app_name: &str,
+    expected: &WindowsPrompt,
+) -> anyhow::Result<WindowsPrompt> {
+    let Some(prompt) = inspect_prompt_snapshot(
+        target_app_name,
+        expected.target.process_id,
+        &expected.target.window_title,
+        expected.email.as_deref(),
+    )?
+    else {
+        anyhow::bail!("credential prompt disappeared before password insertion");
+    };
+    ensure_same_revalidated_prompt(prompt, expected)
+}
+
+fn ensure_direct_set_value_target_ready(
+    target_app_name: &str,
+    prompt: &WindowsPrompt,
+) -> anyhow::Result<()> {
+    if prompt.target.window_handle == 0 {
+        anyhow::bail!("credential prompt window handle is unavailable before password insertion");
+    }
+    if !window_handle_is_foreground(prompt.target.window_handle) {
+        anyhow::bail!("credential prompt window is not foreground before password insertion");
+    }
+
+    let hwnd = hwnd_from_handle(prompt.target.window_handle);
+    if !native_window_is_visible_and_sized(hwnd) {
+        anyhow::bail!("credential prompt window is not visible before password insertion");
+    }
+    let Some((current_target, class_name)) = target_details_from_hwnd(hwnd) else {
+        anyhow::bail!("credential prompt window disappeared before password insertion");
+    };
+    ensure_direct_set_value_target_matches_expected(&current_target, &prompt.target)?;
+    ensure_direct_set_value_target_is_trusted(
+        target_app_name,
+        &current_target,
+        &class_name,
+        prompt.target.window_handle,
+    )?;
+
+    if !password_field_ready_for_direct_set_value(&prompt.password_field) {
+        anyhow::bail!("password field is not visible and enabled before password insertion");
+    }
+
+    Ok(())
+}
+
+fn ensure_direct_set_value_target_matches_expected(
+    current: &WindowsTarget,
+    expected: &WindowsTarget,
+) -> anyhow::Result<()> {
+    if current.window_handle != expected.window_handle {
+        anyhow::bail!("credential prompt window changed before password insertion");
+    }
+    if current.process_id != expected.process_id {
+        anyhow::bail!("credential prompt process changed before password insertion");
+    }
+    if !window_title_matches(&current.window_title, &expected.window_title) {
+        anyhow::bail!("credential prompt title changed before password insertion");
+    }
+    Ok(())
+}
+
+fn ensure_direct_set_value_target_is_trusted(
+    target_app_name: &str,
+    target: &WindowsTarget,
+    class_name: &str,
+    window_handle: isize,
+) -> anyhow::Result<()> {
+    let trusted_target = target_app_matches_with_class(target_app_name, target, class_name)
+        && target_window_should_be_scanned_for_prompt(target_app_name, target, class_name);
+    let trusted_system_prompt = is_builtin_target_name(target_app_name)
+        && system_credential_dialog_matches(target, class_name)
+        && system_credential_prompt_owned_by_target(target_app_name, window_handle);
+
+    if trusted_target || trusted_system_prompt {
+        Ok(())
+    } else {
+        anyhow::bail!("credential prompt target is not trusted before password insertion")
+    }
+}
+
+fn password_field_ready_for_direct_set_value(element: &UIElement) -> bool {
+    password_field_ready_for_direct_set_value_with_state(
+        element.is_offscreen().unwrap_or(true),
+        element.is_enabled().unwrap_or(false),
+        prompt_element_rect(element),
+        is_native_password_field(element) || is_password_like_edit(element),
+    )
+}
+
+fn password_field_ready_for_direct_set_value_with_state(
+    is_offscreen: bool,
+    is_enabled: bool,
+    rect: Option<ElementRect>,
+    password_identity_matches: bool,
+) -> bool {
+    !is_offscreen && is_enabled && rect.is_some() && password_identity_matches
 }
 
 fn prompt_from_window(
@@ -2335,37 +2519,29 @@ mod tests {
     }
 
     #[test]
-    fn post_submit_prompt_email_mismatch_returns_prompt_mismatch() {
-        assert_eq!(
-            super::classify_post_submit_state(
+    fn post_submit_state_classification_handles_prompt_session_and_failure() {
+        for (prompt_email, target_running, has_session, expected) in [
+            (
                 Some("other@example.com"),
                 true,
                 false,
-                "user@example.com"
+                Some("prompt_mismatch"),
             ),
-            Some("prompt_mismatch")
-        );
-    }
-
-    #[test]
-    fn post_submit_prompt_matching_email_returns_still_prompt() {
-        assert_eq!(
-            super::classify_post_submit_state(
-                Some("USER@example.com"),
-                true,
-                false,
-                "user@example.com"
-            ),
-            Some("still_prompt")
-        );
-    }
-
-    #[test]
-    fn post_submit_no_prompt_without_session_stays_unknown_until_timeout() {
-        assert_eq!(
-            super::classify_post_submit_state(None, true, false, "user@example.com"),
-            None
-        );
+            (Some("USER@example.com"), true, false, Some("still_prompt")),
+            (None, true, false, None),
+            (None, true, true, Some("authenticated")),
+            (None, false, false, Some("failed")),
+        ] {
+            assert_eq!(
+                super::classify_post_submit_state(
+                    prompt_email,
+                    target_running,
+                    has_session,
+                    "user@example.com"
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2417,6 +2593,65 @@ mod tests {
             "windows security",
             Some("other@example.com")
         ));
+        assert!(!super::prompt_metadata_matches_snapshot(
+            &target,
+            None,
+            42,
+            "windows security",
+            Some("user@example.com")
+        ));
+    }
+
+    #[test]
+    fn direct_setvalue_target_validation_requires_same_window_identity() {
+        let expected = WindowsTarget {
+            process_id: 42,
+            process_name: "CredentialUIBroker".to_string(),
+            process_path: system32_path("CredentialUIBroker.exe"),
+            window_title: "Windows Security".to_string(),
+            window_handle: 7,
+            frontmost: true,
+        };
+        assert!(
+            super::ensure_direct_set_value_target_matches_expected(&expected, &expected).is_ok()
+        );
+
+        let mutations: [fn(&mut WindowsTarget); 3] = [
+            |target: &mut WindowsTarget| target.process_id = 43,
+            |target: &mut WindowsTarget| target.window_title = "Other".to_string(),
+            |target: &mut WindowsTarget| target.window_handle = 8,
+        ];
+        for mutate in mutations {
+            let mut current = expected.clone();
+            mutate(&mut current);
+            assert!(
+                super::ensure_direct_set_value_target_matches_expected(&current, &expected)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_setvalue_password_field_requires_visible_enabled_bounds_and_identity() {
+        let rect = ElementRect::new(10, 10, 110, 40);
+
+        for (is_offscreen, is_enabled, bounds, identity_matches, expected) in [
+            (false, true, rect, true, true),
+            (true, true, rect, true, false),
+            (false, false, rect, true, false),
+            (false, true, None, true, false),
+            (false, true, rect, false, false),
+        ] {
+            assert_eq!(
+                super::password_field_ready_for_direct_set_value_with_state(
+                    is_offscreen,
+                    is_enabled,
+                    bounds,
+                    identity_matches,
+                ),
+                expected
+            );
+        }
     }
 
     fn trusted_windows_security_target() -> WindowsTarget {

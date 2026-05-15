@@ -1000,12 +1000,18 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
-    fn poll_cadence_backs_off_only_for_stable_statuses() {
+    fn poll_cadence_backs_off_for_stable_statuses_but_keeps_prompts_fast() {
         let settings = AppSettings {
             poll_interval_secs: 60,
             ..AppSettings::default()
         };
         let mut cadence = PollCadence::default();
+        let prompt = MonitorStatus::LoginWindowDetected {
+            process_id: 42,
+            window_title: "Sign in".to_string(),
+            prompt_email: Some("user@example.com".to_string()),
+            prompt_origin: "window".to_string(),
+        };
 
         assert_eq!(
             cadence.next_delay(&settings, &MonitorStatus::Connected),
@@ -1024,17 +1030,14 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(
-            cadence.next_delay(
-                &settings,
-                &MonitorStatus::LoginWindowDetected {
-                    process_id: 42,
-                    window_title: "Sign in".to_string(),
-                    prompt_email: Some("user@example.com".to_string()),
-                    prompt_origin: "window".to_string(),
-                },
-            ),
+            cadence.next_delay(&settings, &prompt),
             Duration::from_secs(1)
         );
+        assert_eq!(
+            cadence.next_delay(&settings, &prompt),
+            Duration::from_secs(1)
+        );
+
         assert_eq!(
             cadence.next_delay(&settings, &MonitorStatus::Unknown),
             Duration::from_secs(1)
@@ -1047,74 +1050,11 @@ mod tests {
             cadence.next_delay(&settings, &MonitorStatus::Unknown),
             Duration::from_secs(3)
         );
-    }
-
-    #[test]
-    fn prompt_status_poll_wakes_up_after_one_second_even_with_status_backoff() {
-        let settings = AppSettings {
-            poll_interval_secs: 1,
-            ..AppSettings::default()
-        };
-        let mut cadence = PollCadence::default();
-
-        assert_eq!(
-            cadence.next_delay(&settings, &MonitorStatus::Connected),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            cadence.next_delay(&settings, &MonitorStatus::Connected),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            cadence.next_delay(&settings, &MonitorStatus::Connected),
-            Duration::from_secs(4)
-        );
 
         assert_eq!(PROMPT_STATUS_POLL_INTERVAL, Duration::from_secs(1));
         assert_eq!(
-            Duration::from_secs(4).min(PROMPT_STATUS_POLL_INTERVAL),
-            Duration::from_secs(1)
-        );
-    }
-
-    #[test]
-    fn macos_fallback_prompt_probe_uses_prompt_poll_interval() {
-        assert_eq!(
             MACOS_FALLBACK_PROMPT_PROBE_INTERVAL,
             PROMPT_STATUS_POLL_INTERVAL
-        );
-    }
-
-    #[test]
-    fn credential_prompt_poll_cadence_stays_one_second_after_stable_backoff() {
-        let settings = AppSettings {
-            poll_interval_secs: 1,
-            ..AppSettings::default()
-        };
-        let mut cadence = PollCadence::default();
-
-        for _ in 0..4 {
-            let _ = cadence.next_delay(&settings, &MonitorStatus::Connected);
-        }
-
-        let prompt = MonitorStatus::LoginWindowDetected {
-            process_id: 42,
-            window_title: "Windows Security".to_string(),
-            prompt_email: Some("user@example.com".to_string()),
-            prompt_origin: "window".to_string(),
-        };
-
-        assert_eq!(
-            cadence.next_delay(&settings, &prompt),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            cadence.next_delay(&settings, &prompt),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            cadence.next_delay(&settings, &prompt),
-            Duration::from_secs(1)
         );
     }
 
@@ -1195,45 +1135,30 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_enabled_account_match_is_not_allowed() {
-        let accounts = [
-            account("account-1", "user@example.com", true),
-            account("account-2", " USER@example.com ", true),
-        ];
-
-        let decision = account_for_visible_prompt_email(&accounts, Some("user@example.com"));
-
-        assert!(matches!(decision, PromptAccountDecision::Ambiguous));
+    fn duplicate_enabled_account_matches_are_ambiguous_without_target_disambiguation() {
+        for accounts in [
+            vec![
+                account("account-1", "user@example.com", true),
+                account("account-2", " USER@example.com ", true),
+            ],
+            vec![
+                account("account-1", "user@example.com", true),
+                account("account-2", " USER@example.com ", true),
+                account("account-3", "other@example.com", true),
+            ],
+            vec![
+                account("account-1", "user@example.com", true),
+                account("account-2", "user@example.com", true),
+                account("account-3", "USER@example.com", true),
+            ],
+        ] {
+            let decision = account_for_visible_prompt_email(&accounts, Some("user@example.com"));
+            assert!(matches!(decision, PromptAccountDecision::Ambiguous));
+        }
     }
 
     #[test]
-    fn same_email_matches_are_ambiguous_without_target_disambiguation() {
-        let accounts = [
-            account("account-1", "user@example.com", true),
-            account("account-2", " USER@example.com ", true),
-            account("account-3", "other@example.com", true),
-        ];
-
-        let decision = account_for_visible_prompt_email(&accounts, Some("user@example.com"));
-
-        assert!(matches!(decision, PromptAccountDecision::Ambiguous));
-    }
-
-    #[test]
-    fn three_same_email_matches_are_ambiguous_without_target_disambiguation() {
-        let accounts = [
-            account("account-1", "user@example.com", true),
-            account("account-2", "user@example.com", true),
-            account("account-3", "USER@example.com", true),
-        ];
-
-        let decision = account_for_visible_prompt_email(&accounts, Some("user@example.com"));
-
-        assert!(matches!(decision, PromptAccountDecision::Ambiguous));
-    }
-
-    #[test]
-    fn stale_prompt_suppression_expires_and_allows_retry_after_ttl() {
+    fn prompt_retry_suppression_respects_key_and_retention() {
         let now = std::time::Instant::now();
         let cooldown = Duration::from_secs(20);
         let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
@@ -1258,42 +1183,28 @@ mod tests {
             retry_time,
             cooldown
         ));
-    }
 
-    #[test]
-    fn verified_context_uses_same_key_for_unknown_fallback_suppression() {
-        let now = std::time::Instant::now();
         let context = verified_context("account-1", 42, "Sign in", "user@example.com", now);
-        let prompt_key = LoginPromptKey::from_verified_context(&context);
+        let verified_prompt_key = LoginPromptKey::from_verified_context(&context);
         let mut attempts = HashMap::new();
-        attempts.insert(prompt_key.clone(), now);
+        attempts.insert(verified_prompt_key.clone(), now);
 
         assert!(prompt_retry_is_suppressed(
             &mut attempts,
-            &prompt_key,
+            &verified_prompt_key,
             now + Duration::from_secs(1),
             PROMPT_ATTEMPT_RETENTION,
         ));
-    }
 
-    #[test]
-    fn verified_context_suppression_expires_for_unknown_fallback() {
-        let now = std::time::Instant::now();
-        let context = verified_context("account-1", 42, "Sign in", "user@example.com", now);
-        let prompt_key = LoginPromptKey::from_verified_context(&context);
-        let mut attempts = HashMap::from([(prompt_key.clone(), now)]);
+        let mut attempts = HashMap::from([(verified_prompt_key.clone(), now)]);
 
         assert!(!prompt_retry_is_suppressed(
             &mut attempts,
-            &prompt_key,
+            &verified_prompt_key,
             now + PROMPT_ATTEMPT_RETENTION + Duration::from_millis(1),
             PROMPT_ATTEMPT_RETENTION,
         ));
-    }
 
-    #[test]
-    fn different_prompt_key_bypasses_recent_suppression() {
-        let now = std::time::Instant::now();
         let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
         let different_prompt = make_prompt_key("account-1", 43, "Sign in", "user@example.com");
         let mut attempts = HashMap::from([(prompt_key, now)]);

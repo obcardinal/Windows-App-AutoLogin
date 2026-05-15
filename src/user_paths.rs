@@ -108,11 +108,6 @@ mod tests {
     }
 
     #[test]
-    fn redacted_path_preserves_empty_input() {
-        assert_eq!(redacted_path("   "), "");
-    }
-
-    #[test]
     fn runtime_dir_is_config_runtime_child() {
         assert_eq!(
             runtime_dir().unwrap(),

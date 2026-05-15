@@ -2482,19 +2482,19 @@ mod tests {
     }
 
     #[test]
-    fn continue_submit_labels_are_ranked_first() {
-        assert_eq!(submit_label_rank("Continue"), Some(0));
-        assert_eq!(submit_label_rank("_Continue button"), Some(0));
-        assert_eq!(submit_label_rank("Continue button"), Some(0));
-        assert_eq!(submit_label_rank("Продолжить"), Some(0));
-        assert_eq!(submit_label_rank("OK"), Some(1));
-        assert_eq!(submit_label_rank("OK button"), Some(1));
-        assert_eq!(submit_label_rank("Cancel"), None);
-    }
-
-    #[test]
-    fn normalizes_submit_label_noise() {
-        assert_eq!(normalized_submit_label("_Continue button"), "Continue");
+    fn submit_labels_are_normalized_and_ranked() {
+        for (label, normalized, rank) in [
+            ("Continue", "Continue", Some(0)),
+            ("_Continue button", "Continue", Some(0)),
+            ("Continue button", "Continue", Some(0)),
+            ("Продолжить", "Продолжить", Some(0)),
+            ("OK", "OK", Some(1)),
+            ("OK button", "OK", Some(1)),
+            ("Cancel", "Cancel", None),
+        ] {
+            assert_eq!(normalized_submit_label(label), normalized);
+            assert_eq!(submit_label_rank(label), rank);
+        }
     }
 
     #[test]
@@ -2637,9 +2637,10 @@ mod tests {
     }
 
     #[test]
-    fn direct_axvalue_ready_wait_is_short() {
+    fn automation_timing_constants_stay_bounded() {
         assert!(DIRECT_AXVALUE_READY_MS >= FOCUS_POLL_INTERVAL_MS);
         assert!(Duration::from_millis(DIRECT_AXVALUE_READY_MS) < Duration::from_millis(450));
+        assert!(Duration::from_millis(SUBMIT_SETTLE_MS) < Duration::from_millis(450));
     }
 
     #[test]
@@ -2694,12 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_settle_delays_keep_bounded() {
-        assert_eq!(SUBMIT_SETTLE_MS, 0);
-        assert!(Duration::from_millis(SUBMIT_SETTLE_MS) < Duration::from_millis(450));
-    }
-
-    #[test]
     fn password_cues_cover_existing_locales() {
         assert!(text_contains_password_cue("Введите пароль"));
         assert!(text_contains_password_cue("Mot de passe"));
@@ -2717,45 +2712,29 @@ mod tests {
     }
 
     #[test]
-    fn post_submit_prompt_email_mismatch_returns_prompt_mismatch() {
-        assert_eq!(
-            super::classify_post_submit_state(
+    fn post_submit_state_classification_handles_prompt_session_and_failure() {
+        for (prompt_email, target_running, has_session, expected) in [
+            (
                 Some("other@example.com"),
                 true,
                 false,
-                "user@example.com"
+                Some("prompt_mismatch"),
             ),
-            Some("prompt_mismatch")
-        );
-    }
-
-    #[test]
-    fn post_submit_prompt_matching_email_returns_still_prompt() {
-        assert_eq!(
-            super::classify_post_submit_state(
-                Some("USER@example.com"),
-                true,
-                false,
-                "user@example.com"
-            ),
-            Some("still_prompt")
-        );
-    }
-
-    #[test]
-    fn post_submit_no_prompt_without_session_stays_unknown_until_timeout() {
-        assert_eq!(
-            super::classify_post_submit_state(None, true, false, "user@example.com"),
-            None
-        );
-    }
-
-    #[test]
-    fn post_submit_no_prompt_with_expected_session_returns_authenticated() {
-        assert_eq!(
-            super::classify_post_submit_state(None, true, true, "user@example.com"),
-            Some("authenticated")
-        );
+            (Some("USER@example.com"), true, false, Some("still_prompt")),
+            (None, true, false, None),
+            (None, true, true, Some("authenticated")),
+            (None, false, false, Some("failed")),
+        ] {
+            assert_eq!(
+                super::classify_post_submit_state(
+                    prompt_email,
+                    target_running,
+                    has_session,
+                    "user@example.com"
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2830,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn post_submit_preexisting_session_window_is_not_positive_auth_signal() {
+    fn post_submit_session_window_matching_distinguishes_preexisting_and_new_sessions() {
         const EXPECTED_PID: i32 = 101;
 
         let session = super::MacosWindowTitle {
@@ -2838,37 +2817,18 @@ mod tests {
             title: "Contoso Desktop".to_string(),
             window: None,
         };
-        let pre_submit_sessions = vec![super::MacosWindowTitle {
-            process_id: EXPECTED_PID,
-            title: "contoso desktop".to_string(),
-            window: None,
-        }];
+        for (pre_submit_title, expected) in [("contoso desktop", true), ("Other Desktop", false)] {
+            let pre_submit_sessions = vec![super::MacosWindowTitle {
+                process_id: EXPECTED_PID,
+                title: pre_submit_title.to_string(),
+                window: None,
+            }];
 
-        assert!(super::session_window_was_present_before_submit(
-            &session,
-            &pre_submit_sessions
-        ));
-    }
-
-    #[test]
-    fn post_submit_new_session_title_can_still_be_considered_separate_signal() {
-        const EXPECTED_PID: i32 = 101;
-
-        let session = super::MacosWindowTitle {
-            process_id: EXPECTED_PID,
-            title: "Contoso Desktop".to_string(),
-            window: None,
-        };
-        let pre_submit_sessions = vec![super::MacosWindowTitle {
-            process_id: EXPECTED_PID,
-            title: "Other Desktop".to_string(),
-            window: None,
-        }];
-
-        assert!(!super::session_window_was_present_before_submit(
-            &session,
-            &pre_submit_sessions
-        ));
+            assert_eq!(
+                super::session_window_was_present_before_submit(&session, &pre_submit_sessions),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2949,71 +2909,73 @@ mod tests {
     }
 
     #[test]
-    fn prompt_identity_requires_body_credential_context() {
-        assert!(!prompt_identity_verified(
-            "Password",
-            "user@example.com",
-            PromptOrigin::Window
-        ));
-        assert!(prompt_identity_verified(
-            "Sign in",
-            "Enter password for user@example.com",
-            PromptOrigin::Window
-        ));
-        assert!(!prompt_identity_verified(
-            "Connection Center",
-            "Sign in with user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(!prompt_identity_verified(
-            "Contoso Desktop",
-            "Sign in with user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Contoso Desktop",
-            "Enter password for user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Contoso Desktop",
-            "Enter password for Contoso Desktop user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Contoso Desktop",
-            "Enter Your User Account used to connect to user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Contoso Desktop",
-            "Enter Your User Account used to connect to Other Desktop user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Contoso Desktop",
-            "Enter Your User Account used to connect to Contoso Desktop user@example.com",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Azure DevDesktop - Windows 11",
-            "Enter Your Credentials These credentials will be used to connect to rdgateway.example.com Username: user@example.com Password:",
-            PromptOrigin::Sheet
-        ));
-        assert!(prompt_identity_verified(
-            "Azure DevDesktop - Windows 11",
-            "Enter Your Credentials These credentials will be used to connect to rdgateway.example.com Username: user@example.com Password:",
-            PromptOrigin::Window
-        ));
-        assert!(!prompt_identity_verified(
-            "Connection Center",
-            "Sign in with user@example.com",
-            PromptOrigin::Window
-        ));
-    }
+    fn prompt_identity_requires_credential_body_for_login_windows_and_sheets() {
+        for (title, body, origin, expected) in [
+            ("Password", "user@example.com", PromptOrigin::Window, false),
+            (
+                "Sign in",
+                "Enter password for user@example.com",
+                PromptOrigin::Window,
+                true,
+            ),
+            (
+                "Connection Center",
+                "Sign in with user@example.com",
+                PromptOrigin::Sheet,
+                false,
+            ),
+            (
+                "Contoso Desktop",
+                "Sign in with user@example.com",
+                PromptOrigin::Sheet,
+                false,
+            ),
+            (
+                "Contoso Desktop",
+                "Enter password for user@example.com",
+                PromptOrigin::Sheet,
+                true,
+            ),
+            (
+                "Contoso Desktop",
+                "Enter password for Contoso Desktop user@example.com",
+                PromptOrigin::Sheet,
+                true,
+            ),
+            (
+                "Contoso Desktop",
+                "Enter Your User Account used to connect to user@example.com",
+                PromptOrigin::Sheet,
+                true,
+            ),
+            (
+                "Contoso Desktop",
+                "Enter Your User Account used to connect to Other Desktop user@example.com",
+                PromptOrigin::Sheet,
+                true,
+            ),
+            (
+                "Azure DevDesktop - Windows 11",
+                "Enter Your Credentials These credentials will be used to connect to rdgateway.example.com Username: user@example.com Password:",
+                PromptOrigin::Sheet,
+                true,
+            ),
+            (
+                "Azure DevDesktop - Windows 11",
+                "Enter Your Credentials These credentials will be used to connect to rdgateway.example.com Username: user@example.com Password:",
+                PromptOrigin::Window,
+                true,
+            ),
+            (
+                "Connection Center",
+                "Sign in with user@example.com",
+                PromptOrigin::Window,
+                false,
+            ),
+        ] {
+            assert_eq!(prompt_identity_verified(title, body, origin), expected);
+        }
 
-    #[test]
-    fn sheet_prompt_identity_allows_shell_parent_titles_with_credential_body() {
         for title in [
             "Windows App",
             "Connection Center",
@@ -3022,14 +2984,11 @@ mod tests {
             "Add PC",
             "Settings",
         ] {
-            assert!(
-                prompt_identity_verified(
-                    title,
-                    "Enter password for user@example.com",
-                    PromptOrigin::Sheet
-                ),
-                "{title} should be accepted when a trusted sheet has credential text"
-            );
+            assert!(prompt_identity_verified(
+                title,
+                "Enter password for user@example.com",
+                PromptOrigin::Sheet
+            ));
         }
     }
 

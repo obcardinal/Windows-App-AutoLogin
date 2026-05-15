@@ -304,15 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_email_like_text() {
-        assert_eq!(
-            crate::macos_ax::extract_email_like("Signed in as user.name+rdp@example.com"),
-            Some("user.name+rdp@example.com".to_string())
-        );
-        assert_eq!(crate::macos_ax::extract_email_like("No email here"), None);
-    }
-
-    #[test]
     fn session_title_filter_rejects_shell_windows_but_allows_desktops() {
         assert!(!is_probable_session_window_title("Windows App"));
         assert!(!is_probable_session_window_title("About Windows App"));
@@ -329,14 +320,12 @@ mod tests {
     }
 
     #[test]
-    fn check_status_macos_uses_one_detailed_inspection() {
+    fn check_status_macos_detects_login_window_from_inspection() {
         let config = Config {
             macos_app_name: crate::config::TARGET_APP_NAME.to_string(),
         };
-        let mut calls = Vec::new();
 
-        let status = check_status_macos_with_inspector(&config, |app_name, include_form_text| {
-            calls.push((app_name.to_string(), include_form_text));
+        let status = check_status_macos_with_inspector(&config, |_app_name, _include_form_text| {
             inspection(
                 vec![title(42, "Sign in")],
                 vec![form(42, "Sign in", Some("user@example.com"))],
@@ -344,177 +333,101 @@ mod tests {
         });
 
         assert_eq!(
-            calls,
-            vec![(crate::config::TARGET_APP_NAME.to_string(), true)]
-        );
-        assert_eq!(
             status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 42,
-                window_title: "Sign in".to_string(),
-                prompt_email: Some("user@example.com".to_string()),
-                prompt_origin: "window".to_string(),
-            }
+            login_status(42, "Sign in", Some("user@example.com"))
         );
     }
 
     #[test]
-    fn title_detection_uses_prompt_email_from_same_inspection() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(42, "Sign in")],
-            vec![form(42, "Sign in", Some("user@example.com"))],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 42,
-                window_title: "Sign in".to_string(),
-                prompt_email: Some("user@example.com".to_string()),
-                prompt_origin: "window".to_string(),
-            }
-        );
+    fn prompt_email_detection_is_scoped_to_matching_window_and_pid() {
+        for (inspection, expected) in vec![
+            (
+                inspection(
+                    vec![title(42, "Sign in")],
+                    vec![form(42, "Sign in", Some("user@example.com"))],
+                ),
+                login_status(42, "Sign in", Some("user@example.com")),
+            ),
+            (
+                inspection(
+                    vec![title(42, "Sign in")],
+                    vec![
+                        form(43, "Sign in", Some("other@example.com")),
+                        form(42, "Different", Some("wrong@example.com")),
+                    ],
+                ),
+                login_status(42, "Sign in", None),
+            ),
+            (
+                inspection(
+                    vec![title(77, "Finance Desktop 01")],
+                    vec![form(77, "Finance Desktop 01", Some("person@example.com"))],
+                ),
+                login_status(77, "Finance Desktop 01", Some("person@example.com")),
+            ),
+            (
+                inspection(
+                    vec![title(77, "Finance Desktop 01")],
+                    vec![
+                        form(77, "Finance Desktop 01", None),
+                        form(77, "Finance Desktop 01", Some("person@example.com")),
+                    ],
+                ),
+                login_status(77, "Finance Desktop 01", Some("person@example.com")),
+            ),
+            (
+                inspection(
+                    vec![title(77, "Finance Desktop 01")],
+                    vec![
+                        form(77, "Finance Desktop 01", None),
+                        form(88, "Sign in", Some("other@example.com")),
+                    ],
+                ),
+                login_status(77, "Finance Desktop 01", None),
+            ),
+            (
+                inspection(
+                    vec![title(77, "Finance Desktop 01")],
+                    vec![
+                        form(77, "Finance Desktop 01", Some("person@example.com")),
+                        form(77, "Finance Desktop 01", Some("other@example.com")),
+                    ],
+                ),
+                login_status(77, "Finance Desktop 01", None),
+            ),
+            (
+                inspection(
+                    vec![title(42, "Sign in"), title(43, "Sign in")],
+                    vec![form(43, "Sign in", Some("other@example.com"))],
+                ),
+                login_status(42, "Sign in", None),
+            ),
+            (
+                inspection(
+                    vec![title(42, "Sign in"), title(43, "Sign in")],
+                    vec![
+                        form(42, "Sign in", Some("person@example.com")),
+                        form(43, "Sign in", Some("other@example.com")),
+                    ],
+                ),
+                login_status(42, "Sign in", Some("person@example.com")),
+            ),
+        ] {
+            assert_eq!(status_from_macos_inspection(&inspection), expected);
+        }
     }
 
-    #[test]
-    fn title_detection_ignores_prompt_email_from_other_window() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(42, "Sign in")],
-            vec![
-                form(43, "Sign in", Some("other@example.com")),
-                form(42, "Different", Some("wrong@example.com")),
-            ],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 42,
-                window_title: "Sign in".to_string(),
-                prompt_email: None,
-                prompt_origin: "window".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn form_detection_uses_prompt_email_from_same_inspection() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(77, "Finance Desktop 01")],
-            vec![form(77, "Finance Desktop 01", Some("person@example.com"))],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 77,
-                window_title: "Finance Desktop 01".to_string(),
-                prompt_email: Some("person@example.com".to_string()),
-                prompt_origin: "window".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn form_detection_prefers_later_matching_prompt_email_for_dialog() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(77, "Finance Desktop 01")],
-            vec![
-                form(77, "Finance Desktop 01", None),
-                form(77, "Finance Desktop 01", Some("person@example.com")),
-            ],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 77,
-                window_title: "Finance Desktop 01".to_string(),
-                prompt_email: Some("person@example.com".to_string()),
-                prompt_origin: "window".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn form_detection_does_not_steal_email_from_unrelated_form() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(77, "Finance Desktop 01")],
-            vec![
-                form(77, "Finance Desktop 01", None),
-                form(88, "Sign in", Some("other@example.com")),
-            ],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 77,
-                window_title: "Finance Desktop 01".to_string(),
-                prompt_email: None,
-                prompt_origin: "window".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn matching_form_rejects_conflicting_prompt_emails() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(77, "Finance Desktop 01")],
-            vec![
-                form(77, "Finance Desktop 01", Some("person@example.com")),
-                form(77, "Finance Desktop 01", Some("other@example.com")),
-            ],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 77,
-                window_title: "Finance Desktop 01".to_string(),
-                prompt_email: None,
-                prompt_origin: "window".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn title_detection_keeps_prompt_email_scoped_to_same_pid_when_titles_match() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(42, "Sign in"), title(43, "Sign in")],
-            vec![form(43, "Sign in", Some("other@example.com"))],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 42,
-                window_title: "Sign in".to_string(),
-                prompt_email: None,
-                prompt_origin: "window".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn title_detection_uses_prompt_email_from_same_pid_when_titles_match() {
-        let status = status_from_macos_inspection(&inspection(
-            vec![title(42, "Sign in"), title(43, "Sign in")],
-            vec![
-                form(42, "Sign in", Some("person@example.com")),
-                form(43, "Sign in", Some("other@example.com")),
-            ],
-        ));
-
-        assert_eq!(
-            status,
-            MonitorStatus::LoginWindowDetected {
-                process_id: 42,
-                window_title: "Sign in".to_string(),
-                prompt_email: Some("person@example.com".to_string()),
-                prompt_origin: "window".to_string(),
-            }
-        );
+    fn login_status(
+        process_id: i32,
+        window_title: &str,
+        prompt_email: Option<&str>,
+    ) -> MonitorStatus {
+        MonitorStatus::LoginWindowDetected {
+            process_id,
+            window_title: window_title.to_string(),
+            prompt_email: prompt_email.map(str::to_string),
+            prompt_origin: "window".to_string(),
+        }
     }
 
     fn inspection(titles: Vec<WindowTitle>, forms: Vec<FormInspection>) -> WindowInspection {

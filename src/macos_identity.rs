@@ -527,82 +527,6 @@ fn requirement_string_literal(value: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-#[cfg(test)]
-fn signature_cache_key(path: &Path, identity: TrustedIdentity) -> anyhow::Result<String> {
-    let mut parts = vec![metadata_cache_component("bundle", path)?];
-    for relative in [
-        "Contents/Info.plist",
-        "Contents/_CodeSignature/CodeResources",
-    ] {
-        let child = path.join(relative);
-        if child.exists() {
-            parts.push(metadata_cache_component(relative, &child)?);
-        }
-    }
-
-    let executable_dir = path.join("Contents/MacOS");
-    if let Ok(entries) = std::fs::read_dir(executable_dir) {
-        let mut executable_paths = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        executable_paths.sort();
-        for executable_path in executable_paths {
-            parts.push(metadata_cache_component(
-                "Contents/MacOS",
-                &executable_path,
-            )?);
-        }
-    }
-
-    Ok(format!(
-        "{}|team:{}|bundle:{}|{}",
-        path.display(),
-        identity.team_id,
-        identity.bundle_id,
-        parts.join("|")
-    ))
-}
-
-#[cfg(target_os = "macos")]
-#[cfg(test)]
-fn metadata_cache_component(label: &str, path: &Path) -> anyhow::Result<String> {
-    let metadata = std::fs::metadata(path)?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(format!(
-            "{}:{}|dev:{}|ino:{}|len:{}|mtime:{}",
-            label,
-            path.display(),
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            modified_nanos
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        Ok(format!(
-            "{}:{}|len:{}|mtime:{}",
-            label,
-            path.display(),
-            metadata.len(),
-            modified_nanos
-        ))
-    }
-}
-
-#[cfg(target_os = "macos")]
 #[allow(dead_code)]
 fn run_command_with_timeout(
     command: &mut Command,
@@ -629,9 +553,8 @@ fn run_command_with_timeout(
 mod tests {
     use super::{
         code_sign_requirement_source, live_code_validation_flags, path_has_symlink_component,
-        proc_pidpath_buffer_to_path, signature_cache_key, static_code_validation_flags,
+        proc_pidpath_buffer_to_path, static_code_validation_flags,
         trusted_process_infos_from_identities, valid_team_id, CodeSignFlags, ProcessIdentity,
-        TrustedIdentity,
     };
     use std::path::PathBuf;
 
@@ -659,33 +582,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_app_identity_is_rejected() {
-        let error = trusted_process_infos_from_identities(
-            "Lookalike App",
-            &[],
-            |_pid, _path, _identity| Ok(true),
-        )
-        .unwrap_err();
+    fn unsupported_app_identities_are_rejected() {
+        for app_name in ["Lookalike App", "Microsoft Remote Desktop"] {
+            let error =
+                trusted_process_infos_from_identities(app_name, &[], |_pid, _path, _identity| {
+                    Ok(true)
+                })
+                .unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "unsupported app identity for secure automation: Lookalike App"
-        );
-    }
-
-    #[test]
-    fn microsoft_remote_desktop_identity_is_rejected() {
-        let error = trusted_process_infos_from_identities(
-            "Microsoft Remote Desktop",
-            &[],
-            |_pid, _path, _identity| Ok(true),
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "unsupported app identity for secure automation: Microsoft Remote Desktop"
-        );
+            assert_eq!(
+                error.to_string(),
+                format!("unsupported app identity for secure automation: {app_name}")
+            );
+        }
     }
 
     #[test]
@@ -904,45 +813,5 @@ mod tests {
             nul_terminated.as_os_str().as_bytes(),
             b"/Applications/Windows App.app"
         );
-    }
-
-    #[test]
-    fn signature_cache_key_includes_nested_executable_metadata() {
-        let bundle_path = unique_temp_bundle_path();
-        let macos_dir = bundle_path.join("Contents/MacOS");
-        std::fs::create_dir_all(&macos_dir).unwrap();
-        std::fs::create_dir_all(bundle_path.join("Contents/_CodeSignature")).unwrap();
-        std::fs::write(bundle_path.join("Contents/Info.plist"), b"plist").unwrap();
-        std::fs::write(
-            bundle_path.join("Contents/_CodeSignature/CodeResources"),
-            b"codesign",
-        )
-        .unwrap();
-        let executable = macos_dir.join("Windows App");
-        std::fs::write(&executable, b"one").unwrap();
-
-        let identity = TrustedIdentity {
-            bundle_id: "com.microsoft.rdc.macos",
-            team_id: "UBF8T346G9",
-        };
-        let first = signature_cache_key(&bundle_path, identity).unwrap();
-
-        std::fs::write(&executable, b"changed executable").unwrap();
-        let second = signature_cache_key(&bundle_path, identity).unwrap();
-
-        assert_ne!(first, second);
-        let _ = std::fs::remove_dir_all(bundle_path);
-    }
-
-    fn unique_temp_bundle_path() -> PathBuf {
-        let unique = format!(
-            "windows-app-autologin-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        std::env::temp_dir().join(unique).join("Windows App.app")
     }
 }

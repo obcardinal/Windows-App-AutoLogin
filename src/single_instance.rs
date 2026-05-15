@@ -1970,16 +1970,32 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn stale_lock_with_dead_pid_is_reclaimed() {
-        let root = temp_test_root("stale-lock-reclaimed");
-        let lock_dir = root.join(LOCK_DIR_NAME);
-        std::fs::create_dir_all(&lock_dir).unwrap();
-        write_test_private_text(lock_dir.join("pid"), "99999999").unwrap();
+    fn stale_lock_entries_are_reclaimed() {
+        for case in ["dead-pid", "lock-file", "root-file"] {
+            let root = temp_test_root(&format!("stale-lock-{case}-reclaimed"));
+            match case {
+                "dead-pid" => {
+                    let lock_dir = root.join(LOCK_DIR_NAME);
+                    std::fs::create_dir_all(&lock_dir).unwrap();
+                    write_test_private_text(lock_dir.join("pid"), "99999999").unwrap();
+                }
+                "lock-file" => {
+                    std::fs::create_dir_all(&root).unwrap();
+                    std::fs::write(root.join(LOCK_DIR_NAME), "not-a-lock-directory").unwrap();
+                }
+                "root-file" => {
+                    let _ = std::fs::remove_dir_all(&root);
+                    std::fs::write(&root, "not-a-lock-root-directory").unwrap();
+                }
+                _ => unreachable!(),
+            }
 
-        let acquired = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
-        assert_eq!(lock_pid(&acquired), Some(std::process::id()));
+            let acquired =
+                acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
+            assert_eq!(lock_pid(&acquired), Some(std::process::id()));
 
-        let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1994,33 +2010,6 @@ mod tests {
             panic!("legacy live pid lock was reclaimed");
         };
         assert!(error.to_string().contains("already running"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn stale_lock_filename_is_reclaimed() {
-        let root = temp_test_root("stale-lock-file-reclaimed");
-        let lock_path = root.join(LOCK_DIR_NAME);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(&lock_path, "not-a-lock-directory").unwrap();
-
-        let acquired = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
-        assert_eq!(lock_pid(&acquired), Some(std::process::id()));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn stale_lock_root_filename_is_reclaimed() {
-        let root = temp_test_root("stale-lock-root-file-reclaimed");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::write(&root, "not-a-lock-root-directory").unwrap();
-
-        let acquired = acquire_lock_dir_in_root(&root, LOCK_DIR_NAME, "already running").unwrap();
-        assert_eq!(lock_pid(&acquired), Some(std::process::id()));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2175,23 +2164,18 @@ mod tests {
 
     #[cfg(all(target_os = "macos", unix))]
     #[test]
-    fn macos_containing_app_bundle_finds_parent_bundle() {
-        let path = PathBuf::from(
-            "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
-        );
-
-        assert_eq!(
-            macos_containing_app_bundle(&path),
-            Some(PathBuf::from("/Applications/WindowsAppAutoLogin.app"))
-        );
-    }
-
-    #[cfg(all(target_os = "macos", unix))]
-    #[test]
-    fn macos_containing_app_bundle_rejects_unbundled_path() {
-        let path = PathBuf::from("/tmp/windows-app-autologin");
-
-        assert_eq!(macos_containing_app_bundle(&path), None);
+    fn macos_containing_app_bundle_handles_bundled_and_unbundled_paths() {
+        for (path, expected) in [
+            (
+                PathBuf::from(
+                    "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
+                ),
+                Some(PathBuf::from("/Applications/WindowsAppAutoLogin.app")),
+            ),
+            (PathBuf::from("/tmp/windows-app-autologin"), None),
+        ] {
+            assert_eq!(macos_containing_app_bundle(&path), expected);
+        }
     }
 
     #[cfg(all(target_os = "macos", unix))]
@@ -2424,30 +2408,23 @@ mod tests {
 
     #[cfg(all(target_os = "macos", unix))]
     #[test]
-    fn macos_proc_pidpath_preserves_leading_and_trailing_spaces() {
+    fn macos_proc_pidpath_preserves_path_bytes_until_first_nul() {
         use std::os::unix::ffi::OsStrExt;
 
-        let leading = macos_proc_pidpath_buffer_to_path(b" /tmp/windows-app-autologin").unwrap();
-        let trailing = macos_proc_pidpath_buffer_to_path(b"/tmp/windows-app-autologin ").unwrap();
-
-        assert_eq!(
-            leading.as_os_str().as_bytes(),
-            b" /tmp/windows-app-autologin"
-        );
-        assert_eq!(
-            trailing.as_os_str().as_bytes(),
-            b"/tmp/windows-app-autologin "
-        );
-    }
-
-    #[cfg(all(target_os = "macos", unix))]
-    #[test]
-    fn macos_proc_pidpath_stops_at_first_nul_without_trimming() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let path = macos_proc_pidpath_buffer_to_path(b"/tmp/app \0/spoof").unwrap();
-
-        assert_eq!(path.as_os_str().as_bytes(), b"/tmp/app ");
+        for (buffer, expected) in [
+            (
+                b" /tmp/windows-app-autologin".as_slice(),
+                b" /tmp/windows-app-autologin".as_slice(),
+            ),
+            (
+                b"/tmp/windows-app-autologin ".as_slice(),
+                b"/tmp/windows-app-autologin ".as_slice(),
+            ),
+            (b"/tmp/app \0/spoof".as_slice(), b"/tmp/app ".as_slice()),
+        ] {
+            let path = macos_proc_pidpath_buffer_to_path(buffer).unwrap();
+            assert_eq!(path.as_os_str().as_bytes(), expected);
+        }
     }
 
     #[cfg(all(target_os = "macos", unix))]

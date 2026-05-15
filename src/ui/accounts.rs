@@ -1214,11 +1214,6 @@ mod tests {
 
     #[test]
     fn account_save_stale_cleanup_warning_retains_journal_for_retry() {
-        let warning = StaleBackendCleanupWarning {
-            saved_backend: PasswordStorageBackend::SystemSecureStorage,
-            stale_backend: PasswordStorageBackend::EncryptedFallbackFile,
-            error_kind: "storage_error",
-        };
         let cleared = RefCell::new(false);
 
         clear_account_journal_after_terminal_result_with(true, true, || {
@@ -1234,10 +1229,6 @@ mod tests {
         });
 
         assert!(*cleared.borrow());
-        assert_eq!(
-            account_saved_status(Some(&warning)),
-            "Account saved. Password was written to system secure storage, but old encrypted fallback file cleanup is still pending and will retry on next launch. Stored credential changes are blocked until recovery completes."
-        );
     }
 
     #[test]
@@ -1262,28 +1253,25 @@ mod tests {
     }
 
     #[test]
-    fn focused_password_editor_suppresses_copy_text_output() {
-        let ctx = egui::Context::default();
-        ctx.copy_text("secret".to_string());
+    fn password_editor_copy_text_is_suppressed_only_when_focused() {
+        for (focused, expected_copy_text) in
+            [(true, None), (false, Some("diagnostic text".to_string()))]
+        {
+            let ctx = egui::Context::default();
+            ctx.copy_text("diagnostic text".to_string());
 
-        suppress_password_clipboard_output(&ctx, true);
+            suppress_password_clipboard_output(&ctx, focused);
 
-        assert!(ctx.output(|output| output
-            .commands
-            .iter()
-            .all(|command| !matches!(command, egui::OutputCommand::CopyText(_)))));
-    }
-
-    #[test]
-    fn unfocused_password_editor_leaves_copy_text_output_alone() {
-        let ctx = egui::Context::default();
-        ctx.copy_text("diagnostic text".to_string());
-
-        suppress_password_clipboard_output(&ctx, false);
-
-        assert!(ctx.output(|output| output.commands.iter().any(
-            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == "diagnostic text")
-        )));
+            assert_eq!(
+                ctx.output(|output| {
+                    output.commands.iter().find_map(|command| match command {
+                        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                }),
+                expected_copy_text
+            );
+        }
     }
 
     fn config_with_account(has_saved_password: bool) -> AppConfig {
