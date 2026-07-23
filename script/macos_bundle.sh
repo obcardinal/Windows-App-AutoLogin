@@ -28,7 +28,48 @@ waal_cargo_version() {
 
 waal_build_version() {
   local cargo_version="$1"
-  /usr/bin/printf '%s.%s\n' "$cargo_version" "$(/bin/date +%Y%m%d%H%M%S)"
+  local build_version="${WAAL_BUILD_VERSION:-${cargo_version%%[-+]*}}"
+
+  if ! waal_valid_build_version "$build_version"; then
+    echo "Invalid CFBundleVersion: $build_version" >&2
+    echo "Use one to three numeric components; the first may contain up to four digits and the others up to two." >&2
+    exit 1
+  fi
+
+  /usr/bin/printf '%s\n' "$build_version"
+}
+
+waal_valid_build_version() {
+  local value="$1"
+  local IFS='.'
+  local components=()
+  local component
+
+  case "$value" in
+    ""|.*|*..*|*.) return 1 ;;
+  esac
+  case "$value" in
+    *[!0-9.]*) return 1 ;;
+  esac
+
+  read -r -a components <<<"$value"
+  if [ "${#components[@]}" -lt 1 ] || [ "${#components[@]}" -gt 3 ]; then
+    return 1
+  fi
+
+  for component in "${components[@]}"; do
+    case "$component" in
+      ""|*[!0-9]*) return 1 ;;
+    esac
+  done
+
+  [ "${#components[0]}" -le 4 ] || return 1
+  if [ "${#components[@]}" -ge 2 ]; then
+    [ "${#components[1]}" -le 2 ] || return 1
+  fi
+  if [ "${#components[@]}" -ge 3 ]; then
+    [ "${#components[2]}" -le 2 ] || return 1
+  fi
 }
 
 waal_xml_escape() {

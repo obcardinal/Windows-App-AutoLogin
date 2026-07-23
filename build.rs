@@ -136,8 +136,16 @@ fn build_metadata(
 }
 
 fn write_build_metadata(macos_identity: &MacosIdentity, macos_team_id: &str) {
-    let debug_metadata = format!("{}\0", build_metadata(macos_identity, macos_team_id, true));
-    let release_metadata = format!("{}\0", build_metadata(macos_identity, macos_team_id, false));
+    // Keep the marker separated from neighboring printable constants after LTO so
+    // release packaging can reliably extract it with `strings`.
+    let debug_metadata = format!(
+        "\0{}\0",
+        build_metadata(macos_identity, macos_team_id, true)
+    );
+    let release_metadata = format!(
+        "\0{}\0",
+        build_metadata(macos_identity, macos_team_id, false)
+    );
     let debug_bytes = rust_byte_array(&debug_metadata);
     let release_bytes = rust_byte_array(&release_metadata);
     let source = format!(

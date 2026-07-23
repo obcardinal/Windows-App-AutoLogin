@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 use crate::macos_identity;
 #[cfg(target_os = "macos")]
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AccessibilityStatus {
@@ -48,11 +48,27 @@ fn raw_accessibility_is_trusted() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-static CURRENT_APP_IDENTITY_TRUSTED: OnceLock<bool> = OnceLock::new();
+static CURRENT_APP_IDENTITY_TRUSTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 pub(crate) fn current_app_identity_is_trusted() -> bool {
-    *CURRENT_APP_IDENTITY_TRUSTED.get_or_init(current_app_identity_is_trusted_uncached)
+    cache_successful_identity_trust(
+        &CURRENT_APP_IDENTITY_TRUSTED,
+        current_app_identity_is_trusted_uncached,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn cache_successful_identity_trust(cache: &AtomicBool, verify: impl FnOnce() -> bool) -> bool {
+    if cache.load(Ordering::Acquire) {
+        return true;
+    }
+
+    let trusted = verify();
+    if trusted {
+        cache.store(true, Ordering::Release);
+    }
+    trusted
 }
 
 #[cfg(target_os = "macos")]
@@ -69,7 +85,7 @@ fn current_app_identity_is_trusted_uncached() -> bool {
     if crate::macos_identity::path_has_symlink_component(&bundle_path) {
         return false;
     }
-    app_bundle_identity_is_trusted(&bundle_path)
+    current_app_bundle_identity_is_trusted(&bundle_path)
 }
 
 #[cfg(target_os = "macos")]
@@ -83,16 +99,43 @@ pub(crate) fn current_app_identity_is_trusted() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
+fn canonical_app_bundle_path(bundle_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if crate::macos_identity::path_has_symlink_component(bundle_path) {
+        return None;
+    }
     let Ok(bundle_path) = bundle_path.canonicalize() else {
-        return false;
+        return None;
     };
     if crate::macos_identity::path_has_symlink_component(&bundle_path) {
-        return false;
+        return None;
     }
-    if bundle_identifier(&bundle_path).as_deref() != Some(crate::app_identity::macos_bundle_id()) {
+    Some(bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn current_app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
+    let Some(bundle_path) = canonical_app_bundle_path(bundle_path) else {
         return false;
+    };
+
+    if crate::app_identity::macos_development_identity() {
+        return bundle_identifier_is_expected(&bundle_path)
+            && development_app_bundle_identity_is_trusted(&bundle_path);
     }
+
+    // The live SecCode requirement validates both the signed bundle identifier and
+    // Team ID. It intentionally does not impose an install-directory policy.
+    current_process_signature_is_trusted(&bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
+    let Some(bundle_path) = canonical_app_bundle_path(bundle_path) else {
+        return false;
+    };
+    if !bundle_identifier_is_expected(&bundle_path) {
+        return false;
+    };
 
     if crate::app_identity::macos_development_identity() {
         return development_app_bundle_identity_is_trusted(&bundle_path);
@@ -100,6 +143,48 @@ fn app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
 
     bundle_path == std::path::Path::new(crate::app_identity::TRUSTED_MACOS_BUNDLE_PATH)
         && app_bundle_signature_is_trusted(&bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_identifier_is_expected(bundle_path: &std::path::Path) -> bool {
+    bundle_identifier(bundle_path).as_deref() == Some(crate::app_identity::macos_bundle_id())
+}
+
+#[cfg(target_os = "macos")]
+fn current_process_signature_is_trusted(bundle_path: &std::path::Path) -> bool {
+    signed_current_process_matches_identity(
+        std::process::id(),
+        bundle_path,
+        crate::app_identity::macos_bundle_id(),
+        crate::app_identity::macos_team_id(),
+        |pid, bundle_path, bundle_id, team_id| {
+            macos_identity::signed_live_process_matches_identity(
+                pid,
+                bundle_path,
+                bundle_id,
+                team_id,
+            )
+            .unwrap_or(false)
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn signed_current_process_matches_identity(
+    pid: u32,
+    bundle_path: &std::path::Path,
+    bundle_id: &'static str,
+    team_id: Option<&'static str>,
+    verify: impl FnOnce(i32, &std::path::Path, &'static str, &'static str) -> bool,
+) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(team_id) = team_id.filter(|team_id| macos_identity::valid_team_id(team_id)) else {
+        return false;
+    };
+
+    verify(pid, bundle_path, bundle_id, team_id)
 }
 
 #[cfg(target_os = "macos")]
@@ -246,12 +331,61 @@ mod accessibility_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::app_bundle_signature_is_trusted;
+    use super::{
+        app_bundle_signature_is_trusted, cache_successful_identity_trust,
+        signed_current_process_matches_identity,
+    };
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn own_app_signature_requires_configured_valid_team_id() {
         assert!(!app_bundle_signature_is_trusted(std::path::Path::new(
             "/Applications/WindowsAppAutoLogin.app"
         )));
+    }
+
+    #[test]
+    fn signed_current_process_identity_accepts_a_valid_bundle_outside_applications() {
+        let bundle_path = std::path::Path::new("/Users/test/Downloads/WindowsAppAutoLogin.app");
+
+        assert!(signed_current_process_matches_identity(
+            42,
+            bundle_path,
+            "com.example.WindowsAppAutoLogin",
+            Some("ABCDE12345"),
+            |pid, path, bundle_id, team_id| {
+                assert_eq!(pid, 42);
+                assert_eq!(path, bundle_path);
+                assert_eq!(bundle_id, "com.example.WindowsAppAutoLogin");
+                assert_eq!(team_id, "ABCDE12345");
+                true
+            },
+        ));
+    }
+
+    #[test]
+    fn signed_current_process_identity_rejects_a_missing_or_invalid_team_id() {
+        let bundle_path = std::path::Path::new("/tmp/WindowsAppAutoLogin.app");
+
+        for team_id in [None, Some("invalid")] {
+            assert!(!signed_current_process_matches_identity(
+                42,
+                bundle_path,
+                "com.example.WindowsAppAutoLogin",
+                team_id,
+                |_, _, _, _| panic!("invalid identity must not be verified"),
+            ));
+        }
+    }
+
+    #[test]
+    fn current_process_identity_cache_retries_after_false_and_caches_success() {
+        let cache = AtomicBool::new(false);
+
+        assert!(!cache_successful_identity_trust(&cache, || false));
+        assert!(cache_successful_identity_trust(&cache, || true));
+        assert!(cache_successful_identity_trust(&cache, || {
+            panic!("a successful identity result must be cached")
+        }));
     }
 }

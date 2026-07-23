@@ -404,8 +404,10 @@ fn accessibility_log_message(
     status: &crate::autologin::AccessibilityStatus,
 ) -> String {
     format!(
-        "{event} ax_trusted_for_current_process={} current_process_path_redacted={} app_bundle_path_redacted={}",
+        "{event} trusted={} raw_trusted={} identity_trusted={} current_process_path_redacted={} app_bundle_path_redacted={}",
         status.trusted,
+        status.raw_trusted,
+        status.identity_trusted,
         crate::user_paths::redacted_path(&status.current_process_path),
         crate::user_paths::redacted_path(&status.app_bundle_path)
     )
@@ -996,6 +998,8 @@ mod tests {
         );
 
         let message = &logs[0].message;
+        assert!(message.contains(" trusted=false raw_trusted=true identity_trusted=false "));
+        assert!(!message.contains("ax_trusted_for_current_process"));
         assert!(message.contains("current_process_path_redacted=[path]"));
         assert!(message.contains("app_bundle_path_redacted=[path]"));
         assert!(!message.contains("windows-app-autologin"));

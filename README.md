@@ -85,7 +85,7 @@ Create a production macOS release ZIP with a freshly built, signed, notarized, a
 WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
 WAAL_MACOS_TEAM_ID=ABCDE12345 \
 WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
-WAAL_NOTARY_PROFILE=windows-app-autologin-release \
+WAAL_NOTARY_PROFILE=your-notary-profile \
 script/package_macos.sh --release
 ```
 
@@ -328,6 +328,8 @@ The development script does not perform Developer ID signing or notarization. It
 
 Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script builds the release binary from the current checkout in a staging target directory, assembles the `.app`, signs it with `WAAL_CODESIGN_IDENTITY`, notarizes it with `WAAL_NOTARY_PROFILE`, staples the ticket, and then zips only the verified staged bundle. Pre-existing `dist/*.app` bundles are ignored as inputs.
 
+The current release pipeline intentionally produces an ARM64 macOS binary. `CFBundleVersion` defaults to the numeric Cargo package version and can be overridden with a valid one-to-three-component `WAAL_BUILD_VERSION`.
+
 Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID and Team ID, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It removes any stale output ZIP before validation, strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, then validates the staged bundle and the extracted ZIP artifact before publishing the ZIP.
 
 Use `script/package_macos.sh --release-diagnostics-artifact` only for an intentional support artifact. A release diagnostics artifact is built by the package script with `--features release-diagnostics`, a separate `WAAL_DIAGNOSTICS_BUNDLE_ID`, and the diagnostics app name `WindowsAppAutoLoginDiagnostics.app`; the package script requires both `WAAL_RELEASE_BUNDLE_ID` and `WAAL_DIAGNOSTICS_BUNDLE_ID` and refuses to package if the diagnostics bundle ID matches the production or development bundle ID. `script/build_and_run.sh --dev-ui` is not a release diagnostics path because it builds `dev-tools`, which includes `debug-fill` and is rejected by packaging.
@@ -339,7 +341,7 @@ WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
 WAAL_DIAGNOSTICS_BUNDLE_ID=com.example.WindowsAppAutoLogin.Diagnostics \
 WAAL_MACOS_TEAM_ID=ABCDE12345 \
 WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
-WAAL_NOTARY_PROFILE=windows-app-autologin-release \
+WAAL_NOTARY_PROFILE=your-notary-profile \
 script/package_macos.sh --release-diagnostics-artifact
 ```
 

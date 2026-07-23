@@ -140,6 +140,9 @@ build_release_executable() {
         -u WAAL_DEVELOPMENT_RELEASE \
         -u WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH \
         -u WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH \
+        WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
+        WAAL_DIAGNOSTICS_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID" \
+        WAAL_MACOS_TEAM_ID="$EXPECTED_TEAM_ID" \
         RUSTFLAGS="$release_rustflags" \
         CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build \
         --locked \
@@ -153,6 +156,8 @@ build_release_executable() {
         -u WAAL_DEVELOPMENT_RELEASE \
         -u WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH \
         -u WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH \
+        WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
+        WAAL_MACOS_TEAM_ID="$EXPECTED_TEAM_ID" \
         RUSTFLAGS="$release_rustflags" \
         CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build --locked --release --bin "$BINARY_NAME"
     fi
@@ -175,6 +180,32 @@ assemble_release_bundle() {
     "$APP_DISPLAY_NAME" \
     "$CARGO_VERSION" \
     "$BUILD_VERSION"
+}
+
+remove_signature_breaking_xattrs() {
+  local bundle_dir="$1"
+  local candidates_file="$STAGE_DIR/signature-xattr-candidates.bin"
+  local candidate
+  local listed_xattrs
+  local attribute
+
+  if ! /usr/bin/find "$bundle_dir" -print0 >"$candidates_file"; then
+    echo "Failed to enumerate the staged bundle while removing signature-breaking extended attributes." >&2
+    exit 1
+  fi
+
+  while IFS= read -r -d '' candidate; do
+    if ! listed_xattrs="$(/usr/bin/xattr "$candidate")"; then
+      echo "Failed to inspect extended attributes: $candidate" >&2
+      exit 1
+    fi
+
+    for attribute in com.apple.FinderInfo com.apple.ResourceFork; do
+      if /usr/bin/printf '%s\n' "$listed_xattrs" | /usr/bin/grep -Fx "$attribute" >/dev/null; then
+        /usr/bin/xattr -d "$attribute" "$candidate"
+      fi
+    done
+  done <"$candidates_file"
 }
 
 sign_release_bundle() {
@@ -430,6 +461,7 @@ verify_release_bundle() {
   local bundle_dir="$1"
 
   require_tool codesign
+  require_tool lipo
   require_tool plutil
   require_tool spctl
   require_tool xcrun
@@ -445,6 +477,20 @@ verify_release_bundle() {
     exit 1
   fi
   require_info_plist_string "$bundle_dir" NSAppleEventsUsageDescription
+
+  local bundle_executable
+  local executable
+  local architectures
+  bundle_executable="$(/usr/bin/plutil -extract CFBundleExecutable raw "$bundle_dir/Contents/Info.plist")"
+  executable="$bundle_dir/Contents/MacOS/$bundle_executable"
+  if ! architectures="$(/usr/bin/lipo -archs "$executable" 2>/dev/null)"; then
+    echo "Unable to inspect release executable architecture: $executable" >&2
+    exit 1
+  fi
+  if [ "$architectures" != "arm64" ]; then
+    echo "Release executable must contain exactly the arm64 architecture; found: $architectures" >&2
+    exit 1
+  fi
 
   local requirement
   requirement="=anchor apple generic and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and identifier \"$EXPECTED_BUNDLE_ID\""
@@ -515,6 +561,7 @@ require_tool codesign
 require_tool ditto
 require_tool cargo
 require_tool iconutil
+require_tool lipo
 require_tool mktemp
 require_tool od
 require_tool plutil
@@ -525,6 +572,7 @@ require_tool strings
 require_tool tr
 require_tool unzip
 require_tool xcrun
+require_tool xattr
 require_tool zip
 require_tool zipinfo
 
@@ -544,6 +592,8 @@ TMP_ZIP="$STAGE_DIR/$(/usr/bin/basename "$ZIP_PATH")"
 
 build_release_executable
 assemble_release_bundle "$STAGED_BUNDLE"
+verify_release_build_metadata "$STAGED_BUNDLE"
+remove_signature_breaking_xattrs "$STAGED_BUNDLE"
 sign_release_bundle "$STAGED_BUNDLE"
 notarize_and_staple_bundle "$STAGED_BUNDLE"
 
