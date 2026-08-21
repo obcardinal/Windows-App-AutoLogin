@@ -10,16 +10,17 @@ use std::ffi::c_void;
 use std::fmt;
 use std::thread;
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_ELEMENT_COUNT: usize = 900;
 const AX_SEARCH_DEPTH: usize = 12;
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 0.15;
-const FOCUS_SETTLE_MS: u64 = 50;
 const FOCUS_POLL_INTERVAL_MS: u64 = 10;
 #[cfg_attr(not(test), allow(dead_code))]
 const DIRECT_AXVALUE_READY_MS: u64 = 40;
 const FAST_SUBMIT_READY_TIMEOUT_MS: u64 = 60;
-const SUBMIT_SETTLE_MS: u64 = 0;
+const PASSWORD_CLEANUP_ATTEMPTS: usize = 3;
+const PASSWORD_CLEANUP_RETRY_MS: u64 = 50;
 
 const AX_WINDOWS: &str = "AXWindows";
 const AX_SHEETS: &str = "AXSheets";
@@ -39,7 +40,6 @@ const AX_FRONTMOST: &str = "AXFrontmost";
 const AX_MAIN: &str = "AXMain";
 const AX_PARENT: &str = "AXParent";
 const AX_PRESS: &str = "AXPress";
-const AX_RAISE: &str = "AXRaise";
 
 const AX_BUTTON_ROLE: &str = "AXButton";
 const AX_TEXT_FIELD_ROLE: &str = "AXTextField";
@@ -58,7 +58,6 @@ pub(crate) struct MacosInspection {
     pub(crate) has_session: bool,
     pub(crate) session_windows: Vec<MacosWindowTitle>,
     pub(crate) window_titles: Vec<MacosWindowTitle>,
-    pub(crate) forms: Vec<MacosFormInspection>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,14 +82,6 @@ impl fmt::Debug for MacosWindowTitle {
             .field("window", &self.window.is_some())
             .finish()
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct MacosFormInspection {
-    pub(crate) process_id: i32,
-    pub(crate) title: String,
-    pub(crate) prompt_email: Option<String>,
-    pub(crate) prompt_origin: &'static str,
 }
 
 #[derive(Clone)]
@@ -234,7 +225,7 @@ pub(crate) struct MacosSubmittedPrompt {
     email: String,
     origin: PromptOrigin,
     target_window: AxElement,
-    pre_submit_session_windows: Vec<MacosWindowTitle>,
+    prompt_container: AxElement,
 }
 
 impl fmt::Debug for MacosSubmittedPrompt {
@@ -433,22 +424,34 @@ impl AxElement {
             .collect()
     }
 
-    fn set_bool_attr(&self, attr: &'static str, value: bool) -> bool {
-        let attr = CFString::from_static_string(attr);
-        let value = CFBoolean::from(value);
-        unsafe {
-            AXUIElementSetAttributeValue(self.raw, attr.as_concrete_TypeRef(), value.as_CFTypeRef())
-                == K_AX_ERROR_SUCCESS
-        }
-    }
-
     fn set_string_attr(&self, attr: &'static str, value: &str) -> bool {
         let attr = CFString::from_static_string(attr);
-        let value = CFString::new(value);
-        unsafe {
-            AXUIElementSetAttributeValue(self.raw, attr.as_concrete_TypeRef(), value.as_CFTypeRef())
-                == K_AX_ERROR_SUCCESS
+        let mut utf16 = Zeroizing::new(value.encode_utf16().collect::<Vec<u16>>());
+        let value_ref = unsafe {
+            CFStringCreateWithCharactersNoCopy(
+                std::ptr::null(),
+                utf16.as_ptr(),
+                utf16.len() as isize,
+                kCFAllocatorNull,
+            )
+        };
+        if value_ref.is_null() {
+            return false;
         }
+        let cf_value = unsafe { CFString::wrap_under_create_rule(value_ref) };
+        let success = unsafe {
+            AXUIElementSetAttributeValue(
+                self.raw,
+                attr.as_concrete_TypeRef(),
+                cf_value.as_CFTypeRef(),
+            ) == K_AX_ERROR_SUCCESS
+        };
+        // CFString does not own/copy this buffer. Release it before wiping the
+        // backing UTF-16 representation so no local plaintext allocation is
+        // left to the allocator after the AX call returns.
+        drop(cf_value);
+        utf16.zeroize();
+        success
     }
 
     fn perform_action(&self, action: &'static str) -> bool {
@@ -561,10 +564,18 @@ fn inspect_process(
                 inspection.target = Some(target.clone());
             }
 
-            let visible_sheets = sheet_candidates_for_window(window)
-                .into_iter()
-                .filter(|sheet| !is_hidden(sheet))
-                .collect::<Vec<_>>();
+            // Reading an AX subtree can expose unrelated remote-session
+            // content. Only the live foreground parent is eligible for
+            // credential-sheet inspection; background/session windows remain
+            // title-only metadata.
+            let visible_sheets = if window_frontmost {
+                sheet_candidates_for_window(window)
+                    .into_iter()
+                    .filter(|sheet| !is_hidden(sheet))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let visible_sheet_count = visible_sheets.len();
             let any_explicit_frontmost_sheet =
                 visible_sheets.iter().any(element_explicitly_frontmost);
@@ -603,7 +614,10 @@ fn inspect_process(
                     window: Some(window.clone()),
                 });
             }
-            if found_sheet_prompt || !window_should_scan_for_prompt(window, &window_title) {
+            if found_sheet_prompt
+                || !window_frontmost
+                || !window_should_scan_for_prompt(window, &window_title)
+            {
                 continue;
             }
 
@@ -697,12 +711,6 @@ fn record_prompt_candidate(inspection: &mut MacosInspection, prompt: MacosPrompt
         return;
     }
 
-    inspection.forms.push(MacosFormInspection {
-        process_id: prompt.target.process_id,
-        title: prompt.target.window_title.clone(),
-        prompt_email: prompt.email.clone(),
-        prompt_origin: prompt.origin.as_str(),
-    });
     inspection.prompts.push(prompt);
 }
 
@@ -876,6 +884,10 @@ pub(crate) fn preflight_password_load_prompt(
     Ok(verified_prompt)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "security-sensitive prompt identity and write guards stay explicit at this boundary"
+)]
 pub(crate) fn fill_verified_password(
     app_name: &str,
     verified_prompt: MacosVerifiedPrompt,
@@ -913,10 +925,12 @@ pub(crate) fn fill_verified_password(
     let password_field_focused = false;
     let method_used = match method {
         MacosFillMethod::DirectAxValue => {
+            ensure_live_prompt_window_title(&verified_prompt.prompt, expected_window_title)?;
             ensure_revalidated_frontmost(
                 prompt_is_frontmost_now(&verified_prompt.prompt),
                 "password insertion",
             )?;
+            guard()?;
             if set_password_value(&prepared.password_field, password) {
                 "axvalue"
             } else {
@@ -972,15 +986,22 @@ pub(crate) fn submit_filled_prompt(
     filled_prompt: &MacosFilledPrompt,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<MacosSubmitResult> {
-    guard()?;
     let prompt = &filled_prompt.prompt;
+    guard()?;
     let button = revalidate_filled_prompt(app_name, filled_prompt)?;
-    let pre_submit_session_windows = Vec::new();
-
+    ensure_submit_side_effect_target_ready(
+        app_name,
+        prompt,
+        &button,
+        &filled_prompt.trusted_process,
+        &filled_prompt.expected_email,
+        &prompt.target.window_title,
+        "fast submit",
+    )?;
+    // AX reads above may block until their messaging timeout. Recheck the
+    // cancellation generation immediately before the one submit side effect.
+    guard()?;
     if button.perform_action(AX_PRESS) {
-        if SUBMIT_SETTLE_MS > 0 {
-            thread::sleep(Duration::from_millis(SUBMIT_SETTLE_MS));
-        }
         return Ok(MacosSubmitResult {
             submit_method: "axpress_fast",
             submit_status: "ok",
@@ -994,31 +1015,7 @@ pub(crate) fn submit_filled_prompt(
                 email: filled_prompt.expected_email.clone(),
                 origin: prompt.origin,
                 target_window: prompt.target_window.clone(),
-                pre_submit_session_windows,
-            }),
-        });
-    }
-
-    raise_prompt(prompt);
-    let button = revalidate_filled_prompt(app_name, filled_prompt)?;
-    if button.perform_action(AX_PRESS) {
-        if SUBMIT_SETTLE_MS > 0 {
-            thread::sleep(Duration::from_millis(SUBMIT_SETTLE_MS));
-        }
-        return Ok(MacosSubmitResult {
-            submit_method: "axpress_fast",
-            submit_status: "ok",
-            axpress_attempted: true,
-            axpress_result: "success_after_raise",
-            enter_fallback_attempted: false,
-            enter_fallback_result: "not_needed",
-            submitted_prompt: Some(MacosSubmittedPrompt {
-                process_id: prompt.target.process_id,
-                window_title: prompt.target.window_title.clone(),
-                email: filled_prompt.expected_email.clone(),
-                origin: prompt.origin,
-                target_window: prompt.target_window.clone(),
-                pre_submit_session_windows,
+                prompt_container: prompt.native_container.clone(),
             }),
         });
     }
@@ -1043,87 +1040,18 @@ pub(crate) fn submit_prompt_after_fill(
     expected_email: &str,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<MacosSubmitResult> {
-    if let Some(filled_prompt) = filled_prompt.filter(|filled_prompt| {
+    let Some(filled_prompt) = filled_prompt.filter(|filled_prompt| {
         filled_prompt.matches_expected(
             expected_process_id,
             expected_window_title,
             expected_prompt_origin,
             expected_email,
         )
-    }) {
-        return submit_filled_prompt(app_name, filled_prompt, guard);
-    }
+    }) else {
+        anyhow::bail!("filled credential prompt identity is unavailable or changed before submit");
+    };
 
-    submit_prompt(
-        app_name,
-        expected_process_id,
-        expected_window_title,
-        expected_prompt_origin,
-        expected_email,
-        guard,
-    )
-}
-
-pub(crate) fn submit_prompt(
-    app_name: &str,
-    expected_process_id: i32,
-    expected_window_title: &str,
-    expected_prompt_origin: &str,
-    expected_email: &str,
-    guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<MacosSubmitResult> {
-    guard()?;
-    let pre_submit_session_windows = Vec::new();
-
-    guard()?;
-    let revalidated_prompt = revalidate_prompt(
-        app_name,
-        expected_process_id,
-        expected_window_title,
-        expected_prompt_origin,
-        expected_email,
-    )?;
-    let prompt = revalidated_prompt.prompt;
-    let enabled_submit_button = prompt
-        .submit_button
-        .as_ref()
-        .filter(|button| element_enabled(button))
-        .cloned();
-    if let Some(button) = &enabled_submit_button {
-        ensure_element_belongs_to_process(button, expected_process_id, "submit button")?;
-        ensure_element_within_prompt_root(button, &prompt.prompt_root, "submit button")?;
-        if button.perform_action(AX_PRESS) {
-            if SUBMIT_SETTLE_MS > 0 {
-                thread::sleep(Duration::from_millis(SUBMIT_SETTLE_MS));
-            }
-            return Ok(MacosSubmitResult {
-                submit_method: "axpress",
-                submit_status: "ok",
-                axpress_attempted: true,
-                axpress_result: "success",
-                enter_fallback_attempted: false,
-                enter_fallback_result: "not_needed",
-                submitted_prompt: Some(MacosSubmittedPrompt {
-                    process_id: expected_process_id,
-                    window_title: expected_window_title.to_string(),
-                    email: expected_email.to_string(),
-                    origin: prompt.origin,
-                    target_window: prompt.target_window.clone(),
-                    pre_submit_session_windows,
-                }),
-            });
-        }
-    }
-
-    Ok(MacosSubmitResult {
-        submit_method: "axpress",
-        submit_status: "failed",
-        axpress_attempted: enabled_submit_button.is_some(),
-        axpress_result: "failed",
-        enter_fallback_attempted: false,
-        enter_fallback_result: "disabled",
-        submitted_prompt: None,
-    })
+    submit_filled_prompt(app_name, filled_prompt, guard)
 }
 
 fn revalidate_filled_prompt(
@@ -1135,6 +1063,7 @@ fn revalidate_filled_prompt(
     if prompt.target.window_title.trim().is_empty() {
         anyhow::bail!("credential prompt title missing before fast submit");
     }
+    ensure_live_prompt_window_title(prompt, &prompt.target.window_title)?;
     if !prompt
         .email
         .as_deref()
@@ -1193,6 +1122,68 @@ fn revalidate_filled_prompt(
     Ok(button.clone())
 }
 
+fn ensure_submit_side_effect_target_ready(
+    app_name: &str,
+    prompt: &MacosPrompt,
+    button: &AxElement,
+    expected_trusted_process: &macos_identity::TrustedProcessInfo,
+    expected_email: &str,
+    expected_window_title: &str,
+    action: &'static str,
+) -> anyhow::Result<()> {
+    let expected_process_id = prompt.target.process_id;
+    ensure_live_prompt_window_title(prompt, expected_window_title)?;
+    ensure_element_belongs_to_process(&prompt.target_window, expected_process_id, "target window")?;
+    ensure_element_belongs_to_process(
+        &prompt.native_container,
+        expected_process_id,
+        "prompt container",
+    )?;
+    ensure_element_belongs_to_process(&prompt.prompt_root, expected_process_id, "prompt root")?;
+    ensure_element_belongs_to_process(
+        &prompt.password_field,
+        expected_process_id,
+        "password field",
+    )?;
+    ensure_element_belongs_to_process(button, expected_process_id, "submit button")?;
+    ensure_element_within_prompt_root(
+        &prompt.prompt_root,
+        &prompt.native_container,
+        "prompt root",
+    )?;
+    ensure_element_within_prompt_root(
+        &prompt.password_field,
+        &prompt.prompt_root,
+        "password field",
+    )?;
+    ensure_element_within_prompt_root(button, &prompt.prompt_root, "submit button")?;
+    if is_hidden(&prompt.target_window)
+        || is_hidden(&prompt.native_container)
+        || is_hidden(&prompt.prompt_root)
+        || is_hidden(&prompt.password_field)
+        || is_hidden(button)
+        || !has_secure_password_field_identity(&prompt.password_field)
+        || !element_enabled(button)
+    {
+        anyhow::bail!("verified submit button is not visible and enabled before {action}");
+    }
+    ensure_prompt_identity_text_still_matches(
+        prompt,
+        expected_process_id,
+        expected_email,
+        expected_window_title,
+        prompt.origin,
+        action,
+    )?;
+    let trusted_process = current_trusted_process_info(app_name, expected_process_id)?;
+    ensure_trusted_process_matches(
+        &trusted_process,
+        expected_trusted_process,
+        "credential prompt process identity changed before submit side effect",
+    )?;
+    ensure_revalidated_frontmost(prompt_is_frontmost_now(prompt), action)
+}
+
 pub(crate) fn post_check_state(
     app_name: &str,
     expected_process_id: i32,
@@ -1202,15 +1193,23 @@ pub(crate) fn post_check_state(
     timeout: Duration,
 ) -> &'static str {
     let started = Instant::now();
+    let mut consecutive_submitted_prompt_absences = 0_u8;
     loop {
         match inspect_process(app_name, Some(expected_process_id), None) {
             Ok(inspection) => {
+                if let Some(submitted_prompt) = submitted_prompt {
+                    consecutive_submitted_prompt_absences = next_prompt_absence_observations(
+                        consecutive_submitted_prompt_absences,
+                        submitted_prompt_is_still_present(submitted_prompt),
+                    );
+                }
                 let state = classify_post_submit_inspection(
                     &inspection,
                     expected_process_id,
                     expected_window_title,
                     expected_email,
                     submitted_prompt,
+                    consecutive_submitted_prompt_absences >= 2,
                 );
 
                 if inspection.prompt.is_some() {
@@ -1237,6 +1236,7 @@ fn classify_post_submit_inspection(
     expected_window_title: &str,
     expected_email: &str,
     submitted_prompt: Option<&MacosSubmittedPrompt>,
+    submitted_prompt_disappearance_confirmed: bool,
 ) -> Option<&'static str> {
     let target_running = inspection.target.as_ref().is_some_and(|target| {
         target.process_id == expected_process_id
@@ -1246,7 +1246,12 @@ fn classify_post_submit_inspection(
                 .any(|title| title.process_id == expected_process_id)
     });
     let has_session_for_expected_process = submitted_prompt.is_some_and(|submitted_prompt| {
-        submitted_prompt_matches_expected(submitted_prompt, expected_process_id, expected_email)
+        submitted_prompt_disappearance_confirmed
+            && submitted_prompt_matches_expected(
+                submitted_prompt,
+                expected_process_id,
+                expected_email,
+            )
             && inspection.session_windows.iter().any(|session| {
                 session.process_id == expected_process_id
                     && submitted_prompt_matches_session_window(submitted_prompt, session)
@@ -1268,6 +1273,39 @@ fn classify_post_submit_inspection(
         has_session_for_expected_process,
         expected_email,
     )
+}
+
+fn next_prompt_absence_observations(previous: u8, prompt_is_present: bool) -> u8 {
+    if prompt_is_present {
+        0
+    } else {
+        previous.saturating_add(1)
+    }
+}
+
+fn submitted_prompt_is_still_present(submitted_prompt: &MacosSubmittedPrompt) -> bool {
+    if submitted_prompt.target_window.process_id() != Some(submitted_prompt.process_id)
+        || submitted_prompt.prompt_container.process_id() != Some(submitted_prompt.process_id)
+    {
+        return false;
+    }
+
+    match submitted_prompt.origin {
+        PromptOrigin::Sheet => submitted_prompt
+            .target_window
+            .array_attr(AX_SHEETS)
+            .iter()
+            .any(|sheet| {
+                sheet.same_element(&submitted_prompt.prompt_container) && !is_hidden(sheet)
+            }),
+        PromptOrigin::Window => AxElement::application(submitted_prompt.process_id)
+            .map(|app| {
+                app.array_attr(AX_WINDOWS).iter().any(|window| {
+                    window.same_element(&submitted_prompt.prompt_container) && !is_hidden(window)
+                })
+            })
+            .unwrap_or(false),
+    }
 }
 
 fn classify_post_submit_prompt_candidates(
@@ -1319,51 +1357,16 @@ fn submitted_prompt_matches_session_window(
     submitted_prompt: &MacosSubmittedPrompt,
     session: &MacosWindowTitle,
 ) -> bool {
-    if submitted_prompt.origin != PromptOrigin::Sheet {
-        return false;
-    }
-    if submitted_prompt.pre_submit_session_windows.is_empty() {
-        return false;
-    }
-    if session_window_was_present_before_submit(
-        session,
-        &submitted_prompt.pre_submit_session_windows,
-    ) {
-        return false;
-    }
-    if !session
-        .title
-        .trim()
-        .eq_ignore_ascii_case(submitted_prompt.window_title.trim())
-    {
-        return false;
-    }
-    session
-        .window
-        .as_ref()
-        .is_some_and(|window| !window.same_element(&submitted_prompt.target_window))
-}
-
-fn session_window_was_present_before_submit(
-    session: &MacosWindowTitle,
-    pre_submit_sessions: &[MacosWindowTitle],
-) -> bool {
-    pre_submit_sessions
-        .iter()
-        .any(|pre_submit| same_session_window_identity(session, pre_submit))
-}
-
-fn same_session_window_identity(left: &MacosWindowTitle, right: &MacosWindowTitle) -> bool {
-    if left.process_id != right.process_id
-        || !left.title.trim().eq_ignore_ascii_case(right.title.trim())
-    {
-        return false;
-    }
-
-    match (&left.window, &right.window) {
-        (Some(left_window), Some(right_window)) => left_window.same_element(right_window),
-        _ => true,
-    }
+    submitted_prompt.origin == PromptOrigin::Sheet
+        && session.process_id == submitted_prompt.process_id
+        && session
+            .title
+            .trim()
+            .eq_ignore_ascii_case(submitted_prompt.window_title.trim())
+        && session
+            .window
+            .as_ref()
+            .is_some_and(|window| window.same_element(&submitted_prompt.target_window))
 }
 
 fn classify_post_submit_state(
@@ -1462,6 +1465,7 @@ fn revalidate_prepared_prompt_for_fill(
     expected_email: &str,
 ) -> anyhow::Result<PreparedPromptForFill> {
     let prompt = &verified_prompt.prompt;
+    ensure_live_prompt_window_title(prompt, expected_window_title)?;
     ensure_element_belongs_to_process(&prompt.target_window, expected_process_id, "target window")?;
     ensure_element_belongs_to_process(&prompt.prompt_root, expected_process_id, "prompt root")?;
     ensure_element_belongs_to_process(
@@ -1553,6 +1557,25 @@ fn ensure_prompt_identity_text_still_matches(
     }
 }
 
+fn ensure_live_prompt_window_title(
+    prompt: &MacosPrompt,
+    expected_window_title: &str,
+) -> anyhow::Result<()> {
+    let live_title = prompt
+        .target_window
+        .string_attr(AX_TITLE)
+        .unwrap_or_default();
+    if !live_title.trim().is_empty()
+        && live_title
+            .trim()
+            .eq_ignore_ascii_case(expected_window_title.trim())
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("credential prompt window title changed before automation side effect")
+    }
+}
+
 fn prompt_text_snapshot_changed(snapshot: &PromptTextSnapshot) -> bool {
     let attrs = snapshot
         .element
@@ -1577,23 +1600,10 @@ fn prompt_text_snapshots_match(
     )
 }
 
-fn raise_prompt(prompt: &MacosPrompt) {
-    if let Some(app) = AxElement::application(prompt.target.process_id) {
-        let _ = app.set_bool_attr(AX_FRONTMOST, true);
-    }
-    let _ = prompt.target_window.perform_action(AX_RAISE);
-    let _ = prompt.target_window.set_bool_attr(AX_MAIN, true);
-    let _ = prompt.native_container.perform_action(AX_RAISE);
-}
-
 fn ensure_prompt_frontmost_for_automation(
     prompt: &MacosPrompt,
     action: &str,
 ) -> anyhow::Result<()> {
-    if !prompt_is_frontmost_now(prompt) {
-        raise_prompt(prompt);
-        thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
-    }
     ensure_revalidated_frontmost(prompt_is_frontmost_now(prompt), action)
 }
 
@@ -1726,6 +1736,76 @@ fn wait_for_prompt_submit_button_enabled(prompt: &MacosPrompt, timeout: Duration
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(remaining.min(Duration::from_millis(FOCUS_POLL_INTERVAL_MS)));
+    }
+}
+
+pub(crate) fn clear_filled_password(
+    app_name: &str,
+    filled_prompt: &MacosFilledPrompt,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..PASSWORD_CLEANUP_ATTEMPTS {
+        match clear_original_password_once(app_name, filled_prompt) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < PASSWORD_CLEANUP_ATTEMPTS {
+            thread::sleep(Duration::from_millis(PASSWORD_CLEANUP_RETRY_MS));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("password cleanup was not attempted")))
+}
+
+fn clear_original_password_once(
+    app_name: &str,
+    filled_prompt: &MacosFilledPrompt,
+) -> anyhow::Result<()> {
+    let prompt = &filled_prompt.prompt;
+    let expected_process_id = prompt.target.process_id;
+    ensure_element_belongs_to_process(&prompt.target_window, expected_process_id, "target window")?;
+    ensure_element_belongs_to_process(
+        &prompt.native_container,
+        expected_process_id,
+        "prompt container",
+    )?;
+    ensure_element_belongs_to_process(&prompt.prompt_root, expected_process_id, "prompt root")?;
+    ensure_element_belongs_to_process(
+        &prompt.password_field,
+        expected_process_id,
+        "password field",
+    )?;
+    ensure_element_within_prompt_root(
+        &prompt.native_container,
+        &prompt.target_window,
+        "prompt container",
+    )?;
+    ensure_element_within_prompt_root(
+        &prompt.prompt_root,
+        &prompt.native_container,
+        "prompt root",
+    )?;
+    ensure_element_within_prompt_root(
+        &prompt.password_field,
+        &prompt.prompt_root,
+        "password field",
+    )?;
+    if is_hidden(&prompt.target_window)
+        || is_hidden(&prompt.prompt_root)
+        || is_hidden(&prompt.password_field)
+        || !has_secure_password_field_identity(&prompt.password_field)
+    {
+        anyhow::bail!("original filled password field is no longer the visible secure field");
+    }
+    let trusted_process = current_trusted_process_info(app_name, expected_process_id)?;
+    ensure_trusted_process_matches(
+        &trusted_process,
+        &filled_prompt.trusted_process,
+        "credential prompt process identity changed before password cleanup",
+    )?;
+    if set_password_value(&prompt.password_field, "") {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to clear the original filled password field")
     }
 }
 
@@ -2162,14 +2242,16 @@ fn is_native_password_field(element: &AxElement) -> bool {
 }
 
 fn is_secure_password_insertion_field(element: &AxElement) -> bool {
-    !is_hidden(element)
-        && element_enabled(element)
-        && [AX_ROLE, AX_SUBROLE].iter().any(|attr| {
-            element.string_attr(attr).is_some_and(|value| {
-                value.eq_ignore_ascii_case(AX_SECURE_TEXT_FIELD_ROLE)
-                    || normalized_identifier(&value) == "securetextfield"
-            })
+    !is_hidden(element) && element_enabled(element) && has_secure_password_field_identity(element)
+}
+
+fn has_secure_password_field_identity(element: &AxElement) -> bool {
+    [AX_ROLE, AX_SUBROLE].iter().any(|attr| {
+        element.string_attr(attr).is_some_and(|value| {
+            value.eq_ignore_ascii_case(AX_SECURE_TEXT_FIELD_ROLE)
+                || normalized_identifier(&value) == "securetextfield"
         })
+    })
 }
 
 fn is_password_like_text_field(element: &AxElement) -> bool {
@@ -2544,6 +2626,17 @@ type AXUIElementRef = *const c_void;
 type AXError = i32;
 const K_AX_ERROR_SUCCESS: AXError = 0;
 
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFAllocatorNull: *const c_void;
+    fn CFStringCreateWithCharactersNoCopy(
+        allocator: *const c_void,
+        chars: *const u16,
+        num_chars: isize,
+        contents_deallocator: *const c_void,
+    ) -> CFStringRef;
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
@@ -2575,7 +2668,6 @@ mod tests {
         prompt_identity_verified, prompt_text_element_should_contribute,
         prompt_window_title_matches, select_submit_label_for_test, submit_label_rank,
         text_contains_password_cue, PromptOrigin, DIRECT_AXVALUE_READY_MS, FOCUS_POLL_INTERVAL_MS,
-        SUBMIT_SETTLE_MS,
     };
     use std::time::Duration;
 
@@ -2717,6 +2809,11 @@ mod tests {
         assert!(revalidation < write);
         assert!(revalidation < final_frontmost_revalidation);
         assert!(final_frontmost_revalidation < write);
+        let adjacent_guard = fill_verified_password[..write]
+            .rfind("guard()?")
+            .expect("generation guard immediately before password write");
+        assert!(final_frontmost_revalidation < adjacent_guard);
+        assert!(adjacent_guard < write);
 
         let prepared_revalidation = implementation
             .split("fn revalidate_prepared_prompt_for_fill")
@@ -2726,6 +2823,47 @@ mod tests {
         assert!(prepared_revalidation.contains(
             "ensure_revalidated_frontmost(prompt_is_frontmost_now(prompt), \"password insertion\")"
         ));
+    }
+
+    #[test]
+    fn password_axvalue_uses_wiped_no_copy_cfstring_backing() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let setter = implementation
+            .split("fn set_string_attr")
+            .nth(1)
+            .and_then(|tail| tail.split("fn perform_action").next())
+            .unwrap();
+
+        assert!(setter.contains("Zeroizing::new"));
+        assert!(setter.contains("CFStringCreateWithCharactersNoCopy"));
+        assert!(setter.contains("kCFAllocatorNull"));
+        assert!(setter.contains("drop(cf_value)"));
+        assert!(setter.contains("utf16.zeroize()"));
+        assert!(!setter.contains("CFString::new(value)"));
+    }
+
+    #[test]
+    fn live_window_title_is_rechecked_at_fill_and_submit_boundaries() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let fill = implementation
+            .split("pub(crate) fn fill_verified_password")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn submit_filled_prompt").next())
+            .unwrap();
+        let fast_submit = implementation
+            .split("fn revalidate_filled_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn post_check_state").next())
+            .unwrap();
+
+        assert!(fill.contains("ensure_live_prompt_window_title"));
+        assert!(fast_submit.contains("ensure_live_prompt_window_title"));
     }
 
     #[test]
@@ -2747,7 +2885,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_raise_revalidation_fails_closed() {
+    fn foreground_loss_fails_closed_without_raising_or_retrying_submit() {
         assert!(super::ensure_revalidated_frontmost(false, "password insertion").is_err());
         assert!(super::ensure_revalidated_frontmost(true, "password insertion").is_ok());
 
@@ -2760,11 +2898,17 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("fn ensure_revalidated_frontmost").next())
             .unwrap();
-        let raise = focus_revalidation.find("raise_prompt(prompt)").unwrap();
-        let recheck = focus_revalidation
-            .rfind("prompt_is_frontmost_now(prompt)")
+        assert!(focus_revalidation.contains("prompt_is_frontmost_now(prompt)"));
+        assert!(!focus_revalidation.contains("raise_prompt"));
+        assert!(!implementation.contains("AX_RAISE"));
+
+        let fast_submit = implementation
+            .split("pub(crate) fn submit_filled_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn submit_prompt_after_fill").next())
             .unwrap();
-        assert!(raise < recheck);
+        assert_eq!(fast_submit.matches("perform_action(AX_PRESS)").count(), 1);
+        assert!(!fast_submit.contains("success_after_raise"));
     }
 
     #[test]
@@ -2810,9 +2954,11 @@ mod tests {
 
     #[test]
     fn automation_timing_constants_stay_bounded() {
-        assert!(DIRECT_AXVALUE_READY_MS >= FOCUS_POLL_INTERVAL_MS);
-        assert!(Duration::from_millis(DIRECT_AXVALUE_READY_MS) < Duration::from_millis(450));
-        assert!(Duration::from_millis(SUBMIT_SETTLE_MS) < Duration::from_millis(450));
+        let direct_ready_ms = std::hint::black_box(DIRECT_AXVALUE_READY_MS);
+        let focus_poll_interval_ms = std::hint::black_box(FOCUS_POLL_INTERVAL_MS);
+
+        assert!(direct_ready_ms >= focus_poll_interval_ms);
+        assert!(Duration::from_millis(direct_ready_ms) < Duration::from_millis(450));
     }
 
     #[test]
@@ -2939,7 +3085,8 @@ mod tests {
                 EXPECTED_PID,
                 "Sign in",
                 "user@example.com",
-                None
+                None,
+                false,
             ),
             None
         );
@@ -2974,33 +3121,57 @@ mod tests {
                 EXPECTED_PID,
                 "Contoso Desktop",
                 "user@example.com",
-                None
+                None,
+                false,
             ),
             None
         );
     }
 
     #[test]
-    fn post_submit_session_window_matching_distinguishes_preexisting_and_new_sessions() {
-        const EXPECTED_PID: i32 = 101;
+    fn post_submit_session_success_is_bound_to_the_submitted_sheet_parent() {
+        let implementation = include_str!("macos_ax.rs");
+        let matcher = implementation
+            .split("fn submitted_prompt_matches_session_window")
+            .nth(1)
+            .and_then(|tail| tail.split("fn classify_post_submit_state").next())
+            .unwrap();
 
-        let session = super::MacosWindowTitle {
-            process_id: EXPECTED_PID,
-            title: "Contoso Desktop".to_string(),
-            window: None,
-        };
-        for (pre_submit_title, expected) in [("contoso desktop", true), ("Other Desktop", false)] {
-            let pre_submit_sessions = vec![super::MacosWindowTitle {
-                process_id: EXPECTED_PID,
-                title: pre_submit_title.to_string(),
-                window: None,
-            }];
+        assert!(matcher.contains("submitted_prompt.origin == PromptOrigin::Sheet"));
+        assert!(matcher.contains("session.process_id == submitted_prompt.process_id"));
+        assert!(matcher.contains("window.same_element(&submitted_prompt.target_window)"));
+    }
 
-            assert_eq!(
-                super::session_window_was_present_before_submit(&session, &pre_submit_sessions),
-                expected
-            );
-        }
+    #[test]
+    fn post_submit_requires_two_consecutive_submitted_prompt_absences() {
+        let mut observations = 0;
+        observations = super::next_prompt_absence_observations(observations, false);
+        assert_eq!(observations, 1);
+        assert!(observations < 2);
+
+        observations = super::next_prompt_absence_observations(observations, true);
+        assert_eq!(observations, 0);
+
+        observations = super::next_prompt_absence_observations(observations, false);
+        observations = super::next_prompt_absence_observations(observations, false);
+        assert_eq!(observations, 2);
+    }
+
+    #[test]
+    fn submitted_prompt_identity_is_checked_independently_of_content_scan() {
+        let implementation = include_str!("macos_ax.rs");
+        let checker = implementation
+            .split("fn submitted_prompt_is_still_present")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn classify_post_submit_prompt_candidates")
+                    .next()
+            })
+            .unwrap();
+
+        assert!(checker.contains("prompt_container"));
+        assert!(checker.contains("array_attr(AX_SHEETS)"));
+        assert!(checker.contains("array_attr(AX_WINDOWS)"));
     }
 
     #[test]
@@ -3124,6 +3295,15 @@ mod tests {
             Some("AXSystemDialog"),
             "Authentication"
         ));
+
+        let implementation = include_str!("macos_ax.rs");
+        let inspection = implementation
+            .split("fn inspect_process(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn trusted_process_infos_for_inspection").next())
+            .unwrap();
+        assert!(inspection.contains("let visible_sheets = if window_frontmost"));
+        assert!(inspection.contains("|| !window_frontmost"));
     }
 
     #[test]

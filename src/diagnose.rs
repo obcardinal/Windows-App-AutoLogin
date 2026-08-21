@@ -1046,11 +1046,11 @@ fn run_osascript(script: &str) -> std::io::Result<BoundedProcessOutput> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| Error::new(ErrorKind::Other, "missing osascript stdout pipe"))?;
+        .ok_or_else(|| Error::other("missing osascript stdout pipe"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| Error::new(ErrorKind::Other, "missing osascript stderr pipe"))?;
+        .ok_or_else(|| Error::other("missing osascript stderr pipe"))?;
     let stdout_reader =
         thread::spawn(move || read_pipe_capped(stdout, MAX_DIAGNOSTIC_RAW_OUTPUT_BYTES));
     let stderr_reader =
@@ -1122,7 +1122,7 @@ fn join_pipe_reader(
 ) -> std::io::Result<BoundedPipeCapture> {
     reader
         .join()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "pipe reader panicked"))?
+        .map_err(|_| std::io::Error::other("pipe reader panicked"))?
 }
 
 #[cfg(target_os = "macos")]

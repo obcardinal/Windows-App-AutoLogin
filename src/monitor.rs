@@ -9,6 +9,7 @@ pub(crate) enum MonitorStatus {
     ProcessNotFound,
     LoginWindowDetected {
         process_id: i32,
+        window_handle: isize,
         window_title: String,
         prompt_email: Option<String>,
         prompt_origin: String,
@@ -53,7 +54,6 @@ struct WindowInspection {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct WindowTitle {
-    process_id: i32,
     title: String,
 }
 
@@ -99,35 +99,20 @@ fn status_from_macos_inspection(inspection: &WindowInspection) -> MonitorStatus 
         inspection.titles.len()
     );
 
-    for title in &inspection.titles {
-        for keyword in LOGIN_TITLE_KEYWORDS {
-            if contains_keyword(&title.title, keyword) {
-                debug!("Login window detected on macOS by title keyword");
-                let form = matching_form(inspection, title.process_id, &title.title);
-                return MonitorStatus::LoginWindowDetected {
-                    process_id: title.process_id,
-                    window_title: title.title.clone(),
-                    prompt_email: form.and_then(|form| form.prompt_email.clone()),
-                    prompt_origin: form
-                        .map(|form| form.prompt_origin)
-                        .unwrap_or("window")
-                        .to_string(),
-                };
-            }
-        }
-    }
-
-    if let Some(dialog_form) = inspection.forms.first() {
-        let matching_prompt_form =
-            matching_form(inspection, dialog_form.process_id, &dialog_form.title);
-        let form = matching_prompt_form.unwrap_or(dialog_form);
+    if let [form] = inspection.forms.as_slice() {
         debug!("Login dialog detected on macOS inside trusted Windows App process");
         return MonitorStatus::LoginWindowDetected {
             process_id: form.process_id,
+            window_handle: 0,
             window_title: form.title.clone(),
-            prompt_email: matching_prompt_form.and_then(|form| form.prompt_email.clone()),
+            prompt_email: form.prompt_email.clone(),
             prompt_origin: form.prompt_origin.to_string(),
         };
+    }
+
+    if inspection.forms.len() > 1 {
+        debug!("Multiple macOS login forms were reported; refusing ambiguous automation");
+        return MonitorStatus::Unknown;
     }
 
     if inspection
@@ -146,66 +131,31 @@ fn status_from_macos_inspection(inspection: &WindowInspection) -> MonitorStatus 
 #[cfg(target_os = "macos")]
 fn inspect_windows_app_macos_native(app_name: &str, _include_form_text: bool) -> WindowInspection {
     match crate::macos_ax::inspect(app_name) {
-        Ok(inspection) => WindowInspection {
-            process_found: Some(inspection.target.is_some()),
-            titles: inspection
-                .window_titles
-                .into_iter()
-                .map(|title| WindowTitle {
-                    process_id: title.process_id,
-                    title: title.title,
-                })
-                .collect(),
-            forms: inspection
-                .forms
-                .into_iter()
-                .map(|form| FormInspection {
-                    process_id: form.process_id,
-                    title: form.title,
-                    prompt_email: form.prompt_email,
-                    prompt_origin: form.prompt_origin,
-                })
-                .collect(),
-        },
+        Ok(inspection) => {
+            // macos_ax::prompt is populated only for one unambiguous live
+            // foreground prompt. Never promote background forms or a login-like
+            // background window title into an automatic-fill event.
+            let foreground_form = inspection.prompt.as_ref().map(|prompt| FormInspection {
+                process_id: prompt.target.process_id,
+                title: prompt.target.window_title.clone(),
+                prompt_email: prompt.email.clone(),
+                prompt_origin: prompt.origin.as_str(),
+            });
+            WindowInspection {
+                process_found: Some(inspection.target.is_some()),
+                titles: inspection
+                    .window_titles
+                    .into_iter()
+                    .map(|title| WindowTitle { title: title.title })
+                    .collect(),
+                forms: foreground_form.into_iter().collect(),
+            }
+        }
         Err(e) => {
             debug!(error = %e, "Native macOS AX inspection failed");
             WindowInspection::default()
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn matching_form<'a>(
-    inspection: &'a WindowInspection,
-    process_id: i32,
-    title: &str,
-) -> Option<&'a FormInspection> {
-    let mut matching = inspection.forms.iter().filter(|form| {
-        form.process_id == process_id
-            && form.title == title
-            && form.prompt_email.as_deref().is_some()
-    });
-    let first = matching.next()?;
-    let first_email = first
-        .prompt_email
-        .as_deref()
-        .map(canonical_prompt_email)
-        .unwrap_or_default();
-    if matching.any(|form| {
-        form.prompt_email
-            .as_deref()
-            .map(canonical_prompt_email)
-            .is_some_and(|email| email != first_email)
-    }) {
-        return None;
-    }
-
-    Some(first)
-}
-
-#[cfg(target_os = "macos")]
-fn canonical_prompt_email(email: &str) -> String {
-    email.trim().to_lowercase()
 }
 
 #[cfg(target_os = "macos")]
@@ -248,22 +198,6 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
     }
     false
 }
-
-#[cfg(target_os = "macos")]
-const LOGIN_TITLE_KEYWORDS: &[&str] = &[
-    "Sign in",
-    "Authentication",
-    "Credentials",
-    "Login",
-    "Password",
-    "Enter password",
-    "Microsoft account",
-    "Work or school",
-    "Authenticate",
-    "Log in",
-    "Sign-in",
-    "Credential",
-];
 
 #[cfg(target_os = "macos")]
 const NON_SESSION_TITLE_KEYWORDS: &[&str] = &[
@@ -339,82 +273,34 @@ mod tests {
     }
 
     #[test]
-    fn prompt_email_detection_is_scoped_to_matching_window_and_pid() {
-        for (inspection, expected) in vec![
-            (
-                inspection(
-                    vec![title(42, "Sign in")],
-                    vec![form(42, "Sign in", Some("user@example.com"))],
-                ),
-                login_status(42, "Sign in", Some("user@example.com")),
-            ),
-            (
-                inspection(
-                    vec![title(42, "Sign in")],
-                    vec![
-                        form(43, "Sign in", Some("other@example.com")),
-                        form(42, "Different", Some("wrong@example.com")),
-                    ],
-                ),
-                login_status(42, "Sign in", None),
-            ),
-            (
-                inspection(
-                    vec![title(77, "Finance Desktop 01")],
-                    vec![form(77, "Finance Desktop 01", Some("person@example.com"))],
-                ),
-                login_status(77, "Finance Desktop 01", Some("person@example.com")),
-            ),
-            (
-                inspection(
-                    vec![title(77, "Finance Desktop 01")],
-                    vec![
-                        form(77, "Finance Desktop 01", None),
-                        form(77, "Finance Desktop 01", Some("person@example.com")),
-                    ],
-                ),
-                login_status(77, "Finance Desktop 01", Some("person@example.com")),
-            ),
-            (
-                inspection(
-                    vec![title(77, "Finance Desktop 01")],
-                    vec![
-                        form(77, "Finance Desktop 01", None),
-                        form(88, "Sign in", Some("other@example.com")),
-                    ],
-                ),
-                login_status(77, "Finance Desktop 01", None),
-            ),
-            (
-                inspection(
-                    vec![title(77, "Finance Desktop 01")],
-                    vec![
-                        form(77, "Finance Desktop 01", Some("person@example.com")),
-                        form(77, "Finance Desktop 01", Some("other@example.com")),
-                    ],
-                ),
-                login_status(77, "Finance Desktop 01", None),
-            ),
-            (
-                inspection(
-                    vec![title(42, "Sign in"), title(43, "Sign in")],
-                    vec![form(43, "Sign in", Some("other@example.com"))],
-                ),
-                login_status(42, "Sign in", None),
-            ),
-            (
-                inspection(
-                    vec![title(42, "Sign in"), title(43, "Sign in")],
-                    vec![
-                        form(42, "Sign in", Some("person@example.com")),
-                        form(43, "Sign in", Some("other@example.com")),
-                    ],
-                ),
-                login_status(42, "Sign in", Some("person@example.com")),
-            ),
-        ] {
-            assert_eq!(status_from_macos_inspection(&inspection), expected);
-        }
+    fn login_like_background_title_without_foreground_form_is_not_automated() {
+        let status = status_from_macos_inspection(&inspection(vec![title(42, "Sign in")], vec![]));
+
+        assert_eq!(status, MonitorStatus::Unknown);
+    }
+
+    #[test]
+    fn sole_foreground_prompt_is_authoritative_and_multiple_forms_fail_closed() {
+        let foreground = inspection(
+            vec![title(42, "Unrelated background window")],
+            vec![form(77, "Sign in", Some("person@example.com"))],
+        );
+        assert_eq!(
+            status_from_macos_inspection(&foreground),
+            login_status(77, "Sign in", Some("person@example.com"))
+        );
+
+        let ambiguous = inspection(
+            vec![title(42, "Sign in"), title(43, "Sign in")],
+            vec![
+                form(42, "Sign in", Some("person@example.com")),
+                form(43, "Sign in", Some("other@example.com")),
+            ],
+        );
+        assert_eq!(
+            status_from_macos_inspection(&ambiguous),
+            MonitorStatus::Unknown
+        );
     }
 
     fn login_status(
@@ -424,6 +310,7 @@ mod tests {
     ) -> MonitorStatus {
         MonitorStatus::LoginWindowDetected {
             process_id,
+            window_handle: 0,
             window_title: window_title.to_string(),
             prompt_email: prompt_email.map(str::to_string),
             prompt_origin: "window".to_string(),
@@ -438,9 +325,8 @@ mod tests {
         }
     }
 
-    fn title(process_id: i32, title: &str) -> WindowTitle {
+    fn title(_process_id: i32, title: &str) -> WindowTitle {
         WindowTitle {
-            process_id,
             title: title.to_string(),
         }
     }

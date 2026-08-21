@@ -2,13 +2,14 @@ use crate::app::AutoLoginApp;
 use crate::models::{Account, AccountId, AppConfig};
 use crate::storage::{
     begin_account_config_save_journal, begin_account_delete_journal,
-    cleanup_unused_fallback_key_material, clear_pending_storage_operation, delete_account,
-    is_pending_storage_operation_in_progress, load_password, pending_storage_recovery_user_status,
-    save_account, save_account_with_outcome, save_config, StaleBackendCleanupWarning,
+    cleanup_unused_fallback_key_material, clear_pending_storage_operation, config_write_committed,
+    delete_account, is_pending_storage_operation_in_progress, load_password,
+    pending_storage_recovery_user_status, save_account, save_account_with_outcome, save_config,
+    StaleBackendCleanupWarning,
 };
 use crate::ui::theme;
 use eframe::egui;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const STATE_COLUMN_WIDTH: f32 = 88.0;
 const TABLE_SPACING: f32 = 8.0;
@@ -20,12 +21,9 @@ const ACCOUNT_ROW_HEIGHT: f32 = 36.0;
 const ACCOUNT_EDITOR_WIDTH: f32 = 430.0;
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
 const ACCOUNT_EDITOR_PASSWORD_WIDTH: f32 = 286.0;
-const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
 const ACTION_ICON_SIZE: f32 = 17.0;
-const PASSWORD_ICON_SIZE: f32 = 18.0;
 const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
-const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
-const EYE_OFF_ICON: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
+const PASSWORD_EDITOR_MAX_BYTES: usize = 4096;
 const PENCIL_ICON: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
 const TRASH_ICON: &[u8] = include_bytes!("../../assets/icons/trash.svg");
 
@@ -129,13 +127,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                 app.set_status("An enabled account with this email already exists");
             } else {
                 next_config.accounts[idx].enabled = enabling;
-                if let Err(e) = save_config(&next_config) {
-                    let _ = e;
-                    app.set_status("Failed to update account. The account was left unchanged.");
-                } else {
-                    app.config = next_config;
-                    app.set_status("Account updated");
-                    sync_worker_accounts(app, false);
+                match save_config(&next_config) {
+                    Err(e) if !config_write_committed(&e) => {
+                        app.set_status("Failed to update account. The account was left unchanged.");
+                    }
+                    result => {
+                        if let Err(e) = result {
+                            tracing::warn!(error = %e, "Account update committed, but config durability confirmation failed");
+                            app.set_status("Account updated, but disk durability could not be confirmed. The saved state will be checked on next launch.");
+                        } else {
+                            app.set_status("Account updated");
+                        }
+                        app.config = next_config;
+                        sync_worker_accounts(app, false);
+                    }
                 }
             }
         }
@@ -160,7 +165,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                         cleanup_unused_fallback_key_material().is_err()
                     };
                 app.config = outcome.config;
-                if outcome.password_cleanup_warning {
+                if outcome.config_durability_warning {
+                    tracing::warn!(
+                        "Account removal committed, but config durability confirmation failed"
+                    );
+                    app.set_status(
+                        "Account deleted, but disk durability could not be confirmed. Cleanup remains pending and will be checked on next launch.",
+                    );
+                } else if outcome.password_cleanup_warning {
                     tracing::warn!(
                         "Account deleted, but saved password cleanup failed after config save"
                     );
@@ -222,20 +234,24 @@ where
 
     let mut next_config = config.clone();
     next_config.accounts.remove(idx);
-    if let Err(e) = save_config_op(&next_config) {
-        let _ = e;
-        let _ = clear_journal_op();
-        return Err("Failed to save the account removal. The account was not deleted and saved password storage was left unchanged.".to_string());
-    }
+    let config_durability_warning = match save_config_op(&next_config) {
+        Ok(()) => false,
+        Err(e) if config_write_committed(&e) => true,
+        Err(_) => {
+            let _ = clear_journal_op();
+            return Err("Failed to save the account removal. The account was not deleted and saved password storage was left unchanged.".to_string());
+        }
+    };
 
     let password_cleanup_warning = delete_account_op(&account.id).is_err();
-    let journal_cleanup_warning = if password_cleanup_warning {
+    let journal_cleanup_warning = if password_cleanup_warning || config_durability_warning {
         false
     } else {
         clear_journal_op().is_err()
     };
     Ok(DeleteAccountOutcome {
         config: next_config,
+        config_durability_warning,
         password_cleanup_warning,
         journal_cleanup_warning,
     })
@@ -244,6 +260,7 @@ where
 #[derive(Debug)]
 struct DeleteAccountOutcome {
     config: AppConfig,
+    config_durability_warning: bool,
     password_cleanup_warning: bool,
     journal_cleanup_warning: bool,
 }
@@ -441,27 +458,170 @@ fn open_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp, account: Acc
 }
 
 fn clear_temp_password(app: &mut AutoLoginApp) {
-    app.temp_password = Zeroizing::new(String::new());
+    app.temp_password = empty_password_buffer();
+}
+
+fn empty_password_buffer() -> Zeroizing<String> {
+    // Fixed up-front capacity prevents password edits from leaving old heap
+    // allocations behind during String growth. Zeroizing wipes the entire
+    // capacity when this buffer is replaced or dropped.
+    Zeroizing::new(String::with_capacity(PASSWORD_EDITOR_MAX_BYTES))
 }
 
 fn password_editor_id(account_id: &str) -> egui::Id {
     egui::Id::new((PASSWORD_EDITOR_ID_SALT, account_id))
 }
 
-fn prepare_password_editor_state(ctx: &egui::Context, id: egui::Id) {
-    let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-    state.set_undoer(egui::util::undoer::Undoer::with_settings(
-        egui::util::undoer::Settings {
-            max_undos: 0,
-            ..Default::default()
-        },
-    ));
-    state.store(ctx, id);
-}
-
 fn forget_password_editor_state(ctx: &egui::Context, id: egui::Id) {
     ctx.memory_mut(|memory| memory.surrender_focus(id));
     ctx.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id));
+}
+
+/// Minimal password input used instead of egui::TextEdit. TextEdit clones its
+/// complete backing string every frame for change reporting and its Undoer,
+/// even when max_undos is zero. This editor keeps only the Zeroizing backing
+/// buffer and consumes/zeroizes owned input-event strings immediately.
+///
+/// Native windowing/IME layers can still transiently own typed characters
+/// before egui delivers them; application code cannot guarantee wiping those
+/// platform allocations. Password reveal is intentionally unavailable so the
+/// renderer and accessibility tree receive only bullets.
+fn secure_password_editor(
+    ui: &mut egui::Ui,
+    password: &mut Zeroizing<String>,
+    id: egui::Id,
+    hint: &str,
+) -> egui::Response {
+    let desired_size = egui::vec2(ACCOUNT_EDITOR_PASSWORD_WIDTH, 24.0);
+    let (_, rect) = ui.allocate_space(desired_size);
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if response.clicked() {
+        response.request_focus();
+    }
+
+    if response.has_focus() {
+        consume_password_input_events(ui.ctx(), password);
+        suppress_password_clipboard_output(ui.ctx(), true);
+    }
+
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(4),
+        ui.visuals().extreme_bg_color,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let (display, color) = if password.is_empty() {
+        (hint.to_string(), ui.visuals().weak_text_color())
+    } else {
+        (
+            std::iter::repeat_n(
+                egui::epaint::text::PASSWORD_REPLACEMENT_CHAR,
+                password.chars().count(),
+            )
+            .collect::<String>(),
+            visuals.text_color(),
+        )
+    };
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        display,
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+    );
+    if response.has_focus() {
+        let cursor_x =
+            (rect.left() + 8.0 + password.chars().count() as f32 * 8.0).min(rect.right() - 5.0);
+        ui.painter().vline(
+            cursor_x,
+            (rect.top() + 4.0)..=(rect.bottom() - 4.0),
+            egui::Stroke::new(1.0, visuals.text_color()),
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), "Password")
+    });
+    response
+}
+
+fn consume_password_input_events(ctx: &egui::Context, password: &mut Zeroizing<String>) {
+    ctx.input_mut(|input| {
+        let events = std::mem::take(&mut input.events);
+        let mut retained = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                egui::Event::Text(mut text) | egui::Event::Paste(mut text) => {
+                    append_password_input(password, &text);
+                    text.zeroize();
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(mut text)) => {
+                    append_password_input(password, &text);
+                    text.zeroize();
+                }
+                egui::Event::Ime(egui::ImeEvent::Preedit(mut text)) => {
+                    // Do not retain composition plaintext in widget state.
+                    text.zeroize();
+                }
+                egui::Event::Copy | egui::Event::Cut => {}
+                egui::Event::Key {
+                    key: egui::Key::Backspace | egui::Key::Delete,
+                    pressed: true,
+                    ..
+                } => pop_password_char(password),
+                other => retained.push(other),
+            }
+        }
+        input.events = retained;
+
+        // InputState keeps a clone of every RawInput event for the lifetime of
+        // the frame. Consuming `input.events` alone therefore leaves a second
+        // plaintext password copy behind. Scrub that clone without processing
+        // it again; non-secret events remain available to egui.
+        scrub_password_event_copies(&mut input.raw.events);
+    });
+}
+
+fn scrub_password_event_copies(events: &mut Vec<egui::Event>) {
+    let raw_events = std::mem::take(events);
+    let mut retained = Vec::with_capacity(raw_events.len());
+    for event in raw_events {
+        match event {
+            egui::Event::Text(mut text)
+            | egui::Event::Paste(mut text)
+            | egui::Event::Ime(egui::ImeEvent::Preedit(mut text))
+            | egui::Event::Ime(egui::ImeEvent::Commit(mut text)) => text.zeroize(),
+            egui::Event::Copy | egui::Event::Cut => {}
+            other => retained.push(other),
+        }
+    }
+    *events = retained;
+}
+
+fn append_password_input(password: &mut String, input: &str) {
+    for character in input
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+    {
+        if password.len() + character.len_utf8() > PASSWORD_EDITOR_MAX_BYTES {
+            break;
+        }
+        password.push(character);
+    }
+}
+
+fn pop_password_char(password: &mut String) {
+    let Some((new_len, _)) = password.char_indices().next_back() else {
+        return;
+    };
+    // String::truncate leaves removed bytes initialized in spare capacity.
+    // Wipe the removed UTF-8 codepoint before shortening the allocation.
+    unsafe {
+        let bytes = password.as_mut_vec();
+        bytes[new_len..].zeroize();
+        bytes.truncate(new_len);
+    }
 }
 
 fn suppress_password_clipboard_output(ctx: &egui::Context, password_field_has_focus: bool) {
@@ -548,7 +708,6 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let mut close_editor = false;
     let mut account_to_save: Option<Account> = None;
     let password_editor_id = password_editor_id(&account_snapshot.id);
-    prepare_password_editor_state(ui.ctx(), password_editor_id);
     egui::Window::new(title)
         .open(&mut open)
         .resizable(false)
@@ -569,33 +728,16 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                         ui.end_row();
 
                         ui.label("Password");
-                        ui.horizontal(|ui| {
-                            let password_edit = egui::TextEdit::singleline(&mut *app.temp_password)
-                                .id(password_editor_id)
-                                .hint_text(if is_existing {
-                                    "Leave blank to keep saved password"
-                                } else {
-                                    "Password"
-                                })
-                                .password(!app.show_password);
-                            let password_response =
-                                ui.add_sized([ACCOUNT_EDITOR_PASSWORD_WIDTH, 24.0], password_edit);
-                            suppress_password_clipboard_output(
-                                ui.ctx(),
-                                password_response.has_focus(),
-                            );
-                            let tooltip = if app.show_password {
-                                "Hide password"
+                        secure_password_editor(
+                            ui,
+                            &mut app.temp_password,
+                            password_editor_id,
+                            if is_existing {
+                                "Leave blank to keep saved password"
                             } else {
-                                "Show password"
-                            };
-                            if password_visibility_button(ui, app.show_password)
-                                .on_hover_text(tooltip)
-                                .clicked()
-                            {
-                                app.show_password = !app.show_password;
-                            }
-                        });
+                                "Password"
+                            },
+                        );
                         ui.end_row();
                     });
 
@@ -692,21 +834,6 @@ fn account_action_button(
     ui.add_enabled(enabled, button)
 }
 
-fn password_visibility_button(ui: &mut egui::Ui, password_visible: bool) -> egui::Response {
-    let (uri, bytes) = if password_visible {
-        ("bytes://icons/eye-off.svg", EYE_OFF_ICON)
-    } else {
-        ("bytes://icons/eye.svg", EYE_ICON)
-    };
-    let button = egui::Button::image(svg_icon(uri, bytes, PASSWORD_ICON_SIZE, theme::TEXT))
-        .fill(egui::Color32::from_rgb(246, 249, 252))
-        .stroke(egui::Stroke::new(1.0, theme::STROKE))
-        .corner_radius(egui::CornerRadius::same(7))
-        .min_size(egui::vec2(ACCOUNT_EDITOR_TOGGLE_WIDTH, 28.0));
-
-    ui.add(button)
-}
-
 fn svg_icon(
     uri: &'static str,
     bytes: &'static [u8],
@@ -753,8 +880,17 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
     account.username = account.username.trim().to_string();
     account.has_saved_password = previous_password_saved;
 
-    let new_password =
-        (!app.temp_password.is_empty()).then(|| Zeroizing::new(app.temp_password.to_string()));
+    // Move the sole password allocation into the save transaction. Avoid a
+    // second plaintext String and blank the editor immediately; all failure
+    // paths then zeroize the moved buffer when this function returns.
+    let new_password = if app.temp_password.is_empty() {
+        None
+    } else {
+        Some(std::mem::replace(
+            &mut app.temp_password,
+            empty_password_buffer(),
+        ))
+    };
     let username_changed = existing_account
         .is_some_and(|existing| existing.username.trim() != account.username.trim());
     let only_password_changed = new_password.is_some()
@@ -784,6 +920,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
             }
         };
         let mut cleanup_warning = None;
+        let mut fallback_key_cleanup_warning = false;
         if let Some(password) = new_password.as_ref() {
             match save_account_with_outcome(
                 &account,
@@ -792,6 +929,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
             ) {
                 Ok(outcome) => {
                     cleanup_warning = outcome.stale_cleanup_warning;
+                    fallback_key_cleanup_warning = outcome.fallback_key_cleanup_warning;
                 }
                 Err(e) => {
                     let _ = e;
@@ -803,9 +941,13 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         }
         clear_account_journal_after_terminal_result(
             account_journal_started,
-            cleanup_warning.is_some(),
+            cleanup_warning.is_some() || fallback_key_cleanup_warning,
         );
-        app.set_status(account_saved_status(cleanup_warning.as_ref()));
+        app.set_status(account_saved_status(
+            cleanup_warning.as_ref(),
+            fallback_key_cleanup_warning,
+            false,
+        ));
         app.sync_saved_config_to_worker(true);
         return true;
     }
@@ -855,6 +997,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         false
     };
     let mut cleanup_warning = None;
+    let mut fallback_key_cleanup_warning = false;
     if let Some(password) = new_password.as_ref() {
         match save_account_with_outcome(
             &account,
@@ -863,6 +1006,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         ) {
             Ok(outcome) => {
                 cleanup_warning = outcome.stale_cleanup_warning;
+                fallback_key_cleanup_warning = outcome.fallback_key_cleanup_warning;
             }
             Err(e) => {
                 let _ = e;
@@ -907,6 +1051,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
             ) {
                 Ok(outcome) => {
                     cleanup_warning = outcome.stale_cleanup_warning;
+                    fallback_key_cleanup_warning = outcome.fallback_key_cleanup_warning;
                 }
                 Err(e) => {
                     let _ = e;
@@ -930,20 +1075,29 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         next_config.accounts.push(account.clone());
     }
 
-    if let Err(e) = save_config(&next_config) {
-        let _ = e;
-        let mut rollback_errors = Vec::new();
-        if new_password.is_some() || username_changed {
-            if is_existing {
-                if let (Some(previous_account), Some(previous_password)) =
-                    (previous_account.as_ref(), previous_password.as_deref())
-                {
-                    let previous_password = previous_password.as_str();
-                    if let Err(rollback_error) = save_account(
-                        previous_account,
-                        previous_password,
-                        app.config.settings.use_keyring,
-                    ) {
+    let config_durability_warning = match save_config(&next_config) {
+        Ok(()) => false,
+        Err(e) if config_write_committed(&e) => {
+            tracing::warn!(error = %e, "Account config replacement committed, but durability confirmation failed");
+            true
+        }
+        Err(_) => {
+            let mut rollback_errors = Vec::new();
+            if new_password.is_some() || username_changed {
+                if is_existing {
+                    if let (Some(previous_account), Some(previous_password)) =
+                        (previous_account.as_ref(), previous_password.as_deref())
+                    {
+                        let previous_password = previous_password.as_str();
+                        if let Err(rollback_error) = save_account(
+                            previous_account,
+                            previous_password,
+                            app.config.settings.use_keyring,
+                        ) {
+                            let _ = rollback_error;
+                            rollback_errors.push(());
+                        }
+                    } else if let Err(rollback_error) = delete_account(&account.id) {
                         let _ = rollback_error;
                         rollback_errors.push(());
                     }
@@ -951,25 +1105,28 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
                     let _ = rollback_error;
                     rollback_errors.push(());
                 }
-            } else if let Err(rollback_error) = delete_account(&account.id) {
-                let _ = rollback_error;
-                rollback_errors.push(());
             }
+            if rollback_errors.is_empty() {
+                clear_account_journal_after_terminal_result(account_journal_started, false);
+                app.set_status("Failed to save account changes. The account was left unchanged.");
+            } else {
+                app.set_status("Failed to save account changes, and automatic password rollback could not be confirmed. Please check storage before trying again.");
+            }
+            return false;
         }
-        if rollback_errors.is_empty() {
-            clear_account_journal_after_terminal_result(account_journal_started, false);
-            app.set_status("Failed to save account changes. The account was left unchanged.");
-        } else {
-            app.set_status("Failed to save account changes, and automatic password rollback could not be confirmed. Please check storage before trying again.");
-        }
-        return false;
-    } else {
+    };
+
+    {
         clear_account_journal_after_terminal_result(
             account_journal_started,
-            cleanup_warning.is_some(),
+            cleanup_warning.is_some() || fallback_key_cleanup_warning || config_durability_warning,
         );
         app.config = next_config;
-        app.set_status(account_saved_status(cleanup_warning.as_ref()));
+        app.set_status(account_saved_status(
+            cleanup_warning.as_ref(),
+            fallback_key_cleanup_warning,
+            config_durability_warning,
+        ));
     }
 
     sync_worker_accounts(app, false);
@@ -985,9 +1142,13 @@ fn enabled_account_conflicts_with_candidate(existing: &Account, candidate_email:
             .eq_ignore_ascii_case(candidate_email.trim())
 }
 
-fn account_saved_status(cleanup_warning: Option<&StaleBackendCleanupWarning>) -> String {
-    cleanup_warning.map_or_else(
-        || "Account saved".to_string(),
+fn account_saved_status(
+    cleanup_warning: Option<&StaleBackendCleanupWarning>,
+    fallback_key_cleanup_warning: bool,
+    config_durability_warning: bool,
+) -> String {
+    let mut status = cleanup_warning.map_or_else(
+        || "Account saved.".to_string(),
         |warning| {
             format!(
                 "Account saved. Password was written to {}, but old {} cleanup is still pending and will retry on next launch. Stored credential changes are blocked until recovery completes.",
@@ -995,7 +1156,14 @@ fn account_saved_status(cleanup_warning: Option<&StaleBackendCleanupWarning>) ->
                 warning.stale_backend.label()
             )
         },
-    )
+    );
+    if fallback_key_cleanup_warning {
+        status.push_str(" Old fallback encryption-key cleanup is still pending and will retry; no password data was rolled back.");
+    }
+    if config_durability_warning {
+        status.push_str(" Disk durability could not be confirmed; the committed state will be checked on next launch.");
+    }
+    status
 }
 
 fn clear_account_journal_after_terminal_result(started: bool, keep_for_cleanup_retry: bool) {
@@ -1038,9 +1206,10 @@ fn sync_worker_accounts(app: &mut AutoLoginApp, refresh_passwords: bool) {
 mod tests {
     use super::enabled_account_conflicts_with_candidate;
     use super::{
-        account_saved_status, clear_account_journal_after_terminal_result_with,
-        delete_account_transaction, forget_password_editor_state, password_editor_id,
-        prepare_password_editor_state, suppress_password_clipboard_output,
+        account_saved_status, append_password_input,
+        clear_account_journal_after_terminal_result_with, delete_account_transaction,
+        empty_password_buffer, forget_password_editor_state, password_editor_id, pop_password_char,
+        scrub_password_event_copies, suppress_password_clipboard_output,
     };
     use crate::models::{Account, AppConfig};
     use crate::storage::{PasswordStorageBackend, StaleBackendCleanupWarning};
@@ -1113,6 +1282,43 @@ mod tests {
         assert_eq!(
             events.into_inner(),
             vec!["journal", "save_config", "clear_journal"]
+        );
+    }
+
+    #[test]
+    fn delete_account_transaction_does_not_rollback_after_committed_config_warning() {
+        let config = config_with_account(true);
+        let events = RefCell::new(Vec::new());
+
+        let outcome = delete_account_transaction(
+            &config,
+            0,
+            |_, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("save_config_committed");
+                Err(crate::storage::committed_config_write_test_error())
+            },
+            || {
+                events.borrow_mut().push("clear_journal");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.config.accounts.is_empty());
+        assert!(outcome.config_durability_warning);
+        assert!(!outcome.password_cleanup_warning);
+        assert!(!outcome.journal_cleanup_warning);
+        assert_eq!(
+            events.into_inner(),
+            vec!["journal", "save_config_committed", "delete"]
         );
     }
 
@@ -1232,7 +1438,7 @@ mod tests {
             error_kind: "storage_error",
         };
 
-        let status = account_saved_status(Some(&warning));
+        let status = account_saved_status(Some(&warning), false, false);
 
         assert!(status.contains("Account saved"));
         assert!(status.contains("system secure storage"));
@@ -1240,6 +1446,16 @@ mod tests {
         assert!(status.contains("will retry on next launch"));
         assert!(status.contains("Stored credential changes are blocked"));
         assert!(!status.contains("storage_error"));
+    }
+
+    #[test]
+    fn account_saved_status_surfaces_key_cleanup_and_durability_without_secrets() {
+        let status = account_saved_status(None, true, true);
+
+        assert!(status.contains("Account saved"));
+        assert!(status.contains("fallback encryption-key cleanup is still pending"));
+        assert!(status.contains("Disk durability could not be confirmed"));
+        assert!(!status.contains("account-1"));
     }
 
     #[test]
@@ -1305,28 +1521,49 @@ mod tests {
     }
 
     #[test]
-    fn password_editor_state_never_keeps_undo_or_redo_text() {
-        let ctx = egui::Context::default();
-        let id = password_editor_id("account-1");
-        let cursor = egui::text::CCursorRange::default();
-        let mut prior_undoer = egui::util::undoer::Undoer::default();
-        prior_undoer.add_undo(&(cursor, "prior-placeholder".to_string()));
-        let mut prior_state = egui::text_edit::TextEditState::default();
-        prior_state.set_undoer(prior_undoer);
-        prior_state.store(&ctx, id);
+    fn password_editor_scrubs_cloned_raw_secret_events_but_retains_normal_input() {
+        let normal_key = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut events = vec![
+            egui::Event::Text("typed-secret".to_string()),
+            egui::Event::Paste("pasted-secret".to_string()),
+            egui::Event::Ime(egui::ImeEvent::Preedit("composed-secret".to_string())),
+            egui::Event::Ime(egui::ImeEvent::Commit("committed-secret".to_string())),
+            egui::Event::Copy,
+            egui::Event::Cut,
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            normal_key.clone(),
+        ];
 
-        prepare_password_editor_state(&ctx, id);
+        scrub_password_event_copies(&mut events);
 
-        let state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
-        let mut undoer = state.undoer();
-        let first_frame = (cursor, "first-placeholder".to_string());
-        let second_frame = (cursor, "second-placeholder".to_string());
-        undoer.feed_state(0.0, &first_frame);
-        undoer.feed_state(2.0, &second_frame);
-        assert!(!undoer.has_undo(&first_frame));
-        assert!(!undoer.has_undo(&second_frame));
-        assert!(!undoer.has_redo(&first_frame));
-        assert!(!undoer.has_redo(&second_frame));
+        assert_eq!(
+            events,
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled), normal_key]
+        );
+    }
+
+    #[test]
+    fn password_editor_uses_fixed_allocation_and_wipes_deleted_utf8_bytes() {
+        let mut password = empty_password_buffer();
+        let original_ptr = password.as_ptr();
+        append_password_input(&mut password, "secret💣");
+        assert_eq!(password.as_ptr(), original_ptr);
+        let old_len = password.len();
+
+        pop_password_char(&mut password);
+
+        assert_eq!(password.as_str(), "secret");
+        let removed_len = old_len - password.len();
+        let removed = unsafe {
+            std::slice::from_raw_parts(password.as_ptr().add(password.len()), removed_len)
+        };
+        assert!(removed.iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -1363,8 +1600,8 @@ mod tests {
             .expect("account editor end");
         let editor = &implementation[editor_start..editor_end];
 
-        assert!(editor.contains("prepare_password_editor_state(ui.ctx(), password_editor_id);"));
-        assert!(editor.contains(".id(password_editor_id)"));
+        assert!(editor.contains("secure_password_editor("));
+        assert!(!editor.contains("egui::TextEdit::singleline(&mut *app.temp_password)"));
         assert!(editor.contains("forget_password_editor_state(ui.ctx(), password_editor_id);"));
         assert!(editor.contains("clear_temp_password(app);"));
     }

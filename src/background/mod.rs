@@ -52,8 +52,6 @@ const PROMPT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MACOS_FALLBACK_PROMPT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const UNKNOWN_POLL_BACKOFF_MAX: Duration = Duration::from_secs(3);
-const MAX_RECENT_PROMPT_ATTEMPTS: usize = 32;
-const PROMPT_ATTEMPT_RETENTION: Duration = Duration::from_secs(3);
 const PRE_PASSWORD_REPORT_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 struct FlagGuard {
@@ -135,6 +133,7 @@ struct PromptRetrySuppression {
 struct LoginPromptKey {
     account_id: String,
     process_id: i32,
+    window_handle: isize,
     window_title: String,
     prompt_email: String,
     prompt_origin: String,
@@ -144,16 +143,18 @@ impl LoginPromptKey {
     fn new(
         account_id: String,
         process_id: i32,
+        window_handle: isize,
         window_title: String,
         prompt_email: String,
         prompt_origin: String,
     ) -> Self {
         Self {
-            account_id,
+            account_id: canonical_prompt_component(&account_id),
             process_id,
-            window_title,
-            prompt_email,
-            prompt_origin,
+            window_handle,
+            window_title: canonical_prompt_component(&window_title),
+            prompt_email: canonical_prompt_component(&prompt_email),
+            prompt_origin: canonical_prompt_component(&prompt_origin),
         }
     }
 
@@ -162,11 +163,19 @@ impl LoginPromptKey {
         Self::new(
             context.account_id.clone(),
             context.process_id,
+            #[cfg(target_os = "windows")]
+            context.window_handle,
+            #[cfg(not(target_os = "windows"))]
+            0,
             context.window_title.clone(),
             context.prompt_email.clone(),
             context.prompt_origin.clone(),
         )
     }
+}
+
+fn canonical_prompt_component(value: &str) -> String {
+    value.trim().to_lowercase()
 }
 
 #[derive(Debug, PartialEq)]
@@ -211,64 +220,28 @@ fn account_for_visible_prompt_email<'a>(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn prompt_retry_is_suppressed(
-    recent_prompt_attempts: &mut HashMap<LoginPromptKey, Instant>,
+    recent_prompt_attempts: &HashMap<LoginPromptKey, Instant>,
     prompt_key: &LoginPromptKey,
-    now: Instant,
-    cooldown: Duration,
 ) -> bool {
-    prune_recent_prompt_attempts(recent_prompt_attempts, now, cooldown);
-    recent_prompt_attempts
-        .get(prompt_key)
-        .is_some_and(|attempted_at| now.duration_since(*attempted_at) < cooldown)
+    // PID/HWND/title/origin are observations of one account identity and must
+    // not create extra attempts. Keep older identities in the episode map so
+    // an A -> B -> A config sequence cannot re-arm A by deleting its history.
+    recent_prompt_attempts.keys().any(|attempted| {
+        attempted.account_id == prompt_key.account_id
+            && attempted.prompt_email == prompt_key.prompt_email
+    })
 }
 
-fn prune_recent_prompt_attempts(
-    recent_prompt_attempts: &mut HashMap<LoginPromptKey, Instant>,
-    now: Instant,
-    retention: Duration,
-) {
-    recent_prompt_attempts.retain(|_, attempted_at| now.duration_since(*attempted_at) < retention);
-
-    while recent_prompt_attempts.len() > MAX_RECENT_PROMPT_ATTEMPTS {
-        let Some(oldest_key) = recent_prompt_attempts
-            .iter()
-            .min_by_key(|(_, attempted_at)| **attempted_at)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        recent_prompt_attempts.remove(&oldest_key);
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn fill_attempt_should_suppress_same_prompt_retry(report: &FillAttemptReport) -> bool {
-    report.success
-        || report_bool_field(report, "password_loaded")
-        || report_bool_field(report, "fill_attempted")
-        || report_bool_field(report, "submit_attempted")
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn report_bool_field(report: &FillAttemptReport, field: &str) -> bool {
-    report.field(field) == Some("true")
-}
-
-fn record_prompt_retry_suppression(
-    suppression: Option<PromptRetrySuppression>,
-    report: &FillAttemptReport,
-) {
-    if !fill_attempt_should_suppress_same_prompt_retry(report) {
-        return;
-    }
+fn reserve_prompt_retry_suppression(suppression: Option<&PromptRetrySuppression>) -> bool {
     let Some(suppression) = suppression else {
-        return;
+        return true;
     };
     let now = Instant::now();
-    if let Ok(mut prompts) = suppression.recent_prompt_attempts.lock() {
-        prompts.insert(suppression.prompt_key, now);
-        prune_recent_prompt_attempts(&mut prompts, now, PROMPT_ATTEMPT_RETENTION);
+    let Ok(mut prompts) = suppression.recent_prompt_attempts.lock() else {
+        return false;
     };
+    prompts.insert(suppression.prompt_key.clone(), now);
+    true
 }
 
 fn ensure_generation_current(
@@ -343,6 +316,34 @@ fn clear_recent_prompt_attempts(
 ) {
     if let Ok(mut prompts) = recent_prompt_attempts.lock() {
         prompts.clear();
+    }
+}
+
+#[derive(Debug, Default)]
+struct DefinitiveNoPromptTracker {
+    consecutive_polls: u8,
+}
+
+impl DefinitiveNoPromptTracker {
+    fn observe_prompt(&mut self) {
+        self.consecutive_polls = 0;
+    }
+
+    fn observe_indeterminate(&mut self) {
+        self.consecutive_polls = 0;
+    }
+
+    fn observe_definitive_no_prompt(
+        &mut self,
+        recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    ) -> bool {
+        self.consecutive_polls = self.consecutive_polls.saturating_add(1);
+        if self.consecutive_polls < 2 {
+            return false;
+        }
+        clear_recent_prompt_attempts(recent_prompt_attempts);
+        self.consecutive_polls = 0;
+        true
     }
 }
 
@@ -464,11 +465,11 @@ async fn handle_command(
     settings: &mut AppSettings,
     accounts: &mut Vec<Account>,
     generation: &Arc<AtomicU64>,
-) -> bool {
+) {
     match cmd {
         WorkerCommand::Start => {
             if *running {
-                return false;
+                return;
             }
             *running = true;
             generation.fetch_add(1, Ordering::SeqCst);
@@ -476,11 +477,10 @@ async fn handle_command(
                 .send(WorkerEvent::StatusChanged(WorkerStatus::Running))
                 .await;
             info!("Background worker started");
-            false
         }
         WorkerCommand::Stop => {
             if !*running {
-                return false;
+                return;
             }
             *running = false;
             generation.fetch_add(1, Ordering::SeqCst);
@@ -488,7 +488,6 @@ async fn handle_command(
                 .send(WorkerEvent::StatusChanged(WorkerStatus::Idle))
                 .await;
             info!("Background worker stopped");
-            true
         }
         WorkerCommand::ApplyConfig {
             settings: next_settings,
@@ -512,9 +511,6 @@ async fn handle_command(
                     accounts.len(),
                     refresh_passwords
                 );
-                true
-            } else {
-                false
             }
         }
     }
@@ -527,15 +523,9 @@ async fn drain_commands(
     settings: &mut AppSettings,
     accounts: &mut Vec<Account>,
     generation: &Arc<AtomicU64>,
-    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
 ) {
-    let mut should_clear_recent_prompts = false;
     while let Ok(cmd) = cmd_rx.try_recv() {
-        should_clear_recent_prompts |=
-            handle_command(cmd, event_tx, running, settings, accounts, generation).await;
-    }
-    if should_clear_recent_prompts {
-        clear_recent_prompt_attempts(recent_prompt_attempts);
+        handle_command(cmd, event_tx, running, settings, accounts, generation).await;
     }
 }
 
@@ -548,7 +538,6 @@ async fn wait_or_handle_command(
     settings: &mut AppSettings,
     accounts: &mut Vec<Account>,
     generation: &Arc<AtomicU64>,
-    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
 ) -> bool {
     tokio::select! {
         _ = sleep(duration) => true,
@@ -556,11 +545,7 @@ async fn wait_or_handle_command(
             let Some(cmd) = maybe_cmd else {
                 return false;
             };
-            let should_clear_recent_prompts =
-                handle_command(cmd, event_tx, running, settings, accounts, generation).await;
-            if should_clear_recent_prompts {
-                clear_recent_prompt_attempts(recent_prompt_attempts);
-            }
+            handle_command(cmd, event_tx, running, settings, accounts, generation).await;
             drain_commands(
                 cmd_rx,
                 event_tx,
@@ -568,7 +553,6 @@ async fn wait_or_handle_command(
                 settings,
                 accounts,
                 generation,
-                recent_prompt_attempts,
             )
             .await;
             true
@@ -586,6 +570,21 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
         return false;
     };
 
+    // Reserve the stable prompt identity before the worker thread starts. A
+    // crash, cancellation, rejected credential, or storage failure must not
+    // turn into an unbounded automatic retry loop against the same prompt.
+    if !reserve_prompt_retry_suppression(job.prompt_retry_suppression.as_ref()) {
+        warn!("Fill current prompt skipped; retry-suppression state is unavailable");
+        let _ = job.event_tx.try_send(log_event(
+            LogLevel::Warn,
+            format!(
+                "{} skipped: retry-suppression state is unavailable",
+                job.trigger.label()
+            ),
+        ));
+        return false;
+    }
+
     std::thread::spawn(move || {
         let CurrentPromptAttempt {
             trigger,
@@ -595,7 +594,7 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
             generation,
             expected_generation,
             prompt_context,
-            prompt_retry_suppression,
+            prompt_retry_suppression: _,
             ..
         } = job;
         let _automation_guard = automation_guard;
@@ -613,7 +612,6 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                 )
             },
         );
-        record_prompt_retry_suppression(prompt_retry_suppression, &report);
         if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
             warn!("Could not persist fill attempt report: {e}");
         }
@@ -654,6 +652,7 @@ pub(crate) fn spawn(
         #[cfg(target_os = "macos")]
         let mut last_macos_prompt_probe: Option<Instant> = None;
         let mut poll_cadence = PollCadence::default();
+        let mut no_prompt_tracker = DefinitiveNoPromptTracker::default();
         let mut pre_password_report_persistence = PrePasswordReportPersistence::default();
         let mut pre_password_generation = generation.load(Ordering::SeqCst);
 
@@ -665,11 +664,11 @@ pub(crate) fn spawn(
                 &mut settings,
                 &mut accounts,
                 &generation,
-                &recent_prompt_attempts,
             )
             .await;
 
             if !running {
+                no_prompt_tracker.consecutive_polls = 0;
                 pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
                     IDLE_SLEEP,
@@ -679,7 +678,6 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
-                    &recent_prompt_attempts,
                 )
                 .await
                 {
@@ -690,6 +688,7 @@ pub(crate) fn spawn(
 
             let current_generation = generation.load(Ordering::SeqCst);
             if current_generation != pre_password_generation {
+                no_prompt_tracker.consecutive_polls = 0;
                 pre_password_report_persistence.reset_observed_state();
                 pre_password_generation = current_generation;
             }
@@ -704,7 +703,6 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
-                    &recent_prompt_attempts,
                 )
                 .await
                 {
@@ -727,7 +725,6 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
-                    &recent_prompt_attempts,
                 )
                 .await
                 {
@@ -777,25 +774,36 @@ pub(crate) fn spawn(
             pre_password_report_persistence.begin_poll_tick();
             pre_password_report_persistence
                 .observe_monitor_status(&status, cfg!(not(target_os = "macos")));
+            let mut definitive_no_prompt_this_tick = false;
+            let mut prompt_observed_this_tick = false;
 
             match status {
                 MonitorStatus::Connected => {
-                    if let Ok(mut prompts) = recent_prompt_attempts.lock() {
-                        prompts.clear();
+                    definitive_no_prompt_this_tick = true;
+                }
+                MonitorStatus::Unknown => {
+                    // Distinguish an indeterminate UIA failure from a
+                    // successful no-prompt inspection. A single successful
+                    // inspection is still insufficient to re-arm automation.
+                    #[cfg(target_os = "windows")]
+                    if crate::windows_ui::inspect(crate::config::TARGET_APP_NAME)
+                        .is_ok_and(|inspection| inspection.prompt.is_none())
+                    {
+                        definitive_no_prompt_this_tick = true;
                     }
                 }
-                MonitorStatus::Unknown => {}
                 MonitorStatus::ProcessNotFound => {
-                    if let Ok(mut prompts) = recent_prompt_attempts.lock() {
-                        prompts.clear();
-                    }
+                    definitive_no_prompt_this_tick = true;
                 }
                 MonitorStatus::LoginWindowDetected {
                     process_id,
+                    window_handle,
                     window_title,
                     prompt_email,
                     prompt_origin,
                 } => {
+                    prompt_observed_this_tick = true;
+                    no_prompt_tracker.observe_prompt();
                     let account_decision =
                         account_for_visible_prompt_email(&accounts, prompt_email.as_deref());
                     #[cfg(target_os = "macos")]
@@ -810,22 +818,15 @@ pub(crate) fn spawn(
                             let prompt_key = LoginPromptKey::new(
                                 account.id.clone(),
                                 process_id,
+                                window_handle,
                                 window_title.clone(),
                                 prompt_email.clone(),
                                 prompt_origin.clone(),
                             );
-                            let now = Instant::now();
                             let suppressed = recent_prompt_attempts
                                 .lock()
-                                .map(|mut prompts| {
-                                    prompt_retry_is_suppressed(
-                                        &mut prompts,
-                                        &prompt_key,
-                                        now,
-                                        PROMPT_ATTEMPT_RETENTION,
-                                    )
-                                })
-                                .unwrap_or(false);
+                                .map(|prompts| prompt_retry_is_suppressed(&prompts, &prompt_key))
+                                .unwrap_or(true);
                             if suppressed {
                                 debug!("Login prompt retry suppressed for recent prompt");
                                 let mut fields = monitor_prompt_fields(
@@ -844,6 +845,8 @@ pub(crate) fn spawn(
                                 let prompt_context = debug_fill::VerifiedPromptContext {
                                     account_id: account.id.clone(),
                                     process_id,
+                                    #[cfg(target_os = "windows")]
+                                    window_handle,
                                     window_title: window_title.clone(),
                                     prompt_email,
                                     prompt_origin,
@@ -947,18 +950,14 @@ pub(crate) fn spawn(
                         )
                     }) {
                         Ok(Some(prompt_context)) => {
+                            prompt_observed_this_tick = true;
+                            definitive_no_prompt_this_tick = false;
+                            no_prompt_tracker.observe_prompt();
                             let prompt_key = LoginPromptKey::from_verified_context(&prompt_context);
                             let suppressed = recent_prompt_attempts
                                 .lock()
-                                .map(|mut prompts| {
-                                    prompt_retry_is_suppressed(
-                                        &mut prompts,
-                                        &prompt_key,
-                                        now,
-                                        PROMPT_ATTEMPT_RETENTION,
-                                    )
-                                })
-                                .unwrap_or(false);
+                                .map(|prompts| prompt_retry_is_suppressed(&prompts, &prompt_key))
+                                .unwrap_or(true);
                             if suppressed {
                                 debug!("macOS fallback prompt retry suppressed for recent prompt");
                                 emit_pre_password_skip_report(
@@ -1006,7 +1005,6 @@ pub(crate) fn spawn(
                                         &mut settings,
                                         &mut accounts,
                                         &generation,
-                                        &recent_prompt_attempts,
                                     )
                                     .await
                                     {
@@ -1017,10 +1015,14 @@ pub(crate) fn spawn(
                             }
                         }
                         Ok(None) => {
+                            if !prompt_observed_this_tick {
+                                definitive_no_prompt_this_tick = true;
+                            }
                             pre_password_report_persistence.observe_no_prompt();
                             trace!("macOS fallback preflight found no credential prompt");
                         }
                         Err(reason) => {
+                            definitive_no_prompt_this_tick = false;
                             debug!(reason = %reason, "macOS fallback prompt preflight skipped");
                             emit_pre_password_skip_report(
                                 &event_tx,
@@ -1036,6 +1038,14 @@ pub(crate) fn spawn(
                 }
             }
 
+            if prompt_observed_this_tick {
+                no_prompt_tracker.observe_prompt();
+            } else if definitive_no_prompt_this_tick {
+                no_prompt_tracker.observe_definitive_no_prompt(&recent_prompt_attempts);
+            } else {
+                no_prompt_tracker.observe_indeterminate();
+            }
+
             #[cfg(target_os = "macos")]
             if prompt_attempt_started {
                 if !wait_or_handle_command(
@@ -1046,7 +1056,6 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
-                    &recent_prompt_attempts,
                 )
                 .await
                 {
@@ -1063,7 +1072,6 @@ pub(crate) fn spawn(
                 &mut settings,
                 &mut accounts,
                 &generation,
-                &recent_prompt_attempts,
             )
             .await
             {
@@ -1076,13 +1084,12 @@ pub(crate) fn spawn(
 #[cfg(test)]
 mod tests {
     use super::{
-        account_for_visible_prompt_email, ensure_generation_current,
-        fill_attempt_should_suppress_same_prompt_retry, handle_command,
+        account_for_visible_prompt_email, ensure_generation_current, handle_command,
         prompt_account_decision_allows_macos_probe, prompt_retry_is_suppressed,
-        record_prompt_retry_suppression, wait_or_handle_command, LoginPromptKey, MonitorStatus,
-        PollCadence, PrePasswordReportPersistence, PromptAccountDecision, PromptRetrySuppression,
-        WorkerCommand, WorkerEvent, MACOS_FALLBACK_PROMPT_PROBE_INTERVAL,
-        MAX_RECENT_PROMPT_ATTEMPTS, PRE_PASSWORD_REPORT_PERSIST_INTERVAL, PROMPT_ATTEMPT_RETENTION,
+        reserve_prompt_retry_suppression, wait_or_handle_command, DefinitiveNoPromptTracker,
+        LoginPromptKey, MonitorStatus, PollCadence, PrePasswordReportPersistence,
+        PromptAccountDecision, PromptRetrySuppression, WorkerCommand, WorkerEvent,
+        MACOS_FALLBACK_PROMPT_PROBE_INTERVAL, PRE_PASSWORD_REPORT_PERSIST_INTERVAL,
         PROMPT_STATUS_POLL_INTERVAL,
     };
     use crate::debug_fill;
@@ -1102,6 +1109,7 @@ mod tests {
         let mut cadence = PollCadence::default();
         let prompt = MonitorStatus::LoginWindowDetected {
             process_id: 42,
+            window_handle: 7,
             window_title: "Sign in".to_string(),
             prompt_email: Some("user@example.com".to_string()),
             prompt_origin: "window".to_string(),
@@ -1412,211 +1420,77 @@ mod tests {
     }
 
     #[test]
-    fn prompt_retry_suppression_respects_key_and_retention() {
+    fn prompt_retry_suppression_is_account_wide_within_identity_and_remembers_a_b_a() {
         let now = std::time::Instant::now();
-        let cooldown = Duration::from_secs(20);
         let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
-        let stale_key = make_prompt_key("account-2", 77, "Old sign in", "old@example.com");
-        let mut attempts = HashMap::from([
-            (prompt_key.clone(), now - Duration::from_secs(19)),
-            (stale_key.clone(), now - Duration::from_secs(21)),
-        ]);
+        let mut attempts = HashMap::from([(prompt_key.clone(), now)]);
 
+        assert!(prompt_retry_is_suppressed(&attempts, &prompt_key));
         assert!(prompt_retry_is_suppressed(
-            &mut attempts,
-            &prompt_key,
-            now,
-            cooldown
+            &attempts,
+            &make_prompt_key("account-1", 43, "Sign in", "user@example.com"),
         ));
-        assert!(!attempts.contains_key(&stale_key));
-
-        let retry_time = now + Duration::from_secs(2);
+        assert!(prompt_retry_is_suppressed(
+            &attempts,
+            &LoginPromptKey::new(
+                " ACCOUNT-1 ".to_string(),
+                999,
+                999,
+                " SIGN IN ".to_string(),
+                " USER@EXAMPLE.COM ".to_string(),
+                " WINDOW ".to_string(),
+            ),
+        ));
         assert!(!prompt_retry_is_suppressed(
-            &mut attempts,
-            &prompt_key,
-            retry_time,
-            cooldown
+            &attempts,
+            &make_prompt_key("account-2", 43, "Sign in", "other@example.com"),
         ));
+        let replacement_identity =
+            make_prompt_key("account-1", 44, "Sign in", "replacement@example.com");
+        assert!(!prompt_retry_is_suppressed(
+            &attempts,
+            &replacement_identity,
+        ));
+        assert_eq!(attempts.len(), 1);
+
+        attempts.insert(replacement_identity.clone(), now);
+        assert!(prompt_retry_is_suppressed(&attempts, &replacement_identity,));
+        assert!(prompt_retry_is_suppressed(&attempts, &prompt_key));
 
         let context = verified_context("account-1", 42, "Sign in", "user@example.com", now);
         let verified_prompt_key = LoginPromptKey::from_verified_context(&context);
-        let mut attempts = HashMap::new();
         attempts.insert(verified_prompt_key.clone(), now);
 
-        assert!(prompt_retry_is_suppressed(
-            &mut attempts,
-            &verified_prompt_key,
-            now + Duration::from_secs(1),
-            PROMPT_ATTEMPT_RETENTION,
-        ));
-
-        let mut attempts = HashMap::from([(verified_prompt_key.clone(), now)]);
-
-        assert!(!prompt_retry_is_suppressed(
-            &mut attempts,
-            &verified_prompt_key,
-            now + PROMPT_ATTEMPT_RETENTION + Duration::from_millis(1),
-            PROMPT_ATTEMPT_RETENTION,
-        ));
-
-        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
-        let different_prompt = make_prompt_key("account-1", 43, "Sign in", "user@example.com");
-        let mut attempts = HashMap::from([(prompt_key, now)]);
-
-        assert!(!prompt_retry_is_suppressed(
-            &mut attempts,
-            &different_prompt,
-            now,
-            Duration::from_secs(20),
-        ));
+        assert!(prompt_retry_is_suppressed(&attempts, &verified_prompt_key));
     }
 
     #[test]
-    fn recent_prompt_attempts_are_bounded_to_newest_entries() {
-        let now = std::time::Instant::now();
-        let newest_key = make_prompt_key(
-            "newest-account",
-            999,
-            "Newest Sign in",
-            "newest@example.com",
-        );
-        let mut attempts = HashMap::new();
-        for index in 0..(MAX_RECENT_PROMPT_ATTEMPTS + 8) {
-            let key = make_prompt_key(
-                &format!("account-{index}"),
-                index as i32,
-                "Sign in",
-                &format!("user-{index}@example.com"),
-            );
-            attempts.insert(key, now - Duration::from_secs((index + 1) as u64));
-        }
-        attempts.insert(newest_key.clone(), now);
+    fn suppression_rearms_only_after_two_definitive_no_prompt_polls() {
+        let key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(key.clone(), Instant::now())])));
+        let mut tracker = DefinitiveNoPromptTracker::default();
 
-        let missing_key =
-            make_prompt_key("missing-account", 1000, "Sign in", "missing@example.com");
+        assert!(!tracker.observe_definitive_no_prompt(&attempts));
+        assert!(attempts.lock().unwrap().contains_key(&key));
 
-        assert!(!prompt_retry_is_suppressed(
-            &mut attempts,
-            &missing_key,
-            now,
-            Duration::from_secs(120),
-        ));
+        tracker.observe_indeterminate();
+        assert!(!tracker.observe_definitive_no_prompt(&attempts));
+        assert!(attempts.lock().unwrap().contains_key(&key));
 
-        assert!(attempts.len() <= MAX_RECENT_PROMPT_ATTEMPTS);
-        assert!(attempts.contains_key(&newest_key));
+        assert!(tracker.observe_definitive_no_prompt(&attempts));
+        assert!(attempts.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn fill_attempt_suppression_requires_success_or_secret_bearing_attempt() {
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(true, &[])
-        ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(false, &[("post_check_state", "prompt_gone_unknown")])
-        ));
-
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(false, &[("password_load_attempted", "true")])
-        ));
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(
-                false,
-                &[
-                    ("password_load_attempted", "true"),
-                    ("password_loaded", "true")
-                ]
-            )
-        ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report_with_failure(
-                false,
-                &[("password_load_attempted", "true")],
-                Some("password_load_failed_for_selected_account")
-            )
-        ));
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(false, &[("submit_attempted", "true")])
-        ));
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(false, &[("fill_attempted", "true"), ("fill_status", "ok")])
-        ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report_with_failure(false, &[], Some("fill_failed"))
-        ));
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report_with_failure(
-                false,
-                &[("password_loaded", "true")],
-                Some("fill_script_failed")
-            )
-        ));
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report_with_failure(
-                false,
-                &[("password_loaded", "true")],
-                Some("attempt_cancelled_after_password_load_accounts_settings_changed")
-            )
-        ));
-        assert!(fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(
-                false,
-                &[("fill_attempted", "true"), ("fill_status", "not_found")]
-            )
-        ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report(false, &[("prompt_context_revalidation_result", "stale")])
-        ));
-        assert!(!fill_attempt_should_suppress_same_prompt_retry(
-            &fill_report_with_failure(
-                false,
-                &[
-                    ("pre_password_revalidation_attempted", "true"),
-                    ("pre_password_revalidation_result", "failed")
-                ],
-                Some("pre_password_revalidation_failed")
-            )
-        ));
-    }
-
-    #[test]
-    fn prompt_retry_suppression_is_recorded_only_for_suppressible_outcome() {
+    fn prompt_retry_suppression_reserves_before_attempt_start() {
         let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
         let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let suppression = PromptRetrySuppression {
+            recent_prompt_attempts: attempts.clone(),
+            prompt_key: prompt_key.clone(),
+        };
 
-        record_prompt_retry_suppression(
-            Some(PromptRetrySuppression {
-                recent_prompt_attempts: attempts.clone(),
-                prompt_key: prompt_key.clone(),
-            }),
-            &fill_report(false, &[("password_load_attempted", "true")]),
-        );
-        assert!(attempts.lock().unwrap().is_empty());
-
-        record_prompt_retry_suppression(
-            Some(PromptRetrySuppression {
-                recent_prompt_attempts: attempts.clone(),
-                prompt_key: prompt_key.clone(),
-            }),
-            &fill_report(
-                false,
-                &[
-                    ("password_load_attempted", "true"),
-                    ("password_loaded", "true"),
-                ],
-            ),
-        );
-
-        assert!(attempts.lock().unwrap().contains_key(&prompt_key));
-        attempts.lock().unwrap().clear();
-
-        record_prompt_retry_suppression(
-            Some(PromptRetrySuppression {
-                recent_prompt_attempts: attempts.clone(),
-                prompt_key: prompt_key.clone(),
-            }),
-            &fill_report(true, &[]),
-        );
-
+        assert!(reserve_prompt_retry_suppression(Some(&suppression)));
         assert!(attempts.lock().unwrap().contains_key(&prompt_key));
     }
 
@@ -1723,7 +1597,6 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
-                &recent_prompt_attempts,
             )
             .await
         );
@@ -1738,12 +1611,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_or_handle_command_handles_stop_and_clears_recent_prompts() {
+    async fn wait_or_handle_command_handles_stop_without_rearming_suppression() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(1);
         let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
         let generation = std::sync::Arc::new(AtomicU64::new(5));
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
         let recent_prompt_attempts = Arc::new(Mutex::new(HashMap::from([(
-            make_prompt_key("account-1", 42, "Sign in", "user@example.com"),
+            prompt_key.clone(),
             Instant::now(),
         )])));
         let mut running = true;
@@ -1761,14 +1635,16 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
-                &recent_prompt_attempts,
             )
             .await
         );
 
         assert!(!running);
         assert_eq!(generation.load(Ordering::SeqCst), 6);
-        assert!(recent_prompt_attempts.lock().unwrap().is_empty());
+        assert!(recent_prompt_attempts
+            .lock()
+            .unwrap()
+            .contains_key(&prompt_key));
         match event_rx.try_recv().unwrap() {
             WorkerEvent::StatusChanged(WorkerStatus::Idle) => {}
             other => panic!("expected idle status, got {other:?}"),
@@ -1776,20 +1652,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_or_handle_command_apply_config_refresh_clears_recent_prompts() {
+    async fn unscoped_password_refresh_invalidates_generation_but_preserves_suppression() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(1);
         let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
         let generation = std::sync::Arc::new(AtomicU64::new(9));
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
         let recent_prompt_attempts = Arc::new(Mutex::new(HashMap::from([(
-            make_prompt_key("account-1", 42, "Sign in", "user@example.com"),
+            prompt_key.clone(),
             Instant::now(),
         )])));
         let mut running = true;
         let mut settings = AppSettings::default();
         let mut accounts = vec![account("account-1", "user@example.com", true)];
-        let mut next_settings = settings.clone();
-        next_settings.start_minimized = !settings.start_minimized;
-        let next_accounts = vec![account("account-2", "other@example.com", true)];
+        let next_settings = settings.clone();
+        let next_accounts = accounts.clone();
 
         cmd_tx
             .send(WorkerCommand::ApplyConfig {
@@ -1809,7 +1685,6 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
-                &recent_prompt_attempts,
             )
             .await
         );
@@ -1818,7 +1693,170 @@ mod tests {
         assert_eq!(settings, next_settings);
         assert_eq!(accounts, next_accounts);
         assert_eq!(generation.load(Ordering::SeqCst), 10);
-        assert!(recent_prompt_attempts.lock().unwrap().is_empty());
+        assert!(recent_prompt_attempts
+            .lock()
+            .unwrap()
+            .contains_key(&prompt_key));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unrelated_settings_change_preserves_prompt_suppression() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = std::sync::Arc::new(AtomicU64::new(21));
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let recent_prompt_attempts = Arc::new(Mutex::new(HashMap::from([(
+            prompt_key.clone(),
+            Instant::now(),
+        )])));
+        let mut running = true;
+        let mut settings = AppSettings::default();
+        let mut accounts = vec![account("account-1", "user@example.com", true)];
+        let mut next_settings = settings.clone();
+        next_settings.start_minimized = !settings.start_minimized;
+
+        cmd_tx
+            .send(WorkerCommand::ApplyConfig {
+                settings: next_settings.clone(),
+                accounts: accounts.clone(),
+                refresh_passwords: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_or_handle_command(
+                Duration::from_secs(60),
+                &mut cmd_rx,
+                &event_tx,
+                &mut running,
+                &mut settings,
+                &mut accounts,
+                &generation,
+            )
+            .await
+        );
+
+        assert_eq!(settings, next_settings);
+        assert_eq!(generation.load(Ordering::SeqCst), 22);
+        assert!(recent_prompt_attempts
+            .lock()
+            .unwrap()
+            .contains_key(&prompt_key));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn account_identity_change_rearms_new_identity_without_forgetting_old_identity() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = std::sync::Arc::new(AtomicU64::new(31));
+        let unchanged_key = make_prompt_key("account-1", 42, "Sign in", "one@example.com");
+        let changed_key = make_prompt_key("account-2", 43, "Sign in", "two@example.com");
+        let recent_prompt_attempts = Arc::new(Mutex::new(HashMap::from([
+            (unchanged_key.clone(), Instant::now()),
+            (changed_key.clone(), Instant::now()),
+        ])));
+        let mut running = true;
+        let mut settings = AppSettings::default();
+        let mut accounts = vec![
+            account("account-1", "one@example.com", true),
+            account("account-2", "two@example.com", true),
+        ];
+        let next_accounts = vec![
+            account("account-1", "one@example.com", true),
+            account("account-2", "replacement@example.com", true),
+        ];
+
+        cmd_tx
+            .send(WorkerCommand::ApplyConfig {
+                settings: settings.clone(),
+                accounts: next_accounts.clone(),
+                refresh_passwords: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_or_handle_command(
+                Duration::from_secs(60),
+                &mut cmd_rx,
+                &event_tx,
+                &mut running,
+                &mut settings,
+                &mut accounts,
+                &generation,
+            )
+            .await
+        );
+
+        assert_eq!(accounts, next_accounts);
+        assert_eq!(generation.load(Ordering::SeqCst), 32);
+        let replacement_key =
+            make_prompt_key("account-2", 44, "Sign in", "replacement@example.com");
+        let mut attempts = recent_prompt_attempts.lock().unwrap();
+        assert!(attempts.contains_key(&unchanged_key));
+        assert!(attempts.contains_key(&changed_key));
+        assert!(!prompt_retry_is_suppressed(&attempts, &replacement_key));
+
+        attempts.insert(replacement_key.clone(), Instant::now());
+        assert!(prompt_retry_is_suppressed(&attempts, &replacement_key));
+        assert!(prompt_retry_is_suppressed(&attempts, &changed_key));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn batched_account_a_b_a_changes_preserve_original_suppression() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(2);
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = std::sync::Arc::new(AtomicU64::new(41));
+        let original_key = make_prompt_key("account-1", 42, "Sign in", "a@example.com");
+        let recent_prompt_attempts = Arc::new(Mutex::new(HashMap::from([(
+            original_key.clone(),
+            Instant::now(),
+        )])));
+        let mut running = true;
+        let mut settings = AppSettings::default();
+        let original_accounts = vec![account("account-1", "a@example.com", true)];
+        let replacement_accounts = vec![account("account-1", "b@example.com", true)];
+        let mut accounts = original_accounts.clone();
+
+        cmd_tx
+            .send(WorkerCommand::ApplyConfig {
+                settings: settings.clone(),
+                accounts: replacement_accounts,
+                refresh_passwords: true,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(WorkerCommand::ApplyConfig {
+                settings: settings.clone(),
+                accounts: original_accounts.clone(),
+                refresh_passwords: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_or_handle_command(
+                Duration::from_secs(60),
+                &mut cmd_rx,
+                &event_tx,
+                &mut running,
+                &mut settings,
+                &mut accounts,
+                &generation,
+            )
+            .await
+        );
+
+        assert_eq!(accounts, original_accounts);
+        assert_eq!(generation.load(Ordering::SeqCst), 43);
+        let attempts = recent_prompt_attempts.lock().unwrap();
+        assert!(attempts.contains_key(&original_key));
+        assert!(prompt_retry_is_suppressed(&attempts, &original_key));
         assert!(event_rx.try_recv().is_err());
     }
 
@@ -1840,6 +1878,7 @@ mod tests {
         LoginPromptKey::new(
             account_id.to_string(),
             process_id,
+            process_id as isize,
             window_title.to_string(),
             prompt_email.to_string(),
             "window".to_string(),
@@ -1856,31 +1895,14 @@ mod tests {
         debug_fill::VerifiedPromptContext {
             account_id: account_id.to_string(),
             process_id,
+            #[cfg(target_os = "windows")]
+            window_handle: process_id as isize,
             window_title: window_title.to_string(),
             prompt_email: prompt_email.to_string(),
             prompt_origin: "window".to_string(),
             detected_at,
             #[cfg(target_os = "windows")]
             monitor_check_ms: 0,
-        }
-    }
-
-    fn fill_report(success: bool, fields: &[(&str, &str)]) -> debug_fill::FillAttemptReport {
-        fill_report_with_failure(success, fields, (!success).then_some("test_failure"))
-    }
-
-    fn fill_report_with_failure(
-        success: bool,
-        fields: &[(&str, &str)],
-        failure_reason: Option<&str>,
-    ) -> debug_fill::FillAttemptReport {
-        debug_fill::FillAttemptReport {
-            fields: fields
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect(),
-            success,
-            failure_reason: failure_reason.map(str::to_string),
         }
     }
 }

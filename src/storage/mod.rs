@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+#[cfg(target_os = "windows")]
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 const SERVICE_NAME: &str = "WindowsAppAutoLogin";
@@ -11,6 +13,8 @@ const FALLBACK_KEY_ACCOUNT: &str = "fallback-encryption-key";
 const SCOPED_FALLBACK_KEY_ACCOUNT_PREFIX: &str = "fallback-account-key:";
 const CONFIG_FILE_NAME: &str = "config.json";
 const PASSWORD_FILE_NAME: &str = "passwords.json";
+const PASSWORD_FILE_LOCK_NAME: &str = "passwords.lock";
+const STAGED_FALLBACK_KEYS_FILE_NAME: &str = "staged-fallback-keys.json";
 const FALLBACK_KEY_FILE_NAME: &str = "fallback.key";
 const PENDING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.json";
 const RECOVERING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.recovering.json";
@@ -33,15 +37,20 @@ const PENDING_STORAGE_TEMP_FILE_PREFIXES: &[&str] = &[
     "pending-storage-operation.json.tmp.",
     "pending-storage-operation.recovering.json.tmp.",
 ];
+const PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES: &[&str] =
+    &["passwords.json.tmp.", "staged-fallback-keys.json.tmp."];
 const LEGACY_FALLBACK_KEY_RESIDUE_PREFIXES: &[&str] =
     &["fallback.json.invalid.", "fallback.key.invalid."];
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PASSWORD_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_FALLBACK_KEY_FILE_BYTES: u64 = 128;
 const MAX_PENDING_STORAGE_OPERATION_FILE_BYTES: u64 = 64 * 1024;
+const MAX_STAGED_FALLBACK_KEYS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS: usize = 16 * 1024;
 const MAX_FALLBACK_KEY_ID_CHARS: usize = 64;
 const MAX_RETIRED_FALLBACK_KEYS: usize = 4096;
+const MAX_STAGED_FALLBACK_KEYS: usize = 4096;
+const STAGED_FALLBACK_KEYS_VERSION: u8 = 1;
 const PENDING_STORAGE_OPERATION_VERSION: u8 = 1;
 const AES_GCM_NONCE_BYTES: usize = 12;
 const AES_GCM_TAG_BYTES: usize = 16;
@@ -109,6 +118,21 @@ fn private_file_write_committed(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<PrivateFileWriteCommitted>())
+}
+
+/// Returns true only when the target pathname was already atomically replaced.
+/// Callers must keep the new in-memory state and must not perform destructive
+/// rollback/cleanup in this case: only the final permission/directory durability
+/// confirmation failed.
+pub(crate) fn config_write_committed(error: &anyhow::Error) -> bool {
+    private_file_write_committed(error)
+}
+
+#[cfg(test)]
+pub(crate) fn committed_config_write_test_error() -> anyhow::Error {
+    anyhow::Error::new(PrivateFileWriteCommitted {
+        source: anyhow::anyhow!("test failure after config replacement"),
+    })
 }
 
 pub(crate) fn is_pending_storage_operation_in_progress(error: &anyhow::Error) -> bool {
@@ -418,6 +442,17 @@ fn load_config_file(path: &Path) -> anyhow::Result<AppConfig> {
         Ok(()) => {
             cleanup_migrated_legacy_credentials(&legacy_password_migration.cleanup_ids_after_save)
         }
+        Err(e) if config_write_committed(&e) => {
+            // The migrated config is now the visible file, so deleting the
+            // migration target would corrupt it. Also retain the legacy source
+            // credentials until directory durability is confirmed on a later
+            // launch.
+            warn!(
+                path = %redacted_path(path),
+                error = %e,
+                "Migrated config replacement committed, but durability confirmation failed; credentials retained for recovery"
+            );
+        }
         Err(e) => {
             if cleanup_legacy_migration_target_after_failed_save(&legacy_password_migration) {
                 mark_legacy_migration_target_unsaved(&mut config, &legacy_password_migration);
@@ -681,22 +716,36 @@ fn backup_invalid_config_file(path: &Path, load_error: &anyhow::Error) -> anyhow
     };
     if metadata.file_type().is_symlink() {
         std::fs::remove_file(path)?;
-        return Ok(());
+        return sync_parent_dir(path);
     }
     if !metadata.file_type().is_file() {
         return Ok(());
     }
     validate_private_file_for_read(path)?;
-    let content = read_private_file_bytes(path, MAX_CONFIG_FILE_BYTES)?;
-    let backup_content = invalid_config_diagnostic_backup_bytes(path, &content, load_error)?;
+    let content = Zeroizing::new(read_private_file_bytes(path, MAX_CONFIG_FILE_BYTES)?);
+    let diagnostic = invalid_config_diagnostic_backup_bytes(path, &content, load_error)?;
 
-    let backup_path = invalid_config_diagnostic_backup_path(path);
-    write_private_file_create_new_atomic(&backup_path, "json.tmp", &backup_content)?;
-    delete_sensitive_private_file_if_present(path)?;
+    // Preserve the exact bytes (including account ids/usernames needed to recover
+    // orphaned credentials) instead of replacing them with a redacted summary.
+    // The containing directory and both quarantine files remain private.
+    let quarantine_path = invalid_config_quarantine_path(path);
+    if std::fs::symlink_metadata(&quarantine_path).is_ok() {
+        anyhow::bail!("invalid config quarantine destination already exists");
+    }
+    std::fs::rename(path, &quarantine_path)?;
+    validate_private_file_for_read(&quarantine_path)
+        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
+    secure_path_permissions(&quarantine_path, 0o600)
+        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
+    sync_parent_dir(&quarantine_path)
+        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
+
+    let diagnostic_path = invalid_config_diagnostic_path(&quarantine_path);
+    write_private_file_create_new_atomic(&diagnostic_path, "json.tmp", &diagnostic)?;
     Ok(())
 }
 
-fn invalid_config_diagnostic_backup_path(path: &Path) -> PathBuf {
+fn invalid_config_quarantine_path(path: &Path) -> PathBuf {
     let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
     let nonce = chrono::Utc::now()
         .timestamp_nanos_opt()
@@ -707,6 +756,14 @@ fn invalid_config_diagnostic_backup_path(path: &Path) -> PathBuf {
         std::process::id(),
         nonce
     ))
+}
+
+fn invalid_config_diagnostic_path(quarantine_path: &Path) -> PathBuf {
+    let name = quarantine_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json.invalid");
+    quarantine_path.with_file_name(format!("{name}.diagnostic.json"))
 }
 
 fn invalid_config_diagnostic_backup_bytes(
@@ -840,8 +897,127 @@ fn password_file_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join(PASSWORD_FILE_NAME))
 }
 
+fn password_file_lock_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join(PASSWORD_FILE_LOCK_NAME))
+}
+
+struct PasswordFileTransactionLock {
+    file: std::fs::File,
+}
+
+impl Drop for PasswordFileTransactionLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            warn!(
+                error_kind = storage_error_kind(&error.into()),
+                "Password file transaction lock release failed"
+            );
+        }
+    }
+}
+
+fn acquire_password_file_transaction_lock() -> anyhow::Result<PasswordFileTransactionLock> {
+    ensure_config_dir()?;
+    acquire_password_file_transaction_lock_at(&password_file_lock_path()?)
+}
+
+fn acquire_password_file_transaction_lock_at(
+    path: &Path,
+) -> anyhow::Result<PasswordFileTransactionLock> {
+    if let Some(parent) = path.parent() {
+        validate_private_dir(parent)?;
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                if no_follow_open_error(&error) {
+                    anyhow::anyhow!("password transaction lock must be a regular private file")
+                } else {
+                    error.into()
+                }
+            })?
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("password transaction lock must be a regular private file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!("password transaction lock is not owned by the current user");
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+        crate::private_permissions::strip_macos_acl(path)?;
+    }
+    #[cfg(windows)]
+    crate::private_permissions::validate_windows_private_file_handle(&file)?;
+    secure_path_permissions(path, 0o600)?;
+
+    file.lock()?;
+    Ok(PasswordFileTransactionLock { file })
+}
+
+fn with_password_file_transaction<T>(
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _lock = acquire_password_file_transaction_lock()?;
+    prepare_password_file_transaction()?;
+    operation()
+}
+
+fn prepare_password_file_transaction() -> anyhow::Result<()> {
+    let dir = config_dir()?;
+    cleanup_storage_temp_files_in_dir(&dir, PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES)?;
+    if let Err(error) = reconcile_staged_fallback_keys() {
+        // An orphan contains key material but has no ciphertext reference, so
+        // failed retirement should remain retryable without denying access to
+        // active password records. A later staged save still must update the
+        // journal successfully before it can create new key material.
+        warn!(
+            error_kind = storage_error_kind(&error),
+            "Staged fallback key recovery remains pending"
+        );
+    }
+    Ok(())
+}
+
 fn fallback_key_file_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join(FALLBACK_KEY_FILE_NAME))
+}
+
+fn staged_fallback_keys_file_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join(STAGED_FALLBACK_KEYS_FILE_NAME))
 }
 
 fn pending_storage_operation_file_path() -> anyhow::Result<PathBuf> {
@@ -875,6 +1051,22 @@ struct PasswordFile {
 struct ScopedFallbackKeyRef {
     account_id: AccountId,
     key_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct StagedFallbackKeysJournal {
+    version: u8,
+    #[serde(default)]
+    keys: Vec<ScopedFallbackKeyRef>,
+}
+
+impl Default for StagedFallbackKeysJournal {
+    fn default() -> Self {
+        Self {
+            version: STAGED_FALLBACK_KEYS_VERSION,
+            keys: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1063,20 +1255,18 @@ fn decode_secure_storage_secret(
     stored: &str,
 ) -> anyhow::Result<SecureStorageSecret> {
     if let Some(encoded) = stored.strip_prefix(WINDOWS_USER_BOUND_SECRET_PREFIX) {
-        let protected = STANDARD.decode(encoded)?;
+        let protected = Zeroizing::new(STANDARD.decode(encoded)?);
         let plaintext_bytes = windows_user_bound_unprotect(purpose, &protected)?;
-        let plaintext = String::from_utf8(plaintext_bytes.as_slice().to_vec())?;
         return Ok(SecureStorageSecret {
-            plaintext: Zeroizing::new(plaintext),
+            plaintext: zeroizing_bytes_into_string(plaintext_bytes)?,
             needs_migration: false,
         });
     }
     if let Some(encoded) = stored.strip_prefix(WINDOWS_LEGACY_WAAB_SECRET_PREFIX) {
-        let protected = STANDARD.decode(encoded)?;
+        let protected = Zeroizing::new(STANDARD.decode(encoded)?);
         let plaintext_bytes = windows_legacy_waab_unprotect(purpose, &protected)?;
-        let plaintext = String::from_utf8(plaintext_bytes.as_slice().to_vec())?;
         return Ok(SecureStorageSecret {
-            plaintext: Zeroizing::new(plaintext),
+            plaintext: zeroizing_bytes_into_string(plaintext_bytes)?,
             needs_migration: true,
         });
     }
@@ -1133,7 +1323,6 @@ fn windows_protect_data_with_entropy(
     plaintext: &[u8],
     entropy: &[u8; 32],
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
         CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
@@ -1156,9 +1345,7 @@ fn windows_protect_data_with_entropy(
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let output = windows_blob_to_zeroizing_vec(&output_blob);
-        let _ = LocalFree(Some(HLOCAL(output_blob.pbData.cast())));
-        output
+        windows_blob_to_zeroizing_vec_and_free(&mut output_blob)
     }
 }
 
@@ -1167,7 +1354,6 @@ fn windows_unprotect_data_with_entropy(
     protected: &[u8],
     entropy: &[u8; 32],
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
         CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
@@ -1190,9 +1376,7 @@ fn windows_unprotect_data_with_entropy(
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let output = windows_blob_to_zeroizing_vec(&output_blob);
-        let _ = LocalFree(Some(HLOCAL(output_blob.pbData.cast())));
-        output
+        windows_blob_to_zeroizing_vec_and_free(&mut output_blob)
     }
 }
 
@@ -1212,14 +1396,55 @@ fn windows_data_blob(
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn windows_blob_to_zeroizing_vec(
-    blob: &windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
+unsafe fn windows_blob_to_zeroizing_vec_and_free(
+    blob: &mut windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if blob.pbData.is_null() || blob.cbData == 0 {
         anyhow::bail!("Windows user-bound DPAPI returned an empty blob");
     }
-    let bytes = unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) };
+    let local_blob = WindowsLocalBlob {
+        ptr: blob.pbData,
+        len: blob.cbData as usize,
+    };
+    *blob = windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB::default();
+    let bytes = unsafe { std::slice::from_raw_parts(local_blob.ptr, local_blob.len) };
     Ok(Zeroizing::new(bytes.to_vec()))
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsLocalBlob {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsLocalBlob {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+
+        if self.ptr.is_null() {
+            return;
+        }
+        // DPAPI allocates both protect and unprotect output with LocalAlloc.
+        // Wipe the OS-owned allocation before releasing it. This is essential
+        // for plaintext and cheap defense-in-depth for protected output.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr, self.len).zeroize();
+            let _ = LocalFree(Some(HLOCAL(self.ptr.cast())));
+        }
+        self.ptr = std::ptr::null_mut();
+        self.len = 0;
+    }
+}
+
+fn zeroizing_bytes_into_string(mut bytes: Zeroizing<Vec<u8>>) -> anyhow::Result<Zeroizing<String>> {
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(value) => Ok(Zeroizing::new(value)),
+        Err(error) => {
+            let _invalid_bytes = Zeroizing::new(error.into_bytes());
+            anyhow::bail!("secure storage plaintext is not valid UTF-8")
+        }
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1375,6 +1600,135 @@ fn validate_fallback_key_id(key_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_scoped_fallback_key_ref(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<()> {
+    if key_ref.account_id.trim().is_empty() || key_ref.account_id.len() > 256 {
+        anyhow::bail!("staged fallback key journal contains invalid account id");
+    }
+    validate_fallback_key_id(&key_ref.key_id)
+}
+
+fn validate_staged_fallback_keys_journal(
+    journal: &StagedFallbackKeysJournal,
+) -> anyhow::Result<()> {
+    if journal.version != STAGED_FALLBACK_KEYS_VERSION {
+        anyhow::bail!("staged fallback key journal has unsupported version");
+    }
+    if journal.keys.len() > MAX_STAGED_FALLBACK_KEYS {
+        anyhow::bail!("staged fallback key journal contains too many entries");
+    }
+    let mut key_ids = HashSet::new();
+    for key_ref in &journal.keys {
+        validate_scoped_fallback_key_ref(key_ref)?;
+        if !key_ids.insert(key_ref.key_id.as_str()) {
+            anyhow::bail!("staged fallback key journal contains a duplicate key id");
+        }
+    }
+    Ok(())
+}
+
+fn load_staged_fallback_keys_journal() -> anyhow::Result<StagedFallbackKeysJournal> {
+    let path = staged_fallback_keys_file_path()?;
+    if !path.exists() {
+        return Ok(StagedFallbackKeysJournal::default());
+    }
+    let content = read_private_text_file(&path, MAX_STAGED_FALLBACK_KEYS_FILE_BYTES)?;
+    let journal = serde_json::from_str::<StagedFallbackKeysJournal>(&content)?;
+    validate_staged_fallback_keys_journal(&journal)?;
+    Ok(journal)
+}
+
+fn save_staged_fallback_keys_journal(journal: &StagedFallbackKeysJournal) -> anyhow::Result<()> {
+    validate_staged_fallback_keys_journal(journal)?;
+    let path = staged_fallback_keys_file_path()?;
+    if journal.keys.is_empty() {
+        return delete_sensitive_private_file_if_present(&path);
+    }
+    let content = serde_json::to_string_pretty(journal)?;
+    write_private_file_atomic(&path, "json.tmp", content.as_bytes())
+}
+
+fn track_staged_fallback_key(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<()> {
+    validate_scoped_fallback_key_ref(key_ref)?;
+    let mut journal = load_staged_fallback_keys_journal()?;
+    if !journal.keys.contains(key_ref) {
+        journal.keys.push(key_ref.clone());
+        save_staged_fallback_keys_journal(&journal)?;
+    }
+    Ok(())
+}
+
+fn untrack_staged_fallback_keys(keys: &[ScopedFallbackKeyRef]) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let key_ids = keys
+        .iter()
+        .map(|key_ref| key_ref.key_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut journal = load_staged_fallback_keys_journal()?;
+    journal
+        .keys
+        .retain(|key_ref| !key_ids.contains(key_ref.key_id.as_str()));
+    save_staged_fallback_keys_journal(&journal)
+}
+
+fn active_scoped_fallback_keys(file: &PasswordFile) -> HashSet<ScopedFallbackKeyRef> {
+    file.key_ids
+        .iter()
+        .map(|(account_id, key_id)| ScopedFallbackKeyRef {
+            account_id: account_id.clone(),
+            key_id: key_id.clone(),
+        })
+        .collect()
+}
+
+fn reconcile_staged_fallback_keys() -> anyhow::Result<()> {
+    let file = load_password_file()?;
+    let journal = load_staged_fallback_keys_journal()?;
+    if journal.keys.is_empty() {
+        return Ok(());
+    }
+
+    let active = active_scoped_fallback_keys(&file);
+    reconcile_staged_fallback_keys_with_ops(journal, &active, delete_scoped_fallback_key, |next| {
+        save_staged_fallback_keys_journal(next)
+    })
+}
+
+fn reconcile_staged_fallback_keys_with_ops<D, S>(
+    mut journal: StagedFallbackKeysJournal,
+    active: &HashSet<ScopedFallbackKeyRef>,
+    mut delete_key: D,
+    mut save_journal: S,
+) -> anyhow::Result<()>
+where
+    D: FnMut(&ScopedFallbackKeyRef) -> anyhow::Result<()>,
+    S: FnMut(&StagedFallbackKeysJournal) -> anyhow::Result<()>,
+{
+    let mut remaining = Vec::new();
+    let mut failures = 0usize;
+    for key_ref in std::mem::take(&mut journal.keys) {
+        if active.contains(&key_ref) {
+            continue;
+        }
+        if let Err(error) = delete_key(&key_ref) {
+            failures += 1;
+            warn!(
+                account_id = %redacted_account_id(&key_ref.account_id),
+                error_kind = storage_error_kind(&error),
+                "Crash-orphaned staged fallback key cleanup failed"
+            );
+            remaining.push(key_ref);
+        }
+    }
+    journal.keys = remaining;
+    save_journal(&journal)?;
+    if failures > 0 {
+        anyhow::bail!("{failures} staged fallback key cleanup attempts failed");
+    }
+    Ok(())
+}
+
 fn validate_pending_storage_operation(operation: &PendingStorageOperation) -> anyhow::Result<()> {
     if operation.version != PENDING_STORAGE_OPERATION_VERSION {
         anyhow::bail!("pending storage operation has unsupported version");
@@ -1515,15 +1869,25 @@ fn write_private_file_atomic(
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
-    secure_path_permissions(path, 0o600)
+    finish_private_file_commit_with_ops(
+        path,
+        |target| secure_path_permissions(target, 0o600),
+        sync_parent_dir,
+    )
+}
+
+fn finish_private_file_commit_with_ops<P, S>(
+    path: &Path,
+    mut secure_permissions: P,
+    mut sync_parent: S,
+) -> anyhow::Result<()>
+where
+    P: FnMut(&Path) -> anyhow::Result<()>,
+    S: FnMut(&Path) -> anyhow::Result<()>,
+{
+    secure_permissions(path)
         .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
-    if let Err(e) = sync_parent_dir(path) {
-        warn!(
-            path = %crate::user_paths::redacted_path(&path.display().to_string()),
-            error = %e,
-            "private file write committed, but parent directory sync failed"
-        );
-    }
+    sync_parent(path).map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
     Ok(())
 }
 
@@ -1891,7 +2255,7 @@ fn cleanup_legacy_fallback_key_file(path: &Path) -> anyhow::Result<()> {
             error = %e,
             "fallback key was migrated to Keychain, but stale key file cleanup failed"
         );
-        return Err(e.into());
+        return Err(e);
     }
     Ok(())
 }
@@ -2031,9 +2395,9 @@ fn encrypt_password_with_key(key: &[u8; 32], plaintext: &str) -> anyhow::Result<
             .encrypt(nonce, plaintext.as_bytes())
             .map_err(|e| anyhow::anyhow!("encryption failed: {:?}", e))?,
     );
-    let mut combined = nonce_bytes.to_vec();
+    let mut combined = Zeroizing::new(nonce_bytes.to_vec());
     combined.extend_from_slice(&ciphertext);
-    Ok(STANDARD.encode(&combined))
+    Ok(STANDARD.encode(&*combined))
 }
 
 fn decrypt_password_with_key(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Zeroizing<String>> {
@@ -2049,9 +2413,7 @@ fn decrypt_password_with_key(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Zero
             .decrypt(nonce, &data[AES_GCM_NONCE_BYTES..])
             .map_err(|e| anyhow::anyhow!("decryption failed: {:?}", e))?,
     );
-    let plaintext_string = std::str::from_utf8(&plaintext)?.to_owned();
-    drop(plaintext);
-    Ok(Zeroizing::new(plaintext_string))
+    zeroizing_bytes_into_string(plaintext)
 }
 
 fn decrypt_password_with_fallback_key(
@@ -2120,19 +2482,56 @@ fn stage_scoped_fallback_entry(
 ) -> anyhow::Result<(ScopedFallbackKeyRef, String)> {
     let (key_ref, key) = new_scoped_fallback_key(account_id)?;
     let encrypted = encrypt_password_with_key(&key, plaintext)?;
-    save_scoped_fallback_key(&key_ref, &key)?;
+    // Persist intent before material enters Keychain/Credential Manager. A
+    // process crash after the save can then discover and retire the orphan on
+    // the next locked password-file transaction.
+    track_staged_fallback_key(&key_ref)?;
+    if let Err(error) = save_scoped_fallback_key(&key_ref, &key) {
+        // A secure-store provider may persist the value before reporting an
+        // error. Retire defensively; only remove the durable journal record
+        // once deletion is confirmed.
+        match delete_scoped_fallback_key(&key_ref) {
+            Ok(()) => {
+                if let Err(cleanup_error) =
+                    untrack_staged_fallback_keys(std::slice::from_ref(&key_ref))
+                {
+                    warn!(
+                        account_id = %redacted_account_id(&key_ref.account_id),
+                        error_kind = storage_error_kind(&cleanup_error),
+                        "Failed to clear staged fallback key journal after key save failure"
+                    );
+                }
+            }
+            Err(cleanup_error) => warn!(
+                account_id = %redacted_account_id(&key_ref.account_id),
+                error_kind = storage_error_kind(&cleanup_error),
+                "Failed key save may have committed; staged-key journal retained for cleanup"
+            ),
+        }
+        return Err(error);
+    }
     Ok((key_ref, encrypted))
 }
 
 fn cleanup_uncommitted_scoped_keys(keys: &[ScopedFallbackKeyRef]) {
+    let mut deleted = Vec::new();
     for key_ref in keys {
-        if let Err(e) = delete_scoped_fallback_key(key_ref) {
-            warn!(
-                account_id = %redacted_account_id(&key_ref.account_id),
-                error_kind = storage_error_kind(&e),
-                "Uncommitted scoped fallback key cleanup failed"
-            );
+        match delete_scoped_fallback_key(key_ref) {
+            Ok(()) => deleted.push(key_ref.clone()),
+            Err(e) => {
+                warn!(
+                    account_id = %redacted_account_id(&key_ref.account_id),
+                    error_kind = storage_error_kind(&e),
+                    "Uncommitted scoped fallback key cleanup failed"
+                );
+            }
         }
+    }
+    if let Err(e) = untrack_staged_fallback_keys(&deleted) {
+        warn!(
+            error_kind = storage_error_kind(&e),
+            "Uncommitted fallback keys were deleted, but staged-key journal cleanup failed"
+        );
     }
 }
 
@@ -2263,22 +2662,58 @@ where
 fn commit_password_file_with_staged_keys<SF, CK>(
     file: &PasswordFile,
     staged_keys: &[ScopedFallbackKeyRef],
-    mut save_file: SF,
-    mut cleanup_uncommitted: CK,
-) -> anyhow::Result<()>
+    save_file: SF,
+    cleanup_uncommitted: CK,
+) -> anyhow::Result<bool>
 where
     SF: FnMut(&PasswordFile) -> anyhow::Result<()>,
     CK: FnMut(&[ScopedFallbackKeyRef]),
 {
+    commit_password_file_with_staged_keys_with_ops(
+        file,
+        staged_keys,
+        save_file,
+        cleanup_uncommitted,
+        untrack_staged_fallback_keys,
+    )
+}
+
+fn commit_password_file_with_staged_keys_with_ops<SF, CK, UT>(
+    file: &PasswordFile,
+    staged_keys: &[ScopedFallbackKeyRef],
+    mut save_file: SF,
+    mut cleanup_uncommitted: CK,
+    mut untrack_staged: UT,
+) -> anyhow::Result<bool>
+where
+    SF: FnMut(&PasswordFile) -> anyhow::Result<()>,
+    CK: FnMut(&[ScopedFallbackKeyRef]),
+    UT: FnMut(&[ScopedFallbackKeyRef]) -> anyhow::Result<()>,
+{
     match save_file(file) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Err(e) = untrack_staged(staged_keys) {
+                warn!(
+                    error_kind = storage_error_kind(&e),
+                    "Password file committed, but staged-key journal cleanup remains pending"
+                );
+                return Ok(true);
+            }
+            Ok(false)
+        }
         Err(e) => {
             if password_file_write_committed(&e) {
+                if let Err(journal_error) = untrack_staged(staged_keys) {
+                    warn!(
+                        error_kind = storage_error_kind(&journal_error),
+                        "Committed staged fallback keys remain journaled for safe recovery"
+                    );
+                }
                 warn!(
                     error_kind = storage_error_kind(&e),
                     "Password file commit completed, but durability verification failed; staged keys remain active"
                 );
-                return Ok(());
+                return Ok(true);
             }
             cleanup_uncommitted(staged_keys);
             Err(e)
@@ -2300,7 +2735,7 @@ fn stage_and_commit_fallback_password_with_ops<SE, ML, SF, CK>(
     mut migrate_legacy: ML,
     save_file: SF,
     mut cleanup_uncommitted: CK,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
     SE: FnMut(&AccountId, &str) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
     ML: FnMut(&mut PasswordFile) -> anyhow::Result<Vec<ScopedFallbackKeyRef>>,
@@ -2321,12 +2756,17 @@ where
     commit_password_file_with_staged_keys(file, &staged_keys, save_file, cleanup_uncommitted)
 }
 
-fn finalize_fallback_key_retirement(file: &mut PasswordFile) {
+/// Returns a non-secret warning flag. Cleanup failure never invalidates a
+/// password-file commit; failed key references remain in the file so the next
+/// locked transaction can retry them.
+fn finalize_fallback_key_retirement(file: &mut PasswordFile) -> bool {
     let before = (file.retired_keys.len(), file.retire_legacy_shared_key);
     let cleanup_result = cleanup_retired_fallback_keys(file);
     let after = (file.retired_keys.len(), file.retire_legacy_shared_key);
+    let mut warning = cleanup_result.is_err();
     if before != after {
         if let Err(e) = save_password_file(file) {
+            warning = true;
             warn!(
                 error_kind = storage_error_kind(&e),
                 "Fallback key retirement succeeded, but cleanup metadata could not be committed"
@@ -2339,12 +2779,17 @@ fn finalize_fallback_key_retirement(file: &mut PasswordFile) {
             "Fallback key retirement remains pending and will be retried"
         );
     }
+    warning
 }
 
-fn save_to_file(account: &Account, password: &str) -> anyhow::Result<()> {
+fn save_to_file(account: &Account, password: &str) -> anyhow::Result<bool> {
+    with_password_file_transaction(|| save_to_file_locked(account, password))
+}
+
+fn save_to_file_locked(account: &Account, password: &str) -> anyhow::Result<bool> {
     let mut file = load_password_file()?;
-    finalize_fallback_key_retirement(&mut file);
-    if let Err(e) = stage_and_commit_fallback_password_with_ops(
+    let mut cleanup_warning = finalize_fallback_key_retirement(&mut file);
+    let password_file_durability_warning = match stage_and_commit_fallback_password_with_ops(
         &mut file,
         account,
         password,
@@ -2353,16 +2798,26 @@ fn save_to_file(account: &Account, password: &str) -> anyhow::Result<()> {
         save_password_file,
         cleanup_uncommitted_scoped_keys,
     ) {
-        warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_password_file failed");
-        return Err(e);
+        Ok(warning) => warning,
+        Err(e) => {
+            warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_password_file failed");
+            return Err(e);
+        }
+    };
+    cleanup_warning |= password_file_durability_warning;
+    if !password_file_durability_warning {
+        cleanup_warning |= finalize_fallback_key_retirement(&mut file);
     }
-    finalize_fallback_key_retirement(&mut file);
-    Ok(())
+    Ok(cleanup_warning)
 }
 
 fn load_from_file(account: &Account) -> anyhow::Result<LoadedStoredPassword> {
+    with_password_file_transaction(|| load_from_file_locked(account))
+}
+
+fn load_from_file_locked(account: &Account) -> anyhow::Result<LoadedStoredPassword> {
     let mut file = load_password_file()?;
-    finalize_fallback_key_retirement(&mut file);
+    let _cleanup_warning = finalize_fallback_key_retirement(&mut file);
     let encrypted = Zeroizing::new(password_entry_for_account(&file, &account.id)?.to_string());
     if encrypted.len() > MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS {
         anyhow::bail!("encrypted password entry is too large");
@@ -2406,15 +2861,19 @@ fn load_from_file(account: &Account) -> anyhow::Result<LoadedStoredPassword> {
             save_password_file,
             cleanup_uncommitted_scoped_keys,
         ) {
-            Ok(()) => {
-                finalize_fallback_key_retirement(&mut file);
+            Ok(password_file_durability_warning) => {
+                if !password_file_durability_warning {
+                    let _cleanup_warning = finalize_fallback_key_retirement(&mut file);
+                }
                 info!(account_id = %redacted_account_id(&account.id), "Migrated fallback password to independently rotated key storage");
             }
             Err(e) => {
                 warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy fallback storage, but migration commit failed");
             }
         },
-        Ok(false) => finalize_fallback_key_retirement(&mut file),
+        Ok(false) => {
+            let _cleanup_warning = finalize_fallback_key_retirement(&mut file);
+        }
         Err(e) => {
             cleanup_uncommitted_scoped_keys(&staged_keys);
             warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded, but migration to independently rotated fallback key storage failed");
@@ -2438,23 +2897,40 @@ fn password_entry_for_account<'a>(
 }
 
 fn delete_from_file(account_id: &AccountId) -> anyhow::Result<()> {
+    with_password_file_transaction(|| delete_from_file_locked(account_id))
+}
+
+fn delete_from_file_locked(account_id: &AccountId) -> anyhow::Result<()> {
     let mut file = load_password_file()?;
-    finalize_fallback_key_retirement(&mut file);
+    let prior_cleanup_warning = finalize_fallback_key_retirement(&mut file);
     if !remove_fallback_entry(&mut file, account_id) {
-        return Ok(());
+        return if prior_cleanup_warning {
+            anyhow::bail!("fallback key retirement remains pending")
+        } else {
+            Ok(())
+        };
     }
     let staged_keys = migrate_legacy_fallback_entries(&mut file)?;
-    commit_password_file_with_staged_keys(
+    let password_file_durability_warning = commit_password_file_with_staged_keys(
         &file,
         &staged_keys,
         save_password_file,
         cleanup_uncommitted_scoped_keys,
     )?;
-    finalize_fallback_key_retirement(&mut file);
+    if prior_cleanup_warning
+        || password_file_durability_warning
+        || finalize_fallback_key_retirement(&mut file)
+    {
+        anyhow::bail!("password entry was deleted, but fallback key retirement remains pending")
+    }
     Ok(())
 }
 
 pub(crate) fn cleanup_unused_fallback_key_material() -> anyhow::Result<()> {
+    with_password_file_transaction(cleanup_unused_fallback_key_material_locked)
+}
+
+fn cleanup_unused_fallback_key_material_locked() -> anyhow::Result<()> {
     let mut file = load_password_file()?;
     let before = (file.retired_keys.len(), file.retire_legacy_shared_key);
     let cleanup_result = cleanup_retired_fallback_keys(&mut file);
@@ -2533,6 +3009,9 @@ impl StaleBackendCleanupWarning {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SaveAccountOutcome {
     pub(crate) stale_cleanup_warning: Option<StaleBackendCleanupWarning>,
+    /// The new password is committed, but one or more obsolete fallback keys
+    /// could not yet be retired. Retry metadata remains in passwords.json.
+    pub(crate) fallback_key_cleanup_warning: bool,
 }
 
 fn save_password(
@@ -2569,6 +3048,7 @@ fn save_password_to_backend(
                 info!(account_id = %redacted_account_id(&account.id), "Password saved to secure storage successfully");
                 return Ok(SaveAccountOutcome {
                     stale_cleanup_warning,
+                    fallback_key_cleanup_warning: false,
                 });
             }
             Err(e) => anyhow::bail!(
@@ -2582,13 +3062,13 @@ fn save_password_to_backend(
             "Keyring disabled; using weaker local encrypted file storage by explicit setting"
         );
     }
-    match save_to_file(account, password) {
-        Ok(()) => {}
+    let fallback_key_cleanup_warning = match save_to_file(account, password) {
+        Ok(warning) => warning,
         Err(e) => {
             warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_to_file failed");
             return Err(e);
         }
-    }
+    };
     info!(
         account_id = %redacted_account_id(&account.id),
         "Password saved to fallback encrypted file storage"
@@ -2602,6 +3082,7 @@ fn save_password_to_backend(
     );
     Ok(SaveAccountOutcome {
         stale_cleanup_warning,
+        fallback_key_cleanup_warning,
     })
 }
 
@@ -3677,10 +4158,12 @@ pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_invalid_config_file, cleanup_fallback_key_if_password_file_empty,
+        active_scoped_fallback_keys, backup_invalid_config_file,
+        cleanup_fallback_key_if_password_file_empty,
         cleanup_legacy_fallback_key_residue_files_in_dir, cleanup_retired_fallback_keys_with_ops,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
-        clear_pending_storage_operation_paths, decode_bound_password,
+        cleanup_storage_temp_files_in_dir, clear_pending_storage_operation_paths,
+        commit_password_file_with_staged_keys_with_ops, decode_bound_password,
         decrypt_password_with_fallback_key, decrypt_password_with_key,
         delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
         encode_bound_password, encrypt_password_with_key, ensure_no_pending_storage_operation,
@@ -3692,17 +4175,20 @@ mod tests {
         pending_storage_backend_to_cleanup, pending_storage_operation_account_ids_known,
         quarantine_pending_storage_operation_file, read_private_text_file,
         reconcile_account_config_save_operation_with_ops,
-        reconcile_account_delete_operation_with_ops, redact_password_load_error,
-        redacted_account_id, remove_fallback_entry, save_pending_storage_operation_to_paths,
-        sha256_hex, stage_and_commit_fallback_password_with_ops, storage_error_kind,
+        reconcile_account_delete_operation_with_ops, reconcile_staged_fallback_keys_with_ops,
+        redact_password_load_error, redacted_account_id, remove_fallback_entry,
+        save_pending_storage_operation_to_paths, sha256_hex,
+        stage_and_commit_fallback_password_with_ops, storage_error_kind,
         validate_password_file_shape, validate_pending_storage_operation,
         verify_pending_storage_surviving_backend, write_private_file_atomic,
         write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
         LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted, PasswordStorageBackend,
-        PendingStorageOperation, ScopedFallbackKeyRef, StoredPasswordFormat, AES_GCM_NONCE_BYTES,
-        AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES, PENDING_STORAGE_OPERATION_VERSION,
+        PendingStorageOperation, ScopedFallbackKeyRef, StagedFallbackKeysJournal,
+        StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
+        PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES, PENDING_STORAGE_OPERATION_VERSION,
         SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE,
-        WINDOWS_LEGACY_WAAB_SECRET_PREFIX, WINDOWS_USER_BOUND_SECRET_PREFIX,
+        STAGED_FALLBACK_KEYS_VERSION, WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
+        WINDOWS_USER_BOUND_SECRET_PREFIX,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -4476,6 +4962,89 @@ mod tests {
         assert!(password_entry_for_account(&file, &"USER@example.com".to_string()).is_err());
     }
 
+    #[test]
+    fn staged_fallback_recovery_deletes_only_crash_orphans() {
+        let active_key = ScopedFallbackKeyRef {
+            account_id: "active-account".to_string(),
+            key_id: "00000000-0000-4000-8000-000000000001".to_string(),
+        };
+        let orphan_key = ScopedFallbackKeyRef {
+            account_id: "orphan-account".to_string(),
+            key_id: "00000000-0000-4000-8000-000000000002".to_string(),
+        };
+        let journal = StagedFallbackKeysJournal {
+            version: STAGED_FALLBACK_KEYS_VERSION,
+            keys: vec![active_key.clone(), orphan_key.clone()],
+        };
+        let deleted = RefCell::new(Vec::new());
+        let saved = RefCell::new(None);
+
+        reconcile_staged_fallback_keys_with_ops(
+            journal,
+            &std::collections::HashSet::from([active_key]),
+            |key_ref| {
+                deleted.borrow_mut().push(key_ref.clone());
+                Ok(())
+            },
+            |next| {
+                *saved.borrow_mut() = Some(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(deleted.into_inner(), vec![orphan_key]);
+        assert!(saved.into_inner().unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn staged_fallback_recovery_keeps_failed_deletion_retryable() {
+        let orphan_key = ScopedFallbackKeyRef {
+            account_id: "orphan-account".to_string(),
+            key_id: "00000000-0000-4000-8000-000000000003".to_string(),
+        };
+        let journal = StagedFallbackKeysJournal {
+            version: STAGED_FALLBACK_KEYS_VERSION,
+            keys: vec![orphan_key.clone()],
+        };
+        let saved = RefCell::new(None);
+
+        let error = reconcile_staged_fallback_keys_with_ops(
+            journal,
+            &std::collections::HashSet::new(),
+            |_| anyhow::bail!("credential store unavailable"),
+            |next| {
+                *saved.borrow_mut() = Some(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cleanup attempts failed"));
+        assert_eq!(saved.into_inner().unwrap().keys, vec![orphan_key]);
+    }
+
+    #[test]
+    fn password_transaction_temp_cleanup_is_prefix_bounded() {
+        let root = temp_storage_test_dir("password-transaction-temp-cleanup");
+        let password_temp = root.join("passwords.json.tmp.123.456");
+        let journal_temp = root.join("staged-fallback-keys.json.tmp.123.456");
+        let unrelated = root.join("passwords.json.backup");
+        std::fs::write(&password_temp, "ciphertext").unwrap();
+        std::fs::write(&journal_temp, "metadata").unwrap();
+        std::fs::write(&unrelated, "keep").unwrap();
+
+        let cleaned =
+            cleanup_storage_temp_files_in_dir(&root, PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES)
+                .unwrap();
+
+        assert_eq!(cleaned, 2);
+        assert!(!password_temp.exists());
+        assert!(!journal_temp.exists());
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn temp_storage_test_dir(name: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4542,7 +5111,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_config_backup_does_not_retain_account_metadata() {
+    fn invalid_config_quarantine_preserves_exact_metadata_privately() {
         let root = temp_storage_test_dir("invalid-config-backup-redacted");
         let config_path = root.join("config.json");
         let original = r#"{
@@ -4568,8 +5137,26 @@ mod tests {
 
         assert!(!config_path.exists());
         let backups = invalid_storage_operation_entries(&root, "config.json.invalid.");
-        assert_eq!(backups.len(), 1);
-        let backup = std::fs::read_to_string(&backups[0]).unwrap();
+        assert_eq!(backups.len(), 2);
+        let quarantine = backups
+            .iter()
+            .find(|path| !path.to_string_lossy().ends_with(".diagnostic.json"))
+            .unwrap();
+        let diagnostic_path = backups
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".diagnostic.json"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(quarantine).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(quarantine).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let backup = std::fs::read_to_string(diagnostic_path).unwrap();
         assert!(!backup.contains("user@example.com"));
         assert!(!backup.contains("account-secret-id"));
         assert!(!backup.contains("has_saved_password"));
@@ -4591,7 +5178,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_invalid_config_backup_omits_raw_content() {
+    fn malformed_invalid_config_quarantine_preserves_raw_content_but_redacts_diagnostic() {
         let root = temp_storage_test_dir("malformed-config-backup-redacted");
         let config_path = root.join("config.json");
         let original = r#"{"accounts":[{"id":"account-secret-id","username":"user@example.com"}],"#;
@@ -4605,8 +5192,17 @@ mod tests {
 
         assert!(!config_path.exists());
         let backups = invalid_storage_operation_entries(&root, "config.json.invalid.");
-        assert_eq!(backups.len(), 1);
-        let backup = std::fs::read_to_string(&backups[0]).unwrap();
+        assert_eq!(backups.len(), 2);
+        let quarantine = backups
+            .iter()
+            .find(|path| !path.to_string_lossy().ends_with(".diagnostic.json"))
+            .unwrap();
+        let diagnostic_path = backups
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".diagnostic.json"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(quarantine).unwrap(), original);
+        let backup = std::fs::read_to_string(diagnostic_path).unwrap();
         assert!(!backup.contains("user@example.com"));
         assert!(!backup.contains("account-secret-id"));
         assert!(!backup.contains(original));
@@ -5147,7 +5743,7 @@ mod tests {
         };
         let cleanup_calls = Cell::new(0usize);
 
-        super::commit_password_file_with_staged_keys(
+        let durability_warning = commit_password_file_with_staged_keys_with_ops(
             &file,
             std::slice::from_ref(&key_ref),
             |_| {
@@ -5156,10 +5752,47 @@ mod tests {
                 }))
             },
             |_| cleanup_calls.set(cleanup_calls.get() + 1),
+            |_| Ok(()),
         )
         .unwrap();
 
+        assert!(durability_warning);
         assert_eq!(cleanup_calls.get(), 0);
+    }
+
+    #[test]
+    fn committed_password_file_keeps_active_key_when_journal_cleanup_fails() {
+        let key_ref = ScopedFallbackKeyRef {
+            account_id: "account-1".to_string(),
+            key_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let file = PasswordFile {
+            passwords: HashMap::from([(key_ref.account_id.clone(), "new-ciphertext".to_string())]),
+            key_ids: HashMap::from([(key_ref.account_id.clone(), key_ref.key_id.clone())]),
+            ..PasswordFile::default()
+        };
+        let cleanup_calls = Cell::new(0usize);
+        let untrack_calls = Cell::new(0usize);
+
+        let durability_warning = commit_password_file_with_staged_keys_with_ops(
+            &file,
+            std::slice::from_ref(&key_ref),
+            |_| Ok(()),
+            |_| cleanup_calls.set(cleanup_calls.get() + 1),
+            |_| {
+                untrack_calls.set(untrack_calls.get() + 1);
+                anyhow::bail!("journal durability unavailable")
+            },
+        )
+        .unwrap();
+
+        assert!(durability_warning);
+        assert_eq!(cleanup_calls.get(), 0);
+        assert_eq!(untrack_calls.get(), 1);
+        assert_eq!(
+            active_scoped_fallback_keys(&file),
+            std::collections::HashSet::from([key_ref])
+        );
     }
 
     #[test]
@@ -5513,6 +6146,86 @@ mod tests {
         write_private_file_atomic(&path, "json.tmp", b"new").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_commit_directory_sync_failure_is_classified_as_committed() {
+        let path = std::path::Path::new("config.json");
+        let error = super::finish_private_file_commit_with_ops(
+            path,
+            |_| Ok(()),
+            |_| anyhow::bail!("directory sync failed"),
+        )
+        .unwrap_err();
+
+        assert!(super::private_file_write_committed(&error));
+        assert!(error.to_string().contains("replacement committed"));
+    }
+
+    #[test]
+    fn password_transaction_lock_serializes_independent_handles() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = temp_storage_test_dir("password-lock-serializes");
+        let lock_path = root.join("passwords.lock");
+        let first = super::acquire_password_file_transaction_lock_at(&lock_path).unwrap();
+        let (attempting_tx, attempting_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let second_path = lock_path.clone();
+        let waiter = std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            let second = super::acquire_password_file_transaction_lock_at(&second_path).unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(second);
+        });
+
+        attempting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn password_transaction_lock_prevents_lost_read_modify_write_updates() {
+        let root = temp_storage_test_dir("password-lock-rmw");
+        let lock_path = root.join("passwords.lock");
+        let state_path = root.join("state.json");
+        write_test_private_text(&state_path, "{}");
+
+        let workers = (0..12)
+            .map(|worker| {
+                let lock_path = lock_path.clone();
+                let state_path = state_path.clone();
+                std::thread::spawn(move || {
+                    let _lock =
+                        super::acquire_password_file_transaction_lock_at(&lock_path).unwrap();
+                    let content = std::fs::read_to_string(&state_path).unwrap();
+                    let mut state: HashMap<String, usize> = serde_json::from_str(&content).unwrap();
+                    std::thread::yield_now();
+                    state.insert(format!("account-{worker}"), worker);
+                    let serialized = serde_json::to_string(&state).unwrap();
+                    std::fs::write(&state_path, serialized).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let state: HashMap<String, usize> =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(state.len(), 12);
+        for worker in 0..12 {
+            assert_eq!(state[&format!("account-{worker}")], worker);
+        }
+
         let _ = std::fs::remove_dir_all(root);
     }
 

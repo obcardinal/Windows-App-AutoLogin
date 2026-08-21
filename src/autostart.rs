@@ -91,6 +91,7 @@ fn enable() -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        ensure_windows_autostart_executable_identity(&app_path)?;
         windows_enable_current_user(&app_path)?;
         if !windows_registered_command_matches_path(&app_path) {
             anyhow::bail!(
@@ -116,7 +117,7 @@ fn enable() -> anyhow::Result<()> {
                 "Open at Login was written, but the LaunchAgent does not point to this app."
             );
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -146,7 +147,7 @@ fn disable() -> anyhow::Result<()> {
         remove_launch_agent_file()?;
         remove_legacy_launch_agent_files()?;
         remove_macos_login_items_by_name()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -213,7 +214,7 @@ pub(crate) fn cleanup_stale() -> anyhow::Result<()> {
         if !launch_agent_matches_current_exe() || !current_autostart_path_is_stable() {
             remove_launch_agent_file()?;
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -892,7 +893,11 @@ fn windows_cleanup_stale() -> anyhow::Result<()> {
     let Some(command) = windows_registered_command() else {
         return Ok(());
     };
-    if windows_exact_startup_command_app_path(&command).is_none() {
+    let registered_path = windows_exact_startup_command_app_path(&command);
+    if registered_path
+        .as_deref()
+        .is_none_or(|path| !windows_autostart_executable_identity_is_trusted(path))
+    {
         windows_disable_current_user()?;
     }
 
@@ -904,6 +909,48 @@ fn windows_registered_command_matches_path(app_path: &str) -> bool {
     windows_registered_command()
         .as_deref()
         .is_some_and(|command| windows_startup_command_exactly_matches_path(command, app_path))
+        && windows_autostart_executable_identity_is_trusted(app_path)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_autostart_identity_policy_allows(
+    publishable_release: bool,
+    configured_signer_identity_present: bool,
+    authenticode_signature_matches: bool,
+) -> bool {
+    // Unsigned startup is an explicit development-only capability: the build
+    // must not carry the publishable-release marker emitted by build.rs.
+    !publishable_release || (configured_signer_identity_present && authenticode_signature_matches)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_executable_identity_is_trusted(app_path: &str) -> bool {
+    let publishable_release = cfg!(waal_publishable_release);
+    let configured_publisher = env!("WAAL_WINDOWS_AUTHENTICODE_PUBLISHER").trim();
+    let configured_cert_sha256 = env!("WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256").trim();
+    let signature_matches = publishable_release
+        && !configured_publisher.is_empty()
+        && !configured_cert_sha256.is_empty()
+        && crate::windows_ui::windows_executable_authenticode_identity_matches(
+            app_path,
+            configured_publisher,
+            configured_cert_sha256,
+        );
+    windows_autostart_identity_policy_allows(
+        publishable_release,
+        !configured_publisher.is_empty() && !configured_cert_sha256.is_empty(),
+        signature_matches,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_autostart_executable_identity(app_path: &str) -> anyhow::Result<()> {
+    if windows_autostart_executable_identity_is_trusted(app_path) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Open at Login requires a valid Authenticode signature from the pinned release signer."
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -954,7 +1001,7 @@ fn launch_agent_program_path(path: &std::path::Path) -> Option<String> {
     if dict.get("Label")?.as_str()? != macos_launch_agent_label() {
         return None;
     }
-    if dict.get("RunAtLoad")?.as_bool()? != true {
+    if !dict.get("RunAtLoad")?.as_bool()? {
         return None;
     }
     let bundle_ids = dict.get("AssociatedBundleIdentifiers")?.as_array()?;
@@ -1529,6 +1576,35 @@ mod tests {
             );
             assert_eq!(windows_exact_startup_command_app_path(&candidate), None);
         }
+    }
+
+    #[test]
+    fn publishable_windows_autostart_requires_configured_matching_authenticode_signer() {
+        assert!(windows_autostart_identity_policy_allows(
+            false, false, false
+        ));
+        assert!(windows_autostart_identity_policy_allows(false, true, false));
+        assert!(!windows_autostart_identity_policy_allows(true, false, true));
+        assert!(!windows_autostart_identity_policy_allows(true, true, false));
+        assert!(windows_autostart_identity_policy_allows(true, true, true));
+    }
+
+    #[test]
+    fn windows_autostart_runtime_policy_uses_publishable_marker_and_pinned_signer() {
+        let implementation = include_str!("autostart.rs");
+        let policy = implementation
+            .split("fn windows_autostart_executable_identity_is_trusted")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn ensure_windows_autostart_executable_identity")
+                    .next()
+            })
+            .unwrap();
+
+        assert!(policy.contains("cfg!(waal_publishable_release)"));
+        assert!(policy.contains("WAAL_WINDOWS_AUTHENTICODE_PUBLISHER"));
+        assert!(policy.contains("WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256"));
+        assert!(policy.contains("windows_executable_authenticode_identity_matches"));
     }
 
     #[test]

@@ -76,12 +76,28 @@ Other app names, copied bundles, unsigned bundles, modified bundles, or unexpect
 - macOS may also ask for Automation permission to control System Events; approve it only for the expected Windows App AutoLogin bundle.
 - For macOS bundle creation: `sips` and `iconutil`.
 - For macOS release packaging: a Developer ID Application signing identity available to `codesign`, plus an `xcrun notarytool` keychain profile.
+- For a publishable Windows distribution: an x64 MSVC Rust toolchain, a Visual Studio Developer PowerShell environment with `link.exe` and `rc.exe`, Windows SDK `signtool.exe`, and an installed code-signing certificate with an accessible private key.
 
 ## Build
 
 Create a production macOS release ZIP with a freshly built, signed, notarized, and stapled app bundle:
 
 ```bash
+RELEASE_CARGO="$(rustup which cargo)"
+RELEASE_RUSTC="$(rustup which rustc)"
+RELEASE_SYSROOT="$($RELEASE_RUSTC --print sysroot)"
+export WAAL_RELEASE_CARGO_PATH="$RELEASE_CARGO"
+export WAAL_RELEASE_RUSTC_PATH="$RELEASE_RUSTC"
+export WAAL_RELEASE_RUST_SYSROOT="$RELEASE_SYSROOT"
+export WAAL_RELEASE_EXPECTED_CARGO_SHA256="$(shasum -a 256 "$RELEASE_CARGO" | awk '{print $1}')"
+export WAAL_RELEASE_EXPECTED_RUSTC_SHA256="$(shasum -a 256 "$RELEASE_RUSTC" | awk '{print $1}')"
+export WAAL_RELEASE_EXPECTED_CLANG_SHA256="$(shasum -a 256 /usr/bin/clang | awk '{print $1}')"
+export WAAL_RELEASE_EXPECTED_CLANGXX_SHA256="$(shasum -a 256 /usr/bin/clang++ | awk '{print $1}')"
+export WAAL_RELEASE_EXPECTED_AR_SHA256="$(shasum -a 256 /usr/bin/ar | awk '{print $1}')"
+# Compute WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256 with directory_tree_sha256
+# from script/package_macos.sh, and compute the native aggregate as documented below.
+export WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256=<reviewed-sysroot-tree-sha256>
+export WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256=<reviewed-native-aggregate-sha256>
 WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
 WAAL_MACOS_TEAM_ID=ABCDE12345 \
 WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
@@ -95,6 +111,38 @@ Build-check the Windows implementation from another host when the target is inst
 
 ```bash
 cargo check --target x86_64-pc-windows-gnu --all-targets --all-features
+```
+
+Create a publishable Windows x86-64 distribution from a Visual Studio Developer PowerShell prompt. The certificate thumbprint is not a password or private key:
+
+```powershell
+$env:WAAL_WINDOWS_SIGN_CERT_THUMBPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
+$env:WAAL_WINDOWS_RELEASE_GIT_PATH = "C:\Program Files\Git\cmd\git.exe"
+$env:WAAL_WINDOWS_RELEASE_TAR_PATH = "C:\Windows\System32\tar.exe"
+$env:WAAL_RELEASE_CARGO_PATH = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
+$env:WAAL_RELEASE_RUSTC_PATH = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
+$env:WAAL_RELEASE_RUST_SYSROOT = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc"
+$env:WAAL_WINDOWS_RELEASE_LINK_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\link.exe"
+$env:WAAL_WINDOWS_RELEASE_RC_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\rc.exe"
+$env:WAAL_WINDOWS_RELEASE_SIGNTOOL_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\signtool.exe"
+$env:WAAL_WINDOWS_RELEASE_LIB = "<reviewed semicolon-separated absolute MSVC/SDK library directories>"
+$env:WAAL_WINDOWS_RELEASE_INCLUDE = "<reviewed semicolon-separated absolute MSVC/SDK include directories>"
+$env:WAAL_WINDOWS_RELEASE_LIBPATH = "<reviewed semicolon-separated absolute MSVC/SDK reference directories>"
+# Set each corresponding WAAL_*_EXPECTED_*_SHA256 value to a reviewed lowercase
+# (Get-FileHash -Algorithm SHA256 -LiteralPath <path>).Hash.ToLowerInvariant().
+# Also set WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256 and
+# WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256 as documented below.
+.\script\build_windows_dist.ps1
+```
+
+The corresponding Windows hash variables are `WAAL_WINDOWS_RELEASE_EXPECTED_GIT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_TAR_SHA256`, `WAAL_RELEASE_EXPECTED_CARGO_SHA256`, `WAAL_RELEASE_EXPECTED_RUSTC_SHA256`, `WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LINK_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_RC_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_SIGNTOOL_SHA256`, and `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256`.
+
+The default Windows command is fail-closed: it requires a clean Git checkout, rejects links/gitlinks in the committed source tree, builds a fresh self-contained snapshot with an isolated Cargo home, verifies the locked dependency graph and every pinned build/materialization/signing tool, sanitizes MSVC injection variables, embeds the exact Git commit/tree plus signer name and certificate SHA-256 fingerprint, signs and RFC 3161 timestamps the executable, verifies Authenticode against that exact certificate, and writes `SHA256SUMS.txt` plus `BUILD-PROVENANCE.txt`. Publication uses a verified candidate plus rollback backup inside `dist`; the previous package remains recoverable until the activated package passes its final metadata, hash, provenance, and Authenticode checks.
+
+For an unsigned local VM test artifact only, opt in explicitly. This uses a separate directory name and is never a publishable release:
+
+```powershell
+.\script\build_windows_dist.ps1 -Development
 ```
 
 Build and launch the local macOS development app bundle. This path uses the development bundle identity and ad-hoc signing; it is not a production release build:
@@ -208,18 +256,18 @@ If **Use system secure storage** is disabled, passwords are stored in an encrypt
 passwords.json
 ```
 
-That fallback uses AES-256-GCM. Its encryption key is still stored in the system secure store under:
+That fallback uses AES-256-GCM. Every account and every saved password revision receives a fresh independent 256-bit key. The scoped keys are stored in the system secure store under:
 
 - Service: `WindowsAppAutoLoginFallbackKey`
-- Account: `fallback-encryption-key`
+- Account: `fallback-account-key:<random-key-id>`
 
-The fallback file is not independent of Keychain or Credential Manager: if the fallback key cannot be created or read from the current user's system secure store, fallback password save/load will fail. On Windows, that key is stored in Credential Manager and protected by user-bound DPAPI. The service name, account ID, purpose, and normalized email hash are validation and routing metadata, not a guarantee that only this executable can decrypt it. Manual metadata edits fail closed.
+The former shared `fallback-encryption-key` entry is accepted only while migrating legacy records and is retired after the independently keyed ciphertext map is durably committed. The fallback file is not independent of Keychain or Credential Manager: if a referenced scoped key cannot be created or read from the current user's system secure store, fallback password save/load will fail. On Windows, each key is stored in Credential Manager and protected by user-bound DPAPI. The key envelope binds its random key ID to the account ID; the service name, account metadata, purpose, and normalized email hash are validation and routing metadata, not a guarantee that only this executable can decrypt it. Manual metadata edits fail closed.
 
 Recent builds migrate saved passwords when switching storage mode. The app copies and verifies passwords in the new storage before saving the setting, then attempts to remove old copies from the previous backend. If copying or verification fails, the setting is left unchanged. If only old-copy cleanup fails after a save or migration succeeds, passwords remain available in the selected storage and cleanup remains pending for the next launch instead of being forgotten.
 
-During storage-mode and account metadata changes, the app writes a private pending-operation journal so a restart can finish cleanup or restore a consistent config after a crash. Cleanup warnings mean a migration target was verified or an account save completed in the selected backend, but stale old material may remain until recovery succeeds. While that journal exists, stored credential changes are blocked and the app retries cleanup on startup. Manual cleanup targets, if the warning persists, are the old `WindowsAppAutoLogin` account-ID secure-store entries, stale `passwords.json` records, and old fallback key material under `WindowsAppAutoLoginFallbackKey` / `fallback-encryption-key` or legacy `fallback.key`. Do not delete the fallback key while any fallback password records remain.
+During storage-mode and account metadata changes, the app writes a private pending-operation journal so a restart can finish cleanup or restore a consistent config after a crash. A separate durable staged-key journal is committed before a new scoped fallback key is created; startup reconciliation preserves keys referenced by committed `passwords.json` records and removes only uncommitted crash orphans. Cleanup warnings mean a migration target was verified or an account save completed in the selected backend, but stale old material may remain until recovery succeeds. While a pending operation exists, stored credential changes are blocked and the app retries cleanup on startup. Manual cleanup targets, if the warning persists, are the old `WindowsAppAutoLogin` account-ID secure-store entries, stale `passwords.json` records, and retired fallback key material under `WindowsAppAutoLoginFallbackKey`, including legacy `fallback-encryption-key` or `fallback.key` material. Do not manually delete a scoped or legacy fallback key while a fallback password record may still reference it.
 
-If Keychain asks for permission repeatedly, make sure you are launching the same app bundle each time and choose **Always Allow** for the intended app identity.
+If Keychain asks for permission repeatedly, make sure you are launching the same app bundle each time and choose **Always Allow** only for the intended app identity. Local ad-hoc development signatures are intentionally bound to the executable cdhash, so rebuilding the development bundle changes its identity and can require a new prompt. A stable Developer ID release identity is the appropriate choice when permissions must survive rebuilds.
 
 ## How Autofill Works
 
@@ -316,7 +364,7 @@ The test suite covers the main safety decisions: visible-email matching, missing
 
 ## Packaging Notes
 
-`script/build_and_run.sh` creates a local app bundle and ad-hoc signs it when `codesign` is available.
+`script/build_and_run.sh` creates a local app bundle and ad-hoc signs it when `codesign` is available. The development signature uses the default cdhash-bound designated requirement; it does not trust every ad-hoc application that copies the public bundle identifier. Because the cdhash changes after a rebuild, Accessibility, Automation, and Keychain approval may need to be granted again.
 
 Current development bundle ID:
 
@@ -326,11 +374,15 @@ obcardinal.windows-app-autologin
 
 The development script does not perform Developer ID signing or notarization. It opts into `WAAL_DEVELOPMENT_RELEASE=1` only for local non-production release-profile bundles.
 
-Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script requires the Git checkout to have no tracked or untracked changes, records the exact 40-hex `HEAD` commit and tree IDs in the executable metadata, materializes an isolated source snapshot directly from that commit, and rechecks both the checkout and embedded values before publishing. It builds the snapshot in a sanitized environment with only packager-owned path-remapping flags, assembles the `.app` from snapshot assets, signs it with `WAAL_CODESIGN_IDENTITY`, notarizes it with `WAAL_NOTARY_PROFILE`, staples the ticket, and then zips only the verified staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs.
+Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script requires the Git checkout to have no tracked, untracked, assume-unchanged, or skip-worktree changes; records the exact 40-hex `HEAD` commit and tree IDs; materializes an isolated source snapshot directly from that commit; and rechecks both the checkout and embedded values before publishing. Cargo runs with a new packager-owned `HOME`, `CARGO_HOME`, temporary directory, target directory, fixed system-tool path, and no Cargo configuration in its working-directory ancestors. The dependency graph must contain only the archived root package and locked crates.io packages—external path, Git, alternate-registry, and source-replacement inputs are rejected. Cargo, rustc, the complete Rust sysroot, `/usr/bin/clang`, `/usr/bin/clang++`, and `/usr/bin/ar` must be explicitly selected and match reviewed SHA-256 pins; their provenance is embedded in the executable and signed `BUILD-PROVENANCE.txt`. The script assembles the `.app` from snapshot assets, signs it with `WAAL_CODESIGN_IDENTITY`, notarizes it with `WAAL_NOTARY_PROFILE`, staples the ticket, and zips only the verified staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs, and `dist` must be a real directory rather than a symlink.
+
+The sysroot tree digest is SHA-256 over ordinal byte-sorted regular-file entries encoded as `relative/path`, NUL, lowercase file SHA-256, NUL; symbolic links and special nodes are rejected. The macOS native aggregate is SHA-256 over the NUL-terminated lowercase hashes of `clang`, `clang++`, and `ar`, in exactly that order. The Windows native aggregate uses `link.exe`, `rc.exe`, and `signtool.exe`, in exactly that order. These ordered aggregate values are the `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256` pins.
 
 The current release pipeline intentionally produces an ARM64 macOS binary. `CFBundleVersion` defaults to the numeric Cargo package version and can be overridden with a valid one-to-three-component `WAAL_BUILD_VERSION`.
 
-Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID, Team ID, source commit, and source tree, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It removes any stale output ZIP only after source validation, strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, then validates the staged bundle and the extracted ZIP artifact before publishing the ZIP.
+Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID, Team ID, source commit/tree, target, and toolchain hashes, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It removes any stale output ZIP only after source validation, strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, then validates the staged bundle and the extracted ZIP artifact before publishing the ZIP.
+
+The project previously used development bundle ID `dev.codex.windows-app-autologin`; the current ID is `obcardinal.windows-app-autologin`. Release and development scripts do not reset privacy databases or alter Keychain access lists automatically. If an obsolete grant remains, remove only the old app entry from **System Settings → Privacy & Security → Accessibility** and **Automation**. If you deliberately want command-line cleanup, run the bundle-scoped `tccutil reset Accessibility dev.codex.windows-app-autologin` and `tccutil reset AppleEvents dev.codex.windows-app-autologin` yourself after reviewing the target. In Keychain Access, inspect the `WindowsAppAutoLogin` and `WindowsAppAutoLoginFallbackKey` items and remove only a stale application entry from Access Control; do not delete password items or the fallback key while fallback records exist. For the current ad-hoc development ID, prefer removing and re-adding the exact rebuilt app in System Settings rather than resetting unrelated applications.
 
 Use `script/package_macos.sh --release-diagnostics-artifact` only for an intentional support artifact. A release diagnostics artifact is built by the package script with `--features release-diagnostics`, a separate `WAAL_DIAGNOSTICS_BUNDLE_ID`, and the diagnostics app name `WindowsAppAutoLoginDiagnostics.app`; the package script requires both `WAAL_RELEASE_BUNDLE_ID` and `WAAL_DIAGNOSTICS_BUNDLE_ID` and refuses to package if the diagnostics bundle ID matches the production or development bundle ID. `script/build_and_run.sh --dev-ui` is not a release diagnostics path because it builds `dev-tools`, which includes `debug-fill` and is rejected by packaging.
 

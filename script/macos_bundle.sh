@@ -209,11 +209,23 @@ waal_assemble_app_bundle() {
 waal_codesign_development_bundle() {
   local bundle_dir="$1"
   local bundle_id="$2"
+  local designated_requirement
 
   /usr/bin/codesign \
     --force \
     --sign - \
     --identifier "$bundle_id" \
-    --requirements "=designated => identifier \"$bundle_id\"" \
     "$bundle_dir"
+
+  if ! designated_requirement="$(/usr/bin/codesign -d -r- "$bundle_dir" 2>&1)"; then
+    echo "Unable to inspect the development bundle designated requirement." >&2
+    return 1
+  fi
+  case "$designated_requirement" in
+    *'designated => cdhash H"'*) ;;
+    *)
+      echo "Development ad-hoc signature is not cdhash-bound." >&2
+      return 1
+      ;;
+  esac
 }

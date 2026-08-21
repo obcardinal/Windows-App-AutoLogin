@@ -178,8 +178,7 @@ fn enumerate_processes(app_name: &str) -> anyhow::Result<Vec<ProcessIdentity>> {
             let executable_path = process_executable_path(pid)?;
             let bundle_path = containing_app_bundle(&executable_path)?;
             trusted_candidates
-                .iter()
-                .any(|candidate| *candidate == bundle_path)
+                .contains(&bundle_path)
                 .then(|| ProcessIdentity {
                     pid,
                     bundle_id: identity.bundle_id.to_string(),
@@ -230,10 +229,7 @@ fn native_process_ids() -> Vec<i32> {
     }
 
     pids.truncate(bytes as usize / std::mem::size_of::<libc::pid_t>());
-    pids.into_iter()
-        .filter(|pid| *pid > 0)
-        .map(|pid| pid as i32)
-        .collect()
+    pids.into_iter().filter(|pid| *pid > 0).collect()
 }
 
 #[cfg(target_os = "macos")]

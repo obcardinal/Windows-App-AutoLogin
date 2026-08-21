@@ -21,10 +21,10 @@ pub(crate) fn runtime_dir() -> anyhow::Result<PathBuf> {
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        return Ok(canonical_home_dir()?
+        Ok(canonical_home_dir()?
             .join("Library")
             .join("Application Support")
-            .join(APP_DIR_NAME));
+            .join(APP_DIR_NAME))
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -276,13 +276,13 @@ impl FullUiInstanceGuard {
         {
             let (lock_dir, lock_file) =
                 acquire_lock_dir_named(FULL_UI_LOCK_DIR_NAME, FULL_UI_ALREADY_RUNNING_MESSAGE)?;
-            return Ok(Self {
+            Ok(Self {
                 lock_nonce: lock_owner(&lock_dir)
                     .map(|owner| owner.nonce)
                     .unwrap_or_default(),
                 _lock_file: lock_file,
                 lock_dir,
-            });
+            })
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -306,12 +306,12 @@ fn acquire_lock_dir() -> anyhow::Result<SingleInstanceGuard> {
                 return Err(e);
             }
         };
-        return Ok(SingleInstanceGuard {
+        Ok(SingleInstanceGuard {
             lock_dir,
             lock_nonce,
             _lock_file: lock_file,
             ipc_server,
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -433,10 +433,7 @@ fn acquire_windows_single_instance() -> anyhow::Result<SingleInstanceGuard> {
     prepare_lock_root(&root)?;
     let lock_file = acquire_windows_single_instance_file_lock(&root)?;
 
-    let ipc_server = match LocalIpcServer::bind() {
-        Ok(server) => server,
-        Err(error) => return Err(error),
-    };
+    let ipc_server = LocalIpcServer::bind()?;
 
     Ok(SingleInstanceGuard {
         ipc_server: Some(ipc_server),
@@ -519,7 +516,7 @@ fn wide_null(value: &str) -> Vec<u16> {
 pub(crate) fn request_activation() -> anyhow::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        return send_local_ipc_command(IPC_COMMAND_ACTIVATE);
+        send_local_ipc_command(IPC_COMMAND_ACTIVATE)
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -542,10 +539,7 @@ pub(crate) fn request_activation() -> anyhow::Result<()> {
 pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        return send_local_ipc_command(&format!(
-            "{IPC_COMMAND_MONITOR_PREFIX}{}",
-            command.as_str()
-        ));
+        send_local_ipc_command(&format!("{IPC_COMMAND_MONITOR_PREFIX}{}", command.as_str()))
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -562,7 +556,7 @@ pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow:
 pub(crate) fn request_config_reload() -> anyhow::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        return send_local_ipc_command(IPC_COMMAND_RELOAD_CONFIG);
+        send_local_ipc_command(IPC_COMMAND_RELOAD_CONFIG)
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -1013,7 +1007,7 @@ fn remove_stale_lock_dir(lock_dir: &Path) -> std::io::Result<()> {
 fn lock_root() -> anyhow::Result<PathBuf> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        return crate::user_paths::runtime_dir();
+        crate::user_paths::runtime_dir()
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -1432,7 +1426,7 @@ fn macos_process_identity_matches_current_app(
     {
         return false;
     }
-    let Some(process_bundle_path) = macos_containing_app_bundle(&process_path) else {
+    let Some(process_bundle_path) = macos_containing_app_bundle(process_path) else {
         return false;
     };
     let Some(current_bundle_path) = macos_containing_app_bundle(current_path) else {
@@ -3277,6 +3271,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(root.join("test-held-lock"))
             .unwrap()
     }

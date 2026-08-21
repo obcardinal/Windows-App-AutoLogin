@@ -26,9 +26,15 @@ serde_json = "1.0"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
+anyhow = "1.0.103"
 keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
-aes-gcm = "0.10"
+# Enable every zeroize hook exposed by the RustCrypto AES-GCM stack. The
+# direct feature activations are intentional: aes-gcm 0.10 does not propagate
+# its zeroize feature to the expanded AES key or POLYVAL backend.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
@@ -65,6 +71,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Pipes",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Accessibility",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

@@ -2,8 +2,9 @@ use crate::app::AutoLoginApp;
 use crate::autostart;
 use crate::models::{AppConfig, AppSettings, FIXED_POLL_INTERVAL_SECS};
 use crate::storage::{
-    is_pending_storage_operation_in_progress, pending_storage_recovery_user_status,
-    storage_mode_migration_error_requires_recovery, StorageModeMigration,
+    config_write_committed, is_pending_storage_operation_in_progress,
+    pending_storage_recovery_user_status, storage_mode_migration_error_requires_recovery,
+    StorageModeMigration,
 };
 use crate::ui::theme;
 use eframe::egui;
@@ -170,28 +171,34 @@ where
         None
     };
 
-    if let Err(e) = save_config_op(&next_config) {
-        let _ = e;
-        if let Some(migration) = &storage_migration {
-            if let Err(rollback_error) = rollback_storage_op(migration) {
-                let _ = rollback_error;
-                return rejected(
+    let mut config_durability_warning = match save_config_op(&next_config) {
+        Ok(()) => false,
+        Err(e) if config_write_committed(&e) => {
+            warn!(error = %e, "Settings config replacement committed, but durability confirmation failed");
+            true
+        }
+        Err(_) => {
+            if let Some(migration) = &storage_migration {
+                if let Err(rollback_error) = rollback_storage_op(migration) {
+                    let _ = rollback_error;
+                    return rejected(
                     current_config,
                     previous_settings,
                     "Failed to save settings, and storage rollback could not be confirmed. Passwords may need manual cleanup.".to_string(),
                 );
+                }
             }
+            clear_storage_journal_after_terminal_result(
+                storage_journal_started,
+                &mut clear_storage_journal_op,
+            );
+            return rejected(
+                current_config,
+                previous_settings,
+                "Failed to save settings. Storage mode was left unchanged.".to_string(),
+            );
         }
-        clear_storage_journal_after_terminal_result(
-            storage_journal_started,
-            &mut clear_storage_journal_op,
-        );
-        return rejected(
-            current_config,
-            previous_settings,
-            "Failed to save settings. Storage mode was left unchanged.".to_string(),
-        );
-    }
+    };
 
     let mut status_parts = Vec::new();
     if auto_start_changed {
@@ -205,22 +212,36 @@ where
             next_config.settings.auto_start = previous_settings.auto_start;
             status_parts
                 .push("Settings saved, but Open at Login could not be updated.".to_string());
-            if let Err(rollback_error) = save_config_op(&next_config) {
-                warn!(
-                    error = %rollback_error,
-                    previous_auto_start = previous_settings.auto_start,
-                    "Failed to persist Open at Login rollback after update failure"
-                );
-                status_parts.push(
-                    "Open at Login settings rollback could not be confirmed; startup repair will re-check the system state."
-                        .to_string(),
-                );
+            match save_config_op(&next_config) {
+                Ok(()) => config_durability_warning = false,
+                Err(rollback_error) if config_write_committed(&rollback_error) => {
+                    config_durability_warning = true;
+                    warn!(error = %rollback_error, previous_auto_start = previous_settings.auto_start, "Open at Login config rollback committed, but durability confirmation failed");
+                }
+                Err(rollback_error) => {
+                    warn!(
+                        error = %rollback_error,
+                        previous_auto_start = previous_settings.auto_start,
+                        "Failed to persist Open at Login rollback after update failure"
+                    );
+                    status_parts.push(
+                        "Open at Login settings rollback could not be confirmed; startup repair will re-check the system state."
+                            .to_string(),
+                    );
+                }
             }
         }
     }
 
     if let Some(migration) = &storage_migration {
-        if let Err(e) = commit_storage_op(migration) {
+        if config_durability_warning {
+            // Deleting the old backend would be unsafe if a crash re-exposed
+            // the previous config. The journal is deliberately retained.
+            status_parts.push(
+                "Settings were committed, but disk durability could not be confirmed. Old password storage cleanup remains pending and will retry on next launch."
+                    .to_string(),
+            );
+        } else if let Err(e) = commit_storage_op(migration) {
             warn!(
                 error = %e,
                 old_storage = storage_mode_label(previous_settings.use_keyring),
@@ -237,6 +258,11 @@ where
                 &mut clear_storage_journal_op,
             );
         }
+    } else if config_durability_warning {
+        status_parts.push(
+            "Settings were committed, but disk durability could not be confirmed; the saved state will be checked on next launch."
+                .to_string(),
+        );
     }
 
     let status = if status_parts.is_empty() {
@@ -470,6 +496,49 @@ mod tests {
                 "save_config:false",
                 "rollback_target"
             ]
+        );
+    }
+
+    #[test]
+    fn committed_config_warning_keeps_new_mode_and_defers_destructive_source_cleanup() {
+        let config = config_with_two_saved_accounts(true);
+        let mut draft = config.settings.clone();
+        draft.use_keyring = false;
+        let events = RefCell::new(Vec::new());
+
+        let result = save_settings_transaction(
+            &config,
+            draft,
+            |_| Ok(()),
+            |_, _, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_, from_use_keyring, to_use_keyring| {
+                events.borrow_mut().push("migrate");
+                Ok(StorageModeMigration::for_test(
+                    vec!["account-1".to_string()],
+                    from_use_keyring,
+                    to_use_keyring,
+                ))
+            },
+            |_| {
+                events.borrow_mut().push("save_config_committed");
+                Err(crate::storage::committed_config_write_test_error())
+            },
+            |_| panic!("committed config must not roll back target credentials"),
+            |_| panic!("old credentials must remain until config durability is confirmed"),
+            || panic!("journal must remain for recovery"),
+        );
+
+        assert!(result.applied);
+        assert!(result.storage_mode_changed);
+        assert!(!result.config.settings.use_keyring);
+        assert!(result.status.contains("durability could not be confirmed"));
+        assert!(result.status.contains("cleanup remains pending"));
+        assert_eq!(
+            events.into_inner(),
+            vec!["journal", "migrate", "save_config_committed"]
         );
     }
 

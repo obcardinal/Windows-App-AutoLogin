@@ -2,9 +2,7 @@
 use crate::macos_identity;
 use crate::models::{Account, AppSettings};
 use crate::storage;
-#[cfg(target_os = "macos")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "macos")]
@@ -20,12 +18,15 @@ struct PromptInfo {
 }
 
 const LAST_FILL_ATTEMPT_REPORT_FILE: &str = "last-fill-attempt.json";
+static REPORT_TEMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct VerifiedPromptContext {
     pub(crate) account_id: String,
     pub(crate) process_id: i32,
+    #[cfg(target_os = "windows")]
+    pub(crate) window_handle: isize,
     pub(crate) window_title: String,
     pub(crate) prompt_email: String,
     pub(crate) prompt_origin: String,
@@ -133,7 +134,7 @@ impl FillAttemptReport {
         let result = if self.success { "success" } else { "failed" };
         let failure = self.failure_reason.as_deref().unwrap_or("");
         format!(
-            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_loaded={} password_load_skip_reason={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} failure_reason={}",
+            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_loaded={} password_load_skip_reason={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} password_cleanup_attempted={} password_cleanup_status={} failure_reason={}",
             result,
             self.field("prompt_context_source").unwrap_or("live_scan"),
             self.field("prompt_context_age_ms").unwrap_or("0"),
@@ -153,6 +154,10 @@ impl FillAttemptReport {
             self.field("axpress_result").unwrap_or("not_found"),
             self.field("enter_fallback_result").unwrap_or("not_needed"),
             self.field("post_check_state").unwrap_or("unknown"),
+            self.field("password_cleanup_attempted")
+                .unwrap_or("false"),
+            self.field("password_cleanup_status")
+                .unwrap_or("not_needed"),
             failure,
         )
     }
@@ -178,12 +183,213 @@ pub(crate) fn pre_password_skip_report(
 
 pub(crate) fn write_last_fill_attempt_report(report: &FillAttemptReport) -> anyhow::Result<()> {
     let dir = crate::user_paths::runtime_dir()?;
-    std::fs::create_dir_all(&dir)?;
     let path = dir.join(LAST_FILL_ATTEMPT_REPORT_FILE);
-    let tmp_path = dir.join(format!("{LAST_FILL_ATTEMPT_REPORT_FILE}.tmp"));
     let bytes = serde_json::to_vec_pretty(report)?;
-    std::fs::write(&tmp_path, bytes)?;
-    std::fs::rename(tmp_path, path)?;
+    write_private_report_atomic(&path, &bytes)
+}
+
+fn write_private_report_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("fill attempt report path has no parent directory"))?;
+    create_private_report_directory(parent)?;
+    secure_report_directory(parent)?;
+    validate_existing_report_target(path)?;
+
+    let (temp_path, mut temp_file) = create_private_report_temp(path)?;
+    let write_result = temp_file
+        .write_all(bytes)
+        .and_then(|_| temp_file.sync_all());
+    if let Err(error) = write_result {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    drop(temp_file);
+
+    if let Err(error) = replace_private_report_file(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    secure_report_file(path)?;
+    sync_report_parent_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_report_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_report_directory(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn create_private_report_temp(path: &Path) -> anyhow::Result<(PathBuf, std::fs::File)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("fill attempt report path has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fill-attempt-report");
+
+    for _ in 0..32 {
+        let nonce = REPORT_TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.{nonce}.tmp",
+            std::process::id(),
+            timestamp
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options
+                .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+        }
+
+        match options.open(&temp_path) {
+            Ok(file) => {
+                if let Err(error) = secure_report_file(&temp_path) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(error);
+                }
+                return Ok((temp_path, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    anyhow::bail!("could not allocate a unique private fill attempt report temp file")
+}
+
+#[cfg(unix)]
+fn secure_report_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!("fill attempt report directory is not a private owned directory");
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)?;
+    #[cfg(target_os = "macos")]
+    crate::private_permissions::strip_macos_acl(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_report_directory(path: &Path) -> anyhow::Result<()> {
+    crate::private_permissions::secure_windows_private_dir(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn secure_report_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_report_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!("fill attempt report is not a private owned regular file");
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    #[cfg(target_os = "macos")]
+    crate::private_permissions::strip_macos_acl(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_report_file(path: &Path) -> anyhow::Result<()> {
+    crate::private_permissions::secure_windows_private_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn secure_report_file(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn validate_existing_report_target(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => secure_report_file(path),
+        Ok(_) => anyhow::bail!("fill attempt report target is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn replace_private_report_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    validate_existing_report_target(path)?;
+    let temp = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temp.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_private_report_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
+    validate_existing_report_target(path)?;
+    std::fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_report_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_report_parent_directory(_parent: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -296,6 +502,8 @@ impl DebugLog {
             ("enter_fallback_result", "not_needed".to_string()),
             ("submit_duration_ms", "0".to_string()),
             ("post_check_state", "unknown".to_string()),
+            ("password_cleanup_attempted", "false".to_string()),
+            ("password_cleanup_status", "not_needed".to_string()),
             ("total_local_attempt_ms", "0".to_string()),
             ("failure_reason", String::new()),
         ] {
@@ -352,6 +560,27 @@ fn log_value(log: &DebugLog, key: &str) -> Option<String> {
         .iter()
         .find(|(field, _)| *field == key)
         .map(|(_, value)| value.clone())
+}
+
+fn record_password_cleanup_result(
+    log: &mut DebugLog,
+    cleanup_result: Option<anyhow::Result<()>>,
+) -> bool {
+    let Some(cleanup_result) = cleanup_result else {
+        log.set("password_cleanup_status", "unavailable");
+        return false;
+    };
+    log.set("password_cleanup_attempted", "true");
+    match cleanup_result {
+        Ok(()) => {
+            log.set("password_cleanup_status", "ok");
+            true
+        }
+        Err(_) => {
+            log.set("password_cleanup_status", "failed");
+            false
+        }
+    }
 }
 
 #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
@@ -699,6 +928,12 @@ fn fill_current_prompt_once_macos(
                 "submit_duration_ms",
                 submit_start.elapsed().as_millis().to_string(),
             );
+            let cleanup_confirmed = record_password_cleanup_result(
+                &mut log,
+                fill_result.filled_prompt.as_ref().map(|filled_prompt| {
+                    crate::macos_ax::clear_filled_password(app_name, filled_prompt)
+                }),
+            );
             let post_state = post_check_state(
                 settings,
                 prompt.process_id,
@@ -708,7 +943,9 @@ fn fill_current_prompt_once_macos(
                 Duration::from_millis(450),
             );
             log.set("post_check_state", post_state);
-            return if post_state == "authenticated" {
+            return if !cleanup_confirmed {
+                log.fail("password_cleanup_failed_after_submit_failure")
+            } else if post_state == "authenticated" {
                 log.finish(None)
             } else {
                 log.fail(format!("submit_failed_{e}"))
@@ -730,6 +967,17 @@ fn fill_current_prompt_once_macos(
         Duration::from_millis(450),
     );
     log.set("post_check_state", post_state);
+    if post_state != "authenticated" {
+        let cleanup_confirmed = record_password_cleanup_result(
+            &mut log,
+            fill_result.filled_prompt.as_ref().map(|filled_prompt| {
+                crate::macos_ax::clear_filled_password(app_name, filled_prompt)
+            }),
+        );
+        if !cleanup_confirmed {
+            return log.fail("password_cleanup_failed_after_post_check");
+        }
+    }
     if post_state == "authenticated" {
         return log.finish(None);
     }
@@ -1283,27 +1531,38 @@ fn fill_current_prompt_once_windows(
     );
 
     let submit_start = Instant::now();
-    let submit_result = match crate::windows_ui::submit_prompt(app_name, &prompt, guard) {
-        Ok(result) => result,
-        Err(e) => {
-            log.set(
-                "submit_duration_ms",
-                submit_start.elapsed().as_millis().to_string(),
-            );
-            let post_state = crate::windows_ui::post_check_state(
-                app_name,
-                target.process_id,
-                expected_email,
-                Duration::from_millis(1200),
-            );
-            log.set("post_check_state", post_state);
-            return if post_state == "authenticated" {
-                log.finish(None)
-            } else {
-                log.fail(format!("submit_script_failed_{e}"))
-            };
-        }
-    };
+    let submit_result =
+        match crate::windows_ui::submit_prompt(app_name, &fill_result.filled_prompt, guard) {
+            Ok(result) => result,
+            Err(e) => {
+                log.set(
+                    "submit_duration_ms",
+                    submit_start.elapsed().as_millis().to_string(),
+                );
+                let cleanup_confirmed = record_password_cleanup_result(
+                    &mut log,
+                    Some(crate::windows_ui::clear_filled_password(
+                        app_name,
+                        &fill_result.filled_prompt,
+                    )),
+                );
+                let post_state = crate::windows_ui::post_check_state(
+                    app_name,
+                    fill_result.filled_prompt.target.process_id,
+                    expected_email,
+                    None,
+                    Duration::from_millis(1200),
+                );
+                log.set("post_check_state", post_state);
+                return if !cleanup_confirmed {
+                    log.fail("password_cleanup_failed_after_submit_failure")
+                } else if post_state == "authenticated" {
+                    log.finish(None)
+                } else {
+                    log.fail(format!("submit_script_failed_{e}"))
+                };
+            }
+        };
     log.set(
         "submit_duration_ms",
         submit_start.elapsed().as_millis().to_string(),
@@ -1324,11 +1583,24 @@ fn fill_current_prompt_once_windows(
 
     let post_state = crate::windows_ui::post_check_state(
         app_name,
-        target.process_id,
+        fill_result.filled_prompt.target.process_id,
         expected_email,
+        submit_result.submitted_prompt.as_ref(),
         Duration::from_millis(1200),
     );
     log.set("post_check_state", post_state);
+    if post_state != "authenticated" {
+        let cleanup_confirmed = record_password_cleanup_result(
+            &mut log,
+            Some(crate::windows_ui::clear_filled_password(
+                app_name,
+                &fill_result.filled_prompt,
+            )),
+        );
+        if !cleanup_confirmed {
+            return log.fail("password_cleanup_failed_after_post_check");
+        }
+    }
     match post_state {
         "authenticated" => log.finish(None),
         "prompt_mismatch" => log.fail("post_submit_prompt_mismatch"),
@@ -1369,6 +1641,7 @@ fn inspect_windows_prompt_for_fill(
     match crate::windows_ui::inspect_prompt_snapshot(
         app_name,
         context.process_id,
+        context.window_handle,
         &context.window_title,
         Some(&context.prompt_email),
     ) {
@@ -1379,6 +1652,7 @@ fn inspect_windows_prompt_for_fill(
                 target,
                 prompt: Some(prompt),
                 has_session: false,
+                session_windows: Vec::new(),
                 password_like_plain_edit_rejected: false,
             })
         }
@@ -2295,6 +2569,58 @@ mod tests {
     ))]
     use super::FillMethod;
 
+    fn private_report_test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "windows-app-autologin-report-{label}-{}-{}",
+            std::process::id(),
+            super::REPORT_TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn last_fill_report_atomic_write_uses_private_unique_temp_file() {
+        let dir = private_report_test_dir("atomic");
+        let path = dir.join("last-fill-attempt.json");
+
+        super::write_private_report_atomic(&path, br#"{"success":true}"#).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"success":true}"#);
+        assert!(!dir.join("last-fill-attempt.json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_fill_report_atomic_write_refuses_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = private_report_test_dir("symlink");
+        let target = dir.join("do-not-overwrite");
+        let report = dir.join("last-fill-attempt.json");
+        std::fs::write(&target, b"sentinel").unwrap();
+        symlink(&target, &report).unwrap();
+
+        assert!(super::write_private_report_atomic(&report, b"replacement").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"sentinel");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn redacted_email_is_not_stable_identifier() {
         assert_eq!(redacted_email("user@example.com"), "[email]");
@@ -2466,6 +2792,46 @@ mod tests {
             "let fill_result = match fill_result {",
             "crate::windows_ui::submit_prompt(",
         );
+    }
+
+    #[test]
+    fn cleanup_failure_is_reported_as_a_hard_failure() {
+        let mut log = super::DebugLog::new("test".to_string());
+        let confirmed = super::record_password_cleanup_result(
+            &mut log,
+            Some(Err(anyhow::anyhow!("simulated cleanup failure"))),
+        );
+        assert!(!confirmed);
+
+        let report = log.fail("password_cleanup_failed_after_post_check");
+        assert!(!report.success);
+        assert_eq!(report.field("password_cleanup_attempted"), Some("true"));
+        assert_eq!(report.field("password_cleanup_status"), Some("failed"));
+        assert_eq!(
+            report.failure_reason.as_deref(),
+            Some("password_cleanup_failed_after_post_check")
+        );
+    }
+
+    #[test]
+    fn failed_submit_and_post_check_never_discard_cleanup_errors() {
+        let implementation = include_str!("debug_fill.rs");
+        let macos_fill = source_between(
+            implementation,
+            "fn fill_current_prompt_once_macos(",
+            "fn detect_current_prompt_context_macos(",
+        );
+        let windows_fill = source_between(
+            implementation,
+            "fn fill_current_prompt_once_windows(",
+            "fn inspect_windows_prompt_for_fill(",
+        );
+
+        for fill in [macos_fill, windows_fill] {
+            assert!(!fill.contains("let _ ="));
+            assert!(fill.contains("password_cleanup_failed_after_submit_failure"));
+            assert!(fill.contains("password_cleanup_failed_after_post_check"));
+        }
     }
 
     #[test]
