@@ -75,8 +75,8 @@ Other app names, copied bundles, unsigned bundles, modified bundles, or unexpect
 - macOS Accessibility permission for the exact app or binary you launch on macOS.
 - macOS may also ask for Automation permission to control System Events; approve it only for the expected Windows App AutoLogin bundle.
 - For macOS bundle creation: `sips` and `iconutil`.
-- For macOS release packaging: a Developer ID Application signing identity available to `codesign`, plus an `xcrun notarytool` keychain profile.
-- For a publishable Windows distribution: an x64 MSVC Rust toolchain, a Visual Studio Developer PowerShell environment with `link.exe` and `rc.exe`, Windows SDK `signtool.exe`, and an installed code-signing certificate with an accessible private key.
+- For macOS release packaging: a Developer ID Application signing identity available to `codesign`, plus a `notarytool` keychain profile.
+- For a publishable Windows distribution: an x64 MSVC Rust toolchain, a Visual Studio Developer PowerShell environment with `cl.exe`, `lib.exe`, `link.exe`, and `rc.exe`, Windows SDK `signtool.exe`, and a code-signing certificate with an accessible private key installed in `Cert:\CurrentUser\My`.
 
 ## Build
 
@@ -86,17 +86,35 @@ Create a production macOS release ZIP with a freshly built, signed, notarized, a
 RELEASE_CARGO="$(rustup which cargo)"
 RELEASE_RUSTC="$(rustup which rustc)"
 RELEASE_SYSROOT="$($RELEASE_RUSTC --print sysroot)"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+XCODE_TOOLCHAIN="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain"
+MACOS_SDKROOT="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+CLANG_RESOURCE_DIR="$($XCODE_TOOLCHAIN/usr/bin/clang -print-resource-dir)"
 export WAAL_RELEASE_CARGO_PATH="$RELEASE_CARGO"
 export WAAL_RELEASE_RUSTC_PATH="$RELEASE_RUSTC"
 export WAAL_RELEASE_RUST_SYSROOT="$RELEASE_SYSROOT"
-export WAAL_RELEASE_EXPECTED_CARGO_SHA256="$(shasum -a 256 "$RELEASE_CARGO" | awk '{print $1}')"
-export WAAL_RELEASE_EXPECTED_RUSTC_SHA256="$(shasum -a 256 "$RELEASE_RUSTC" | awk '{print $1}')"
-export WAAL_RELEASE_EXPECTED_CLANG_SHA256="$(shasum -a 256 /usr/bin/clang | awk '{print $1}')"
-export WAAL_RELEASE_EXPECTED_CLANGXX_SHA256="$(shasum -a 256 /usr/bin/clang++ | awk '{print $1}')"
-export WAAL_RELEASE_EXPECTED_AR_SHA256="$(shasum -a 256 /usr/bin/ar | awk '{print $1}')"
-# Compute WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256 with directory_tree_sha256
-# from script/package_macos.sh, and compute the native aggregate as documented below.
+export WAAL_MACOS_DEVELOPER_DIR="$DEVELOPER_DIR"
+export WAAL_MACOS_SDKROOT="$MACOS_SDKROOT"
+export WAAL_MACOS_CLANG_RESOURCE_DIR="$CLANG_RESOURCE_DIR"
+# Load these values from a separately reviewed, versioned toolchain-pin
+# manifest. Hashing the live tools and immediately trusting those hashes is
+# only candidate generation; it is not release verification.
+export WAAL_RELEASE_EXPECTED_GIT_SHA256=<reviewed-xcode-git-sha256>
+export WAAL_RELEASE_EXPECTED_CARGO_SHA256=<reviewed-cargo-sha256>
+export WAAL_RELEASE_EXPECTED_RUSTC_SHA256=<reviewed-rustc-sha256>
+export WAAL_RELEASE_EXPECTED_CLANG_SHA256=<reviewed-clang-sha256>
+export WAAL_RELEASE_EXPECTED_CLANGXX_SHA256=<reviewed-clangxx-sha256>
+export WAAL_RELEASE_EXPECTED_AR_SHA256=<reviewed-ar-sha256>
+export WAAL_RELEASE_EXPECTED_LD_SHA256=<reviewed-ld-sha256>
+export WAAL_RELEASE_EXPECTED_LD_TAPI_SHA256=<reviewed-libtapi-sha256>
+export WAAL_RELEASE_EXPECTED_LD_CODEDIRECTORY_SHA256=<reviewed-libcodedirectory-sha256>
+export WAAL_RELEASE_EXPECTED_LD_LTO_SHA256=<reviewed-liblto-sha256>
+export WAAL_RELEASE_EXPECTED_LD_SWIFT_DEMANGLE_SHA256=<reviewed-libswift-demangle-sha256>
+export WAAL_RELEASE_EXPECTED_NOTARYTOOL_SHA256=<reviewed-notarytool-sha256>
+export WAAL_RELEASE_EXPECTED_STAPLER_SHA256=<reviewed-stapler-sha256>
 export WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256=<reviewed-sysroot-tree-sha256>
+export WAAL_RELEASE_EXPECTED_MACOS_SDK_SHA256=<reviewed-sdk-tree-sha256>
+export WAAL_RELEASE_EXPECTED_CLANG_RESOURCE_DIR_SHA256=<reviewed-clang-resource-tree-sha256>
 export WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256=<reviewed-native-aggregate-sha256>
 WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
 WAAL_MACOS_TEAM_ID=ABCDE12345 \
@@ -104,6 +122,8 @@ WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
 WAAL_NOTARY_PROFILE=your-notary-profile \
 script/package_macos.sh --release
 ```
+
+The verified files are published as `dist/WindowsAppAutoLogin-macos-<40-hex-commit>.zip` and the commit-addressed `*.zip.sha256` sidecar. Publication uses a same-volume atomic no-replace rename: an existing artifact is never unlinked or overwritten, and older commit artifacts are preserved.
 
 For a local macOS development bundle, use `./script/build_and_run.sh --verify` instead.
 
@@ -117,27 +137,31 @@ Create a publishable Windows x86-64 distribution from a Visual Studio Developer 
 
 ```powershell
 $env:WAAL_WINDOWS_SIGN_CERT_THUMBPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
-$env:WAAL_WINDOWS_RELEASE_GIT_PATH = "C:\Program Files\Git\cmd\git.exe"
+$env:WAAL_WINDOWS_RELEASE_GIT_PATH = "C:\Program Files\Git\mingw64\bin\git.exe"
+$env:WAAL_WINDOWS_RELEASE_GIT_ROOT = "C:\Program Files\Git"
 $env:WAAL_WINDOWS_RELEASE_TAR_PATH = "C:\Windows\System32\tar.exe"
 $env:WAAL_RELEASE_CARGO_PATH = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
 $env:WAAL_RELEASE_RUSTC_PATH = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
 $env:WAAL_RELEASE_RUST_SYSROOT = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc"
+$env:WAAL_WINDOWS_RELEASE_CL_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\cl.exe"
+$env:WAAL_WINDOWS_RELEASE_LIB_EXE_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\lib.exe"
 $env:WAAL_WINDOWS_RELEASE_LINK_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\link.exe"
+$env:WAAL_WINDOWS_RELEASE_MSVC_BIN = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64"
 $env:WAAL_WINDOWS_RELEASE_RC_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\rc.exe"
+$env:WAAL_WINDOWS_RELEASE_SDK_BIN = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64"
 $env:WAAL_WINDOWS_RELEASE_SIGNTOOL_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\signtool.exe"
 $env:WAAL_WINDOWS_RELEASE_LIB = "<reviewed semicolon-separated absolute MSVC/SDK library directories>"
 $env:WAAL_WINDOWS_RELEASE_INCLUDE = "<reviewed semicolon-separated absolute MSVC/SDK include directories>"
 $env:WAAL_WINDOWS_RELEASE_LIBPATH = "<reviewed semicolon-separated absolute MSVC/SDK reference directories>"
-# Set each corresponding WAAL_*_EXPECTED_*_SHA256 value to a reviewed lowercase
-# (Get-FileHash -Algorithm SHA256 -LiteralPath <path>).Hash.ToLowerInvariant().
-# Also set WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256 and
-# WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256 as documented below.
+# Load the corresponding lowercase hashes from a separately reviewed pin
+# manifest. File pins use SHA-256; directory and directory-list pins use the
+# deterministic contracts documented below.
 .\script\build_windows_dist.ps1
 ```
 
-The corresponding Windows hash variables are `WAAL_WINDOWS_RELEASE_EXPECTED_GIT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_TAR_SHA256`, `WAAL_RELEASE_EXPECTED_CARGO_SHA256`, `WAAL_RELEASE_EXPECTED_RUSTC_SHA256`, `WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LINK_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_RC_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_SIGNTOOL_SHA256`, and `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256`.
+The corresponding Windows hash variables are `WAAL_WINDOWS_RELEASE_EXPECTED_GIT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_GIT_ROOT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_TAR_SHA256`, `WAAL_RELEASE_EXPECTED_CARGO_SHA256`, `WAAL_RELEASE_EXPECTED_RUSTC_SHA256`, `WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_CL_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LIB_EXE_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LINK_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_MSVC_BIN_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_RC_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_SDK_BIN_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_SIGNTOOL_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LIB_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_INCLUDE_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LIBPATH_SHA256`, and `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256`.
 
-The default Windows command is fail-closed: it requires a clean Git checkout, rejects links/gitlinks in the committed source tree, builds a fresh self-contained snapshot with an isolated Cargo home, verifies the locked dependency graph and every pinned build/materialization/signing tool, sanitizes MSVC injection variables, embeds the exact Git commit/tree plus signer name and certificate SHA-256 fingerprint, signs and RFC 3161 timestamps the executable, verifies Authenticode against that exact certificate, and writes `SHA256SUMS.txt` plus `BUILD-PROVENANCE.txt`. Publication uses a verified candidate plus rollback backup inside `dist`; the previous package remains recoverable until the activated package passes its final metadata, hash, provenance, and Authenticode checks.
+The default Windows command is fail-closed: it requires a clean Git checkout, rejects links/gitlinks in the committed source tree, builds and repeatedly re-verifies a fresh self-contained snapshot with an isolated Cargo home, verifies the locked dependency graph and every pinned build/materialization/signing tool, and sanitizes generic and target-qualified MSVC injection variables. The physical Git executable and its reported `--exec-path` must remain inside the pinned Git runtime tree; `tar.exe` must be the pinned physical executable in the trusted Windows System32 directory; and `rc.exe` plus `signtool.exe` must remain inside the pinned Windows SDK executable tree. The build embeds the exact Git commit/tree, release-materials aggregate, signer name, and certificate SHA-256 fingerprint, signs and RFC 3161 timestamps the executable, verifies Authenticode against that exact certificate, and writes `SHA256SUMS.txt` covering the executable, documentation, example config, and `BUILD-PROVENANCE.txt`. Publication is a single same-volume rename to an immutable commit-addressed directory such as `dist/WindowsAppAutoLogin-windows-x86_64-<40-hex-commit>`; older committed packages are never renamed or recursively deleted, so a crash cannot remove the previous package.
 
 For an unsigned local VM test artifact only, opt in explicitly. This uses a separate directory name and is never a publishable release:
 
@@ -374,13 +398,13 @@ obcardinal.windows-app-autologin
 
 The development script does not perform Developer ID signing or notarization. It opts into `WAAL_DEVELOPMENT_RELEASE=1` only for local non-production release-profile bundles.
 
-Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script requires the Git checkout to have no tracked, untracked, assume-unchanged, or skip-worktree changes; records the exact 40-hex `HEAD` commit and tree IDs; materializes an isolated source snapshot directly from that commit; and rechecks both the checkout and embedded values before publishing. Cargo runs with a new packager-owned `HOME`, `CARGO_HOME`, temporary directory, target directory, fixed system-tool path, and no Cargo configuration in its working-directory ancestors. The dependency graph must contain only the archived root package and locked crates.io packages—external path, Git, alternate-registry, and source-replacement inputs are rejected. Cargo, rustc, the complete Rust sysroot, `/usr/bin/clang`, `/usr/bin/clang++`, and `/usr/bin/ar` must be explicitly selected and match reviewed SHA-256 pins; their provenance is embedded in the executable and signed `BUILD-PROVENANCE.txt`. The script assembles the `.app` from snapshot assets, signs it with `WAAL_CODESIGN_IDENTITY`, notarizes it with `WAAL_NOTARY_PROFILE`, staples the ticket, and zips only the verified staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs, and `dist` must be a real directory rather than a symlink.
+Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script requires the Git checkout to have no tracked, non-ignored untracked, assume-unchanged, or skip-worktree changes; records the exact 40-hex `HEAD` commit and tree IDs; materializes an isolated source snapshot directly from that commit; independently verifies every materialized file byte and executable mode against its Git blob before and after each Cargo invocation and bundle assembly; and rechecks the checkout, snapshot, and embedded values before publishing. Git uses the explicitly pinned physical Xcode executable with ambient Git configuration, replacement refs, hooks, and local filesystem-monitor execution disabled; tracked archive attributes remain harmless because the extracted file set and every byte are compared with the Git tree. Cargo runs with a new packager-owned `HOME`, `CARGO_HOME`, temporary directory, target directory, fixed system-tool path, explicit `DEVELOPER_DIR` and `SDKROOT`, and no Cargo configuration in its working-directory ancestors. The dependency graph must contain only the archived root package and locked crates.io packages—external path, Git, alternate-registry, and source-replacement inputs are rejected. Cargo, rustc, the complete Rust sysroot, physical Xcode Git, `clang`, `clang++`, `ar`, `ld`, the four Xcode linker runtime libraries, the selected macOS SDK tree, Clang resource directory, `notarytool`, and `stapler` must match separately reviewed SHA-256 pins; `/usr/bin` developer-tool shims are not release inputs. Their hashes are bound into the release-materials aggregate embedded in the executable and into signed `BUILD-PROVENANCE.txt`. The script assembles the `.app` from snapshot assets, signs it with `WAAL_CODESIGN_IDENTITY`, notarizes it with `WAAL_NOTARY_PROFILE`, staples the ticket, and zips only the verified staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs, and `dist` must be a real directory rather than a symlink.
 
-The sysroot tree digest is SHA-256 over ordinal byte-sorted regular-file entries encoded as `relative/path`, NUL, lowercase file SHA-256, NUL; symbolic links and special nodes are rejected. The macOS native aggregate is SHA-256 over the NUL-terminated lowercase hashes of `clang`, `clang++`, and `ar`, in exactly that order. The Windows native aggregate uses `link.exe`, `rc.exe`, and `signtool.exe`, in exactly that order. These ordered aggregate values are the `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256` pins.
+The Rust sysroot tree digest is SHA-256 over ordinal byte-sorted regular-file entries encoded as `relative/path`, NUL, lowercase file SHA-256, NUL; symbolic links and special nodes are rejected. The Xcode SDK/resource-tree digest additionally supports only non-broken symbolic links whose resolved targets remain inside the same pinned root; it encodes each ordinal byte-sorted regular file as `relative/path`, NUL, `file`, NUL, lowercase file SHA-256, NUL and each link as `relative/path`, NUL, `link`, NUL, exact link text, NUL. The macOS native aggregate is SHA-256 over NUL-terminated lowercase hashes, in this exact order: `clang`, `clang++`, `ar`, `ld`, `libtapi.dylib`, `libcodedirectory.dylib`, `libLTO.dylib`, `libswiftDemangle.dylib`, the macOS SDK tree, and the Clang resource directory. The macOS release-materials aggregate applies the same rule in this exact order: physical Xcode Git, Cargo, rustc, the Rust sysroot aggregate, the native-toolchain aggregate, `notarytool`, and `stapler`. The Windows directory-tree digest uses the Rust-sysroot file contract. A Windows `LIB`, `INCLUDE`, or `LIBPATH` list digest first hashes each semicolon-ordered directory tree, then hashes those lowercase tree hashes with a NUL after each. The publishable Windows native aggregate uses the same NUL-terminated-hash rule in this exact order: `cl.exe`, `lib.exe`, `link.exe`, the MSVC compiler-bin directory tree, `rc.exe`, the Windows SDK executable tree, and `signtool.exe`. The Windows release-materials aggregate applies the rule in this exact order: Git executable, Git runtime tree, `tar`, Cargo, rustc, Rust sysroot, native-toolchain aggregate, approved `LIB` content, approved `INCLUDE` content, and approved `LIBPATH` content. These ordered native aggregate values are the `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256` pins; each derived release-materials value is passed to Cargo as `WAAL_RELEASE_MATERIALS_SHA256` and verified in embedded metadata.
 
 The current release pipeline intentionally produces an ARM64 macOS binary. `CFBundleVersion` defaults to the numeric Cargo package version and can be overridden with a valid one-to-three-component `WAAL_BUILD_VERSION`.
 
-Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID, Team ID, source commit/tree, target, and toolchain hashes, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It removes any stale output ZIP only after source validation, strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, then validates the staged bundle and the extracted ZIP artifact before publishing the ZIP.
+Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID, Team ID, source commit/tree, target, toolchain hashes, and release-materials aggregate, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, validates the staged bundle and extracted ZIP, publishes the ZIP and SHA-256 sidecar under immutable commit-addressed names without replacing prior files, then re-hashes and fully verifies the final destination archive.
 
 The project previously used development bundle ID `dev.codex.windows-app-autologin`; the current ID is `obcardinal.windows-app-autologin`. Release and development scripts do not reset privacy databases or alter Keychain access lists automatically. If an obsolete grant remains, remove only the old app entry from **System Settings → Privacy & Security → Accessibility** and **Automation**. If you deliberately want command-line cleanup, run the bundle-scoped `tccutil reset Accessibility dev.codex.windows-app-autologin` and `tccutil reset AppleEvents dev.codex.windows-app-autologin` yourself after reviewing the target. In Keychain Access, inspect the `WindowsAppAutoLogin` and `WindowsAppAutoLoginFallbackKey` items and remove only a stale application entry from Access Control; do not delete password items or the fallback key while fallback records exist. For the current ad-hoc development ID, prefer removing and re-adding the exact rebuilt app in System Settings rather than resetting unrelated applications.
 

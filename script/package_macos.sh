@@ -12,6 +12,8 @@ APP_NAME="$PRODUCTION_APP_NAME"
 APP_DISPLAY_NAME="Windows App AutoLogin"
 DEVELOPMENT_BUNDLE_ID="obcardinal.windows-app-autologin"
 ZIP_PATH=""
+ZIP_SHA256_PATH=""
+RELEASE_ARCHIVE_BASE=""
 BINARY_NAME="windows-app-autologin"
 PRODUCTION_BUNDLE_ID="${WAAL_RELEASE_BUNDLE_ID:-}"
 DIAGNOSTICS_BUNDLE_ID="${WAAL_DIAGNOSTICS_BUNDLE_ID:-}"
@@ -22,11 +24,19 @@ CODESIGN_IDENTITY="${WAAL_CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${WAAL_NOTARY_PROFILE:-}"
 RELEASE=false
 RELEASE_DIAGNOSTICS_ARTIFACT=false
+RELEASE_PRIVATE_ROOT=""
+RELEASE_PRIVATE_ROOT_PARENT=""
+RELEASE_PRIVATE_ROOT_ID=""
+RELEASE_PRIVATE_ROOT_PARENT_ID=""
+RELEASE_TEMP_DIR=""
 STAGE_DIR=""
 BUILD_TARGET_DIR=""
 TARGET_EXECUTABLE=""
 RELEASE_GIT_COMMIT=""
 RELEASE_GIT_TREE=""
+RELEASE_GIT_SOURCE_ROOT=""
+RELEASE_GIT_BIN="/Applications/Xcode.app/Contents/Developer/usr/bin/git"
+RELEASE_GIT_SHA256=""
 RELEASE_SOURCE_ROOT=""
 RELEASE_SOURCE_DIR=""
 RELEASE_CARGO_BIN=""
@@ -39,6 +49,12 @@ RELEASE_CLANG_BIN=""
 RELEASE_CLANGXX_BIN=""
 RELEASE_AR_BIN=""
 RELEASE_LD_BIN=""
+RELEASE_LD_TAPI_BIN=""
+RELEASE_LD_CODEDIRECTORY_BIN=""
+RELEASE_LD_LTO_BIN=""
+RELEASE_LD_SWIFT_DEMANGLE_BIN=""
+RELEASE_NOTARYTOOL_BIN=""
+RELEASE_STAPLER_BIN=""
 RELEASE_BUILD_HOME=""
 RELEASE_CARGO_HOME=""
 RELEASE_CARGO_WORK_DIR=""
@@ -52,9 +68,18 @@ RELEASE_CLANG_SHA256=""
 RELEASE_CLANGXX_SHA256=""
 RELEASE_AR_SHA256=""
 RELEASE_LD_SHA256=""
+RELEASE_LD_TAPI_SHA256=""
+RELEASE_LD_CODEDIRECTORY_SHA256=""
+RELEASE_LD_LTO_SHA256=""
+RELEASE_LD_SWIFT_DEMANGLE_SHA256=""
+RELEASE_NOTARYTOOL_SHA256=""
+RELEASE_STAPLER_SHA256=""
 RELEASE_MACOS_SDK_SHA256=""
 RELEASE_CLANG_RESOURCE_DIR_SHA256=""
 RELEASE_NATIVE_TOOLCHAIN_SHA256=""
+RELEASE_MATERIALS_SHA256=""
+ATOMIC_RENAME_HELPER=""
+ATOMIC_RENAME_HELPER_SHA256=""
 CARGO_VERSION="$(waal_cargo_version "$ROOT_DIR")"
 BUILD_VERSION="$(waal_build_version "$CARGO_VERSION")"
 
@@ -69,12 +94,12 @@ done
 if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
   APP_NAME="$DIAGNOSTICS_APP_NAME"
   APP_DISPLAY_NAME="Windows App AutoLogin Diagnostics"
-  ZIP_PATH="$ROOT_DIR/dist/$APP_NAME-macos-release-diagnostics.zip"
+  RELEASE_ARCHIVE_BASE="$APP_NAME-macos-release-diagnostics"
   EXPECTED_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID"
   EXPECTED_BUNDLE_ID_ENV="WAAL_DIAGNOSTICS_BUNDLE_ID"
 else
   APP_NAME="$PRODUCTION_APP_NAME"
-  ZIP_PATH="$ROOT_DIR/dist/$APP_NAME-macos.zip"
+  RELEASE_ARCHIVE_BASE="$APP_NAME-macos"
   EXPECTED_BUNDLE_ID="$PRODUCTION_BUNDLE_ID"
   EXPECTED_BUNDLE_ID_ENV="WAAL_RELEASE_BUNDLE_ID"
 fi
@@ -107,6 +132,7 @@ valid_git_object_id() {
 # attributes can still affect `git archive`, so the materialized bytes are
 # independently checked against every tree blob below.
 sanitized_git() {
+  verify_release_git_integrity || return 1
   /usr/bin/env -i \
     PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     HOME=/var/empty \
@@ -114,10 +140,44 @@ sanitized_git() {
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_NO_REPLACE_OBJECTS=1 \
-    /usr/bin/git --no-replace-objects \
+    "$RELEASE_GIT_BIN" --no-replace-objects \
       -c core.attributesFile=/dev/null \
+      -c core.fsmonitor=false \
+      -c core.untrackedCache=false \
       -c core.hooksPath=/dev/null \
       "$@"
+}
+
+verify_release_git_integrity() {
+  local expected
+  local actual
+  local canonical
+
+  if [ -z "$RELEASE_GIT_SHA256" ]; then
+    expected="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_GIT_SHA256)" || return 1
+    if [ ! -f "$RELEASE_GIT_BIN" ] || [ ! -x "$RELEASE_GIT_BIN" ] || [ -L "$RELEASE_GIT_BIN" ]; then
+      echo "Pinned physical Xcode Git is unavailable: $RELEASE_GIT_BIN" >&2
+      return 1
+    fi
+    canonical="$(canonical_executable_path "$RELEASE_GIT_BIN")" || return 1
+    if [ "$canonical" != "$RELEASE_GIT_BIN" ]; then
+      echo "Pinned Git path contains a symbolic-link component." >&2
+      return 1
+    fi
+    actual="$(release_tool_sha256 "$RELEASE_GIT_BIN")"
+    if [ "$actual" != "$expected" ]; then
+      echo "Physical Xcode Git SHA-256 does not match WAAL_RELEASE_EXPECTED_GIT_SHA256." >&2
+      return 1
+    fi
+    RELEASE_GIT_SHA256="$expected"
+    return 0
+  fi
+
+  actual="$(release_tool_sha256 "$RELEASE_GIT_BIN")"
+  if [ "$actual" != "$RELEASE_GIT_SHA256" ]; then
+    echo "Physical Xcode Git changed after release provenance initialization." >&2
+    return 1
+  fi
 }
 
 capture_release_provenance_for_root() {
@@ -186,6 +246,7 @@ capture_release_provenance_for_root() {
 
   RELEASE_GIT_COMMIT="$git_commit"
   RELEASE_GIT_TREE="$git_tree"
+  RELEASE_GIT_SOURCE_ROOT="$source_root"
 }
 
 capture_release_provenance() {
@@ -219,7 +280,7 @@ verify_release_tree_contains_only_regular_files() {
   local remainder
   local object_type
 
-  listing="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/waal-release-tree.XXXXXX")" || return 1
+  listing="$(private_release_mktemp waal-release-tree)" || return 1
   if ! sanitized_git -C "$requested_root" ls-tree -rz --full-tree "$expected_commit" >"$listing"; then
     /bin/rm -f -- "$listing"
     echo "Unable to inspect release source tree entry modes." >&2
@@ -277,7 +338,7 @@ verify_materialized_release_source() {
     fi
   done
 
-  listing="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/waal-release-tree-bytes.XXXXXX")" || return 1
+  listing="$(private_release_mktemp waal-release-tree-bytes)" || return 1
   if ! sanitized_git -C "$requested_root" ls-tree -rz --full-tree "$expected_commit" >"$listing"; then
     /bin/rm -f -- "$listing"
     echo "Unable to capture the expected release tree for byte verification." >&2
@@ -372,7 +433,11 @@ materialize_release_source_for_root() {
 }
 
 materialize_release_source() {
-  RELEASE_SOURCE_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/waal-release-source.XXXXXX")"
+  if [ -z "$RELEASE_PRIVATE_ROOT" ] || [ -z "$RELEASE_SOURCE_ROOT" ] \
+    || [ ! -d "$RELEASE_SOURCE_ROOT" ] || [ -L "$RELEASE_SOURCE_ROOT" ]; then
+    echo "Private release source staging is not initialized." >&2
+    return 1
+  fi
   RELEASE_SOURCE_DIR="$RELEASE_SOURCE_ROOT/source"
   materialize_release_source_for_root \
     "$ROOT_DIR" \
@@ -381,6 +446,17 @@ materialize_release_source() {
     "$RELEASE_GIT_TREE"
   CARGO_VERSION="$(waal_cargo_version "$RELEASE_SOURCE_DIR")"
   BUILD_VERSION="$(waal_build_version "$CARGO_VERSION")"
+}
+
+verify_release_snapshot_unchanged() {
+  if [ -z "$RELEASE_SOURCE_DIR" ] || [ -z "$RELEASE_GIT_COMMIT" ]; then
+    echo "Release source snapshot provenance is not initialized." >&2
+    return 1
+  fi
+  verify_materialized_release_source \
+    "$RELEASE_SOURCE_DIR" \
+    "$RELEASE_GIT_SOURCE_ROOT" \
+    "$RELEASE_GIT_COMMIT"
 }
 
 canonical_executable_path() {
@@ -452,6 +528,84 @@ resolve_explicit_release_directory() {
     return 1
   fi
   /usr/bin/printf '%s\n' "$canonical_path"
+}
+
+canonical_existing_path() {
+  local requested_path="$1"
+  /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    /usr/bin/perl -MCwd=abs_path -e '
+      use strict;
+      use warnings;
+      my $path = shift @ARGV;
+      my $resolved = abs_path($path);
+      die "unable to resolve path\n" unless defined $resolved;
+      print $resolved, "\n";
+    ' -- "$requested_path"
+}
+
+verify_release_tool_under_root() {
+  local path="$1"
+  local trusted_root="$2"
+  local expected="$3"
+  local description="$4"
+  local resolved
+  local actual
+
+  case "$path" in
+    "$trusted_root"/*) ;;
+    *)
+      echo "$description is not inside the explicitly selected Xcode Developer directory." >&2
+      return 1
+      ;;
+  esac
+  if [ ! -f "$path" ] || [ ! -x "$path" ]; then
+    echo "$description is not an executable Xcode tool: $path" >&2
+    return 1
+  fi
+  if ! resolved="$(canonical_existing_path "$path")"; then
+    echo "$description cannot be resolved to a physical Xcode tool." >&2
+    return 1
+  fi
+  case "$resolved" in
+    "$trusted_root"/*) ;;
+    *)
+      echo "$description resolves outside the explicitly selected Xcode Developer directory." >&2
+      return 1
+      ;;
+  esac
+  if [ ! -f "$resolved" ] || [ ! -x "$resolved" ]; then
+    echo "$description does not resolve to a regular executable." >&2
+    return 1
+  fi
+  actual="$(release_tool_sha256 "$path")"
+  if [ "$actual" != "$expected" ]; then
+    echo "$description SHA-256 does not match its required release pin." >&2
+    return 1
+  fi
+}
+
+resolve_release_directory_under_root() {
+  local requested_path="$1"
+  local trusted_root="$2"
+  local description="$3"
+  local resolved
+
+  if ! resolved="$(canonical_existing_path "$requested_path")"; then
+    echo "$description cannot be resolved." >&2
+    return 1
+  fi
+  case "$resolved" in
+    "$trusted_root"/*) ;;
+    *)
+      echo "$description resolves outside the explicitly selected Xcode Developer directory." >&2
+      return 1
+      ;;
+  esac
+  if [ ! -d "$resolved" ] || [ -L "$resolved" ]; then
+    echo "$description must resolve to a physical directory." >&2
+    return 1
+  fi
+  /usr/bin/printf '%s\n' "$resolved"
 }
 
 required_expected_sha256() {
@@ -540,11 +694,118 @@ directory_tree_sha256() {
   /usr/bin/printf '%s\n' "$digest"
 }
 
+directory_tree_with_internal_symlinks_sha256() {
+  local requested_root="$1"
+  local root
+  local digest
+
+  if ! root="$(cd "$requested_root" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$root" != "${requested_root%/}" ]; then
+    echo "Hash input must be a physical directory without symbolic-link path components: $requested_root" >&2
+    return 1
+  fi
+  # Xcode SDKs and Clang resource directories contain intentional aliases.
+  # Hash link text as part of the tree and accept a link only when its fully
+  # resolved target remains inside the same pinned root.
+  if ! digest="$(/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    /usr/bin/perl -MCwd=abs_path -MDigest::SHA -MFile::Find -e '
+      use strict;
+      use warnings;
+      use bytes;
+      my $root = shift @ARGV;
+      my @entries;
+      File::Find::find({
+        no_chdir => 1,
+        follow => 0,
+        wanted => sub {
+          my $path = $File::Find::name;
+          return if $path eq $root;
+          my @before = lstat($path);
+          die "lstat failed for $path: $!\n" unless @before;
+          my $relative = substr($path, length($root) + 1);
+          if (-l _) {
+            my $target = readlink($path);
+            die "readlink failed for $path: $!\n" unless defined $target;
+            my $resolved = abs_path($path);
+            die "broken symbolic link rejected: $path\n" unless defined $resolved;
+            die "symbolic link escapes pinned root: $path\n"
+              unless $resolved eq $root || index($resolved, "$root/") == 0;
+            push @entries, [$relative, "link", $target, \@before];
+            return;
+          }
+          return if -d _;
+          die "unsupported filesystem node rejected: $path\n" unless -f _;
+          push @entries, [$relative, "file", $path, \@before];
+        },
+      }, $root);
+      @entries = sort { $a->[0] cmp $b->[0] } @entries;
+      my $aggregate = Digest::SHA->new(256);
+      for my $entry (@entries) {
+        my ($relative, $kind, $value, $before) = @$entry;
+        my $path = "$root/$relative";
+        if ($kind eq "link") {
+          my @after = lstat($path);
+          die "symbolic link disappeared while hashing: $path\n" unless @after && -l _;
+          my $target = readlink($path);
+          die "symbolic link changed while hashing: $path\n"
+            unless defined $target && $target eq $value;
+          for my $index (0, 1, 2, 7, 9, 10) {
+            die "symbolic link metadata changed while hashing: $path\n"
+              if $before->[$index] != $after[$index];
+          }
+          $aggregate->add($relative, "\0link\0", $target, "\0");
+          next;
+        }
+        my @current = lstat($path);
+        die "file disappeared while hashing: $path\n" unless @current && -f _ && !-l _;
+        open my $file, "<:raw", $path or die "open failed for $path: $!\n";
+        my $file_hash = Digest::SHA->new(256)->addfile($file)->hexdigest;
+        close $file or die "close failed for $path: $!\n";
+        my @after = lstat($path);
+        die "file disappeared while hashing: $path\n" unless @after && -f _ && !-l _;
+        for my $index (0, 1, 2, 7, 9, 10) {
+          die "file changed while hashing: $path\n"
+            if $before->[$index] != $after[$index];
+        }
+        $aggregate->add($relative, "\0file\0", $file_hash, "\0");
+      }
+      print $aggregate->hexdigest, "\n";
+    ' -- "$root")"; then
+    echo "Unable to hash pinned Xcode directory: $requested_root" >&2
+    return 1
+  fi
+  if ! valid_sha256 "$digest"; then
+    echo "Unable to hash pinned Xcode directory: $requested_root" >&2
+    return 1
+  fi
+  /usr/bin/printf '%s\n' "$digest"
+}
+
 macos_native_toolchain_sha256() {
-  /usr/bin/printf '%s\0%s\0%s\0' \
+  /usr/bin/printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
     "$RELEASE_CLANG_SHA256" \
     "$RELEASE_CLANGXX_SHA256" \
     "$RELEASE_AR_SHA256" \
+    "$RELEASE_LD_SHA256" \
+    "$RELEASE_LD_TAPI_SHA256" \
+    "$RELEASE_LD_CODEDIRECTORY_SHA256" \
+    "$RELEASE_LD_LTO_SHA256" \
+    "$RELEASE_LD_SWIFT_DEMANGLE_SHA256" \
+    "$RELEASE_MACOS_SDK_SHA256" \
+    "$RELEASE_CLANG_RESOURCE_DIR_SHA256" \
+    | /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/shasum -a 256 \
+    | /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/awk '{ print $1 }'
+}
+
+macos_release_materials_sha256() {
+  /usr/bin/printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+    "$RELEASE_GIT_SHA256" \
+    "$RELEASE_CARGO_SHA256" \
+    "$RELEASE_RUSTC_SHA256" \
+    "$RELEASE_RUST_SYSROOT_SHA256" \
+    "$RELEASE_NATIVE_TOOLCHAIN_SHA256" \
+    "$RELEASE_NOTARYTOOL_SHA256" \
+    "$RELEASE_STAPLER_SHA256" \
     | /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/shasum -a 256 \
     | /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/awk '{ print $1 }'
 }
@@ -575,13 +836,38 @@ verify_release_file_sha256() {
 verify_release_toolchain_integrity() {
   local actual_sysroot
   local actual_sysroot_sha256
+  local actual_sdk_sha256
+  local actual_clang_resource_dir_sha256
   local actual_native_toolchain_sha256
+  local actual_materials_sha256
 
+  verify_release_git_integrity || return 1
   verify_release_file_sha256 "$RELEASE_CARGO_BIN" "$RELEASE_CARGO_SHA256" "Cargo" || return 1
   verify_release_file_sha256 "$RELEASE_RUSTC_BIN" "$RELEASE_RUSTC_SHA256" "rustc" || return 1
-  verify_release_file_sha256 "$RELEASE_CLANG_BIN" "$RELEASE_CLANG_SHA256" "clang" || return 1
-  verify_release_file_sha256 "$RELEASE_CLANGXX_BIN" "$RELEASE_CLANGXX_SHA256" "clang++" || return 1
-  verify_release_file_sha256 "$RELEASE_AR_BIN" "$RELEASE_AR_SHA256" "ar" || return 1
+  verify_release_tool_under_root "$RELEASE_CLANG_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_CLANG_SHA256" "clang" || return 1
+  verify_release_tool_under_root "$RELEASE_CLANGXX_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_CLANGXX_SHA256" "clang++" || return 1
+  verify_release_tool_under_root "$RELEASE_AR_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_AR_SHA256" "ar" || return 1
+  verify_release_tool_under_root "$RELEASE_LD_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_LD_SHA256" "ld" || return 1
+  verify_release_tool_under_root "$RELEASE_LD_TAPI_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_LD_TAPI_SHA256" "ld libtapi" || return 1
+  verify_release_tool_under_root "$RELEASE_LD_CODEDIRECTORY_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_LD_CODEDIRECTORY_SHA256" "ld libcodedirectory" || return 1
+  verify_release_tool_under_root "$RELEASE_LD_LTO_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_LD_LTO_SHA256" "ld libLTO" || return 1
+  verify_release_tool_under_root "$RELEASE_LD_SWIFT_DEMANGLE_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_LD_SWIFT_DEMANGLE_SHA256" "ld libswiftDemangle" || return 1
+  verify_release_tool_under_root "$RELEASE_NOTARYTOOL_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_NOTARYTOOL_SHA256" "notarytool" || return 1
+  verify_release_tool_under_root "$RELEASE_STAPLER_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_STAPLER_SHA256" "stapler" || return 1
+
+  if [ ! -d "$RELEASE_DEVELOPER_DIR" ] || [ -L "$RELEASE_DEVELOPER_DIR" ] \
+    || [ "$(cd "$RELEASE_DEVELOPER_DIR" 2>/dev/null && /bin/pwd -P)" != "$RELEASE_DEVELOPER_DIR" ]; then
+    echo "The explicitly selected Xcode Developer directory is no longer physical." >&2
+    return 1
+  fi
+  if [ "$(resolve_release_directory_under_root "$RELEASE_SDKROOT" "$RELEASE_DEVELOPER_DIR" 'macOS SDK')" != "$RELEASE_SDKROOT" ]; then
+    echo "The pinned macOS SDK path changed after release initialization." >&2
+    return 1
+  fi
+  if [ "$(resolve_release_directory_under_root "$RELEASE_CLANG_RESOURCE_DIR" "$RELEASE_DEVELOPER_DIR" 'Clang resource directory')" != "$RELEASE_CLANG_RESOURCE_DIR" ]; then
+    echo "The pinned Clang resource directory changed after release initialization." >&2
+    return 1
+  fi
 
   actual_sysroot="$(/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     "$RELEASE_RUSTC_BIN" --print sysroot)"
@@ -594,11 +880,31 @@ verify_release_toolchain_integrity() {
     echo "Rust sysroot SHA-256 does not match its required release pin." >&2
     return 1
   fi
+  actual_sdk_sha256="$(directory_tree_with_internal_symlinks_sha256 "$RELEASE_SDKROOT")"
+  if [ "$actual_sdk_sha256" != "$RELEASE_MACOS_SDK_SHA256" ]; then
+    echo "macOS SDK SHA-256 does not match its required release pin." >&2
+    return 1
+  fi
+  actual_clang_resource_dir_sha256="$(directory_tree_with_internal_symlinks_sha256 "$RELEASE_CLANG_RESOURCE_DIR")"
+  if [ "$actual_clang_resource_dir_sha256" != "$RELEASE_CLANG_RESOURCE_DIR_SHA256" ]; then
+    echo "Clang resource directory SHA-256 does not match its required release pin." >&2
+    return 1
+  fi
   actual_native_toolchain_sha256="$(macos_native_toolchain_sha256)"
   if [ "$actual_native_toolchain_sha256" != "$RELEASE_NATIVE_TOOLCHAIN_SHA256" ]; then
     echo "Native toolchain aggregate SHA-256 no longer matches its required release pin." >&2
     return 1
   fi
+  actual_materials_sha256="$(macos_release_materials_sha256)"
+  if [ "$actual_materials_sha256" != "$RELEASE_MATERIALS_SHA256" ]; then
+    echo "Release materials aggregate SHA-256 changed after release initialization." >&2
+    return 1
+  fi
+}
+
+verify_release_notarization_tools_integrity() {
+  verify_release_tool_under_root "$RELEASE_NOTARYTOOL_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_NOTARYTOOL_SHA256" "notarytool" || return 1
+  verify_release_tool_under_root "$RELEASE_STAPLER_BIN" "$RELEASE_DEVELOPER_DIR" "$RELEASE_STAPLER_SHA256" "stapler" || return 1
 }
 
 resolve_and_verify_release_toolchain() {
@@ -606,16 +912,63 @@ resolve_and_verify_release_toolchain() {
   local cargo_dir
   local rustc_dir
   local reported_sysroot
+  local expected_developer_dir
+  local expected_sdkroot
+  local expected_clang_resource_dir
+  local reported_clang_resource_dir
 
   RELEASE_CARGO_BIN="$(resolve_explicit_release_tool WAAL_RELEASE_CARGO_PATH Cargo)"
   RELEASE_RUSTC_BIN="$(resolve_explicit_release_tool WAAL_RELEASE_RUSTC_PATH rustc)"
   RELEASE_RUST_SYSROOT="$(resolve_explicit_release_directory WAAL_RELEASE_RUST_SYSROOT 'the Rust sysroot')"
+  RELEASE_DEVELOPER_DIR="$(resolve_explicit_release_directory WAAL_MACOS_DEVELOPER_DIR 'the Xcode Developer directory')"
+  expected_developer_dir="/Applications/Xcode.app/Contents/Developer"
+  if [ "$RELEASE_DEVELOPER_DIR" != "$expected_developer_dir" ]; then
+    echo "WAAL_MACOS_DEVELOPER_DIR must select the system Xcode Developer directory: $expected_developer_dir" >&2
+    return 1
+  fi
+  RELEASE_CLANG_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+  RELEASE_CLANGXX_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++"
+  RELEASE_AR_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar"
+  RELEASE_LD_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
+  RELEASE_LD_TAPI_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/lib/libtapi.dylib"
+  RELEASE_LD_CODEDIRECTORY_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/lib/libcodedirectory.dylib"
+  RELEASE_LD_LTO_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib"
+  RELEASE_LD_SWIFT_DEMANGLE_BIN="$RELEASE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/lib/libswiftDemangle.dylib"
+  RELEASE_NOTARYTOOL_BIN="$RELEASE_DEVELOPER_DIR/usr/bin/notarytool"
+  RELEASE_STAPLER_BIN="$RELEASE_DEVELOPER_DIR/usr/bin/stapler"
+  expected_sdkroot="${WAAL_MACOS_SDKROOT:-}"
+  case "$expected_sdkroot" in
+    /*) ;;
+    *)
+      echo "WAAL_MACOS_SDKROOT must be an explicit absolute path to a physical macOS SDK." >&2
+      return 1
+      ;;
+  esac
+  RELEASE_SDKROOT="$(resolve_release_directory_under_root "$expected_sdkroot" "$RELEASE_DEVELOPER_DIR" 'macOS SDK')"
+  expected_clang_resource_dir="${WAAL_MACOS_CLANG_RESOURCE_DIR:-}"
+  case "$expected_clang_resource_dir" in
+    /*) ;;
+    *)
+      echo "WAAL_MACOS_CLANG_RESOURCE_DIR must be an explicit absolute path to the Clang resource directory." >&2
+      return 1
+      ;;
+  esac
+  RELEASE_CLANG_RESOURCE_DIR="$(resolve_release_directory_under_root "$expected_clang_resource_dir" "$RELEASE_DEVELOPER_DIR" 'Clang resource directory')"
   RELEASE_CARGO_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_CARGO_SHA256)"
   RELEASE_RUSTC_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_RUSTC_SHA256)"
   RELEASE_RUST_SYSROOT_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256)"
   RELEASE_CLANG_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_CLANG_SHA256)"
   RELEASE_CLANGXX_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_CLANGXX_SHA256)"
   RELEASE_AR_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_AR_SHA256)"
+  RELEASE_LD_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_LD_SHA256)"
+  RELEASE_LD_TAPI_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_LD_TAPI_SHA256)"
+  RELEASE_LD_CODEDIRECTORY_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_LD_CODEDIRECTORY_SHA256)"
+  RELEASE_LD_LTO_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_LD_LTO_SHA256)"
+  RELEASE_LD_SWIFT_DEMANGLE_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_LD_SWIFT_DEMANGLE_SHA256)"
+  RELEASE_NOTARYTOOL_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_NOTARYTOOL_SHA256)"
+  RELEASE_STAPLER_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_STAPLER_SHA256)"
+  RELEASE_MACOS_SDK_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_MACOS_SDK_SHA256)"
+  RELEASE_CLANG_RESOURCE_DIR_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_CLANG_RESOURCE_DIR_SHA256)"
   RELEASE_NATIVE_TOOLCHAIN_SHA256="$(required_expected_sha256 WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256)"
   RELEASE_CARGO_VERSION="$(release_tool_version "$RELEASE_CARGO_BIN")"
   RELEASE_RUSTC_VERSION="$(release_tool_version "$RELEASE_RUSTC_BIN")"
@@ -653,8 +1006,22 @@ resolve_and_verify_release_toolchain() {
     echo "Pinned Rust sysroot does not contain the aarch64-apple-darwin standard library." >&2
     return 1
   fi
+  reported_clang_resource_dir="$(/usr/bin/env -i \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    SDKROOT="$RELEASE_SDKROOT" \
+    "$RELEASE_CLANG_BIN" -print-resource-dir)"
+  if [ "$(canonical_existing_path "$reported_clang_resource_dir")" != "$RELEASE_CLANG_RESOURCE_DIR" ]; then
+    echo "Pinned clang does not report WAAL_MACOS_CLANG_RESOURCE_DIR as its resource directory." >&2
+    return 1
+  fi
   if [ "$(macos_native_toolchain_sha256)" != "$RELEASE_NATIVE_TOOLCHAIN_SHA256" ]; then
-    echo "WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256 does not match the ordered clang/clang++/ar hash aggregate." >&2
+    echo "WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256 does not match the ordered clang/clang++/ar/ld/ld-runtime/SDK/resource-dir hash aggregate." >&2
+    return 1
+  fi
+  RELEASE_MATERIALS_SHA256="$(macos_release_materials_sha256)"
+  if ! valid_sha256 "$RELEASE_MATERIALS_SHA256"; then
+    echo "Unable to compute the release materials aggregate SHA-256." >&2
     return 1
   fi
 
@@ -733,6 +1100,16 @@ release_encoded_rustflags() {
     encoded+=$'\x1f'
     encoded+="--remap-path-prefix=$ROOT_DIR=."
   fi
+  if [ -n "$RELEASE_LD_BIN" ]; then
+    case "$RELEASE_LD_BIN" in
+      *$'\x1f'*|*$'\r'*|*$'\n'*)
+        echo "Pinned ld path contains a character unsafe for CARGO_ENCODED_RUSTFLAGS." >&2
+        return 1
+        ;;
+    esac
+    encoded+=$'\x1f-C\x1f'
+    encoded+="link-arg=-fuse-ld=$RELEASE_LD_BIN"
+  fi
   /usr/bin/printf '%s' "$encoded"
 }
 
@@ -756,6 +1133,7 @@ run_sanitized_release_cargo() {
     return 1
   fi
   reject_cargo_config_in_ancestors "$RELEASE_CARGO_WORK_DIR"
+  verify_release_snapshot_unchanged
   verify_release_toolchain_integrity
 
   if ! (
@@ -765,6 +1143,8 @@ run_sanitized_release_cargo() {
       CARGO_HOME="$RELEASE_CARGO_HOME" \
       TMPDIR="$RELEASE_BUILD_TMPDIR" \
       PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+      DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+      SDKROOT="$RELEASE_SDKROOT" \
       RUSTC="$RELEASE_RUSTC_BIN" \
       RUSTC_WRAPPER= \
       RUSTC_WORKSPACE_WRAPPER= \
@@ -774,6 +1154,7 @@ run_sanitized_release_cargo() {
       CC="$RELEASE_CLANG_BIN" \
       CXX="$RELEASE_CLANGXX_BIN" \
       AR="$RELEASE_AR_BIN" \
+      LD="$RELEASE_LD_BIN" \
       WAAL_PUBLISHABLE_RELEASE=1 \
       WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
       WAAL_DIAGNOSTICS_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID" \
@@ -786,10 +1167,12 @@ run_sanitized_release_cargo() {
       WAAL_RELEASE_RUSTC_SHA256="$RELEASE_RUSTC_SHA256" \
       WAAL_RELEASE_RUST_SYSROOT_SHA256="$RELEASE_RUST_SYSROOT_SHA256" \
       WAAL_RELEASE_NATIVE_TOOLCHAIN_SHA256="$RELEASE_NATIVE_TOOLCHAIN_SHA256" \
+      WAAL_RELEASE_MATERIALS_SHA256="$RELEASE_MATERIALS_SHA256" \
       "$RELEASE_CARGO_BIN" "$@"
   ); then
     return 1
   fi
+  verify_release_snapshot_unchanged
   verify_release_toolchain_integrity
 }
 
@@ -911,12 +1294,761 @@ prepare_dist_root() {
   prepare_dist_root_for_root "$ROOT_DIR"
 }
 
-cleanup() {
-  if [ -n "${STAGE_DIR:-}" ]; then
-    /bin/rm -rf "$STAGE_DIR"
+directory_identity() {
+  local path="$1"
+
+  if [ ! -d "$path" ] || [ -L "$path" ]; then
+    return 1
   fi
-  if [ -n "${RELEASE_SOURCE_ROOT:-}" ]; then
-    /bin/rm -rf "$RELEASE_SOURCE_ROOT"
+  /usr/bin/stat -f '%d:%i' "$path"
+}
+
+verify_private_release_parent_security() {
+  local path="$1"
+  local owner_uid
+  local current_uid
+  local mode
+  local without_other
+  local group_digit
+  local other_digit
+
+  if [ ! -d "$path" ] || [ -L "$path" ]; then
+    echo "Private release parent must be a physical directory: $path" >&2
+    return 1
+  fi
+  owner_uid="$(/usr/bin/stat -f '%u' "$path")"
+  current_uid="$(/usr/bin/id -u)"
+  mode="$(/usr/bin/stat -f '%Lp' "$path")"
+  other_digit="${mode#${mode%?}}"
+  without_other="${mode%?}"
+  group_digit="${without_other#${without_other%?}}"
+  if [ "$owner_uid" != "$current_uid" ]; then
+    echo "Private release parent is not owned by the current user: $path" >&2
+    return 1
+  fi
+  case "$group_digit:$other_digit" in
+    [2367]:*|*:[2367])
+      echo "Private release parent must not be group- or world-writable: $path" >&2
+      return 1
+      ;;
+  esac
+}
+
+verify_private_release_root() {
+  local physical_parent
+  local physical_root
+  local parent_id
+  local root_id
+  local leaf
+  local suffix
+
+  if [ -z "$RELEASE_PRIVATE_ROOT" ] \
+    || [ -z "$RELEASE_PRIVATE_ROOT_PARENT" ] \
+    || [ -z "$RELEASE_PRIVATE_ROOT_ID" ] \
+    || [ -z "$RELEASE_PRIVATE_ROOT_PARENT_ID" ]; then
+    echo "Private release root identity is not initialized." >&2
+    return 1
+  fi
+  case "$RELEASE_PRIVATE_ROOT:$RELEASE_PRIVATE_ROOT_PARENT" in
+    /*:/*) ;;
+    *)
+      echo "Private release root paths must be absolute." >&2
+      return 1
+      ;;
+  esac
+  leaf="$(/usr/bin/basename "$RELEASE_PRIVATE_ROOT")"
+  suffix="${leaf#.package_macos.}"
+  case "$leaf:$suffix" in
+    .package_macos.*:[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;;
+    *)
+      echo "Private release root has an unexpected leaf name." >&2
+      return 1
+      ;;
+  esac
+  if [ "$(/usr/bin/dirname "$RELEASE_PRIVATE_ROOT")" != "$RELEASE_PRIVATE_ROOT_PARENT" ]; then
+    echo "Private release root is outside its recorded parent." >&2
+    return 1
+  fi
+  if ! physical_parent="$(cd "$RELEASE_PRIVATE_ROOT_PARENT" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$physical_parent" != "$RELEASE_PRIVATE_ROOT_PARENT" ]; then
+    echo "Private release root parent is no longer a physical path." >&2
+    return 1
+  fi
+  if ! parent_id="$(directory_identity "$RELEASE_PRIVATE_ROOT_PARENT")" \
+    || [ "$parent_id" != "$RELEASE_PRIVATE_ROOT_PARENT_ID" ]; then
+    echo "Private release root parent identity changed." >&2
+    return 1
+  fi
+  verify_private_release_parent_security "$RELEASE_PRIVATE_ROOT_PARENT" || return 1
+  if ! physical_root="$(cd "$RELEASE_PRIVATE_ROOT" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$physical_root" != "$RELEASE_PRIVATE_ROOT" ]; then
+    echo "Private release root is no longer a physical path." >&2
+    return 1
+  fi
+  if ! root_id="$(directory_identity "$RELEASE_PRIVATE_ROOT")" \
+    || [ "$root_id" != "$RELEASE_PRIVATE_ROOT_ID" ]; then
+    echo "Private release root identity changed." >&2
+    return 1
+  fi
+}
+
+create_private_release_root_for_root() {
+  local requested_root="$1"
+  local physical_root
+  local private_parent
+  local private_root
+  local previous_umask
+  local owner_uid
+  local current_uid
+  local mode
+
+  prepare_dist_root_for_root "$requested_root" || return 1
+  if ! physical_root="$(cd "$requested_root" 2>/dev/null && /bin/pwd -P)"; then
+    echo "Unable to resolve the private release root owner." >&2
+    return 1
+  fi
+  private_parent="$physical_root/dist"
+  if [ -L "$private_parent" ] \
+    || [ "$(cd "$private_parent" 2>/dev/null && /bin/pwd -P)" != "$private_parent" ]; then
+    echo "Private release root parent must be a physical directory." >&2
+    return 1
+  fi
+  verify_private_release_parent_security "$private_parent" || return 1
+
+  RELEASE_PRIVATE_ROOT_PARENT="$private_parent"
+  RELEASE_PRIVATE_ROOT_PARENT_ID="$(directory_identity "$private_parent")" || return 1
+  previous_umask="$(umask)"
+  umask 077
+  if ! private_root="$(/usr/bin/mktemp -d "$private_parent/.package_macos.XXXXXX")"; then
+    umask "$previous_umask"
+    return 1
+  fi
+  umask "$previous_umask"
+
+  RELEASE_PRIVATE_ROOT="$private_root"
+  /bin/chmod 700 "$RELEASE_PRIVATE_ROOT"
+  if [ -L "$RELEASE_PRIVATE_ROOT" ] \
+    || [ "$(cd "$RELEASE_PRIVATE_ROOT" 2>/dev/null && /bin/pwd -P)" != "$RELEASE_PRIVATE_ROOT" ]; then
+    echo "mktemp did not create a physical private release directory." >&2
+    return 1
+  fi
+  RELEASE_PRIVATE_ROOT_ID="$(directory_identity "$RELEASE_PRIVATE_ROOT")" || return 1
+  owner_uid="$(/usr/bin/stat -f '%u' "$RELEASE_PRIVATE_ROOT")"
+  current_uid="$(/usr/bin/id -u)"
+  mode="$(/usr/bin/stat -f '%Lp' "$RELEASE_PRIVATE_ROOT")"
+  if [ "$owner_uid" != "$current_uid" ] || [ "$mode" != "700" ]; then
+    echo "Private release root ownership or mode is unsafe." >&2
+    return 1
+  fi
+  verify_private_release_root || return 1
+
+  STAGE_DIR="$RELEASE_PRIVATE_ROOT/stage"
+  RELEASE_TEMP_DIR="$RELEASE_PRIVATE_ROOT/tmp"
+  RELEASE_SOURCE_ROOT="$RELEASE_PRIVATE_ROOT/source-environment"
+  /bin/mkdir -m 700 "$STAGE_DIR" "$RELEASE_TEMP_DIR" "$RELEASE_SOURCE_ROOT"
+}
+
+create_private_release_root() {
+  create_private_release_root_for_root "$ROOT_DIR"
+}
+
+private_release_mktemp() {
+  local label="$1"
+  local physical_temp
+  local candidate
+
+  case "$label" in
+    ""|*[!A-Za-z0-9._-]*|.|..)
+      echo "Private temporary-file label is unsafe: $label" >&2
+      return 1
+      ;;
+  esac
+  verify_private_release_root || return 1
+  case "$RELEASE_TEMP_DIR" in
+    "$RELEASE_PRIVATE_ROOT"/*) ;;
+    *)
+      echo "Private temporary directory is outside the release root." >&2
+      return 1
+      ;;
+  esac
+  if ! physical_temp="$(cd "$RELEASE_TEMP_DIR" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$physical_temp" != "$RELEASE_TEMP_DIR" ]; then
+    echo "Private temporary directory is not a physical path." >&2
+    return 1
+  fi
+  candidate="$(/usr/bin/mktemp "$RELEASE_TEMP_DIR/$label.XXXXXX")" || return 1
+  /bin/chmod 600 "$candidate"
+  if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+    echo "mktemp did not create a regular private temporary file." >&2
+    return 1
+  fi
+  /usr/bin/printf '%s\n' "$candidate"
+}
+
+release_archive_filename() {
+  local archive_base="$1"
+  local commit="$2"
+
+  case "$archive_base" in
+    ""|.|..|*/*|*$'\r'*|*$'\n'*)
+      echo "Release archive base is not a safe filename: $archive_base" >&2
+      return 1
+      ;;
+  esac
+  if ! valid_git_object_id "$commit"; then
+    echo "Release archive filename requires an exact lowercase 40-hex commit." >&2
+    return 1
+  fi
+  /usr/bin/printf '%s-%s.zip\n' "$archive_base" "$commit"
+}
+
+initialize_release_publication_paths() {
+  local archive_filename
+
+  archive_filename="$(release_archive_filename "$RELEASE_ARCHIVE_BASE" "$RELEASE_GIT_COMMIT")"
+  ZIP_PATH="$ROOT_DIR/dist/$archive_filename"
+  ZIP_SHA256_PATH="$ZIP_PATH.sha256"
+}
+
+verify_release_publication_parent() {
+  local expected_parent="$RELEASE_PRIVATE_ROOT_PARENT"
+  local archive_parent
+  local sidecar_parent
+  local physical_parent
+  local parent_id
+
+  if [ -z "$ZIP_PATH" ] || [ -z "$ZIP_SHA256_PATH" ] || [ -z "$expected_parent" ]; then
+    echo "Release publication paths are not initialized." >&2
+    return 1
+  fi
+  archive_parent="$(/usr/bin/dirname "$ZIP_PATH")"
+  sidecar_parent="$(/usr/bin/dirname "$ZIP_SHA256_PATH")"
+  if [ "$archive_parent" != "$expected_parent" ] || [ "$sidecar_parent" != "$expected_parent" ]; then
+    echo "Release publication paths escaped the verified dist directory." >&2
+    return 1
+  fi
+  if ! physical_parent="$(cd "$expected_parent" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$physical_parent" != "$expected_parent" ]; then
+    echo "Release publication parent is no longer a physical path." >&2
+    return 1
+  fi
+  if ! parent_id="$(directory_identity "$expected_parent")" \
+    || [ "$parent_id" != "$RELEASE_PRIVATE_ROOT_PARENT_ID" ]; then
+    echo "Release publication parent identity changed." >&2
+    return 1
+  fi
+  verify_private_release_parent_security "$expected_parent" || return 1
+}
+
+release_publication_state() {
+  local archive_exists=false
+  local sidecar_exists=false
+  local path
+
+  verify_release_publication_parent || return 1
+  for path in "$ZIP_PATH" "$ZIP_SHA256_PATH"; do
+    if [ -L "$path" ]; then
+      echo "Immutable release artifact must not be a symbolic link: $path" >&2
+      return 1
+    fi
+    if [ -e "$path" ]; then
+      if [ ! -f "$path" ]; then
+        echo "Immutable release artifact must be a regular file: $path" >&2
+        return 1
+      fi
+      if [ "$(/usr/bin/stat -f '%l' "$path")" != "1" ]; then
+        echo "Immutable release artifact must not have additional hard links: $path" >&2
+        return 1
+      fi
+      if [ "$path" = "$ZIP_PATH" ]; then
+        archive_exists=true
+      else
+        sidecar_exists=true
+      fi
+    fi
+  done
+
+  if [ "$archive_exists" = false ] && [ "$sidecar_exists" = true ]; then
+    echo "Refusing unsupported sidecar-only immutable release state: $ZIP_SHA256_PATH" >&2
+    return 1
+  fi
+  if [ "$archive_exists" = true ] && [ "$sidecar_exists" = true ]; then
+    /usr/bin/printf 'complete\n'
+  elif [ "$archive_exists" = true ]; then
+    /usr/bin/printf 'archive-only\n'
+  else
+    /usr/bin/printf 'empty\n'
+  fi
+}
+
+ensure_release_publication_state_supported() {
+  release_publication_state >/dev/null
+}
+
+atomic_no_replace_helper_source() {
+  /usr/bin/printf '%s\n' \
+    '#define _DARWIN_C_SOURCE 1' \
+    '#include <errno.h>' \
+    '#include <fcntl.h>' \
+    '#include <stdio.h>' \
+    '#include <string.h>' \
+    '#include <sys/stat.h>' \
+    '#include <sys/stdio.h>' \
+    '#include <unistd.h>' \
+    '' \
+    'static int report_error(const char *operation, int error_number) {' \
+    '    (void)fprintf(stderr, "%s: %s\n", operation, strerror(error_number));' \
+    '    return 1;' \
+    '}' \
+    '' \
+    'static int valid_leaf(const char *leaf) {' \
+    '    return leaf[0] != 0 && strcmp(leaf, ".") != 0 && strcmp(leaf, "..") != 0' \
+    '        && strchr(leaf, (char)47) == NULL;' \
+    '}' \
+    '' \
+    'int main(int argc, char **argv) {' \
+    '    struct stat source_directory_status;' \
+    '    struct stat destination_directory_status;' \
+    '    struct stat source_status;' \
+    '    struct stat opened_source_status;' \
+    '    struct stat destination_status;' \
+    '    int source_directory = -1;' \
+    '    int destination_directory = -1;' \
+    '    int source_file = -1;' \
+    '    int saved_errno;' \
+    '' \
+    '    if (argc != 5 || !valid_leaf(argv[2]) || !valid_leaf(argv[4])) {' \
+    '        (void)fprintf(stderr, "usage: atomic-no-replace SOURCE_DIR SOURCE_NAME DEST_DIR DEST_NAME\n");' \
+    '        return 2;' \
+    '    }' \
+    '    source_directory = open(argv[1], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);' \
+    '    if (source_directory < 0) {' \
+    '        return report_error("open source directory", errno);' \
+    '    }' \
+    '    destination_directory = open(argv[3], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);' \
+    '    if (destination_directory < 0) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_directory);' \
+    '        return report_error("open destination directory", saved_errno);' \
+    '    }' \
+    '    if (fstat(source_directory, &source_directory_status) != 0' \
+    '            || fstat(destination_directory, &destination_directory_status) != 0) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("inspect publication directories", saved_errno);' \
+    '    }' \
+    '    if (source_directory_status.st_dev != destination_directory_status.st_dev) {' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("publication requires one filesystem", EXDEV);' \
+    '    }' \
+    '    if (fstatat(source_directory, argv[2], &source_status, AT_SYMLINK_NOFOLLOW) != 0) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("inspect publication candidate", saved_errno);' \
+    '    }' \
+    '    if (!S_ISREG(source_status.st_mode)) {' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("publication candidate is not regular", EINVAL);' \
+    '    }' \
+    '    source_file = openat(source_directory, argv[2], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);' \
+    '    if (source_file < 0 || fstat(source_file, &opened_source_status) != 0) {' \
+    '        saved_errno = errno;' \
+    '        if (source_file >= 0) (void)close(source_file);' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("open publication candidate", saved_errno);' \
+    '    }' \
+    '    if (source_status.st_dev != opened_source_status.st_dev' \
+    '            || source_status.st_ino != opened_source_status.st_ino' \
+    '            || !S_ISREG(opened_source_status.st_mode)) {' \
+    '        (void)close(source_file);' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("publication candidate changed", EBUSY);' \
+    '    }' \
+    '    if (fsync(source_file) != 0) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_file);' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("flush publication candidate", saved_errno);' \
+    '    }' \
+    '    (void)close(source_file);' \
+    '    if (fstatat(destination_directory, argv[4], &destination_status, AT_SYMLINK_NOFOLLOW) == 0) {' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("immutable destination already exists", EEXIST);' \
+    '    }' \
+    '    if (errno != ENOENT) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("inspect immutable destination", saved_errno);' \
+    '    }' \
+    '    if (renameatx_np(source_directory, argv[2], destination_directory, argv[4], RENAME_EXCL) != 0) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("atomic no-replace rename", saved_errno);' \
+    '    }' \
+    '    if (fsync(destination_directory) != 0) {' \
+    '        saved_errno = errno;' \
+    '        (void)close(source_directory);' \
+    '        (void)close(destination_directory);' \
+    '        return report_error("flush publication directory", saved_errno);' \
+    '    }' \
+    '    (void)close(source_directory);' \
+    '    (void)close(destination_directory);' \
+    '    return 0;' \
+    '}'
+}
+
+prepare_atomic_no_replace_rename_helper() {
+  local helper_source="$STAGE_DIR/atomic-no-replace.c"
+
+  ATOMIC_RENAME_HELPER="$STAGE_DIR/atomic-no-replace"
+  atomic_no_replace_helper_source >"$helper_source"
+  /bin/chmod 600 "$helper_source"
+  verify_release_toolchain_integrity
+  /usr/bin/env -i \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    HOME="$RELEASE_BUILD_HOME" \
+    TMPDIR="$RELEASE_BUILD_TMPDIR" \
+    DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    SDKROOT="$RELEASE_SDKROOT" \
+    "$RELEASE_CLANG_BIN" \
+      -std=c11 -Os -Wall -Wextra -Werror \
+      -isysroot "$RELEASE_SDKROOT" \
+      "--ld-path=$RELEASE_LD_BIN" \
+      -o "$ATOMIC_RENAME_HELPER" "$helper_source"
+  if [ ! -f "$ATOMIC_RENAME_HELPER" ] || [ -L "$ATOMIC_RENAME_HELPER" ]; then
+    echo "Failed to build the atomic no-replace publication helper." >&2
+    return 1
+  fi
+  /bin/chmod 700 "$ATOMIC_RENAME_HELPER"
+  ATOMIC_RENAME_HELPER_SHA256="$(release_tool_sha256 "$ATOMIC_RENAME_HELPER")"
+  if ! valid_sha256 "$ATOMIC_RENAME_HELPER_SHA256"; then
+    echo "Failed to hash the atomic no-replace publication helper." >&2
+    return 1
+  fi
+  verify_release_toolchain_integrity
+}
+
+atomic_publish_file_no_replace() {
+  local source_path="$1"
+  local destination_path="$2"
+  local source_parent
+  local destination_parent
+  local physical_source_parent
+  local physical_destination_parent
+
+  if [ ! -f "$ATOMIC_RENAME_HELPER" ] || [ ! -x "$ATOMIC_RENAME_HELPER" ] \
+    || [ -L "$ATOMIC_RENAME_HELPER" ] \
+    || [ "$(release_tool_sha256 "$ATOMIC_RENAME_HELPER")" != "$ATOMIC_RENAME_HELPER_SHA256" ]; then
+    echo "Atomic no-replace publication helper is missing or changed." >&2
+    return 1
+  fi
+  if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
+    echo "Publication candidate must be a regular file: $source_path" >&2
+    return 1
+  fi
+  case "$source_path:$destination_path" in
+    /*:/*) ;;
+    *)
+      echo "Publication paths must be absolute." >&2
+      return 1
+      ;;
+  esac
+
+  source_parent="$(/usr/bin/dirname "$source_path")"
+  destination_parent="$(/usr/bin/dirname "$destination_path")"
+  if ! physical_source_parent="$(cd "$source_parent" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$physical_source_parent" != "$source_parent" ]; then
+    echo "Publication candidate directory must be a physical path." >&2
+    return 1
+  fi
+  if ! physical_destination_parent="$(cd "$destination_parent" 2>/dev/null && /bin/pwd -P)" \
+    || [ "$physical_destination_parent" != "$destination_parent" ]; then
+    echo "Publication destination directory must be a physical path." >&2
+    return 1
+  fi
+
+  if ! "$ATOMIC_RENAME_HELPER" \
+    "$source_parent" "$(/usr/bin/basename "$source_path")" \
+    "$destination_parent" "$(/usr/bin/basename "$destination_path")"; then
+    return 1
+  fi
+
+  if [ -e "$source_path" ] || [ -L "$source_path" ]; then
+    echo "Atomic publication left the candidate at its staging path." >&2
+    return 1
+  fi
+  if [ ! -f "$destination_path" ] || [ -L "$destination_path" ]; then
+    echo "Atomic publication did not create a regular destination file." >&2
+    return 1
+  fi
+}
+
+release_sha256_sidecar_contents() {
+  local archive_sha256="$1"
+  local archive_path="$2"
+
+  if ! valid_sha256 "$archive_sha256"; then
+    echo "Release archive SHA-256 is not an exact lowercase digest." >&2
+    return 1
+  fi
+  /usr/bin/printf '%s  %s\n' "$archive_sha256" "$(/usr/bin/basename "$archive_path")"
+}
+
+write_release_sha256_sidecar_candidate() {
+  local sidecar_path="$1"
+  local archive_path="$2"
+  local archive_sha256="$3"
+
+  if [ -e "$sidecar_path" ] || [ -L "$sidecar_path" ]; then
+    echo "Refusing to replace a staged SHA-256 sidecar: $sidecar_path" >&2
+    return 1
+  fi
+  release_sha256_sidecar_contents "$archive_sha256" "$archive_path" >"$sidecar_path"
+  /bin/chmod 644 "$sidecar_path"
+  if [ ! -f "$sidecar_path" ] || [ -L "$sidecar_path" ]; then
+    echo "Failed to create a regular SHA-256 sidecar candidate." >&2
+    return 1
+  fi
+}
+
+verify_release_sha256_sidecar() {
+  local sidecar_path="$1"
+  local archive_path="$2"
+  local archive_sha256="$3"
+  local expected_sidecar_sha256
+  local actual_sidecar_sha256
+
+  if [ ! -f "$sidecar_path" ] || [ -L "$sidecar_path" ]; then
+    echo "Published release is missing its regular SHA-256 sidecar." >&2
+    return 1
+  fi
+  expected_sidecar_sha256="$(
+    release_sha256_sidecar_contents "$archive_sha256" "$archive_path" \
+      | /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/shasum -a 256 \
+      | /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/awk '{ print $1 }'
+  )"
+  actual_sidecar_sha256="$(release_tool_sha256 "$sidecar_path")"
+  if [ "$actual_sidecar_sha256" != "$expected_sidecar_sha256" ]; then
+    echo "Published release SHA-256 sidecar does not match the archive." >&2
+    return 1
+  fi
+}
+
+verify_published_release_hash_evidence() {
+  local archive_path="$1"
+  local sidecar_path="$2"
+  local expected_sha256="$3"
+  local actual_sha256
+
+  if [ ! -f "$archive_path" ] || [ -L "$archive_path" ]; then
+    echo "Published release archive is not a regular file." >&2
+    return 1
+  fi
+  actual_sha256="$(release_tool_sha256 "$archive_path")"
+  if [ "$actual_sha256" != "$expected_sha256" ]; then
+    echo "Published release archive changed after verification." >&2
+    return 1
+  fi
+  verify_release_sha256_sidecar "$sidecar_path" "$archive_path" "$actual_sha256"
+}
+
+verify_published_archive_matches_candidate() {
+  local candidate_path="$1"
+  local archive_path="$2"
+  local expected_sha256="$3"
+  local actual_sha256
+
+  if ! valid_sha256 "$expected_sha256" \
+    || [ ! -f "$candidate_path" ] || [ -L "$candidate_path" ] \
+    || [ ! -f "$archive_path" ] || [ -L "$archive_path" ]; then
+    echo "Exact immutable archive adoption requires two regular files and a valid digest." >&2
+    return 1
+  fi
+  actual_sha256="$(release_tool_sha256 "$archive_path")"
+  if [ "$actual_sha256" != "$expected_sha256" ] \
+    || ! /usr/bin/cmp -s "$candidate_path" "$archive_path"; then
+    echo "Existing immutable release archive differs from the verified candidate." >&2
+    return 1
+  fi
+}
+
+publish_sidecar_candidate_no_replace_or_adopt() {
+  local candidate_path="$1"
+  local archive_path="$2"
+  local sidecar_path="$3"
+  local archive_sha256="$4"
+
+  if [ -e "$sidecar_path" ] || [ -L "$sidecar_path" ]; then
+    if [ ! -f "$sidecar_path" ] || [ -L "$sidecar_path" ] \
+      || [ "$(/usr/bin/stat -f '%l' "$sidecar_path")" != "1" ] \
+      || [ ! -f "$candidate_path" ] || [ -L "$candidate_path" ] \
+      || ! /usr/bin/cmp -s "$candidate_path" "$sidecar_path"; then
+      echo "Existing immutable SHA-256 sidecar differs from the verified candidate." >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  if atomic_publish_file_no_replace "$candidate_path" "$sidecar_path"; then
+    return 0
+  fi
+  # The helper can report a directory-fsync failure after the no-replace
+  # rename has already happened, or another publisher can win the race. Only
+  # exact expected bytes are adoptable; no existing file is ever replaced.
+  if [ -f "$candidate_path" ] && [ ! -L "$candidate_path" ]; then
+    if [ ! -f "$sidecar_path" ] || [ -L "$sidecar_path" ] \
+      || ! /usr/bin/cmp -s "$candidate_path" "$sidecar_path"; then
+      return 1
+    fi
+  elif ! verify_release_sha256_sidecar "$sidecar_path" "$archive_path" "$archive_sha256"; then
+    return 1
+  fi
+}
+
+publish_verified_release_pair() {
+  local archive_candidate="$1"
+  local sidecar_candidate="$2"
+  local expected_sha256="$3"
+  local state
+
+  if ! valid_sha256 "$expected_sha256" \
+    || [ ! -f "$archive_candidate" ] || [ -L "$archive_candidate" ]; then
+    echo "Verified release archive candidate is unavailable." >&2
+    return 1
+  fi
+  write_release_sha256_sidecar_candidate \
+    "$sidecar_candidate" "$ZIP_PATH" "$expected_sha256"
+  verify_release_sha256_sidecar \
+    "$sidecar_candidate" "$ZIP_PATH" "$expected_sha256"
+
+  state="$(release_publication_state)" || return 1
+  case "$state" in
+    empty)
+      if ! atomic_publish_file_no_replace "$archive_candidate" "$ZIP_PATH"; then
+        if [ -f "$archive_candidate" ] && [ ! -L "$archive_candidate" ]; then
+          verify_published_archive_matches_candidate \
+            "$archive_candidate" "$ZIP_PATH" "$expected_sha256" || return 1
+        elif [ ! -f "$ZIP_PATH" ] || [ -L "$ZIP_PATH" ] \
+          || [ "$(release_tool_sha256 "$ZIP_PATH")" != "$expected_sha256" ]; then
+          return 1
+        fi
+      fi
+      ;;
+    archive-only|complete)
+      verify_published_archive_matches_candidate \
+        "$archive_candidate" "$ZIP_PATH" "$expected_sha256" || return 1
+      ;;
+    *)
+      echo "Unsupported immutable release publication state: $state" >&2
+      return 1
+      ;;
+  esac
+
+  if [ ! -f "$ZIP_PATH" ] || [ -L "$ZIP_PATH" ] \
+    || [ "$(release_tool_sha256 "$ZIP_PATH")" != "$expected_sha256" ]; then
+    echo "Published release archive does not match the verified candidate digest." >&2
+    return 1
+  fi
+  publish_sidecar_candidate_no_replace_or_adopt \
+    "$sidecar_candidate" "$ZIP_PATH" "$ZIP_SHA256_PATH" "$expected_sha256"
+  verify_published_release_hash_evidence \
+    "$ZIP_PATH" "$ZIP_SHA256_PATH" "$expected_sha256"
+}
+
+repair_or_adopt_existing_release() {
+  local state="$1"
+  local initial_sha256
+  local verified_sha256
+
+  case "$state" in
+    archive-only|complete) ;;
+    *)
+      echo "Only an existing archive can be repaired or adopted." >&2
+      return 1
+      ;;
+  esac
+  initial_sha256="$(release_tool_sha256 "$ZIP_PATH")"
+  if ! valid_sha256 "$initial_sha256"; then
+    echo "Unable to hash the existing immutable release archive." >&2
+    return 1
+  fi
+  if [ "$state" = complete ]; then
+    verify_published_release_hash_evidence \
+      "$ZIP_PATH" "$ZIP_SHA256_PATH" "$initial_sha256"
+  fi
+
+  # The orphan is not trusted merely because it has the right filename. Run
+  # the same archive, signature, notarization, bundle metadata, commit/tree,
+  # source snapshot, and toolchain verification used for a new candidate.
+  validate_archive_entries "$ZIP_PATH"
+  extract_and_verify_archive "$ZIP_PATH" existing-published-extracted
+  verify_release_source_unchanged
+  verify_release_toolchain_integrity
+  verified_sha256="$(release_tool_sha256 "$ZIP_PATH")"
+  if [ "$verified_sha256" != "$initial_sha256" ]; then
+    echo "Existing immutable release archive changed while it was being verified." >&2
+    return 1
+  fi
+
+  if [ "$state" = archive-only ]; then
+    write_release_sha256_sidecar_candidate \
+      "$TMP_ZIP_SHA256" "$ZIP_PATH" "$verified_sha256"
+    verify_release_sha256_sidecar \
+      "$TMP_ZIP_SHA256" "$ZIP_PATH" "$verified_sha256"
+    publish_sidecar_candidate_no_replace_or_adopt \
+      "$TMP_ZIP_SHA256" "$ZIP_PATH" "$ZIP_SHA256_PATH" "$verified_sha256"
+  fi
+  verify_published_release_hash_evidence \
+    "$ZIP_PATH" "$ZIP_SHA256_PATH" "$verified_sha256"
+  PUBLISHED_ZIP_SHA256="$verified_sha256"
+}
+
+cleanup() {
+  local private_root="${RELEASE_PRIVATE_ROOT:-}"
+  local expected_root_id="${RELEASE_PRIVATE_ROOT_ID:-}"
+  local actual_root_id
+
+  [ -n "$private_root" ] || return 0
+  if ! verify_private_release_root >/dev/null 2>&1; then
+    echo "Warning: refusing cleanup because the private release root path or identity changed: $private_root" >&2
+    return 0
+  fi
+
+  # Anchor traversal to the already-verified directory inode. If an attacker
+  # renames or redirects the recorded pathname after `cd`, the working
+  # directory still names the original private tree. BSD find is physical by
+  # default; -x also refuses to cross into a mounted filesystem. Symlinks are
+  # unlinked as nodes and are never followed.
+  if ! (
+    cd "$private_root" || exit 1
+    actual_root_id="$(directory_identity .)" || exit 1
+    [ "$actual_root_id" = "$expected_root_id" ] || exit 1
+    /usr/bin/find -x . -depth -mindepth 1 -delete
+  ); then
+    echo "Warning: private release cleanup could not safely empty: $private_root" >&2
+    return 0
+  fi
+
+  # The only pathname-based removal is a non-recursive rmdir. Re-checking the
+  # inode prevents deleting a substituted leaf; a race after this check can at
+  # worst remove another empty directory, never recursively erase its content.
+  if ! actual_root_id="$(directory_identity "$private_root" 2>/dev/null)" \
+    || [ "$actual_root_id" != "$expected_root_id" ]; then
+    echo "Warning: private release root moved during cleanup; refusing pathname removal: $private_root" >&2
+    return 0
+  fi
+  if ! /bin/rmdir "$private_root"; then
+    echo "Warning: private release root could not be removed after safe cleanup: $private_root" >&2
   fi
 }
 
@@ -952,6 +2084,7 @@ build_release_executable() {
 
 assemble_release_bundle() {
   local bundle_dir="$1"
+  verify_release_snapshot_unchanged
   waal_assemble_app_bundle \
     "$RELEASE_SOURCE_DIR" \
     "$bundle_dir" \
@@ -961,6 +2094,7 @@ assemble_release_bundle() {
     "$APP_DISPLAY_NAME" \
     "$CARGO_VERSION" \
     "$BUILD_VERSION"
+  verify_release_snapshot_unchanged
 }
 
 macos_release_provenance_contents() {
@@ -968,15 +2102,26 @@ macos_release_provenance_contents() {
     'WAAL_MACOS_BUILD_PROVENANCE_V1' \
     "source-git-commit=$RELEASE_GIT_COMMIT" \
     "source-git-tree=$RELEASE_GIT_TREE" \
+    "git-sha256=$RELEASE_GIT_SHA256" \
     "cargo-version=$RELEASE_CARGO_VERSION" \
     "cargo-sha256=$RELEASE_CARGO_SHA256" \
     "rustc-version=$RELEASE_RUSTC_VERSION" \
     "rustc-sha256=$RELEASE_RUSTC_SHA256" \
     "rust-sysroot-sha256=$RELEASE_RUST_SYSROOT_SHA256" \
     "native-toolchain-sha256=$RELEASE_NATIVE_TOOLCHAIN_SHA256" \
+    "release-materials-sha256=$RELEASE_MATERIALS_SHA256" \
     "clang-sha256=$RELEASE_CLANG_SHA256" \
     "clangxx-sha256=$RELEASE_CLANGXX_SHA256" \
-    "ar-sha256=$RELEASE_AR_SHA256"
+    "ar-sha256=$RELEASE_AR_SHA256" \
+    "ld-sha256=$RELEASE_LD_SHA256" \
+    "ld-libtapi-sha256=$RELEASE_LD_TAPI_SHA256" \
+    "ld-libcodedirectory-sha256=$RELEASE_LD_CODEDIRECTORY_SHA256" \
+    "ld-liblto-sha256=$RELEASE_LD_LTO_SHA256" \
+    "ld-libswift-demangle-sha256=$RELEASE_LD_SWIFT_DEMANGLE_SHA256" \
+    "notarytool-sha256=$RELEASE_NOTARYTOOL_SHA256" \
+    "stapler-sha256=$RELEASE_STAPLER_SHA256" \
+    "macos-sdk-sha256=$RELEASE_MACOS_SDK_SHA256" \
+    "clang-resource-dir-sha256=$RELEASE_CLANG_RESOURCE_DIR_SHA256"
 }
 
 write_macos_release_provenance() {
@@ -1053,8 +2198,13 @@ notarize_and_staple_bundle() {
       -x "*/.DS_Store" "*/._*" "__MACOSX/*" "*/__MACOSX/*" >/dev/null
   )
 
-  /usr/bin/xcrun notarytool submit "$notary_zip" --keychain-profile "$NOTARY_PROFILE" --wait
-  /usr/bin/xcrun stapler staple "$bundle_dir"
+  verify_release_notarization_tools_integrity
+  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    "$RELEASE_NOTARYTOOL_BIN" submit "$notary_zip" --keychain-profile "$NOTARY_PROFILE" --wait
+  verify_release_notarization_tools_integrity
+  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    "$RELEASE_STAPLER_BIN" staple "$bundle_dir"
+  verify_release_notarization_tools_integrity
 }
 
 write_empty_entitlements_plist() {
@@ -1207,6 +2357,7 @@ verify_release_build_metadata() {
   require_metadata_field "$metadata" "release-rustc-sha256" "$RELEASE_RUSTC_SHA256" "Release executable rustc hash does not match the verified toolchain."
   require_metadata_field "$metadata" "release-rust-sysroot-sha256" "$RELEASE_RUST_SYSROOT_SHA256" "Release executable Rust sysroot hash does not match the verified toolchain."
   require_metadata_field "$metadata" "release-native-toolchain-sha256" "$RELEASE_NATIVE_TOOLCHAIN_SHA256" "Release executable native toolchain hash does not match the verified toolchain."
+  require_metadata_field "$metadata" "release-materials-sha256" "$RELEASE_MATERIALS_SHA256" "Release executable materials aggregate does not match the verified release inputs."
   if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
     require_metadata_field "$metadata" "artifact-kind" "release-diagnostics" "Release diagnostics artifact metadata kind is not release-diagnostics."
     require_metadata_field "$metadata" "debug-fill" "false" "Release diagnostics artifact must not include debug-fill."
@@ -1300,7 +2451,6 @@ verify_release_bundle() {
   require_tool lipo
   require_tool plutil
   require_tool spctl
-  require_tool xcrun
 
   local bundle_id
   bundle_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$bundle_dir/Contents/Info.plist")"
@@ -1358,7 +2508,10 @@ verify_release_bundle() {
   verify_release_entitlements "$bundle_dir"
 
   /usr/sbin/spctl --assess --type execute --verbose "$bundle_dir"
-  /usr/bin/xcrun stapler validate "$bundle_dir"
+  verify_release_notarization_tools_integrity
+  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    "$RELEASE_STAPLER_BIN" validate "$bundle_dir"
+  verify_release_notarization_tools_integrity
 }
 
 validate_archive_entries() {
@@ -1382,9 +2535,23 @@ validate_archive_entries() {
 
 extract_and_verify_archive() {
   local zip_path="$1"
-  local extract_dir="$STAGE_DIR/extracted"
-  local extracted_bundle="$extract_dir/$APP_NAME.app"
+  local extract_label="${2:-extracted}"
+  local extract_dir
+  local extracted_bundle
 
+  case "$extract_label" in
+    ""|.|..|*/*|*$'\r'*|*$'\n'*)
+      echo "Archive verification label is not a safe directory name." >&2
+      exit 1
+      ;;
+  esac
+  extract_dir="$STAGE_DIR/$extract_label"
+  extracted_bundle="$extract_dir/$APP_NAME.app"
+
+  if [ -e "$extract_dir" ] || [ -L "$extract_dir" ]; then
+    echo "Archive verification directory already exists: $extract_dir" >&2
+    exit 1
+  fi
   /bin/mkdir -p "$extract_dir"
   /usr/bin/ditto -x -k "$zip_path" "$extract_dir"
   if [ ! -d "$extracted_bundle" ]; then
@@ -1397,7 +2564,6 @@ extract_and_verify_archive() {
 package_macos_main() {
   require_tool codesign
   require_tool ditto
-  require_tool git
   require_tool iconutil
   require_tool lipo
   require_tool mktemp
@@ -1408,26 +2574,26 @@ package_macos_main() {
   require_tool sips
   require_tool sort
   require_tool spctl
+  require_tool stat
   require_tool strings
   require_tool tar
   require_tool tr
   require_tool unzip
-  require_tool xcrun
   require_tool xattr
   require_tool zip
   require_tool zipinfo
 
   validate_release_environment
-  capture_release_provenance
-
   prepare_dist_root
-  /bin/rm -f -- "$ZIP_PATH"
-
-  STAGE_DIR="$(/usr/bin/mktemp -d "$ROOT_DIR/dist/.package_macos.XXXXXX")"
   trap cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  create_private_release_root
+
+  capture_release_provenance
+  initialize_release_publication_paths
+  ensure_release_publication_state_supported
 
   materialize_release_source
   prepare_isolated_release_cargo_home
@@ -1436,9 +2602,27 @@ package_macos_main() {
 
   STAGED_BUNDLE="$STAGE_DIR/$APP_NAME.app"
   TMP_ZIP="$STAGE_DIR/$(/usr/bin/basename "$ZIP_PATH")"
+  TMP_ZIP_SHA256="$STAGE_DIR/$(/usr/bin/basename "$ZIP_SHA256_PATH")"
+  prepare_atomic_no_replace_rename_helper
+
+  EXISTING_PUBLICATION_STATE="$(release_publication_state)"
+  case "$EXISTING_PUBLICATION_STATE" in
+    archive-only|complete)
+      repair_or_adopt_existing_release "$EXISTING_PUBLICATION_STATE"
+      /usr/bin/printf 'Release ZIP: %s\nSHA-256 sidecar: %s\nSHA-256: %s\n' \
+        "$ZIP_PATH" "$ZIP_SHA256_PATH" "$PUBLISHED_ZIP_SHA256"
+      return 0
+      ;;
+    empty) ;;
+    *)
+      echo "Unsupported immutable release publication state: $EXISTING_PUBLICATION_STATE" >&2
+      return 1
+      ;;
+  esac
 
   build_release_executable
   assemble_release_bundle "$STAGED_BUNDLE"
+  verify_release_snapshot_unchanged
   write_macos_release_provenance "$STAGED_BUNDLE"
   verify_release_build_metadata "$STAGED_BUNDLE"
   remove_signature_breaking_xattrs "$STAGED_BUNDLE"
@@ -1457,13 +2641,26 @@ package_macos_main() {
   )
 
   validate_archive_entries "$TMP_ZIP"
-  extract_and_verify_archive "$TMP_ZIP"
+  extract_and_verify_archive "$TMP_ZIP" candidate-extracted
   verify_release_source_unchanged
   verify_release_toolchain_integrity
 
-  /bin/mv -f "$TMP_ZIP" "$ZIP_PATH"
+  CANDIDATE_ZIP_SHA256="$(release_tool_sha256 "$TMP_ZIP")"
+  if ! valid_sha256 "$CANDIDATE_ZIP_SHA256"; then
+    echo "Unable to compute the verified release archive SHA-256." >&2
+    exit 1
+  fi
 
-  echo "$ZIP_PATH"
+  publish_verified_release_pair \
+    "$TMP_ZIP" "$TMP_ZIP_SHA256" "$CANDIDATE_ZIP_SHA256"
+  PUBLISHED_ZIP_SHA256="$CANDIDATE_ZIP_SHA256"
+  validate_archive_entries "$ZIP_PATH"
+  extract_and_verify_archive "$ZIP_PATH" published-extracted
+  verify_release_source_unchanged
+  verify_release_toolchain_integrity
+
+  /usr/bin/printf 'Release ZIP: %s\nSHA-256 sidecar: %s\nSHA-256: %s\n' \
+    "$ZIP_PATH" "$ZIP_SHA256_PATH" "$PUBLISHED_ZIP_SHA256"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

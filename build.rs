@@ -16,6 +16,7 @@ const RELEASE_CARGO_SHA256_ENV: &str = "WAAL_RELEASE_CARGO_SHA256";
 const RELEASE_RUSTC_SHA256_ENV: &str = "WAAL_RELEASE_RUSTC_SHA256";
 const RELEASE_RUST_SYSROOT_SHA256_ENV: &str = "WAAL_RELEASE_RUST_SYSROOT_SHA256";
 const RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV: &str = "WAAL_RELEASE_NATIVE_TOOLCHAIN_SHA256";
+const RELEASE_MATERIALS_SHA256_ENV: &str = "WAAL_RELEASE_MATERIALS_SHA256";
 const WINDOWS_AUTHENTICODE_PUBLISHER_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_PUBLISHER";
 const WINDOWS_AUTHENTICODE_CERT_SHA256_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256";
 
@@ -41,6 +42,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={RELEASE_RUSTC_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed={RELEASE_RUST_SYSROOT_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed={RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV}");
+    println!("cargo:rerun-if-env-changed={RELEASE_MATERIALS_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed=WAAL_PUBLISHABLE_RELEASE");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_PUBLISHER_ENV}");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_CERT_SHA256_ENV}");
@@ -156,6 +158,7 @@ struct ReleaseProvenance {
     rustc_sha256: String,
     rust_sysroot_sha256: String,
     native_toolchain_sha256: String,
+    materials_sha256: String,
 }
 
 fn build_metadata(
@@ -175,7 +178,7 @@ fn build_metadata(
         "development"
     };
     format!(
-        "WAAL_BUILD_METADATA_V1;artifact-kind={};profile={};target-os={};target-arch={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};windows-authenticode-publisher={};windows-authenticode-cert-sha256={};source-git-commit={};source-git-tree={};release-cargo-version={};release-rustc-version={};release-cargo-sha256={};release-rustc-sha256={};release-rust-sysroot-sha256={};release-native-toolchain-sha256={};",
+        "WAAL_BUILD_METADATA_V1;artifact-kind={};profile={};target-os={};target-arch={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};windows-authenticode-publisher={};windows-authenticode-cert-sha256={};source-git-commit={};source-git-tree={};release-cargo-version={};release-rustc-version={};release-cargo-sha256={};release-rustc-sha256={};release-rust-sysroot-sha256={};release-native-toolchain-sha256={};release-materials-sha256={};",
         artifact_kind,
         env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string()),
         metadata_component_env("CARGO_CFG_TARGET_OS"),
@@ -199,6 +202,7 @@ fn build_metadata(
         release_provenance.rustc_sha256,
         release_provenance.rust_sysroot_sha256,
         release_provenance.native_toolchain_sha256,
+        release_provenance.materials_sha256,
     )
 }
 
@@ -277,6 +281,7 @@ fn release_provenance() -> ReleaseProvenance {
     let rustc_sha256 = trimmed_env(RELEASE_RUSTC_SHA256_ENV);
     let rust_sysroot_sha256 = trimmed_env(RELEASE_RUST_SYSROOT_SHA256_ENV);
     let native_toolchain_sha256 = trimmed_env(RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV);
+    let materials_sha256 = trimmed_env(RELEASE_MATERIALS_SHA256_ENV);
     let publishable_release = publishable_release_requested();
     if publishable_release && development_release_allowed() {
         panic!("WAAL_PUBLISHABLE_RELEASE and WAAL_DEVELOPMENT_RELEASE are mutually exclusive");
@@ -294,6 +299,7 @@ fn release_provenance() -> ReleaseProvenance {
             rustc_sha256.as_ref(),
             rust_sysroot_sha256.as_ref(),
             native_toolchain_sha256.as_ref(),
+            materials_sha256.as_ref(),
         ]
         .into_iter()
         .any(|value| value.is_none())
@@ -311,11 +317,12 @@ fn release_provenance() -> ReleaseProvenance {
         rustc_sha256.is_some(),
         rust_sysroot_sha256.is_some(),
         native_toolchain_sha256.is_some(),
+        materials_sha256.is_some(),
     ]
     .into_iter()
     .filter(|supplied| *supplied)
     .count();
-    if supplied_count != 0 && supplied_count != 8 {
+    if supplied_count != 0 && supplied_count != 9 {
         panic!("release provenance fields must either all be set or all be absent");
     }
 
@@ -327,6 +334,7 @@ fn release_provenance() -> ReleaseProvenance {
     let rustc_sha256 = rustc_sha256.unwrap_or_default();
     let rust_sysroot_sha256 = rust_sysroot_sha256.unwrap_or_default();
     let native_toolchain_sha256 = native_toolchain_sha256.unwrap_or_default();
+    let materials_sha256 = materials_sha256.unwrap_or_default();
     if !git_commit.is_empty() && !valid_git_sha1(&git_commit) {
         panic!("{RELEASE_GIT_COMMIT_ENV} must be an exact lowercase 40-hex Git object ID");
     }
@@ -354,6 +362,9 @@ fn release_provenance() -> ReleaseProvenance {
     if !native_toolchain_sha256.is_empty() && !valid_sha256(&native_toolchain_sha256) {
         panic!("{RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV} must be an exact lowercase SHA-256 digest");
     }
+    if !materials_sha256.is_empty() && !valid_sha256(&materials_sha256) {
+        panic!("{RELEASE_MATERIALS_SHA256_ENV} must be an exact lowercase SHA-256 digest");
+    }
 
     ReleaseProvenance {
         git_commit,
@@ -364,6 +375,7 @@ fn release_provenance() -> ReleaseProvenance {
         rustc_sha256,
         rust_sysroot_sha256,
         native_toolchain_sha256,
+        materials_sha256,
     }
 }
 

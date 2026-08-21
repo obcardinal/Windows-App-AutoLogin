@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::monitor::MonitorStatus;
+use crate::monitor::{MonitorObservation, MonitorStatus};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
@@ -7,14 +7,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
-use uiautomation::core::UIMatcherMode;
 use uiautomation::patterns::{UIInvokePattern, UIValuePattern};
-use uiautomation::types::{ControlType, Handle};
+use uiautomation::types::{ControlType, Handle, TreeScope};
 use uiautomation::{UIAutomation, UIElement};
 use windows::core::{BOOL, BSTR, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, HWND,
-    LPARAM, RECT,
+    CloseHandle, GetLastError, APPMODEL_ERROR_NO_PACKAGE, CERT_E_REVOKED, CRYPT_E_NO_SIGNER,
+    CRYPT_E_REVOKED, CRYPT_E_SIGNER_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES,
+    ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, TRUST_E_BAD_DIGEST, TRUST_E_CERT_SIGNATURE,
+    TRUST_E_EXPLICIT_DISTRUST, TRUST_E_MALFORMED_SIGNATURE, TRUST_E_NOSIGNATURE,
+    TRUST_E_NO_SIGNER_CERT,
 };
 use windows::Win32::Security::Cryptography::{
     CertGetNameStringW, CERT_CONTEXT, CERT_NAME_SIMPLE_DISPLAY_TYPE,
@@ -43,8 +45,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
-    GA_ROOT, SW_RESTORE,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
+    ShowWindow, GA_ROOT, SW_RESTORE,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -100,6 +102,7 @@ enum WindowsMicrosoftTargetKind {
     SystemMstsc,
     RemoteDesktopInstall,
     WindowsAppsPackage,
+    #[cfg(test)]
     CredentialBroker,
 }
 
@@ -196,6 +199,8 @@ pub(crate) struct WindowsInspection {
     pub(crate) has_session: bool,
     pub(crate) session_windows: Vec<WindowsSessionWindow>,
     pub(crate) password_like_plain_edit_rejected: bool,
+    pub(crate) prompt_scan_complete: bool,
+    pub(crate) target_process_scan_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +233,44 @@ pub(crate) struct WindowsFillResult {
     pub(crate) filled_prompt: WindowsPrompt,
 }
 
+#[derive(Debug)]
+pub(crate) struct WindowsFillFailure {
+    error: anyhow::Error,
+    cleanup_prompt: Option<Box<WindowsPrompt>>,
+}
+
+impl WindowsFillFailure {
+    fn before_write(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_prompt: None,
+        }
+    }
+
+    fn ambiguous_write(error: anyhow::Error, cleanup_prompt: WindowsPrompt) -> Self {
+        Self {
+            error,
+            cleanup_prompt: Some(Box::new(cleanup_prompt)),
+        }
+    }
+
+    pub(crate) fn cleanup_prompt(&self) -> Option<&WindowsPrompt> {
+        self.cleanup_prompt.as_deref()
+    }
+}
+
+impl std::fmt::Display for WindowsFillFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for WindowsFillFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WindowsSubmitResult {
     pub(crate) submit_method: &'static str,
@@ -245,37 +288,55 @@ pub(crate) struct WindowsSubmittedPrompt {
     prompt_window_handle: isize,
     prompt_window_title: String,
     email: String,
+    trust: WindowsPromptTrust,
+    prompt_runtime_id: Vec<i32>,
     pre_submit_session_windows: Vec<WindowsSessionWindow>,
 }
 
-pub(crate) fn check_status(config: &Config) -> MonitorStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmittedPromptPresence {
+    Present,
+    Absent,
+    Indeterminate,
+}
+
+pub(crate) fn check_status(config: &Config) -> MonitorObservation {
     match inspect(&config.macos_app_name) {
         Ok(inspection) => {
+            let definitive_no_prompt = if inspection.target.is_none() {
+                inspection.target_process_scan_complete
+            } else {
+                inspection.prompt.is_none() && inspection.prompt_scan_complete
+            };
             if inspection.target.is_some() {
                 if let Some(prompt) = inspection.prompt {
-                    return MonitorStatus::LoginWindowDetected {
+                    return MonitorObservation::indeterminate(MonitorStatus::LoginWindowDetected {
                         process_id: prompt.target.process_id,
                         window_handle: prompt.target.window_handle,
                         window_title: prompt.target.window_title,
                         prompt_email: prompt.email,
                         prompt_origin: "windows".to_string(),
-                    };
+                    });
                 }
             } else if inspection.prompt.is_some() {
-                return MonitorStatus::ProcessNotFound;
+                return MonitorObservation::indeterminate(MonitorStatus::Unknown);
             }
 
-            if inspection.target.is_none() {
+            let status = if inspection.target.is_none() {
                 MonitorStatus::ProcessNotFound
             } else if inspection.has_session {
                 MonitorStatus::Connected
             } else {
                 MonitorStatus::Unknown
+            };
+            MonitorObservation {
+                status,
+                definitive_no_prompt,
             }
         }
         Err(e) => {
             tracing::debug!(error = %e, "Unable to inspect Windows UI Automation tree");
-            MonitorStatus::Unknown
+            MonitorObservation::indeterminate(MonitorStatus::Unknown)
         }
     }
 }
@@ -283,107 +344,90 @@ pub(crate) fn check_status(config: &Config) -> MonitorStatus {
 pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection> {
     ensure_fixed_target_app(target_app_name)?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
-    let trusted_running_target = is_builtin_target_name(target_app_name)
-        .then(|| running_target_process(target_app_name))
-        .flatten();
-
-    if trusted_running_target.is_some() {
-        if let Some(prompt) = fast_system_credential_prompt(&automation, target_app_name)? {
-            return Ok(WindowsInspection {
-                target: trusted_running_target.clone(),
-                prompt: Some(prompt),
-                has_session: false,
-                session_windows: Vec::new(),
-                password_like_plain_edit_rejected: false,
-            });
-        }
-    }
+    let trusted_running_targets = if is_builtin_target_name(target_app_name) {
+        trusted_running_target_processes_checked(target_app_name)?
+    } else {
+        Vec::new()
+    };
+    let trusted_running_target = trusted_running_targets.first().cloned();
+    let trusted_process_ids = trusted_running_targets
+        .iter()
+        .map(|target| target.process_id as u32)
+        .collect::<Vec<_>>();
 
     let mut inspection = WindowsInspection {
         target: trusted_running_target,
+        target_process_scan_complete: true,
         ..Default::default()
     };
-    let mut trusted_target_seen = inspection.target.is_some();
     let mut target_prompt: Option<WindowsPrompt> = None;
-    let mut system_prompt: Option<WindowsPrompt> = None;
+    let mut all_trusted_windows_classified = true;
 
-    for candidate in native_visible_windows() {
-        if target_app_matches_with_class(target_app_name, &candidate.target, &candidate.class_name)
-        {
-            trusted_target_seen = true;
-            if inspection.target.is_none() {
-                inspection.target = Some(candidate.target.clone());
+    for candidate in native_visible_windows_for_trusted_process_ids(trusted_process_ids)? {
+        let target_alias_matches = target_aliases(target_app_name)
+            .contains(&normalized_identifier(&candidate.target.process_name));
+        let Some(target_kind) = microsoft_rdp_target_kind(
+            &candidate.target.process_name,
+            &candidate.target.process_path,
+        ) else {
+            anyhow::bail!("trusted target process path identity changed during window enumeration");
+        };
+        if !target_alias_matches {
+            anyhow::bail!("trusted target process name changed during window enumeration");
+        }
+        match windows_target_identity_trust(&candidate.target, target_kind) {
+            WindowsSignatureTrust::Trusted => {}
+            WindowsSignatureTrust::Rejected => anyhow::bail!(
+                "trusted target executable identity changed during window enumeration"
+            ),
+            WindowsSignatureTrust::Indeterminate => {
+                anyhow::bail!("trusted target executable signature state is indeterminate")
             }
-
-            if target_window_should_be_scanned_for_prompt(
-                target_app_name,
-                &candidate.target,
-                &candidate.class_name,
-            ) {
-                let Ok(window) =
-                    automation.element_from_handle(Handle::from(candidate.window_handle))
-                else {
-                    continue;
-                };
-                let prompt_window = inspect_prompt_window(
-                    &automation,
-                    candidate.target.clone(),
-                    WindowsPromptTrust::TrustedTargetProcess,
-                    window,
-                )?;
-                inspection.password_like_plain_edit_rejected |=
-                    prompt_window.password_like_plain_edit_rejected;
-                if let Some(prompt) = prompt_window.prompt {
-                    if prompt.target.frontmost {
-                        inspection.prompt = Some(prompt);
-                        return Ok(inspection);
-                    } else if target_prompt.is_none() {
-                        target_prompt = Some(prompt);
-                    }
-                }
-            } else if is_probable_session_window_title(&candidate.target.window_title) {
-                inspection.has_session = true;
-                inspection.session_windows.push(WindowsSessionWindow {
-                    process_id: candidate.target.process_id,
-                    window_title: candidate.target.window_title.clone(),
-                    window_handle: candidate.target.window_handle,
-                });
-            }
-
-            continue;
+        }
+        if inspection.target.is_none() {
+            inspection.target = Some(candidate.target.clone());
         }
 
-        if system_credential_prompt_matches_target(
+        if target_window_should_be_scanned_for_prompt(
             target_app_name,
             &candidate.target,
             &candidate.class_name,
-            candidate.window_handle,
         ) {
-            let Ok(window) = automation.element_from_handle(Handle::from(candidate.window_handle))
-            else {
-                continue;
-            };
+            let window = automation
+                .element_from_handle(Handle::from(candidate.window_handle))
+                .context("unable to inspect a trusted target prompt window")?;
             let prompt_window = inspect_prompt_window(
                 &automation,
-                candidate.target,
-                WindowsPromptTrust::CredentialBrokerBoundToTarget,
+                candidate.target.clone(),
+                WindowsPromptTrust::TrustedTargetProcess,
                 window,
             )?;
             inspection.password_like_plain_edit_rejected |=
                 prompt_window.password_like_plain_edit_rejected;
+            all_trusted_windows_classified &= prompt_window.scan_complete;
             if let Some(prompt) = prompt_window.prompt {
-                if window_handle_is_foreground(prompt.target.window_handle) {
+                if prompt.target.frontmost {
                     inspection.prompt = Some(prompt);
                     return Ok(inspection);
-                } else if system_prompt.is_none() {
-                    system_prompt = Some(prompt);
+                } else if target_prompt.is_none() {
+                    target_prompt = Some(prompt);
                 }
             }
+        } else if is_probable_session_window_title(&candidate.target.window_title) {
+            inspection.has_session = true;
+            inspection.session_windows.push(WindowsSessionWindow {
+                process_id: candidate.target.process_id,
+                window_title: candidate.target.window_title.clone(),
+                window_handle: candidate.target.window_handle,
+            });
+        } else {
+            all_trusted_windows_classified = false;
         }
     }
 
-    let system_prompt = system_prompt.filter(|_| trusted_target_seen);
-    inspection.prompt = system_prompt.or(target_prompt);
+    inspection.prompt = target_prompt;
+    inspection.prompt_scan_complete =
+        all_trusted_windows_classified && !inspection.password_like_plain_edit_rejected;
 
     Ok(inspection)
 }
@@ -402,7 +446,7 @@ pub(crate) fn inspect_prompt_snapshot(
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
     let mut matches = Vec::new();
 
-    for candidate in native_prompt_snapshot_candidates(process_id, window_handle, window_title) {
+    for candidate in native_prompt_snapshot_candidates(process_id, window_handle, window_title)? {
         let Some(trust) = prompt_candidate_trust(
             target_app_name,
             &candidate.target,
@@ -412,10 +456,9 @@ pub(crate) fn inspect_prompt_snapshot(
             continue;
         };
 
-        let Ok(window) = automation.element_from_handle(Handle::from(candidate.window_handle))
-        else {
-            continue;
-        };
+        let window = automation
+            .element_from_handle(Handle::from(candidate.window_handle))
+            .context("unable to inspect the exact credential prompt snapshot")?;
         let Some(prompt) = prompt_from_window(&automation, candidate.target, trust, window)? else {
             continue;
         };
@@ -524,11 +567,12 @@ pub(crate) fn fill_password(
     password: &str,
     strategy: WindowsFillStrategy,
     guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<WindowsFillResult> {
-    activate_window(prompt.target.window_handle)?;
-    guard()?;
-    let prompt = revalidate_prompt(target_app_name, prompt)?;
-    guard()?;
+) -> Result<WindowsFillResult, WindowsFillFailure> {
+    activate_window(prompt.target.window_handle).map_err(WindowsFillFailure::before_write)?;
+    guard().map_err(WindowsFillFailure::before_write)?;
+    let prompt =
+        revalidate_prompt(target_app_name, prompt).map_err(WindowsFillFailure::before_write)?;
+    guard().map_err(WindowsFillFailure::before_write)?;
 
     match strategy {
         WindowsFillStrategy::DirectSetValue => set_password_value(
@@ -546,10 +590,13 @@ pub(crate) fn fill_password(
                 "direct_uia_value_keyboard_safe",
                 guard,
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "keyboard password input is disabled on Windows; direct UIA password fill failed: {e}"
-                )
+            .map_err(|failure| {
+                WindowsFillFailure {
+                    error: anyhow::anyhow!(
+                        "keyboard password input is disabled on Windows; direct UIA password fill failed: {failure}"
+                    ),
+                    cleanup_prompt: failure.cleanup_prompt,
+                }
             })
         }
     }
@@ -561,10 +608,13 @@ fn set_password_value(
     password: &str,
     fill_method: &'static str,
     guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<WindowsFillResult> {
-    let (prompt, value) = direct_set_value_pattern_after_final_validation(target_app_name, prompt)?;
-    guard()?;
-    set_zeroizing_password_value(&value, password)?;
+) -> Result<WindowsFillResult, WindowsFillFailure> {
+    let (prompt, value) = direct_set_value_pattern_after_final_validation(target_app_name, prompt)
+        .map_err(WindowsFillFailure::before_write)?;
+    guard().map_err(WindowsFillFailure::before_write)?;
+    if let Err(error) = set_zeroizing_password_value(&value, password) {
+        return Err(WindowsFillFailure::ambiguous_write(error, prompt));
+    }
     Ok(WindowsFillResult {
         fill_method,
         fill_status: "ok",
@@ -614,7 +664,7 @@ pub(crate) fn submit_prompt(
     );
     let prompt = revalidate_prompt(target_app_name, &prompt)?;
     ensure_prompt_sensitive_elements_bound(&prompt)?;
-    let pre_submit_session_windows = trusted_session_windows(target_app_name);
+    let pre_submit_session_windows = trusted_session_windows(target_app_name)?;
 
     guard()?;
     let prompt = revalidate_prompt(target_app_name, &prompt)?;
@@ -628,6 +678,7 @@ pub(crate) fn submit_prompt(
     let invoke = button
         .get_pattern::<UIInvokePattern>()
         .map_err(|e| anyhow::anyhow!("submit button lost InvokePattern before submit: {e}"))?;
+    let submitted_prompt = WindowsSubmittedPrompt::new(&prompt, pre_submit_session_windows)?;
     // Keep cancellation/generation invalidation as the final operation before
     // the single submit side effect. All potentially blocking UIA reads above
     // may have yielded long enough for Stop or ApplyConfig to arrive.
@@ -642,10 +693,7 @@ pub(crate) fn submit_prompt(
         axpress_result: "ok",
         enter_fallback_attempted: false,
         enter_fallback_result: "disabled",
-        submitted_prompt: Some(WindowsSubmittedPrompt::new(
-            &prompt,
-            pre_submit_session_windows,
-        )),
+        submitted_prompt: Some(submitted_prompt),
     })
 }
 
@@ -678,9 +726,8 @@ fn clear_original_password_once(
     if !native_window_is_visible_and_sized(hwnd) {
         anyhow::bail!("original filled prompt window is no longer visible");
     }
-    let Some((current_target, class_name)) = target_details_from_hwnd(hwnd) else {
-        anyhow::bail!("original filled prompt window disappeared before cleanup");
-    };
+    let (current_target, class_name) = target_details_from_hwnd_checked(hwnd)
+        .context("original filled prompt window disappeared before cleanup")?;
     if current_target.process_id != expected.process_id
         || current_target.window_handle != expected.window_handle
     {
@@ -693,17 +740,17 @@ fn clear_original_password_once(
         filled_prompt.trust,
     )?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
-    if !uia_element_bound_to_prompt_window(
+    if !uia_element_bound_to_prompt_window_checked(
         &automation,
         &filled_prompt.prompt_root,
         &filled_prompt.prompt_root,
         expected,
-    ) || !uia_element_bound_to_prompt_window(
+    )? || !uia_element_bound_to_prompt_window_checked(
         &automation,
         &filled_prompt.password_field,
         &filled_prompt.prompt_root,
         expected,
-    ) {
+    )? {
         anyhow::bail!("original filled password element is no longer bound to its PID/HWND/root");
     }
     if !has_native_password_field_identity(&filled_prompt.password_field) {
@@ -722,14 +769,26 @@ fn clear_original_password_once(
 }
 
 impl WindowsSubmittedPrompt {
-    fn new(prompt: &WindowsPrompt, pre_submit_session_windows: Vec<WindowsSessionWindow>) -> Self {
-        Self {
+    fn new(
+        prompt: &WindowsPrompt,
+        pre_submit_session_windows: Vec<WindowsSessionWindow>,
+    ) -> anyhow::Result<Self> {
+        let prompt_runtime_id = prompt
+            .prompt_root
+            .get_runtime_id()
+            .context("submitted prompt UI Automation identity unavailable")?;
+        if prompt_runtime_id.is_empty() {
+            anyhow::bail!("submitted prompt UI Automation identity is empty");
+        }
+        Ok(Self {
             process_id: prompt.target.process_id,
             prompt_window_handle: prompt.target.window_handle,
             prompt_window_title: prompt.target.window_title.clone(),
             email: prompt.email.clone().unwrap_or_default(),
+            trust: prompt.trust,
+            prompt_runtime_id,
             pre_submit_session_windows,
-        }
+        })
     }
 }
 
@@ -745,27 +804,44 @@ pub(crate) fn post_check_state(
     }
 
     let started = Instant::now();
+    let mut consecutive_submitted_prompt_absences = 0_u8;
     loop {
         match inspect(target_app_name) {
             Ok(inspection) => {
+                let submitted_presence = submitted_prompt
+                    .map(|submitted| {
+                        submitted_prompt_presence(
+                            target_app_name,
+                            submitted,
+                            expected_process_id,
+                            expected_email,
+                        )
+                        .unwrap_or(SubmittedPromptPresence::Indeterminate)
+                    })
+                    .unwrap_or(SubmittedPromptPresence::Indeterminate);
+                consecutive_submitted_prompt_absences = next_submitted_prompt_absence_observations(
+                    consecutive_submitted_prompt_absences,
+                    submitted_presence,
+                );
+                let submitted_prompt_confirmed_absent =
+                    submitted_prompt.is_some() && consecutive_submitted_prompt_absences >= 2;
                 let target_running = inspection.target.as_ref().is_some_and(|target| {
                     target.process_id == expected_process_id
                         || target_app_matches(target_app_name, target)
                 });
 
                 if let Some(prompt) = inspection.prompt {
-                    return classify_post_submit_state(
-                        prompt.email.as_deref(),
-                        target_running,
-                        submitted_prompt_has_new_session(
-                            submitted_prompt,
-                            &inspection.session_windows,
-                            expected_process_id,
-                            expected_email,
-                        ),
-                        expected_email,
-                    )
-                    .unwrap_or("prompt_gone_unknown");
+                    return if prompt
+                        .email
+                        .as_deref()
+                        .is_some_and(|email| usernames_match(email, expected_email))
+                    {
+                        "still_prompt"
+                    } else if prompt.email.is_some() {
+                        "prompt_mismatch"
+                    } else {
+                        "prompt_gone_unknown"
+                    };
                 }
 
                 if let Some(state) = classify_post_submit_state(
@@ -776,13 +852,16 @@ pub(crate) fn post_check_state(
                         &inspection.session_windows,
                         expected_process_id,
                         expected_email,
-                    ),
+                    ) && submitted_prompt_confirmed_absent
+                        && inspection.prompt_scan_complete,
                     expected_email,
                 ) {
                     return state;
                 }
             }
-            Err(_) => return "failed",
+            Err(_) => {
+                consecutive_submitted_prompt_absences = 0;
+            }
         }
 
         if started.elapsed() >= timeout {
@@ -790,6 +869,86 @@ pub(crate) fn post_check_state(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn next_submitted_prompt_absence_observations(
+    previous: u8,
+    presence: SubmittedPromptPresence,
+) -> u8 {
+    match presence {
+        SubmittedPromptPresence::Absent => previous.saturating_add(1),
+        SubmittedPromptPresence::Present | SubmittedPromptPresence::Indeterminate => 0,
+    }
+}
+
+fn submitted_prompt_presence(
+    target_app_name: &str,
+    submitted: &WindowsSubmittedPrompt,
+    expected_process_id: i32,
+    expected_email: &str,
+) -> anyhow::Result<SubmittedPromptPresence> {
+    if submitted.process_id != expected_process_id
+        || submitted.process_id <= 0
+        || submitted.prompt_window_handle == 0
+        || submitted.prompt_window_title.trim().is_empty()
+        || submitted.prompt_runtime_id.is_empty()
+        || !usernames_match(&submitted.email, expected_email)
+    {
+        return Ok(SubmittedPromptPresence::Indeterminate);
+    }
+
+    let hwnd = hwnd_from_handle(submitted.prompt_window_handle);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return submitted_prompt_absent_after_complete_native_enumeration(submitted);
+    }
+    let mut live_process_id = 0_u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut live_process_id)) };
+    if thread_id == 0 || live_process_id == 0 {
+        anyhow::bail!("submitted prompt native window identity is unavailable");
+    }
+    if live_process_id != submitted.process_id as u32 {
+        return submitted_prompt_absent_after_complete_native_enumeration(submitted);
+    }
+
+    let (live_target, class_name) = target_details_from_hwnd_checked(hwnd)
+        .context("submitted prompt native target details are unavailable")?;
+    if prompt_candidate_trust(
+        target_app_name,
+        &live_target,
+        &class_name,
+        submitted.prompt_window_handle,
+    ) != Some(submitted.trust)
+    {
+        return Ok(SubmittedPromptPresence::Indeterminate);
+    }
+
+    let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+    let current_prompt_root = automation
+        .element_from_handle(Handle::from(submitted.prompt_window_handle))
+        .context("submitted prompt UI Automation root is unavailable")?;
+    let current_runtime_id = current_prompt_root
+        .get_runtime_id()
+        .context("submitted prompt UI Automation identity is unavailable")?;
+    if current_runtime_id == submitted.prompt_runtime_id {
+        Ok(SubmittedPromptPresence::Present)
+    } else {
+        submitted_prompt_absent_after_complete_native_enumeration(submitted)
+    }
+}
+
+fn submitted_prompt_absent_after_complete_native_enumeration(
+    submitted: &WindowsSubmittedPrompt,
+) -> anyhow::Result<SubmittedPromptPresence> {
+    let remaining = native_prompt_snapshot_candidates(
+        submitted.process_id,
+        submitted.prompt_window_handle,
+        &submitted.prompt_window_title,
+    )?;
+    Ok(if remaining.is_empty() {
+        SubmittedPromptPresence::Absent
+    } else {
+        SubmittedPromptPresence::Indeterminate
+    })
 }
 
 fn submitted_prompt_has_new_session(
@@ -994,9 +1153,8 @@ fn ensure_direct_set_value_target_ready(
     if !native_window_is_visible_and_sized(hwnd) {
         anyhow::bail!("credential prompt window is not visible before password insertion");
     }
-    let Some((current_target, class_name)) = target_details_from_hwnd(hwnd) else {
-        anyhow::bail!("credential prompt window disappeared before password insertion");
-    };
+    let (current_target, class_name) = target_details_from_hwnd_checked(hwnd)
+        .context("credential prompt window disappeared before password insertion")?;
     ensure_direct_set_value_target_matches_expected(&current_target, &prompt.target)?;
     ensure_direct_set_value_target_is_trusted(
         target_app_name,
@@ -1029,9 +1187,8 @@ fn ensure_prompt_foreground_and_trusted(
     if !native_window_is_visible_and_sized(hwnd) {
         anyhow::bail!("credential prompt is not visible before {action}");
     }
-    let Some((current_target, class_name)) = target_details_from_hwnd(hwnd) else {
-        anyhow::bail!("credential prompt disappeared before {action}");
-    };
+    let (current_target, class_name) = target_details_from_hwnd_checked(hwnd)
+        .with_context(|| format!("credential prompt disappeared before {action}"))?;
     if current_target.process_id != prompt.target.process_id
         || current_target.window_handle != prompt.target.window_handle
         || !window_title_matches(&current_target.window_title, &prompt.target.window_title)
@@ -1130,62 +1287,72 @@ fn password_field_ready_for_direct_set_value_with_state(
     !is_offscreen && is_enabled && rect.is_some() && native_password_identity_matches
 }
 
-fn uia_element_bound_to_prompt_window(
+fn uia_element_bound_to_prompt_window_checked(
     automation: &UIAutomation,
     element: &UIElement,
     prompt_root: &UIElement,
     target: &WindowsTarget,
-) -> bool {
+) -> anyhow::Result<bool> {
     if target.process_id <= 0 || target.window_handle == 0 {
-        return false;
+        return Ok(false);
     }
-    if prompt_root.get_process_id().ok() != Some(target.process_id as u32)
-        || element.get_process_id().ok() != Some(target.process_id as u32)
+    if prompt_root
+        .get_process_id()
+        .context("prompt root process identity unavailable")?
+        != target.process_id as u32
+        || element
+            .get_process_id()
+            .context("prompt element process identity unavailable")?
+            != target.process_id as u32
     {
-        return false;
+        return Ok(false);
     }
-    if uia_native_window_handle(prompt_root) != Some(target.window_handle) {
-        return false;
+    if prompt_root
+        .get_native_window_handle()
+        .map(Into::<isize>::into)
+        .context("prompt root native window identity unavailable")?
+        != target.window_handle
+    {
+        return Ok(false);
     }
 
-    let Ok(walker) = automation.get_raw_view_walker() else {
-        return false;
-    };
+    let walker = automation
+        .get_raw_view_walker()
+        .context("UI Automation raw-view walker unavailable")?;
     let mut current = element.clone();
     for _ in 0..=UIA_SEARCH_DEPTH {
-        if current.get_process_id().ok() != Some(target.process_id as u32) {
-            return false;
+        if current
+            .get_process_id()
+            .context("prompt ancestry process identity unavailable")?
+            != target.process_id as u32
+        {
+            return Ok(false);
         }
-        if let Some(native_handle) = uia_native_window_handle(&current) {
-            if native_handle != 0
-                && !native_hwnd_is_within_prompt_window(
-                    native_handle,
-                    target.window_handle,
-                    target.process_id,
-                )
-            {
-                return false;
-            }
+        let native_handle = current
+            .get_native_window_handle()
+            .map(Into::<isize>::into)
+            .context("prompt ancestry native window identity unavailable")?;
+        if native_handle != 0
+            && !native_hwnd_is_within_prompt_window(
+                native_handle,
+                target.window_handle,
+                target.process_id,
+            )
+        {
+            return Ok(false);
         }
         if automation
             .compare_elements(&current, prompt_root)
-            .unwrap_or(false)
+            .context("unable to compare prompt ancestry elements")?
         {
-            return true;
+            return Ok(true);
         }
-        let Ok(parent) = walker.get_parent(&current) else {
-            return false;
-        };
+        let parent = walker
+            .get_parent(&current)
+            .context("unable to traverse prompt ancestry")?;
         current = parent;
     }
-    false
-}
-
-fn uia_native_window_handle(element: &UIElement) -> Option<isize> {
-    element
-        .get_native_window_handle()
-        .ok()
-        .map(Into::<isize>::into)
+    Ok(false)
 }
 
 fn native_hwnd_is_within_prompt_window(
@@ -1213,41 +1380,43 @@ fn native_hwnd_is_within_prompt_window(
 
 fn ensure_prompt_sensitive_elements_bound(prompt: &WindowsPrompt) -> anyhow::Result<()> {
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
-    if !uia_element_bound_to_prompt_window(
+    if !uia_element_bound_to_prompt_window_checked(
         &automation,
         &prompt.prompt_root,
         &prompt.prompt_root,
         &prompt.target,
-    ) {
+    )? {
         anyhow::bail!("credential prompt root is no longer bound to the trusted process window");
     }
-    if !uia_element_bound_to_prompt_window(
+    if !uia_element_bound_to_prompt_window_checked(
         &automation,
         &prompt.password_field,
         &prompt.prompt_root,
         &prompt.target,
-    ) {
+    )? {
         anyhow::bail!("password field provider is no longer bound to the trusted prompt window");
     }
-    if prompt.submit_button.as_ref().is_some_and(|button| {
-        !uia_element_bound_to_prompt_window(
+    if let Some(button) = prompt.submit_button.as_ref() {
+        if !uia_element_bound_to_prompt_window_checked(
             &automation,
             button,
             &prompt.prompt_root,
             &prompt.target,
-        )
-    }) {
-        anyhow::bail!("submit button provider is no longer bound to the trusted prompt window");
+        )? {
+            anyhow::bail!("submit button provider is no longer bound to the trusted prompt window");
+        }
     }
-    if prompt.identity_elements.iter().any(|element| {
-        !uia_element_bound_to_prompt_window(
+    for element in &prompt.identity_elements {
+        if !uia_element_bound_to_prompt_window_checked(
             &automation,
             element,
             &prompt.prompt_root,
             &prompt.target,
-        )
-    }) {
-        anyhow::bail!("prompt identity provider is no longer bound to the trusted prompt window");
+        )? {
+            anyhow::bail!(
+                "prompt identity provider is no longer bound to the trusted prompt window"
+            );
+        }
     }
     Ok(())
 }
@@ -1255,6 +1424,15 @@ fn ensure_prompt_sensitive_elements_bound(prompt: &WindowsPrompt) -> anyhow::Res
 struct PromptWindowInspection {
     prompt: Option<WindowsPrompt>,
     password_like_plain_edit_rejected: bool,
+    scan_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptCandidateSelection {
+    None,
+    Unique,
+    Unusable,
+    Ambiguous,
 }
 
 fn prompt_from_window(
@@ -1272,53 +1450,72 @@ fn inspect_prompt_window(
     trust: WindowsPromptTrust,
     window: UIElement,
 ) -> anyhow::Result<PromptWindowInspection> {
-    if !is_usable_window(&window)
-        || !uia_element_bound_to_prompt_window(automation, &window, &window, &target)
-    {
+    if !is_usable_window_checked(&window)? {
         return Ok(PromptWindowInspection {
             prompt: None,
             password_like_plain_edit_rejected: false,
+            scan_complete: false,
         });
     }
-
-    let mut elements = automation
-        .create_matcher()
-        .from_ref(&window)
-        .mode(UIMatcherMode::Raw)
-        .depth(UIA_SEARCH_DEPTH)
-        .timeout(0)
-        .find_all()
-        .unwrap_or_default();
-    if elements.len() > MAX_ELEMENT_COUNT {
-        elements.truncate(MAX_ELEMENT_COUNT);
+    if !uia_element_bound_to_prompt_window_checked(automation, &window, &window, &target)? {
+        anyhow::bail!("credential prompt root is not bound to the trusted PID/HWND/root");
     }
 
-    let Some(prompt_candidate) = select_prompt_candidate(&target.window_title, &elements) else {
+    let condition = automation
+        .create_true_condition()
+        .context("unable to create the trusted prompt UI search condition")?;
+    let elements = window
+        .find_all(TreeScope::Descendants, &condition)
+        .context("unable to enumerate the trusted credential prompt UI tree")?;
+    if elements.len() > MAX_ELEMENT_COUNT {
+        anyhow::bail!("trusted credential prompt UI tree exceeds the safe inspection limit");
+    }
+
+    let (selection, prompt_candidate) = select_prompt_candidate(&target.window_title, &elements)?;
+    if selection == PromptCandidateSelection::Ambiguous {
+        anyhow::bail!("multiple secure credential prompt candidates are visible");
+    }
+    if selection == PromptCandidateSelection::Unusable {
+        anyhow::bail!("secure credential prompt candidate identity is insufficient");
+    }
+    let Some(prompt_candidate) = prompt_candidate else {
+        let password_like_plain_edit_rejected = has_password_like_plain_edit_checked(&elements)?;
         return Ok(PromptWindowInspection {
             prompt: None,
-            password_like_plain_edit_rejected: has_password_like_plain_edit(&elements),
+            password_like_plain_edit_rejected,
+            scan_complete: !password_like_plain_edit_rejected,
         });
     };
-    let sensitive_elements_bound = uia_element_bound_to_prompt_window(
+    let sensitive_elements_bound = uia_element_bound_to_prompt_window_checked(
         automation,
         &prompt_candidate.password_field,
         &window,
         &target,
-    ) && prompt_candidate.submit_button.as_ref().is_none_or(
-        |button| uia_element_bound_to_prompt_window(automation, button, &window, &target),
-    ) && prompt_candidate
-        .identity_elements
-        .iter()
-        .all(|element| uia_element_bound_to_prompt_window(automation, element, &window, &target));
+    )? && match prompt_candidate.submit_button.as_ref() {
+        Some(button) => {
+            uia_element_bound_to_prompt_window_checked(automation, button, &window, &target)?
+        }
+        None => true,
+    };
+    let sensitive_elements_bound = if sensitive_elements_bound {
+        let mut all_identity_elements_bound = true;
+        for element in &prompt_candidate.identity_elements {
+            if !uia_element_bound_to_prompt_window_checked(automation, element, &window, &target)? {
+                all_identity_elements_bound = false;
+                break;
+            }
+        }
+        all_identity_elements_bound
+    } else {
+        false
+    };
     if !sensitive_elements_bound {
-        return Ok(PromptWindowInspection {
-            prompt: None,
-            password_like_plain_edit_rejected: false,
-        });
+        anyhow::bail!("credential prompt providers are not bound to the trusted PID/HWND/root");
     }
 
-    let password_field_description = redacted_element_description(&prompt_candidate.password_field);
-    let password_field_role = element_role_text(&prompt_candidate.password_field);
+    let password_field_description =
+        redacted_element_description_checked(&prompt_candidate.password_field)?;
+    let password_field_role = element_role_text_checked(&prompt_candidate.password_field)?;
     Ok(PromptWindowInspection {
         prompt: Some(WindowsPrompt {
             target,
@@ -1332,15 +1529,20 @@ fn inspect_prompt_window(
             identity_elements: prompt_candidate.identity_elements,
         }),
         password_like_plain_edit_rejected: false,
+        scan_complete: true,
     })
 }
 
-fn has_password_like_plain_edit(elements: &[UIElement]) -> bool {
-    elements.iter().any(|element| {
-        !is_native_password_field(element)
-            && is_password_like_edit(element)
-            && prompt_element_rect(element).is_some()
-    })
+fn has_password_like_plain_edit_checked(elements: &[UIElement]) -> anyhow::Result<bool> {
+    for element in elements {
+        if !is_native_password_field_checked(element)?
+            && is_password_like_edit_checked(element)?
+            && prompt_element_rect_checked(element)?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn target_window_should_be_scanned_for_prompt(
@@ -1376,35 +1578,6 @@ fn prompt_candidate_trust(
         .then_some(WindowsPromptTrust::CredentialBrokerBoundToTarget)
 }
 
-fn fast_system_credential_prompt(
-    automation: &UIAutomation,
-    target_app_name: &str,
-) -> anyhow::Result<Option<WindowsPrompt>> {
-    for (target, window_handle) in native_system_credential_windows() {
-        if !system_credential_prompt_matches_target(
-            target_app_name,
-            &target,
-            "Credential Dialog Xaml Host",
-            window_handle,
-        ) {
-            continue;
-        }
-        let Ok(window) = automation.element_from_handle(Handle::from(window_handle)) else {
-            continue;
-        };
-        if let Some(prompt) = prompt_from_window(
-            automation,
-            target,
-            WindowsPromptTrust::CredentialBrokerBoundToTarget,
-            window,
-        )? {
-            return Ok(Some(prompt));
-        }
-    }
-
-    Ok(None)
-}
-
 struct NativePromptSnapshotCandidate {
     target: WindowsTarget,
     class_name: String,
@@ -1416,15 +1589,22 @@ struct NativePromptSnapshotSearch {
     window_handle: isize,
     window_title: String,
     candidates: Vec<NativePromptSnapshotCandidate>,
+    scan_complete: bool,
+}
+
+struct NativeVisibleWindowSearch {
+    trusted_process_ids: Vec<u32>,
+    candidates: Vec<NativePromptSnapshotCandidate>,
+    scan_complete: bool,
 }
 
 fn native_prompt_snapshot_candidates(
     process_id: i32,
     window_handle: isize,
     window_title: &str,
-) -> Vec<NativePromptSnapshotCandidate> {
+) -> anyhow::Result<Vec<NativePromptSnapshotCandidate>> {
     if process_id <= 0 || window_handle == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut search = NativePromptSnapshotSearch {
@@ -1432,57 +1612,101 @@ fn native_prompt_snapshot_candidates(
         window_handle,
         window_title: window_title.trim().to_string(),
         candidates: Vec::new(),
+        scan_complete: true,
     };
     unsafe {
-        let _ = EnumWindows(
+        EnumWindows(
             Some(enum_native_prompt_snapshot_window),
             LPARAM(&mut search as *mut _ as isize),
-        );
+        )?;
+    }
+    if !search.scan_complete {
+        anyhow::bail!("exact native prompt window enumeration was incomplete");
+    }
+    if search
+        .candidates
+        .iter()
+        .any(|candidate| candidate.target.process_path.trim().is_empty())
+    {
+        anyhow::bail!("exact native prompt process path was unavailable");
     }
     search
         .candidates
         .sort_by_key(|candidate| !window_handle_is_foreground(candidate.window_handle));
-    search.candidates
+    Ok(search.candidates)
 }
 
-fn native_visible_windows() -> Vec<NativePromptSnapshotCandidate> {
-    let mut candidates = Vec::<NativePromptSnapshotCandidate>::new();
-    unsafe {
-        let _ = EnumWindows(
-            Some(enum_native_visible_window),
-            LPARAM(&mut candidates as *mut _ as isize),
-        );
-    }
-    candidates.sort_by_key(|candidate| !window_handle_is_foreground(candidate.window_handle));
-    candidates
-}
-
-fn trusted_session_windows(target_app_name: &str) -> Vec<WindowsSessionWindow> {
-    native_visible_windows()
+fn native_visible_windows(
+    target_app_name: &str,
+) -> anyhow::Result<Vec<NativePromptSnapshotCandidate>> {
+    let trusted_process_ids = trusted_running_target_processes_checked(target_app_name)?
         .into_iter()
-        .filter(|candidate| {
-            target_app_matches_with_class(target_app_name, &candidate.target, &candidate.class_name)
-                && is_probable_session_window_title(&candidate.target.window_title)
-        })
+        .map(|target| target.process_id as u32)
+        .collect::<Vec<_>>();
+    native_visible_windows_for_trusted_process_ids(trusted_process_ids)
+}
+
+fn native_visible_windows_for_trusted_process_ids(
+    trusted_process_ids: Vec<u32>,
+) -> anyhow::Result<Vec<NativePromptSnapshotCandidate>> {
+    if trusted_process_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut search = NativeVisibleWindowSearch {
+        trusted_process_ids,
+        candidates: Vec::new(),
+        scan_complete: true,
+    };
+    unsafe {
+        EnumWindows(
+            Some(enum_native_visible_window),
+            LPARAM(&mut search as *mut _ as isize),
+        )?;
+    }
+    if !search.scan_complete {
+        anyhow::bail!("trusted target visible-window enumeration was incomplete");
+    }
+    search
+        .candidates
+        .sort_by_key(|candidate| !window_handle_is_foreground(candidate.window_handle));
+    Ok(search.candidates)
+}
+
+fn trusted_session_windows(target_app_name: &str) -> anyhow::Result<Vec<WindowsSessionWindow>> {
+    Ok(native_visible_windows(target_app_name)?
+        .into_iter()
+        .filter(|candidate| is_probable_session_window_title(&candidate.target.window_title))
         .map(|candidate| WindowsSessionWindow {
             process_id: candidate.target.process_id,
             window_title: candidate.target.window_title,
             window_handle: candidate.window_handle,
         })
-        .collect()
+        .collect())
 }
 
 unsafe extern "system" fn enum_native_visible_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let candidates = unsafe { &mut *(lparam.0 as *mut Vec<NativePromptSnapshotCandidate>) };
+    let search = unsafe { &mut *(lparam.0 as *mut NativeVisibleWindowSearch) };
 
-    if !native_window_is_visible_and_sized(hwnd) {
+    let mut process_id = 0_u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if thread_id == 0 || process_id == 0 || !search.trusted_process_ids.contains(&process_id) {
         return true.into();
     }
 
-    let Some((target, class_name)) = target_details_from_hwnd(hwnd) else {
-        return true.into();
+    match native_window_is_visible_and_sized_checked(hwnd) {
+        Ok(true) => {}
+        Ok(false) => return true.into(),
+        Err(_) => {
+            search.scan_complete = false;
+            return false.into();
+        }
+    }
+
+    let Ok((target, class_name)) = target_details_from_hwnd_checked(hwnd) else {
+        search.scan_complete = false;
+        return false.into();
     };
-    candidates.push(NativePromptSnapshotCandidate {
+    search.candidates.push(NativePromptSnapshotCandidate {
         target,
         class_name,
         window_handle: hwnd.0.addr() as isize,
@@ -1496,12 +1720,18 @@ unsafe extern "system" fn enum_native_prompt_snapshot_window(hwnd: HWND, lparam:
     if hwnd.0.addr() as isize != search.window_handle {
         return true.into();
     }
-    if !native_window_is_visible_and_sized(hwnd) {
-        return true.into();
+    match native_window_is_visible_and_sized_checked(hwnd) {
+        Ok(true) => {}
+        Ok(false) => return true.into(),
+        Err(_) => {
+            search.scan_complete = false;
+            return false.into();
+        }
     }
 
-    let Some((target, class_name)) = target_details_from_hwnd(hwnd) else {
-        return true.into();
+    let Ok((target, class_name)) = target_details_from_hwnd_checked(hwnd) else {
+        search.scan_complete = false;
+        return false.into();
     };
     if target.process_id != search.process_id {
         return true.into();
@@ -1521,14 +1751,17 @@ unsafe extern "system" fn enum_native_prompt_snapshot_window(hwnd: HWND, lparam:
 }
 
 fn native_window_is_visible_and_sized(hwnd: HWND) -> bool {
-    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        return false;
-    }
+    native_window_is_visible_and_sized_checked(hwnd).unwrap_or(false)
+}
 
+fn native_window_is_visible_and_sized_checked(hwnd: HWND) -> anyhow::Result<bool> {
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return Ok(false);
+    }
     let mut rect = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
-        && rect.right - rect.left > 20
-        && rect.bottom - rect.top > 20
+    unsafe { GetWindowRect(hwnd, &mut rect) }
+        .context("visible native window bounds unavailable")?;
+    Ok(rect.right - rect.left > 20 && rect.bottom - rect.top > 20)
 }
 
 fn prompt_matches_snapshot(
@@ -1573,20 +1806,20 @@ fn window_title_matches(current: &str, expected: &str) -> bool {
     current.trim().eq_ignore_ascii_case(expected.trim())
 }
 
-fn target_details_from_hwnd(hwnd: HWND) -> Option<(WindowsTarget, String)> {
+fn target_details_from_hwnd_checked(hwnd: HWND) -> anyhow::Result<(WindowsTarget, String)> {
     if hwnd.0.addr() == 0 {
-        return None;
+        anyhow::bail!("native window handle is empty");
     }
 
     let mut process_id = 0_u32;
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-    }
-    if process_id == 0 {
-        return None;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if thread_id == 0 || process_id == 0 {
+        anyhow::bail!("native window PID/TID identity is unavailable");
     }
 
-    let process_path = process_image_path(process_id).unwrap_or_default();
+    let process_path = process_image_path(process_id).with_context(|| {
+        format!("native window process path is unavailable for PID {process_id}")
+    })?;
     let process_name = process_name_from_path(&process_path)
         .trim()
         .is_empty()
@@ -1594,16 +1827,18 @@ fn target_details_from_hwnd(hwnd: HWND) -> Option<(WindowsTarget, String)> {
         .flatten()
         .unwrap_or_else(|| process_name_from_path(&process_path));
     let window_handle = hwnd.0.addr() as isize;
+    let window_title = native_window_text_checked(hwnd)?;
+    let class_name = native_window_class_checked(hwnd)?;
     let target = WindowsTarget {
         process_id: process_id as i32,
         process_name,
         process_path,
-        window_title: native_window_text(hwnd),
+        window_title,
         window_handle,
         frontmost: window_handle_is_foreground(window_handle),
     };
 
-    Some((target, native_window_class(hwnd)))
+    Ok((target, class_name))
 }
 
 fn system_credential_prompt_matches_target(
@@ -1622,87 +1857,42 @@ fn system_credential_prompt_matches_target(
     false
 }
 
-fn native_system_credential_windows() -> Vec<(WindowsTarget, isize)> {
-    let mut candidates = Vec::<(WindowsTarget, isize)>::new();
-    unsafe {
-        let _ = EnumWindows(
-            Some(enum_native_system_credential_window),
-            LPARAM(&mut candidates as *mut _ as isize),
-        );
-    }
-    candidates.sort_by_key(|(target, _)| !window_handle_is_foreground(target.window_handle));
-    candidates
-}
-
-unsafe extern "system" fn enum_native_system_credential_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let candidates = unsafe { &mut *(lparam.0 as *mut Vec<(WindowsTarget, isize)>) };
-
-    if !native_window_is_visible_and_sized(hwnd) {
-        return true.into();
-    }
-
-    let title = native_window_text(hwnd);
-    let class_name = native_window_class(hwnd);
-    if !credential_dialog_title_like(&title) || !credential_dialog_class_like(&class_name) {
-        return true.into();
-    }
-
-    let mut process_id = 0_u32;
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-    }
-    if process_id == 0 {
-        return true.into();
-    }
-
-    let process_path = process_image_path(process_id).unwrap_or_default();
-    let process_name = process_name_from_path(&process_path)
-        .trim()
-        .is_empty()
-        .then(|| process_name_from_snapshot(process_id))
-        .flatten()
-        .unwrap_or_else(|| process_name_from_path(&process_path));
-    let window_handle = hwnd.0.addr() as isize;
-    let target = WindowsTarget {
-        process_id: process_id as i32,
-        process_name,
-        process_path,
-        window_title: title,
-        window_handle,
-        frontmost: window_handle_is_foreground(window_handle),
-    };
-
-    if system_credential_dialog_matches(&target, &class_name) {
-        candidates.push((target, window_handle));
-    }
-
-    true.into()
-}
-
-fn native_window_text(hwnd: HWND) -> String {
+fn native_window_text_checked(hwnd: HWND) -> anyhow::Result<String> {
     let mut buffer = [0_u16; 512];
     let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
-    wide_buffer_to_string(&buffer, len.max(0) as usize)
+    if len == 0 && unsafe { GetLastError() } != ERROR_SUCCESS {
+        anyhow::bail!("native window title is unavailable");
+    }
+    Ok(wide_buffer_to_string(&buffer, len.max(0) as usize))
 }
 
-fn native_window_class(hwnd: HWND) -> String {
+fn native_window_class_checked(hwnd: HWND) -> anyhow::Result<String> {
     let mut buffer = [0_u16; 256];
     let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
-    wide_buffer_to_string(&buffer, len.max(0) as usize)
+    if len <= 0 {
+        anyhow::bail!("native window class is unavailable");
+    }
+    Ok(wide_buffer_to_string(&buffer, len as usize))
 }
 
 fn wide_buffer_to_string(buffer: &[u16], len: usize) -> String {
     String::from_utf16_lossy(&buffer[..len.min(buffer.len())])
 }
 
-fn is_usable_window(window: &UIElement) -> bool {
-    if window.is_offscreen().unwrap_or(true) || !window.is_enabled().unwrap_or(false) {
-        return false;
+fn is_usable_window_checked(window: &UIElement) -> anyhow::Result<bool> {
+    if window
+        .is_offscreen()
+        .context("prompt window visibility unavailable")?
+        || !window
+            .is_enabled()
+            .context("prompt window enabled state unavailable")?
+    {
+        return Ok(false);
     }
     window
         .get_bounding_rectangle()
+        .context("prompt window bounds unavailable")
         .map(|rect| rect.get_width() > 20 && rect.get_height() > 20)
-        .unwrap_or(true)
 }
 
 fn window_handle_is_foreground(window_handle: isize) -> bool {
@@ -1819,17 +2009,27 @@ impl ElementRect {
     }
 }
 
-fn select_prompt_candidate(window_title: &str, elements: &[UIElement]) -> Option<PromptCandidate> {
+fn select_prompt_candidate(
+    window_title: &str,
+    elements: &[UIElement],
+) -> anyhow::Result<(PromptCandidateSelection, Option<PromptCandidate>)> {
     let login_title = login_title_like(window_title);
     let mut selected = None;
+    let password_scan = password_field_candidates_checked(elements)?;
+    let mut secure_candidate_unusable = password_scan.unusable_visible_secure_field_seen;
 
-    for candidate in password_field_candidates(elements) {
-        let submit_button = select_submit_button_for_password(elements, candidate.rect);
-        let submit_rect = submit_button.as_ref().and_then(prompt_element_rect);
+    for candidate in password_scan.candidates {
+        let submit_button = select_submit_button_for_password_checked(elements, candidate.rect)?;
+        let submit_rect = submit_button
+            .as_ref()
+            .map(prompt_element_rect_checked)
+            .transpose()?
+            .flatten();
         let (prompt_text, identity_elements) =
-            collect_prompt_text(elements, candidate.rect, submit_rect);
+            collect_prompt_text_checked(elements, candidate.rect, submit_rect)?;
         let prompt_email = extract_email_like(&prompt_text);
         if prompt_email.is_none() && !login_title {
+            secure_candidate_unusable = true;
             continue;
         }
 
@@ -1839,139 +2039,168 @@ fn select_prompt_candidate(window_title: &str, elements: &[UIElement]) -> Option
             submit_button,
             identity_elements,
         };
-        if selected
-            .as_ref()
-            .is_some_and(|selected| prompt_candidates_conflict(selected, &prompt_candidate))
-        {
-            return None;
+        if selected.is_some() {
+            return Ok((PromptCandidateSelection::Ambiguous, None));
         }
-        if selected
-            .as_ref()
-            .is_none_or(|selected| prompt_candidate_preferred(&prompt_candidate, selected))
-        {
-            selected = Some(prompt_candidate);
-        }
+        selected = Some(prompt_candidate);
     }
 
-    selected
+    let selection = match (selected.is_some(), secure_candidate_unusable) {
+        (_, true) => PromptCandidateSelection::Unusable,
+        (true, false) => PromptCandidateSelection::Unique,
+        (false, false) => PromptCandidateSelection::None,
+    };
+    Ok((selection, selected))
 }
 
-fn prompt_candidates_conflict(left: &PromptCandidate, right: &PromptCandidate) -> bool {
-    match (left.email.as_deref(), right.email.as_deref()) {
-        (Some(left), Some(right)) => !usernames_match(left, right),
-        _ => false,
-    }
+struct PasswordFieldCandidateScan {
+    candidates: Vec<PasswordFieldCandidate>,
+    unusable_visible_secure_field_seen: bool,
 }
 
-fn prompt_candidate_preferred(candidate: &PromptCandidate, current: &PromptCandidate) -> bool {
-    prompt_candidate_score(candidate) > prompt_candidate_score(current)
-}
-
-fn prompt_candidate_score(candidate: &PromptCandidate) -> u8 {
-    u8::from(candidate.email.is_some()) * 4 + u8::from(candidate.submit_button.is_some())
-}
-
-fn password_field_candidates(elements: &[UIElement]) -> Vec<PasswordFieldCandidate> {
+fn password_field_candidates_checked(
+    elements: &[UIElement],
+) -> anyhow::Result<PasswordFieldCandidateScan> {
     let mut candidates = Vec::new();
+    let mut unusable_visible_secure_field_seen = false;
     for element in elements {
-        if !is_native_password_field(element) {
+        if !has_native_password_field_identity_checked(element)? {
             continue;
         }
-        if let Some(rect) = prompt_element_rect(element) {
+        if element
+            .is_offscreen()
+            .context("secure password field visibility unavailable")?
+        {
+            continue;
+        }
+        if !element
+            .is_enabled()
+            .context("secure password field enabled state unavailable")?
+        {
+            unusable_visible_secure_field_seen = true;
+            continue;
+        }
+        if let Some(rect) = prompt_element_rect_checked(element)? {
             candidates.push(PasswordFieldCandidate {
                 element: element.clone(),
                 rect,
             });
+        } else {
+            unusable_visible_secure_field_seen = true;
         }
     }
-    candidates
+    Ok(PasswordFieldCandidateScan {
+        candidates,
+        unusable_visible_secure_field_seen,
+    })
 }
 
-fn select_submit_button_for_password(
+struct SubmitButtonCandidate {
+    element: UIElement,
+    enabled: bool,
+    text: String,
+}
+
+fn select_submit_button_for_password_checked(
     elements: &[UIElement],
     password_rect: ElementRect,
-) -> Option<UIElement> {
-    let buttons = elements
-        .iter()
-        .filter(|element| element.get_control_type().ok() == Some(ControlType::Button))
-        .filter(|element| !element.is_offscreen().unwrap_or(true))
-        .filter_map(|element| {
-            let rect = prompt_element_rect(element)?;
-            submit_rect_related_to_password(password_rect, rect).then_some((element, rect))
-        })
-        .collect::<Vec<_>>();
+) -> anyhow::Result<Option<UIElement>> {
+    let mut buttons = Vec::new();
+    for element in elements {
+        if element
+            .get_control_type()
+            .context("submit candidate control type unavailable")?
+            != ControlType::Button
+            || element
+                .is_offscreen()
+                .context("submit candidate visibility unavailable")?
+        {
+            continue;
+        }
+        let Some(rect) = prompt_element_rect_checked(element)? else {
+            continue;
+        };
+        if !submit_rect_related_to_password(password_rect, rect) {
+            continue;
+        }
+        buttons.push(SubmitButtonCandidate {
+            element: element.clone(),
+            enabled: element
+                .is_enabled()
+                .context("submit candidate enabled state unavailable")?,
+            text: submit_button_text_checked(element)?,
+        });
+    }
 
-    ranked_submit_button(&buttons, password_rect, |element| {
-        let text = submit_button_text(element);
-        element.is_enabled().unwrap_or(false) && submit_label_rank(&text) == Some(0)
-    })
-    .or_else(|| {
-        ranked_submit_button(&buttons, password_rect, |element| {
-            let text = submit_button_text(element);
-            element.is_enabled().unwrap_or(false) && is_preferred_submit_label(&text)
-        })
-    })
-    .or_else(|| {
-        ranked_submit_button(&buttons, password_rect, |element| {
-            let text = submit_button_text(element);
-            submit_label_rank(&text) == Some(0)
-        })
-    })
-    .or_else(|| {
-        ranked_submit_button(&buttons, password_rect, |element| {
-            let text = submit_button_text(element);
-            is_preferred_submit_label(&text)
-        })
-    })
+    if let Some(button) = unique_ranked_submit_button(&buttons, |button| {
+        button.enabled && submit_label_rank(&button.text) == Some(0)
+    })? {
+        return Ok(Some(button));
+    }
+    if let Some(button) = unique_ranked_submit_button(&buttons, |button| {
+        button.enabled && is_preferred_submit_label(&button.text)
+    })? {
+        return Ok(Some(button));
+    }
+    if let Some(button) = unique_ranked_submit_button(&buttons, |button| {
+        submit_label_rank(&button.text) == Some(0)
+    })? {
+        return Ok(Some(button));
+    }
+    unique_ranked_submit_button(&buttons, |button| is_preferred_submit_label(&button.text))
 }
 
-fn ranked_submit_button<F>(
-    buttons: &[(&UIElement, ElementRect)],
-    password_rect: ElementRect,
+fn unique_ranked_submit_button<F>(
+    buttons: &[SubmitButtonCandidate],
     matches_rank: F,
-) -> Option<UIElement>
+) -> anyhow::Result<Option<UIElement>>
 where
-    F: Fn(&UIElement) -> bool,
+    F: Fn(&SubmitButtonCandidate) -> bool,
 {
-    buttons
+    Ok(unique_matching_index(buttons, matches_rank)?.map(|index| buttons[index].element.clone()))
+}
+
+fn unique_matching_index<T, F>(items: &[T], matches: F) -> anyhow::Result<Option<usize>>
+where
+    F: Fn(&T) -> bool,
+{
+    let mut matching = items
         .iter()
-        .filter(|(element, _)| matches_rank(element))
-        .min_by_key(|(_, rect)| submit_rect_distance(password_rect, *rect))
-        .map(|(element, _)| (*element).clone())
-}
-
-fn submit_rect_distance(password: ElementRect, submit: ElementRect) -> i32 {
-    let vertical_gap = if submit.top > password.bottom {
-        submit.top - password.bottom
-    } else if password.top > submit.bottom {
-        password.top - submit.bottom
-    } else {
-        0
+        .enumerate()
+        .filter(|(_, item)| matches(item))
+        .map(|(index, _)| index);
+    let Some(selected) = matching.next() else {
+        return Ok(None);
     };
-    vertical_gap.saturating_mul(4) + (password.center_x() - submit.center_x()).abs()
+    if matching.next().is_some() {
+        anyhow::bail!(
+            "multiple equally ranked submit buttons are related to the secure password field"
+        );
+    }
+    Ok(Some(selected))
 }
 
-fn submit_button_text(element: &UIElement) -> String {
+fn submit_button_text_checked(element: &UIElement) -> anyhow::Result<String> {
     let mut text = String::new();
     push_text(&mut text, element.get_name().ok());
     push_text(&mut text, element.get_automation_id().ok());
     push_text(&mut text, element.get_help_text().ok());
     push_text(&mut text, element.get_item_status().ok());
-    text
+    Ok(text)
 }
 
-fn collect_prompt_text(
+fn collect_prompt_text_checked(
     elements: &[UIElement],
     password_rect: ElementRect,
     submit_rect: Option<ElementRect>,
-) -> (String, Vec<UIElement>) {
+) -> anyhow::Result<(String, Vec<UIElement>)> {
     let mut text = String::new();
     let mut identity_elements = Vec::new();
     for element in elements {
-        if !prompt_text_element_should_contribute(element) {
+        if !prompt_text_element_should_contribute_checked(element)? {
             continue;
         }
-        let Some(rect) = prompt_element_rect(element) else {
+        let Some(rect) = prompt_element_rect_checked(element)? else {
             continue;
         };
         if !prompt_text_rect_related_to_password(password_rect, submit_rect, rect) {
@@ -1983,7 +2212,11 @@ fn collect_prompt_text(
         push_text(&mut text, element.get_help_text().ok());
         push_text(&mut text, element.get_item_status().ok());
 
-        if element.get_control_type().ok() == Some(ControlType::Edit) {
+        if element
+            .get_control_type()
+            .context("prompt identity control type unavailable")?
+            == ControlType::Edit
+        {
             if let Ok(value) = element.get_pattern::<UIValuePattern>() {
                 push_text(&mut text, value.get_value().ok());
             }
@@ -1992,28 +2225,42 @@ fn collect_prompt_text(
             identity_elements.push(element.clone());
         }
     }
-    (text, identity_elements)
+    Ok((text, identity_elements))
 }
 
-fn prompt_text_element_should_contribute(element: &UIElement) -> bool {
-    if element.is_offscreen().unwrap_or(true)
-        || is_native_password_field(element)
-        || is_password_like_edit(element)
+fn prompt_text_element_should_contribute_checked(element: &UIElement) -> anyhow::Result<bool> {
+    if element
+        .is_offscreen()
+        .context("prompt identity visibility unavailable")?
     {
-        return false;
+        return Ok(false);
+    }
+    let control_type = element
+        .get_control_type()
+        .context("prompt identity control type unavailable")?;
+    if control_type == ControlType::Edit
+        && (is_native_password_field_checked(element)? || is_password_like_edit_checked(element)?)
+    {
+        return Ok(false);
     }
 
-    element.get_control_type().ok() != Some(ControlType::Button)
+    Ok(control_type != ControlType::Button)
 }
 
-fn prompt_element_rect(element: &UIElement) -> Option<ElementRect> {
-    let rect = element.get_bounding_rectangle().ok()?;
-    ElementRect::new(
+fn prompt_element_rect_checked(element: &UIElement) -> anyhow::Result<Option<ElementRect>> {
+    let rect = element
+        .get_bounding_rectangle()
+        .context("prompt element bounds unavailable")?;
+    Ok(ElementRect::new(
         rect.get_left(),
         rect.get_top(),
         rect.get_right(),
         rect.get_bottom(),
-    )
+    ))
+}
+
+fn prompt_element_rect(element: &UIElement) -> Option<ElementRect> {
+    prompt_element_rect_checked(element).ok().flatten()
 }
 
 fn submit_rect_related_to_password(password: ElementRect, submit: ElementRect) -> bool {
@@ -2047,24 +2294,58 @@ fn rects_horizontally_related(primary: ElementRect, other: ElementRect, max_gap:
 }
 
 fn is_native_password_field(element: &UIElement) -> bool {
-    has_native_password_field_identity(element)
-        && !element.is_offscreen().unwrap_or(true)
-        && element.is_enabled().unwrap_or(false)
+    is_native_password_field_checked(element).unwrap_or(false)
+}
+
+fn is_native_password_field_checked(element: &UIElement) -> anyhow::Result<bool> {
+    if !has_native_password_field_identity_checked(element)? {
+        return Ok(false);
+    }
+    Ok(!element
+        .is_offscreen()
+        .context("secure password field visibility unavailable")?
+        && element
+            .is_enabled()
+            .context("secure password field enabled state unavailable")?)
 }
 
 fn has_native_password_field_identity(element: &UIElement) -> bool {
-    element.get_control_type().ok() == Some(ControlType::Edit)
-        && element.is_password().unwrap_or(false)
+    has_native_password_field_identity_checked(element).unwrap_or(false)
 }
 
-fn is_password_like_edit(element: &UIElement) -> bool {
-    element.get_control_type().ok() == Some(ControlType::Edit)
-        && !element.is_offscreen().unwrap_or(true)
-        && element.is_enabled().unwrap_or(false)
-        && text_contains_password_cue(&element_label_text(element))
+fn has_native_password_field_identity_checked(element: &UIElement) -> anyhow::Result<bool> {
+    if element
+        .get_control_type()
+        .context("secure password candidate control type unavailable")?
+        != ControlType::Edit
+    {
+        return Ok(false);
+    }
+    element
+        .is_password()
+        .context("secure password candidate IsPassword state unavailable")
 }
 
-fn element_label_text(element: &UIElement) -> String {
+fn is_password_like_edit_checked(element: &UIElement) -> anyhow::Result<bool> {
+    if element
+        .get_control_type()
+        .context("plain edit control type unavailable")?
+        != ControlType::Edit
+        || element
+            .is_offscreen()
+            .context("plain edit visibility unavailable")?
+        || !element
+            .is_enabled()
+            .context("plain edit enabled state unavailable")?
+    {
+        return Ok(false);
+    }
+    Ok(text_contains_password_cue(&element_label_text_checked(
+        element,
+    )?))
+}
+
+fn element_label_text_checked(element: &UIElement) -> anyhow::Result<String> {
     let mut text = String::new();
     push_text(&mut text, element.get_name().ok());
     push_text(&mut text, element.get_help_text().ok());
@@ -2074,30 +2355,30 @@ fn element_label_text(element: &UIElement) -> String {
     if let Ok(label) = element.get_labeled_by() {
         push_text(&mut text, label.get_name().ok());
     }
-    text
+    Ok(text)
 }
 
-fn element_role_text(element: &UIElement) -> String {
+fn element_role_text_checked(element: &UIElement) -> anyhow::Result<String> {
     let control_type = element
         .get_control_type()
         .map(|control_type| format!("{control_type:?}"))
-        .unwrap_or_else(|_| "unknown".to_string());
+        .context("password field control type unavailable")?;
     let localized = element.get_localized_control_type().unwrap_or_default();
     let class = element.get_classname().unwrap_or_default();
-    [control_type, localized, class]
+    Ok([control_type, localized, class]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" "))
 }
 
-fn redacted_element_description(element: &UIElement) -> String {
-    let role = element_role_text(element);
-    if role.trim().is_empty() {
+fn redacted_element_description_checked(element: &UIElement) -> anyhow::Result<String> {
+    let role = element_role_text_checked(element)?;
+    Ok(if role.trim().is_empty() {
         "password field".to_string()
     } else {
         format!("password field ({role})")
-    }
+    })
 }
 
 fn push_text(target: &mut String, value: Option<String>) {
@@ -2195,61 +2476,91 @@ fn process_name_from_snapshot(process_id: u32) -> Option<String> {
 }
 
 pub(crate) fn running_target_process(target_app_name: &str) -> Option<WindowsTarget> {
-    let aliases = target_aliases(target_app_name);
-    if aliases.is_empty() {
-        return None;
-    }
-
-    running_processes()?
-        .into_iter()
-        .find_map(|(process_id, snapshot_name)| {
-            let normalized = normalized_identifier(
-                Path::new(&snapshot_name)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or(&snapshot_name),
-            );
-            if !aliases.contains(&normalized) {
-                return None;
-            }
-
-            let process_path = process_image_path(process_id)?;
-            let process_name = process_name_from_path(&process_path);
-            let process_name = if process_name.trim().is_empty() {
-                snapshot_name
-            } else {
-                process_name
-            };
-            let target = WindowsTarget {
-                process_id: process_id as i32,
-                process_name,
-                process_path,
-                window_title: target_app_name.to_string(),
-                window_handle: 0,
-                frontmost: false,
-            };
-
-            target_app_matches(target_app_name, &target).then_some(target)
-        })
+    trusted_running_target_processes_checked(target_app_name)
+        .ok()
+        .and_then(|targets| targets.into_iter().next())
 }
 
-fn running_processes() -> Option<Vec<(u32, String)>> {
+fn trusted_running_target_processes_checked(
+    target_app_name: &str,
+) -> anyhow::Result<Vec<WindowsTarget>> {
+    let aliases = target_aliases(target_app_name);
+    if aliases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut targets = Vec::new();
+    for (process_id, snapshot_name) in running_processes_checked()? {
+        let normalized = normalized_identifier(
+            Path::new(&snapshot_name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(&snapshot_name),
+        );
+        if !aliases.contains(&normalized) {
+            continue;
+        }
+
+        let process_path = process_image_path(process_id).with_context(|| {
+            format!("unable to query a target-like process image for PID {process_id}")
+        })?;
+        let process_name = process_name_from_path(&process_path);
+        let process_name = if process_name.trim().is_empty() {
+            snapshot_name
+        } else {
+            process_name
+        };
+        let target = WindowsTarget {
+            process_id: process_id as i32,
+            process_name,
+            process_path,
+            window_title: target_app_name.to_string(),
+            window_handle: 0,
+            frontmost: false,
+        };
+
+        let Some(kind) = microsoft_rdp_target_kind(&target.process_name, &target.process_path)
+        else {
+            continue;
+        };
+        match windows_target_identity_trust(&target, kind) {
+            WindowsSignatureTrust::Trusted => targets.push(target),
+            WindowsSignatureTrust::Rejected => continue,
+            WindowsSignatureTrust::Indeterminate => {
+                anyhow::bail!("target-like process identity is indeterminate for PID {process_id}")
+            }
+        }
+    }
+
+    Ok(targets)
+}
+
+fn running_processes_checked() -> anyhow::Result<Vec<(u32, String)>> {
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .context("unable to create the native process snapshot")?;
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
 
         let mut processes = Vec::new();
-        let mut found = Process32FirstW(snapshot, &mut entry).is_ok();
-        while found {
-            processes.push((entry.th32ProcessID, process_entry_name(&entry)));
-            found = Process32NextW(snapshot, &mut entry).is_ok();
+        if Process32FirstW(snapshot, &mut entry).is_err() {
+            let error = GetLastError();
+            let _ = CloseHandle(snapshot);
+            anyhow::bail!("unable to read the first native process snapshot entry: {error:?}");
         }
-
-        let _ = CloseHandle(snapshot);
-        Some(processes)
+        loop {
+            processes.push((entry.th32ProcessID, process_entry_name(&entry)));
+            if Process32NextW(snapshot, &mut entry).is_err() {
+                let error = GetLastError();
+                let _ = CloseHandle(snapshot);
+                if error == ERROR_NO_MORE_FILES {
+                    return Ok(processes);
+                }
+                anyhow::bail!("native process enumeration failed before completion: {error:?}");
+            }
+        }
     }
 }
 
@@ -2537,12 +2848,14 @@ fn trusted_microsoft_rdp_target(target: &WindowsTarget) -> bool {
     windows_target_identity_is_trusted(target, kind)
 }
 
+#[cfg(test)]
 fn system_credential_dialog_matches(target: &WindowsTarget, class_name: &str) -> bool {
     credential_dialog_title_like(&target.window_title)
         && trusted_windows_credential_broker(target)
         && credential_dialog_class_like(class_name)
 }
 
+#[cfg(test)]
 fn credential_dialog_title_like(title: &str) -> bool {
     contains_keyword(title, "Windows Security") || contains_keyword(title, "Enter your credentials")
 }
@@ -2555,10 +2868,12 @@ fn credential_dialog_class_like(class_name: &str) -> bool {
         || class_name.contains("xaml")
 }
 
+#[cfg(test)]
 fn trusted_windows_credential_broker_path(path: &str) -> bool {
     trusted_windows_system_exe_path(path, "credentialuibroker.exe")
 }
 
+#[cfg(test)]
 fn trusted_windows_credential_broker(target: &WindowsTarget) -> bool {
     normalized_identifier(&target.process_name) == "credentialuibroker"
         && trusted_windows_credential_broker_path(&target.process_path)
@@ -2569,24 +2884,44 @@ fn windows_target_identity_is_trusted(
     target: &WindowsTarget,
     kind: WindowsMicrosoftTargetKind,
 ) -> bool {
+    matches!(
+        windows_target_identity_trust(target, kind),
+        WindowsSignatureTrust::Trusted
+    )
+}
+
+fn windows_target_identity_trust(
+    target: &WindowsTarget,
+    kind: WindowsMicrosoftTargetKind,
+) -> WindowsSignatureTrust {
     #[cfg(test)]
     if let Some(result) = windows_target_identity_override_result(target, kind) {
-        return result;
+        return if result {
+            WindowsSignatureTrust::Trusted
+        } else {
+            WindowsSignatureTrust::Rejected
+        };
     }
 
     if target.process_id <= 0 || target.process_path.trim().is_empty() {
-        return false;
+        return WindowsSignatureTrust::Indeterminate;
     }
-    if !windows_executable_is_microsoft_signed(&target.process_path) {
-        return false;
+    let signature_trust = windows_executable_microsoft_signature_trust(&target.process_path);
+    if signature_trust != WindowsSignatureTrust::Trusted {
+        return signature_trust;
     }
     if kind == WindowsMicrosoftTargetKind::WindowsAppsPackage {
-        return process_package_full_name(target.process_id)
+        return if process_package_full_name(target.process_id)
             .as_deref()
-            .is_some_and(trusted_windowsapps_microsoft_package_full_name);
+            .is_some_and(trusted_windowsapps_microsoft_package_full_name)
+        {
+            WindowsSignatureTrust::Trusted
+        } else {
+            WindowsSignatureTrust::Indeterminate
+        };
     }
 
-    true
+    WindowsSignatureTrust::Trusted
 }
 
 fn trusted_windowsapps_microsoft_package_full_name(package_full_name: &str) -> bool {
@@ -2612,10 +2947,17 @@ fn trusted_windowsapps_microsoft_package_full_name(package_full_name: &str) -> b
     .any(|prefix| normalized.starts_with(prefix))
 }
 
-fn windows_executable_is_microsoft_signed(path: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSignatureTrust {
+    Trusted,
+    Rejected,
+    Indeterminate,
+}
+
+fn windows_executable_microsoft_signature_trust(path: &str) -> WindowsSignatureTrust {
     unsafe {
         winverifytrust_with_state_validator(path, |trust_data| {
-            wintrust_state_has_microsoft_signer(trust_data)
+            wintrust_state_microsoft_signer_trust(trust_data)
         })
     }
 }
@@ -2637,25 +2979,31 @@ pub(crate) fn windows_executable_authenticode_identity_matches(
     }
     unsafe {
         winverifytrust_with_state_validator(path, |trust_data| {
-            wintrust_state_leaf_identity(trust_data).is_some_and(|(publisher, cert_sha256)| {
-                publisher.trim().to_lowercase() == expected_publisher
-                    && cert_sha256 == expected_cert_sha256
-            })
-        })
+            let Some((publisher, cert_sha256)) = wintrust_state_leaf_identity(trust_data) else {
+                return WindowsSignatureTrust::Indeterminate;
+            };
+            if publisher.trim().to_lowercase() == expected_publisher
+                && cert_sha256 == expected_cert_sha256
+            {
+                WindowsSignatureTrust::Trusted
+            } else {
+                WindowsSignatureTrust::Rejected
+            }
+        }) == WindowsSignatureTrust::Trusted
     }
 }
 
 unsafe fn winverifytrust_with_state_validator(
     path: &str,
-    validate_state: impl FnOnce(&WINTRUST_DATA) -> bool,
-) -> bool {
+    validate_state: impl FnOnce(&WINTRUST_DATA) -> WindowsSignatureTrust,
+) -> WindowsSignatureTrust {
     let mut path_wide = Path::new(path)
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     if path_wide.len() <= 1 {
-        return false;
+        return WindowsSignatureTrust::Rejected;
     }
 
     let mut file_info = WINTRUST_FILE_INFO {
@@ -2685,7 +3033,11 @@ unsafe fn winverifytrust_with_state_validator(
             (&mut trust_data as *mut WINTRUST_DATA).cast::<c_void>(),
         )
     };
-    let verified = status == 0 && validate_state(&trust_data);
+    let state_trust = if status == 0 {
+        validate_state(&trust_data)
+    } else {
+        WindowsSignatureTrust::Indeterminate
+    };
 
     trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
     let _ = unsafe {
@@ -2696,7 +3048,51 @@ unsafe fn winverifytrust_with_state_validator(
         )
     };
 
-    verified
+    classify_authenticode_status(status, state_trust)
+}
+
+fn classify_authenticode_status(
+    status: i32,
+    verified_state: WindowsSignatureTrust,
+) -> WindowsSignatureTrust {
+    if status == 0 {
+        return verified_state;
+    }
+
+    if authenticode_status_is_definitive_rejection(status) {
+        WindowsSignatureTrust::Rejected
+    } else {
+        // WinVerifyTrust can fail because its provider, revocation service,
+        // certificate state, file I/O, or local policy was unavailable. Only
+        // explicit signature/certificate rejection codes may prove that the
+        // target is untrusted; every unknown or operational failure must keep
+        // target presence indeterminate rather than collapsing to "absent".
+        WindowsSignatureTrust::Indeterminate
+    }
+}
+
+fn authenticode_status_is_definitive_rejection(status: i32) -> bool {
+    [
+        TRUST_E_NOSIGNATURE.0,
+        TRUST_E_BAD_DIGEST.0,
+        TRUST_E_MALFORMED_SIGNATURE.0,
+        TRUST_E_CERT_SIGNATURE.0,
+        TRUST_E_EXPLICIT_DISTRUST.0,
+        TRUST_E_NO_SIGNER_CERT.0,
+        CRYPT_E_NO_SIGNER.0,
+        CRYPT_E_SIGNER_NOT_FOUND.0,
+        CRYPT_E_REVOKED.0,
+        CERT_E_REVOKED.0,
+    ]
+    .contains(&status)
+}
+
+#[cfg(test)]
+fn classify_authenticode_test_status(
+    status: i32,
+    state_trust: WindowsSignatureTrust,
+) -> WindowsSignatureTrust {
+    classify_authenticode_status(status, state_trust)
 }
 
 fn wintrust_state_leaf_identity(trust_data: &WINTRUST_DATA) -> Option<(String, String)> {
@@ -2714,33 +3110,45 @@ fn wintrust_state_leaf_identity(trust_data: &WINTRUST_DATA) -> Option<(String, S
     Some((name, fingerprint))
 }
 
-unsafe fn wintrust_state_has_microsoft_signer(trust_data: &WINTRUST_DATA) -> bool {
+unsafe fn wintrust_state_microsoft_signer_trust(
+    trust_data: &WINTRUST_DATA,
+) -> WindowsSignatureTrust {
     let provider = unsafe { WTHelperProvDataFromStateData(trust_data.hWVTStateData) };
     if provider.is_null() {
-        return false;
+        return WindowsSignatureTrust::Indeterminate;
     }
     let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) };
     if signer.is_null() {
-        return false;
+        return WindowsSignatureTrust::Indeterminate;
     }
 
     let Some(leaf_name) = (unsafe { signer_certificate_name(signer, 0) }) else {
-        return false;
+        return WindowsSignatureTrust::Indeterminate;
     };
     if !microsoft_signing_leaf_name_is_allowed(&leaf_name) {
-        return false;
+        return WindowsSignatureTrust::Rejected;
     }
 
     let chain_len = unsafe { (*signer).csCertChain };
     if chain_len <= 1 {
-        return true;
+        return WindowsSignatureTrust::Trusted;
     }
 
-    (1..chain_len).any(|index| {
-        unsafe { signer_certificate_name(signer, index) }
-            .as_deref()
-            .is_some_and(microsoft_chain_name_is_allowed)
-    })
+    let mut unavailable_chain_name = false;
+    for index in 1..chain_len {
+        let Some(name) = (unsafe { signer_certificate_name(signer, index) }) else {
+            unavailable_chain_name = true;
+            continue;
+        };
+        if microsoft_chain_name_is_allowed(&name) {
+            return WindowsSignatureTrust::Trusted;
+        }
+    }
+    if unavailable_chain_name {
+        WindowsSignatureTrust::Indeterminate
+    } else {
+        WindowsSignatureTrust::Rejected
+    }
 }
 
 unsafe fn signer_certificate_name(
@@ -3408,6 +3816,8 @@ mod tests {
             prompt_window_handle: 7,
             prompt_window_title: "Windows Security".to_string(),
             email: "user@example.com".to_string(),
+            trust: super::WindowsPromptTrust::TrustedTargetProcess,
+            prompt_runtime_id: vec![42, 7],
             pre_submit_session_windows: vec![existing.clone()],
         };
 
@@ -3449,6 +3859,98 @@ mod tests {
             42,
             "user@example.com",
         ));
+    }
+
+    #[test]
+    fn post_submit_requires_two_confirmed_exact_prompt_absences() {
+        let mut observations = 0;
+        observations = super::next_submitted_prompt_absence_observations(
+            observations,
+            super::SubmittedPromptPresence::Absent,
+        );
+        assert_eq!(observations, 1);
+
+        observations = super::next_submitted_prompt_absence_observations(
+            observations,
+            super::SubmittedPromptPresence::Indeterminate,
+        );
+        assert_eq!(observations, 0);
+
+        observations = super::next_submitted_prompt_absence_observations(
+            observations,
+            super::SubmittedPromptPresence::Absent,
+        );
+        observations = super::next_submitted_prompt_absence_observations(
+            observations,
+            super::SubmittedPromptPresence::Present,
+        );
+        assert_eq!(observations, 0);
+
+        observations = super::next_submitted_prompt_absence_observations(
+            observations,
+            super::SubmittedPromptPresence::Absent,
+        );
+        observations = super::next_submitted_prompt_absence_observations(
+            observations,
+            super::SubmittedPromptPresence::Absent,
+        );
+        assert_eq!(observations, 2);
+    }
+
+    #[test]
+    fn authenticode_operational_failures_and_missing_state_are_indeterminate() {
+        for status in [
+            windows::Win32::Foundation::CRYPT_E_REVOCATION_OFFLINE.0,
+            windows::Win32::Foundation::CRYPT_E_NO_REVOCATION_CHECK.0,
+            windows::Win32::Foundation::CRYPT_E_NO_REVOCATION_DLL.0,
+            windows::Win32::Foundation::CERT_E_REVOCATION_FAILURE.0,
+            windows::Win32::Foundation::TRUST_E_PROVIDER_UNKNOWN.0,
+            windows::Win32::Foundation::TRUST_E_SYSTEM_ERROR.0,
+            i32::MIN,
+        ] {
+            assert_eq!(
+                super::classify_authenticode_test_status(
+                    status,
+                    super::WindowsSignatureTrust::Rejected,
+                ),
+                super::WindowsSignatureTrust::Indeterminate
+            );
+        }
+        assert_eq!(
+            super::classify_authenticode_test_status(
+                0,
+                super::WindowsSignatureTrust::Indeterminate,
+            ),
+            super::WindowsSignatureTrust::Indeterminate
+        );
+        assert_eq!(
+            super::classify_authenticode_test_status(0, super::WindowsSignatureTrust::Trusted,),
+            super::WindowsSignatureTrust::Trusted
+        );
+    }
+
+    #[test]
+    fn authenticode_explicit_signature_failures_are_rejected() {
+        for status in [
+            windows::Win32::Foundation::TRUST_E_NOSIGNATURE.0,
+            windows::Win32::Foundation::TRUST_E_BAD_DIGEST.0,
+            windows::Win32::Foundation::TRUST_E_MALFORMED_SIGNATURE.0,
+            windows::Win32::Foundation::TRUST_E_EXPLICIT_DISTRUST.0,
+            windows::Win32::Foundation::CRYPT_E_REVOKED.0,
+            windows::Win32::Foundation::CERT_E_REVOKED.0,
+        ] {
+            assert_eq!(
+                super::classify_authenticode_test_status(
+                    status,
+                    super::WindowsSignatureTrust::Indeterminate,
+                ),
+                super::WindowsSignatureTrust::Rejected
+            );
+        }
+        assert_eq!(
+            super::classify_authenticode_test_status(0, super::WindowsSignatureTrust::Rejected,),
+            super::WindowsSignatureTrust::Rejected
+        );
     }
 
     #[test]
@@ -3583,8 +4085,8 @@ mod tests {
         let implementation = include_str!("windows_ui.rs");
         let binding = source_between(
             implementation,
-            "fn uia_element_bound_to_prompt_window(",
-            "fn uia_native_window_handle(",
+            "fn uia_element_bound_to_prompt_window_checked(",
+            "fn native_hwnd_is_within_prompt_window(",
         );
 
         assert!(binding.contains("get_process_id"));
@@ -3606,8 +4108,8 @@ mod tests {
         let implementation = include_str!("windows_ui.rs");
         let candidates = source_between(
             implementation,
-            "fn password_field_candidates(",
-            "fn select_submit_button_for_password(",
+            "fn password_field_candidates_checked(",
+            "struct SubmitButtonCandidate",
         );
         assert!(
             !candidates.contains("is_password_like_edit"),
@@ -3620,18 +4122,47 @@ mod tests {
         let implementation = include_str!("windows_ui.rs");
         let native_detection = source_between(
             implementation,
-            "fn is_native_password_field(",
-            "fn is_password_like_edit(",
+            "fn is_native_password_field_checked(",
+            "fn has_native_password_field_identity(",
         );
         assert!(
-            native_detection.contains("element.is_password().unwrap_or(false)"),
-            "native password detection must require the UIA IsPassword property"
+            native_detection.contains("has_native_password_field_identity_checked"),
+            "native password detection must require checked UIA IsPassword identity"
         );
         assert!(
             !native_detection.contains("text_contains_password_cue")
                 && !native_detection.contains("element_label_text"),
             "native password detection must not use label-based password cues"
         );
+    }
+
+    #[test]
+    fn prompt_scan_fails_closed_on_truncation_ambiguity_and_provider_binding() {
+        let implementation = include_str!("windows_ui.rs");
+        let inspection = source_between(
+            implementation,
+            "fn inspect_prompt_window(",
+            "fn has_password_like_plain_edit_checked(",
+        );
+
+        assert!(inspection.contains("TreeScope::Descendants"));
+        assert!(!inspection.contains("elements.truncate"));
+        assert!(inspection.contains("exceeds the safe inspection limit"));
+        assert!(inspection.contains("PromptCandidateSelection::Ambiguous"));
+        assert!(inspection.contains("providers are not bound"));
+    }
+
+    #[test]
+    fn equally_ranked_submit_candidates_are_rejected_as_ambiguous() {
+        assert_eq!(
+            super::unique_matching_index(&[1, 2, 3], |item| *item == 2).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            super::unique_matching_index(&[1, 2, 3], |item| *item == 4).unwrap(),
+            None
+        );
+        assert!(super::unique_matching_index(&[1, 2, 2], |item| *item == 2).is_err());
     }
 
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {

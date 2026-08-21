@@ -32,6 +32,10 @@ const MICROSOFT_TEAM_ID: &str = "UBF8T346G9";
 #[cfg(target_os = "macos")]
 const PROC_ALL_PIDS: u32 = 1;
 #[cfg(target_os = "macos")]
+const PROC_LIST_GROWTH_ATTEMPTS: usize = 8;
+#[cfg(target_os = "macos")]
+const PROC_LIST_INITIAL_SLACK: usize = 64;
+#[cfg(target_os = "macos")]
 const SEC_CS_SIGNING_INFORMATION: u32 = 1 << 1;
 
 #[cfg(target_os = "macos")]
@@ -78,7 +82,9 @@ pub(crate) fn trusted_process_info_for_pid(
     app_name: &str,
     pid: i32,
 ) -> anyhow::Result<Option<TrustedProcessInfo>> {
-    let Some(executable_path) = process_executable_path(pid) else {
+    let Some(executable_path) = process_executable_path(pid)
+        .with_context(|| format!("unable to resolve executable path for PID {pid}"))?
+    else {
         return Ok(None);
     };
     let Some(bundle_path) = containing_app_bundle(&executable_path) else {
@@ -116,7 +122,7 @@ fn trusted_process_infos_from_identities(
         if process.bundle_id != identity.bundle_id {
             continue;
         }
-        if !bundle_path_is_trusted_location(&process.bundle_path, app_name) {
+        if !bundle_path_is_trusted_location(&process.bundle_path, app_name)? {
             continue;
         }
         if verify_process(process.pid, &process.bundle_path, identity)? {
@@ -152,10 +158,13 @@ fn trusted_bundle_candidates(app_name: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn bundle_path_is_trusted_location(path: &Path, app_name: &str) -> bool {
-    trusted_bundle_candidates(app_name)
-        .into_iter()
-        .any(|candidate| path == candidate && trusted_bundle_candidate_is_usable(&candidate))
+fn bundle_path_is_trusted_location(path: &Path, app_name: &str) -> anyhow::Result<bool> {
+    for candidate in trusted_bundle_candidates(app_name) {
+        if path == candidate {
+            return trusted_bundle_candidate_is_usable(&candidate);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -164,89 +173,181 @@ fn enumerate_processes(app_name: &str) -> anyhow::Result<Vec<ProcessIdentity>> {
         anyhow::bail!("unsupported app identity for secure automation: {app_name}");
     };
 
-    let trusted_candidates = trusted_bundle_candidates(app_name)
-        .into_iter()
-        .filter(|path| trusted_bundle_candidate_is_usable(path))
-        .collect::<Vec<_>>();
+    let mut trusted_candidates = Vec::new();
+    for candidate in trusted_bundle_candidates(app_name) {
+        if trusted_bundle_candidate_is_usable(&candidate)? {
+            trusted_candidates.push(candidate);
+        }
+    }
     if trusted_candidates.is_empty() {
         return Ok(Vec::new());
     }
 
-    Ok(native_process_ids()
-        .into_iter()
-        .filter_map(|pid| {
-            let executable_path = process_executable_path(pid)?;
-            let bundle_path = containing_app_bundle(&executable_path)?;
-            trusted_candidates
-                .contains(&bundle_path)
-                .then(|| ProcessIdentity {
-                    pid,
-                    bundle_id: identity.bundle_id.to_string(),
-                    bundle_path,
-                })
-        })
-        .collect())
+    process_identities_from_pids(
+        native_process_ids()?,
+        &trusted_candidates,
+        identity,
+        process_executable_path,
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn trusted_bundle_candidate_is_usable(path: &Path) -> bool {
-    path.exists() && path.is_dir() && !path_has_symlink_component(path)
+fn process_identities_from_pids(
+    pids: Vec<i32>,
+    trusted_candidates: &[PathBuf],
+    identity: TrustedIdentity,
+    mut executable_path: impl FnMut(i32) -> anyhow::Result<Option<PathBuf>>,
+) -> anyhow::Result<Vec<ProcessIdentity>> {
+    let mut processes = Vec::new();
+    for pid in pids {
+        let Some(executable_path) = executable_path(pid)
+            .with_context(|| format!("unable to resolve executable path for PID {pid}"))?
+        else {
+            // A PID may legitimately disappear after proc_listpids captured
+            // the snapshot. Only that definitive race is safe to omit.
+            continue;
+        };
+        let Some(bundle_path) = containing_app_bundle(&executable_path) else {
+            continue;
+        };
+        if trusted_candidates.contains(&bundle_path) {
+            processes.push(ProcessIdentity {
+                pid,
+                bundle_id: identity.bundle_id.to_string(),
+                bundle_path,
+            });
+        }
+    }
+    Ok(processes)
 }
 
 #[cfg(target_os = "macos")]
+fn trusted_bundle_candidate_is_usable(path: &Path) -> anyhow::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("unable to inspect trusted bundle path {}", path.display())
+            })
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    Ok(!path_has_symlink_component_checked(path)?)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub(crate) fn path_has_symlink_component(path: &Path) -> bool {
+    // Existing callers use this as a fail-closed predicate. An unreadable path
+    // is therefore treated as unsafe rather than silently accepted.
+    path_has_symlink_component_checked(path).unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn path_has_symlink_component_checked(path: &Path) -> anyhow::Result<bool> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        if std::fs::symlink_metadata(&current)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return true;
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("unable to inspect path component {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]
-fn native_process_ids() -> Vec<i32> {
+fn native_process_ids() -> anyhow::Result<Vec<i32>> {
+    clear_errno();
     let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if bytes <= 0 {
-        return Vec::new();
+        return Err(std::io::Error::last_os_error())
+            .context("unable to size the native process list");
     }
 
-    let mut pids = vec![0 as libc::pid_t; bytes as usize / std::mem::size_of::<libc::pid_t>() + 64];
-    let bytes = unsafe {
-        libc::proc_listpids(
-            PROC_ALL_PIDS,
-            0,
-            pids.as_mut_ptr().cast(),
-            (pids.len() * std::mem::size_of::<libc::pid_t>()) as i32,
-        )
-    };
-    if bytes <= 0 {
-        return Vec::new();
-    }
-
-    pids.truncate(bytes as usize / std::mem::size_of::<libc::pid_t>());
-    pids.into_iter().filter(|pid| *pid > 0).collect()
+    let pid_size = std::mem::size_of::<libc::pid_t>();
+    let initial_capacity = (bytes as usize)
+        .div_ceil(pid_size)
+        .checked_add(PROC_LIST_INITIAL_SLACK)
+        .context("native process-list capacity overflow")?;
+    native_process_ids_with_reader(initial_capacity, |pids| {
+        let buffer_bytes = pids
+            .len()
+            .checked_mul(pid_size)
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .context("native process-list buffer is too large")?;
+        clear_errno();
+        let bytes = unsafe {
+            libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), buffer_bytes)
+        };
+        if bytes <= 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("unable to enumerate native processes");
+        }
+        Ok(bytes as usize)
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn process_executable_path(pid: i32) -> Option<PathBuf> {
+fn native_process_ids_with_reader(
+    initial_capacity: usize,
+    mut read: impl FnMut(&mut [libc::pid_t]) -> anyhow::Result<usize>,
+) -> anyhow::Result<Vec<i32>> {
+    let pid_size = std::mem::size_of::<libc::pid_t>();
+    let mut capacity = initial_capacity.max(1);
+    for _ in 0..PROC_LIST_GROWTH_ATTEMPTS {
+        let mut pids = vec![0 as libc::pid_t; capacity];
+        let capacity_bytes = capacity
+            .checked_mul(pid_size)
+            .context("native process-list capacity overflow")?;
+        let bytes = read(&mut pids)?;
+        if bytes > capacity_bytes || bytes % pid_size != 0 {
+            anyhow::bail!("native process list returned an invalid byte count");
+        }
+        if bytes == capacity_bytes {
+            capacity = capacity
+                .checked_mul(2)
+                .context("native process-list capacity overflow")?;
+            continue;
+        }
+
+        pids.truncate(bytes / pid_size);
+        return Ok(pids.into_iter().filter(|pid| *pid > 0).collect());
+    }
+    anyhow::bail!("native process list remained full after repeated growth")
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable_path(pid: i32) -> anyhow::Result<Option<PathBuf>> {
     let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    let len = unsafe {
-        libc::proc_pidpath(
-            pid,
-            buffer.as_mut_ptr().cast(),
-            buffer.len().try_into().ok()?,
-        )
-    };
+    let buffer_len = buffer
+        .len()
+        .try_into()
+        .context("proc_pidpath buffer length does not fit its native argument")?;
+    clear_errno();
+    let len = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer_len) };
     if len <= 0 {
-        return None;
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOENT) => Ok(None),
+            _ => Err(error).with_context(|| format!("proc_pidpath failed for PID {pid}")),
+        };
     }
 
-    proc_pidpath_buffer_to_path(&buffer[..len as usize])
+    let path = proc_pidpath_buffer_to_path(&buffer[..len as usize])
+        .with_context(|| format!("proc_pidpath returned an empty path for PID {pid}"))?;
+    Ok(Some(path))
 }
 
 #[cfg(target_os = "macos")]
@@ -274,27 +375,26 @@ fn verify_trusted_live_process(
     bundle_path: &Path,
     identity: TrustedIdentity,
 ) -> anyhow::Result<bool> {
-    let Some(code) = live_code_for_pid(pid) else {
+    let Some(code) = live_code_for_pid(pid)? else {
         return Ok(false);
     };
-    let Some(live_path) = code
+    let live_url = code
         .path(CodeSignFlags::NONE)
-        .ok()
-        .and_then(|url| url.to_path())
-    else {
-        return Ok(false);
-    };
+        .with_context(|| format!("unable to read live code path for PID {pid}"))?;
+    let live_path = live_url
+        .to_path()
+        .with_context(|| format!("live code path is not a filesystem path for PID {pid}"))?;
     let Some(live_bundle_path) = containing_app_bundle(&live_path) else {
         return Ok(false);
     };
-    if live_bundle_path != bundle_path || path_has_symlink_component(&live_bundle_path) {
+    if live_bundle_path != bundle_path || path_has_symlink_component_checked(&live_bundle_path)? {
         return Ok(false);
     }
 
     with_code_sign_requirement(identity.bundle_id, identity.team_id, |requirement| {
-        Ok(code
-            .check_validity(live_code_validation_flags(), requirement)
-            .is_ok())
+        code.check_validity(live_code_validation_flags(), requirement)
+            .with_context(|| format!("unable to validate live code signature for PID {pid}"))?;
+        Ok(true)
     })
 }
 
@@ -312,7 +412,10 @@ pub(crate) fn signed_live_process_matches_identity(
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn live_process_code_unique_identifier(pid: i32) -> Option<Vec<u8>> {
-    let path = process_executable_path(pid)?;
+    // This API is intentionally best-effort for an existing fail-closed
+    // single-instance comparison. Trusted-target presence uses the checked
+    // Result-returning path above and never reaches this lossy boundary.
+    let path = process_executable_path(pid).ok().flatten()?;
     static_code_unique_identifier_at_path(&path)
 }
 
@@ -332,10 +435,24 @@ pub(crate) fn static_code_path_has_valid_internal_signature(path: &Path) -> bool
 }
 
 #[cfg(target_os = "macos")]
-fn live_code_for_pid(pid: i32) -> Option<SecCode> {
+fn live_code_for_pid(pid: i32) -> anyhow::Result<Option<SecCode>> {
     let mut attributes = GuestAttributes::new();
     attributes.set_pid(pid as libc::pid_t);
-    SecCode::copy_guest_with_attribues(None, &attributes, CodeSignFlags::NONE).ok()
+    match SecCode::copy_guest_with_attribues(None, &attributes, CodeSignFlags::NONE) {
+        Ok(code) => Ok(Some(code)),
+        Err(error) => {
+            // Security.framework reports a lookup failure both for a process
+            // exit race and for identity/signature lookup failures. Recheck
+            // native PID presence: only a confirmed exit is absence; a live
+            // process with an unavailable code identity is indeterminate.
+            if process_executable_path(pid)?.is_none() {
+                Ok(None)
+            } else {
+                Err(error)
+                    .with_context(|| format!("unable to resolve live code identity for PID {pid}"))
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -548,9 +665,10 @@ fn run_command_with_timeout(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        code_sign_requirement_source, live_code_validation_flags, path_has_symlink_component,
-        proc_pidpath_buffer_to_path, static_code_validation_flags,
-        trusted_process_infos_from_identities, valid_team_id, CodeSignFlags, ProcessIdentity,
+        code_sign_requirement_source, live_code_validation_flags, native_process_ids_with_reader,
+        path_has_symlink_component, proc_pidpath_buffer_to_path, process_identities_from_pids,
+        static_code_validation_flags, trusted_process_infos_from_identities, valid_team_id,
+        CodeSignFlags, ProcessIdentity, TrustedIdentity,
     };
     use std::path::PathBuf;
 
@@ -713,6 +831,106 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "verifier unavailable");
+    }
+
+    #[test]
+    fn process_path_lookup_failure_makes_presence_indeterminate() {
+        let error = process_identities_from_pids(
+            vec![4242],
+            &[PathBuf::from("/Applications/Windows App.app")],
+            TrustedIdentity {
+                bundle_id: "com.microsoft.rdc.macos",
+                team_id: "UBF8T346G9",
+            },
+            |_pid| anyhow::bail!("proc_pidpath unavailable"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unable to resolve executable path for PID 4242"
+        );
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("proc_pidpath unavailable")
+        );
+    }
+
+    #[test]
+    fn process_that_exits_during_snapshot_is_definitively_omitted() {
+        let processes = process_identities_from_pids(
+            vec![4242],
+            &[PathBuf::from("/Applications/Windows App.app")],
+            TrustedIdentity {
+                bundle_id: "com.microsoft.rdc.macos",
+                team_id: "UBF8T346G9",
+            },
+            |_pid| Ok(None),
+        )
+        .unwrap();
+
+        assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn full_native_process_buffer_is_grown_and_retried() {
+        let mut reads = 0;
+        let pids = native_process_ids_with_reader(2, |buffer| {
+            reads += 1;
+            match reads {
+                1 => {
+                    assert_eq!(buffer.len(), 2);
+                    buffer.copy_from_slice(&[11, 22]);
+                    Ok(std::mem::size_of_val(buffer))
+                }
+                2 => {
+                    assert_eq!(buffer.len(), 4);
+                    buffer[..3].copy_from_slice(&[11, 22, 33]);
+                    Ok(std::mem::size_of_val(&buffer[..3]))
+                }
+                _ => panic!("unexpected process-list retry"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(reads, 2);
+        assert_eq!(pids, vec![11, 22, 33]);
+    }
+
+    #[test]
+    fn perpetually_full_native_process_buffer_is_indeterminate() {
+        let mut reads = 0;
+        let error = native_process_ids_with_reader(1, |buffer| {
+            reads += 1;
+            buffer.fill(42);
+            Ok(std::mem::size_of_val(buffer))
+        })
+        .unwrap_err();
+
+        assert_eq!(reads, super::PROC_LIST_GROWTH_ATTEMPTS);
+        assert_eq!(
+            error.to_string(),
+            "native process list remained full after repeated growth"
+        );
+    }
+
+    #[test]
+    fn live_signature_api_failures_are_not_collapsed_to_absence() {
+        let implementation = include_str!("macos_identity.rs");
+        let verifier = implementation
+            .split("fn verify_trusted_live_process")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn signed_live_process_matches_identity")
+                    .next()
+            })
+            .unwrap();
+
+        assert!(verifier.contains("unable to read live code path"));
+        assert!(verifier.contains("unable to validate live code signature"));
+        assert!(!verifier.contains(
+            "check_validity(live_code_validation_flags(), requirement)\n            .is_ok()"
+        ));
     }
 
     #[test]

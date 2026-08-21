@@ -893,15 +893,35 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
     };
     let username_changed = existing_account
         .is_some_and(|existing| existing.username.trim() != account.username.trim());
-    let only_password_changed = new_password.is_some()
+    let password_changed = new_password.is_some();
+    let only_password_changed = password_changed
         && existing_account.is_some_and(|existing| {
             previous_password_saved
                 && existing.enabled == account.enabled
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
         });
+    let previous_account = existing_account.cloned();
 
     if only_password_changed {
+        let Some(previous_account) = previous_account.as_ref() else {
+            drop(new_password);
+            app.set_status("Failed to find current account for password rollback");
+            return false;
+        };
+        let previous_password = match load_password(
+            previous_account,
+            app.config.settings.use_keyring,
+        ) {
+            Ok(password) => password,
+            Err(_) => {
+                drop(new_password);
+                app.set_status(
+                    "Failed to read the current password for rollback. The password was left unchanged.",
+                );
+                return false;
+            }
+        };
         let mut after_account = account.clone();
         after_account.has_saved_password = true;
         let account_journal_started = match begin_account_config_save_journal(
@@ -911,6 +931,8 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         ) {
             Ok(()) => true,
             Err(e) => {
+                drop(previous_password);
+                drop(new_password);
                 app.set_status(storage_prepare_failure_status(
                     &e,
                     "The password was left unchanged.",
@@ -931,14 +953,34 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
                     cleanup_warning = outcome.stale_cleanup_warning;
                     fallback_key_cleanup_warning = outcome.fallback_key_cleanup_warning;
                 }
-                Err(e) => {
-                    let _ = e;
-                    clear_account_journal_after_terminal_result(account_journal_started, false);
-                    app.set_status("Failed to save password. The account was left unchanged.");
+                Err(_) => {
+                    // The attempted replacement is no longer needed once the
+                    // write reports failure. Wipe it before compensating
+                    // storage I/O, which may block or display a system prompt.
+                    drop(new_password);
+                    let rollback_confirmed = restore_and_verify_password(
+                        previous_account,
+                        previous_password.as_str(),
+                        app.config.settings.use_keyring,
+                    );
+                    drop(previous_password);
+                    if rollback_confirmed {
+                        let journal_cleared =
+                            clear_account_journal_after_confirmed_rollback(account_journal_started);
+                        if journal_cleared {
+                            app.set_status("Failed to save password. The previous password was restored and the account was left unchanged.");
+                        } else {
+                            app.set_status("Failed to save password. The previous password was restored, but recovery journal cleanup is still pending; restart before changing stored credentials again.");
+                        }
+                    } else {
+                        app.set_status("Password storage reported a failed update, and the previous password could not be verified after rollback. Recovery remains pending; restart before changing stored credentials again.");
+                    }
                     return false;
                 }
             }
         }
+        drop(previous_password);
+        drop(new_password);
         clear_account_journal_after_terminal_result(
             account_journal_started,
             cleanup_warning.is_some() || fallback_key_cleanup_warning,
@@ -952,18 +994,18 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         return true;
     }
 
-    let previous_account = existing_account.cloned();
     let needs_previous_password =
-        is_existing && previous_password_saved && (new_password.is_some() || username_changed);
+        is_existing && previous_password_saved && (password_changed || username_changed);
     let previous_password = if needs_previous_password {
         let Some(existing) = previous_account.as_ref() else {
+            drop(new_password);
             app.set_status("Failed to find current account for rollback");
             return false;
         };
         match load_password(existing, app.config.settings.use_keyring) {
             Ok(password) => Some(password),
-            Err(e) => {
-                let _ = e;
+            Err(_) => {
+                drop(new_password);
                 app.set_status(
                     "Failed to read the current password for rollback. The account was left unchanged.",
                 );
@@ -985,6 +1027,8 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
         ) {
             Ok(()) => true,
             Err(e) => {
+                drop(previous_password);
+                drop(new_password);
                 app.set_status(storage_prepare_failure_status(
                     &e,
                     "The account was left unchanged.",
@@ -1008,57 +1052,73 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
                 cleanup_warning = outcome.stale_cleanup_warning;
                 fallback_key_cleanup_warning = outcome.fallback_key_cleanup_warning;
             }
-            Err(e) => {
-                let _ = e;
-                let mut rollback_errors = Vec::new();
-                if is_existing {
+            Err(_) => {
+                // Do not keep the failed replacement resident while rollback
+                // performs a secure-storage write and read-back.
+                drop(new_password);
+                let rollback_confirmed = if is_existing {
                     if let (Some(previous_account), Some(previous_password)) =
                         (previous_account.as_ref(), previous_password.as_ref())
                     {
-                        if let Err(rollback_error) = save_account(
+                        restore_and_verify_password(
                             previous_account,
                             previous_password.as_str(),
                             app.config.settings.use_keyring,
-                        ) {
-                            let _ = rollback_error;
-                            rollback_errors.push(());
-                        }
-                    } else if let Err(rollback_error) = delete_account(&account.id) {
-                        let _ = rollback_error;
-                        rollback_errors.push(());
+                        )
+                    } else {
+                        delete_account(&account.id).is_ok()
                     }
-                } else if let Err(rollback_error) = delete_account(&account.id) {
-                    let _ = rollback_error;
-                    rollback_errors.push(());
-                }
-
-                if rollback_errors.is_empty() {
-                    clear_account_journal_after_terminal_result(account_journal_started, false);
-                    app.set_status("Failed to save password. The account was left unchanged.");
                 } else {
-                    app.set_status("Failed to save password, and automatic password rollback could not be confirmed. Please check storage before trying again.");
+                    delete_account(&account.id).is_ok()
+                };
+                drop(previous_password);
+                if rollback_confirmed {
+                    let journal_cleared =
+                        clear_account_journal_after_confirmed_rollback(account_journal_started);
+                    if journal_cleared {
+                        app.set_status("Failed to save password. The previous stored state was restored and the account was left unchanged.");
+                    } else {
+                        app.set_status("Failed to save password. The previous stored state was restored, but recovery journal cleanup is still pending; restart before changing stored credentials again.");
+                    }
+                } else {
+                    app.set_status("Password storage reported a failed update, and automatic rollback could not be verified. Recovery remains pending; restart before changing stored credentials again.");
                 }
                 return false;
             }
         }
         account.has_saved_password = true;
     } else if username_changed {
-        if let Some(previous_password) = previous_password.as_ref() {
+        if let Some(previous_password_value) = previous_password.as_ref() {
             match save_account_with_outcome(
                 &account,
-                previous_password.as_str(),
+                previous_password_value.as_str(),
                 app.config.settings.use_keyring,
             ) {
                 Ok(outcome) => {
                     cleanup_warning = outcome.stale_cleanup_warning;
                     fallback_key_cleanup_warning = outcome.fallback_key_cleanup_warning;
                 }
-                Err(e) => {
-                    let _ = e;
-                    clear_account_journal_after_terminal_result(account_journal_started, false);
-                    app.set_status(
-                        "Failed to rebind the saved password to the updated email. The account was left unchanged.",
-                    );
+                Err(_) => {
+                    drop(new_password);
+                    let rollback_confirmed = previous_account.as_ref().is_some_and(|previous| {
+                        restore_and_verify_password(
+                            previous,
+                            previous_password_value.as_str(),
+                            app.config.settings.use_keyring,
+                        )
+                    });
+                    drop(previous_password);
+                    if rollback_confirmed {
+                        let journal_cleared =
+                            clear_account_journal_after_confirmed_rollback(account_journal_started);
+                        if journal_cleared {
+                            app.set_status("Failed to update the account email. The previous password binding was restored and the account was left unchanged.");
+                        } else {
+                            app.set_status("Failed to update the account email. The previous password binding was restored, but recovery journal cleanup is still pending; restart before changing stored credentials again.");
+                        }
+                    } else {
+                        app.set_status("Failed to update the account email, and the previous password binding could not be verified after rollback. Recovery remains pending; restart before changing stored credentials again.");
+                    }
                     return false;
                 }
             }
@@ -1067,6 +1127,7 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
     } else if !is_existing {
         account.has_saved_password = false;
     }
+    drop(new_password);
 
     let mut next_config = app.config.clone();
     if let Some(pos) = next_config.accounts.iter().position(|a| a.id == account.id) {
@@ -1082,39 +1143,42 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
             true
         }
         Err(_) => {
-            let mut rollback_errors = Vec::new();
-            if new_password.is_some() || username_changed {
+            let rollback_confirmed = if password_changed || username_changed {
                 if is_existing {
                     if let (Some(previous_account), Some(previous_password)) =
                         (previous_account.as_ref(), previous_password.as_deref())
                     {
                         let previous_password = previous_password.as_str();
-                        if let Err(rollback_error) = save_account(
+                        restore_and_verify_password(
                             previous_account,
                             previous_password,
                             app.config.settings.use_keyring,
-                        ) {
-                            let _ = rollback_error;
-                            rollback_errors.push(());
-                        }
-                    } else if let Err(rollback_error) = delete_account(&account.id) {
-                        let _ = rollback_error;
-                        rollback_errors.push(());
+                        )
+                    } else {
+                        delete_account(&account.id).is_ok()
                     }
-                } else if let Err(rollback_error) = delete_account(&account.id) {
-                    let _ = rollback_error;
-                    rollback_errors.push(());
+                } else {
+                    delete_account(&account.id).is_ok()
                 }
-            }
-            if rollback_errors.is_empty() {
-                clear_account_journal_after_terminal_result(account_journal_started, false);
-                app.set_status("Failed to save account changes. The account was left unchanged.");
             } else {
-                app.set_status("Failed to save account changes, and automatic password rollback could not be confirmed. Please check storage before trying again.");
+                true
+            };
+            drop(previous_password);
+            if rollback_confirmed {
+                let journal_cleared =
+                    clear_account_journal_after_confirmed_rollback(account_journal_started);
+                if journal_cleared {
+                    app.set_status("Failed to save account changes. The previous stored state was restored and the account was left unchanged.");
+                } else {
+                    app.set_status("Failed to save account changes. The previous stored state was restored, but recovery journal cleanup is still pending; restart before changing stored credentials again.");
+                }
+            } else {
+                app.set_status("Failed to save account changes, and automatic password rollback could not be verified. Recovery remains pending; restart before changing stored credentials again.");
             }
             return false;
         }
     };
+    drop(previous_password);
 
     {
         clear_account_journal_after_terminal_result(
@@ -1132,6 +1196,55 @@ fn save_edited_account(app: &mut AutoLoginApp, account: &Account, is_existing: b
     sync_worker_accounts(app, false);
 
     true
+}
+
+fn restore_and_verify_password(
+    account: &Account,
+    previous_password: &str,
+    use_keyring: bool,
+) -> bool {
+    restore_and_verify_password_with(
+        account,
+        previous_password,
+        use_keyring,
+        save_account,
+        load_password,
+    )
+}
+
+fn restore_and_verify_password_with<S, L>(
+    account: &Account,
+    previous_password: &str,
+    use_keyring: bool,
+    mut save_op: S,
+    mut load_op: L,
+) -> bool
+where
+    S: FnMut(&Account, &str, bool) -> anyhow::Result<()>,
+    L: FnMut(&Account, bool) -> anyhow::Result<Zeroizing<String>>,
+{
+    // A storage API may report an error after committing its write. Always
+    // attempt the compensating write, then read the selected backend back and
+    // verify the previous value before claiming that rollback succeeded.
+    let _ = save_op(account, previous_password, use_keyring);
+    load_op(account, use_keyring)
+        .is_ok_and(|loaded| loaded.as_bytes() == previous_password.as_bytes())
+}
+
+fn clear_account_journal_after_confirmed_rollback(started: bool) -> bool {
+    if !started {
+        return true;
+    }
+    match clear_pending_storage_operation() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Confirmed password rollback completed, but recovery journal cleanup failed"
+            );
+            false
+        }
+    }
 }
 
 fn enabled_account_conflicts_with_candidate(existing: &Account, candidate_email: &str) -> bool {
@@ -1209,7 +1322,8 @@ mod tests {
         account_saved_status, append_password_input,
         clear_account_journal_after_terminal_result_with, delete_account_transaction,
         empty_password_buffer, forget_password_editor_state, password_editor_id, pop_password_char,
-        scrub_password_event_copies, suppress_password_clipboard_output,
+        restore_and_verify_password_with, scrub_password_event_copies,
+        suppress_password_clipboard_output,
     };
     use crate::models::{Account, AppConfig};
     use crate::storage::{PasswordStorageBackend, StaleBackendCleanupWarning};
@@ -1475,6 +1589,47 @@ mod tests {
         });
 
         assert!(*cleared.borrow());
+    }
+
+    #[test]
+    fn failed_password_write_is_rolled_back_and_read_back_before_confirmation() {
+        let account = Account::new("user@example.com");
+        let events = RefCell::new(Vec::new());
+
+        let confirmed = restore_and_verify_password_with(
+            &account,
+            "previous-secret",
+            true,
+            |saved_account, password, use_keyring| {
+                assert_eq!(saved_account.id, account.id);
+                assert_eq!(password, "previous-secret");
+                assert!(use_keyring);
+                events.borrow_mut().push("restore");
+                anyhow::bail!("ambiguous backend result")
+            },
+            |loaded_account, use_keyring| {
+                assert_eq!(loaded_account.id, account.id);
+                assert!(use_keyring);
+                events.borrow_mut().push("verify");
+                Ok(zeroize::Zeroizing::new("previous-secret".to_string()))
+            },
+        );
+
+        assert!(confirmed);
+        assert_eq!(events.into_inner(), vec!["restore", "verify"]);
+    }
+
+    #[test]
+    fn password_rollback_is_not_confirmed_when_read_back_differs() {
+        let account = Account::new("user@example.com");
+
+        assert!(!restore_and_verify_password_with(
+            &account,
+            "previous-secret",
+            false,
+            |_, _, _| Ok(()),
+            |_, _| Ok(zeroize::Zeroizing::new("unexpected-secret".to_string())),
+        ));
     }
 
     #[test]

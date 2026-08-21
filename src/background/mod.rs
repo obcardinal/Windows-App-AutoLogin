@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::debug_fill::{self, FillAttemptReport, FillMethod};
 use crate::models::{Account, AppSettings, LogEntry, LogLevel, WorkerStatus};
-use crate::monitor::{AppMonitor, MonitorStatus};
+use crate::monitor::{AppMonitor, MonitorObservation, MonitorStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -400,10 +400,8 @@ impl PrePasswordReportPersistence {
         self.persisted_this_tick = false;
     }
 
-    fn observe_monitor_status(&mut self, status: &MonitorStatus, connected_is_definitive: bool) {
-        if matches!(status, MonitorStatus::ProcessNotFound)
-            || (connected_is_definitive && matches!(status, MonitorStatus::Connected))
-        {
+    fn observe_monitor_status(&mut self, definitive_no_prompt: bool) {
+        if definitive_no_prompt {
             self.observe_no_prompt();
         }
     }
@@ -737,7 +735,10 @@ pub(crate) fn spawn(
             let tick_start = Instant::now();
             #[cfg(target_os = "windows")]
             let status_check_start = Instant::now();
-            let status = monitor.check_status();
+            let MonitorObservation {
+                status,
+                definitive_no_prompt,
+            } = monitor.check_status();
             #[cfg(target_os = "windows")]
             let monitor_check_ms = status_check_start.elapsed().as_millis();
             let status_poll_delay = poll_cadence.next_delay(&settings, &status);
@@ -772,29 +773,19 @@ pub(crate) fn spawn(
             #[cfg(target_os = "macos")]
             let mut prompt_attempt_started = false;
             pre_password_report_persistence.begin_poll_tick();
-            pre_password_report_persistence
-                .observe_monitor_status(&status, cfg!(not(target_os = "macos")));
-            let mut definitive_no_prompt_this_tick = false;
+            pre_password_report_persistence.observe_monitor_status(definitive_no_prompt);
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut definitive_no_prompt_this_tick = definitive_no_prompt;
             let mut prompt_observed_this_tick = false;
 
             match status {
-                MonitorStatus::Connected => {
-                    definitive_no_prompt_this_tick = true;
-                }
-                MonitorStatus::Unknown => {
-                    // Distinguish an indeterminate UIA failure from a
-                    // successful no-prompt inspection. A single successful
-                    // inspection is still insufficient to re-arm automation.
-                    #[cfg(target_os = "windows")]
-                    if crate::windows_ui::inspect(crate::config::TARGET_APP_NAME)
-                        .is_ok_and(|inspection| inspection.prompt.is_none())
-                    {
-                        definitive_no_prompt_this_tick = true;
-                    }
-                }
-                MonitorStatus::ProcessNotFound => {
-                    definitive_no_prompt_this_tick = true;
-                }
+                MonitorStatus::Connected => {}
+                // Unknown includes any failed or incomplete UI Automation
+                // traversal and can never prove that a submitted prompt is
+                // gone. Only a complete Connected inspection or process exit
+                // may advance the two-observation re-arm tracker on Windows.
+                MonitorStatus::Unknown => {}
+                MonitorStatus::ProcessNotFound => {}
                 MonitorStatus::LoginWindowDetected {
                     process_id,
                     window_handle,
@@ -1015,11 +1006,10 @@ pub(crate) fn spawn(
                             }
                         }
                         Ok(None) => {
-                            if !prompt_observed_this_tick {
-                                definitive_no_prompt_this_tick = true;
-                            }
                             pre_password_report_persistence.observe_no_prompt();
-                            trace!("macOS fallback preflight found no credential prompt");
+                            trace!(
+                                "macOS foreground-only preflight found no prompt; suppression remains until process exit"
+                            );
                         }
                         Err(reason) => {
                             definitive_no_prompt_this_tick = false;
@@ -1317,19 +1307,19 @@ mod tests {
         assert!(persistence.should_persist("missing_email", &fields, now));
 
         persistence.begin_poll_tick();
-        persistence.observe_monitor_status(&MonitorStatus::ProcessNotFound, false);
+        persistence.observe_monitor_status(true);
 
         persistence.begin_poll_tick();
         assert!(persistence.should_persist("missing_email", &fields, now + Duration::from_secs(2),));
 
         persistence.begin_poll_tick();
-        persistence.observe_monitor_status(&MonitorStatus::Connected, true);
+        persistence.observe_monitor_status(true);
 
         persistence.begin_poll_tick();
         assert!(persistence.should_persist("missing_email", &fields, now + Duration::from_secs(4),));
 
         persistence.begin_poll_tick();
-        persistence.observe_monitor_status(&MonitorStatus::Connected, false);
+        persistence.observe_monitor_status(false);
         persistence.begin_poll_tick();
         assert!(!persistence.should_persist(
             "missing_email",

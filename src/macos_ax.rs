@@ -52,6 +52,7 @@ const AX_SYSTEM_DIALOG_SUBROLE: &str = "AXSystemDialog";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MacosInspection {
+    pub(crate) process_found: bool,
     pub(crate) target: Option<MacosTarget>,
     pub(crate) prompt: Option<MacosPrompt>,
     pub(crate) prompts: Vec<MacosPrompt>,
@@ -156,6 +157,44 @@ pub(crate) struct MacosFillResult {
     pub(crate) filled_prompt: Option<MacosFilledPrompt>,
 }
 
+#[derive(Debug)]
+pub(crate) struct MacosFillFailure {
+    error: anyhow::Error,
+    cleanup_prompt: Option<Box<MacosFilledPrompt>>,
+}
+
+impl MacosFillFailure {
+    fn before_write(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_prompt: None,
+        }
+    }
+
+    fn ambiguous_write(error: anyhow::Error, cleanup_prompt: MacosFilledPrompt) -> Self {
+        Self {
+            error,
+            cleanup_prompt: Some(Box::new(cleanup_prompt)),
+        }
+    }
+
+    pub(crate) fn cleanup_prompt(&self) -> Option<&MacosFilledPrompt> {
+        self.cleanup_prompt.as_deref()
+    }
+}
+
+impl fmt::Display for MacosFillFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for MacosFillFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct MacosFilledPrompt {
     prompt: MacosPrompt,
@@ -226,6 +265,7 @@ pub(crate) struct MacosSubmittedPrompt {
     origin: PromptOrigin,
     target_window: AxElement,
     prompt_container: AxElement,
+    pre_submit_session_windows: Vec<MacosWindowTitle>,
 }
 
 impl fmt::Debug for MacosSubmittedPrompt {
@@ -305,6 +345,41 @@ struct AxElement {
     raw: AXUIElementRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AxTraversalCompleteness {
+    Complete,
+    ChildQueryFailed(String),
+    DepthLimitReached { max_depth: usize },
+    ElementLimitReached { max_elements: usize },
+}
+
+#[derive(Debug)]
+struct AxTraversal<T> {
+    elements: Vec<T>,
+    completeness: AxTraversalCompleteness,
+}
+
+impl<T> AxTraversal<T> {
+    fn into_complete_elements(self) -> anyhow::Result<Vec<T>> {
+        match self.completeness {
+            AxTraversalCompleteness::Complete => Ok(self.elements),
+            AxTraversalCompleteness::ChildQueryFailed(error) => {
+                anyhow::bail!("AX element traversal was incomplete: child query failed: {error}")
+            }
+            AxTraversalCompleteness::DepthLimitReached { max_depth } => {
+                anyhow::bail!(
+                    "AX element traversal was incomplete: depth limit {max_depth} was exceeded"
+                )
+            }
+            AxTraversalCompleteness::ElementLimitReached { max_elements } => {
+                anyhow::bail!(
+                    "AX element traversal was incomplete: element limit {max_elements} was exceeded"
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PromptTextSnapshot {
     element: AxElement,
@@ -350,17 +425,24 @@ impl AxElement {
         }
     }
 
-    fn copy_attr(&self, attr: &'static str) -> Option<CFType> {
+    fn copy_attr_result(&self, attr: &'static str) -> anyhow::Result<CFType> {
+        let attr_name = attr;
         let attr = CFString::from_static_string(attr);
         let mut value: CFTypeRef = std::ptr::null();
         let err = unsafe {
             AXUIElementCopyAttributeValue(self.raw, attr.as_concrete_TypeRef(), &mut value)
         };
-        if err == K_AX_ERROR_SUCCESS && !value.is_null() {
-            Some(unsafe { TCFType::wrap_under_create_rule(value) })
-        } else {
-            None
+        if err != K_AX_ERROR_SUCCESS {
+            anyhow::bail!("AX attribute {attr_name} query failed with error {err}");
         }
+        if value.is_null() {
+            anyhow::bail!("AX attribute {attr_name} query returned a null value");
+        }
+        Ok(unsafe { TCFType::wrap_under_create_rule(value) })
+    }
+
+    fn copy_attr(&self, attr: &'static str) -> Option<CFType> {
+        self.copy_attr_result(attr).ok()
     }
 
     fn string_attr(&self, attr: &'static str) -> Option<String> {
@@ -409,18 +491,23 @@ impl AxElement {
             .map(bool::from)
     }
 
-    fn array_attr(&self, attr: &'static str) -> Vec<AxElement> {
-        let Some(array) = self
-            .copy_attr(attr)
-            .and_then(|value| value.downcast_into::<CFArray>())
-        else {
-            return Vec::new();
-        };
+    fn array_attr_checked(&self, attr: &'static str) -> Option<Vec<AxElement>> {
+        self.array_attr_result(attr).ok()
+    }
+
+    fn array_attr_result(&self, attr: &'static str) -> anyhow::Result<Vec<AxElement>> {
+        let array = self
+            .copy_attr_result(attr)?
+            .downcast_into::<CFArray>()
+            .ok_or_else(|| anyhow::anyhow!("AX array attribute has an unexpected value type"))?;
 
         array
             .get_all_values()
             .into_iter()
-            .filter_map(|raw| unsafe { AxElement::borrowed(raw.cast()) })
+            .map(|raw| {
+                unsafe { AxElement::borrowed(raw.cast()) }
+                    .context("AX array attribute contained an invalid element")
+            })
             .collect()
     }
 
@@ -504,7 +591,10 @@ fn inspect_process(
         return Ok(MacosInspection::default());
     }
 
-    let mut inspection = MacosInspection::default();
+    let mut inspection = MacosInspection {
+        process_found: true,
+        ..Default::default()
+    };
     for process in process_infos
         .into_iter()
         .filter(|process| expected_process_id.is_none_or(|pid| process.pid == pid))
@@ -516,7 +606,9 @@ fn inspect_process(
             continue;
         }
         let app_frontmost = app.bool_attr(AX_FRONTMOST).unwrap_or(false);
-        let windows = app.array_attr(AX_WINDOWS);
+        let windows = app
+            .array_attr_result(AX_WINDOWS)
+            .context("unable to enumerate trusted application windows")?;
         let visible_windows = windows
             .iter()
             .filter(|window| !is_hidden(window))
@@ -569,7 +661,7 @@ fn inspect_process(
             // credential-sheet inspection; background/session windows remain
             // title-only metadata.
             let visible_sheets = if window_frontmost {
-                sheet_candidates_for_window(window)
+                sheet_candidates_for_window(window)?
                     .into_iter()
                     .filter(|sheet| !is_hidden(sheet))
                     .collect::<Vec<_>>()
@@ -581,7 +673,9 @@ fn inspect_process(
                 visible_sheets.iter().any(element_explicitly_frontmost);
             let mut found_sheet_prompt = false;
             for sheet in visible_sheets {
-                let sheet_elements = collect_elements(&sheet);
+                let sheet_elements = collect_elements(&sheet)
+                    .into_complete_elements()
+                    .context("credential sheet AX tree traversal was incomplete")?;
                 let sheet_target = MacosTarget {
                     frontmost: sheet_is_frontmost_for_app(
                         app_frontmost,
@@ -599,7 +693,7 @@ fn inspect_process(
                     &sheet_elements,
                     PromptOrigin::Sheet,
                     &process,
-                ) {
+                )? {
                     record_prompt_candidate(&mut inspection, prompt);
                     found_sheet_prompt = true;
                 }
@@ -621,7 +715,9 @@ fn inspect_process(
                 continue;
             }
 
-            let window_elements = collect_elements(window);
+            let window_elements = collect_elements(window)
+                .into_complete_elements()
+                .context("credential window AX tree traversal was incomplete")?;
             if let Some(prompt) = prompt_from_elements(
                 target.clone(),
                 window,
@@ -629,7 +725,7 @@ fn inspect_process(
                 &window_elements,
                 PromptOrigin::Window,
                 &process,
-            ) {
+            )? {
                 record_prompt_candidate(&mut inspection, prompt);
             }
         }
@@ -898,15 +994,16 @@ pub(crate) fn fill_verified_password(
     password: &str,
     method: MacosFillMethod,
     guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<MacosFillResult> {
-    guard()?;
+) -> Result<MacosFillResult, MacosFillFailure> {
+    guard().map_err(MacosFillFailure::before_write)?;
     ensure_verified_prompt_matches_fill_target(
         &verified_prompt,
         expected_process_id,
         expected_window_title,
         expected_prompt_origin,
         expected_email,
-    )?;
+    )
+    .map_err(MacosFillFailure::before_write)?;
     let password_field_role = verified_prompt.prompt.password_field_role.clone();
     let password_field_description_present = !verified_prompt
         .prompt
@@ -919,28 +1016,38 @@ pub(crate) fn fill_verified_password(
         expected_process_id,
         expected_window_title,
         expected_email,
-    )?;
+    )
+    .map_err(MacosFillFailure::before_write)?;
+
+    let prompt = verified_prompt.prompt;
+    let cleanup_prompt = MacosFilledPrompt {
+        prompt: prompt.clone(),
+        expected_email: expected_email.to_string(),
+        trusted_process: prepared.trusted_process.clone(),
+        submit_button_ready_after_fill: false,
+    };
 
     let submit_button_ready_after_fill = false;
     let password_field_focused = false;
     let method_used = match method {
         MacosFillMethod::DirectAxValue => {
-            ensure_live_prompt_window_title(&verified_prompt.prompt, expected_window_title)?;
-            ensure_revalidated_frontmost(
-                prompt_is_frontmost_now(&verified_prompt.prompt),
-                "password insertion",
-            )?;
-            guard()?;
+            ensure_live_prompt_window_title(&prompt, expected_window_title)
+                .map_err(MacosFillFailure::before_write)?;
+            ensure_revalidated_frontmost(prompt_is_frontmost_now(&prompt), "password insertion")
+                .map_err(MacosFillFailure::before_write)?;
+            guard().map_err(MacosFillFailure::before_write)?;
             if set_password_value(&prepared.password_field, password) {
                 "axvalue"
             } else {
-                anyhow::bail!(
-                    "direct AXValue password insertion failed; keyboard fallback disabled for password security"
-                );
+                return Err(MacosFillFailure::ambiguous_write(
+                    anyhow::anyhow!(
+                        "direct AXValue password insertion failed; keyboard fallback disabled for password security"
+                    ),
+                    cleanup_prompt,
+                ));
             }
         }
     };
-    let prompt = verified_prompt.prompt;
 
     Ok(MacosFillResult {
         fill_method: method_used,
@@ -998,8 +1105,21 @@ pub(crate) fn submit_filled_prompt(
         &prompt.target.window_title,
         "fast submit",
     )?;
-    // AX reads above may block until their messaging timeout. Recheck the
-    // cancellation generation immediately before the one submit side effect.
+    let pre_submit_session_windows =
+        visible_session_window_titles_for_process(prompt.target.process_id)?;
+    // The session snapshot performs blocking AX reads. Revalidate the exact
+    // trusted, frontmost prompt again after it so a backgrounded or replaced
+    // prompt cannot receive the eventual AXPress.
+    ensure_submit_side_effect_target_ready(
+        app_name,
+        prompt,
+        &button,
+        &filled_prompt.trusted_process,
+        &filled_prompt.expected_email,
+        &prompt.target.window_title,
+        "final submit",
+    )?;
+    // Recheck cancellation immediately before the one submit side effect.
     guard()?;
     if button.perform_action(AX_PRESS) {
         return Ok(MacosSubmitResult {
@@ -1016,6 +1136,7 @@ pub(crate) fn submit_filled_prompt(
                 origin: prompt.origin,
                 target_window: prompt.target_window.clone(),
                 prompt_container: prompt.native_container.clone(),
+                pre_submit_session_windows,
             }),
         });
     }
@@ -1195,32 +1316,32 @@ pub(crate) fn post_check_state(
     let started = Instant::now();
     let mut consecutive_submitted_prompt_absences = 0_u8;
     loop {
-        match inspect_process(app_name, Some(expected_process_id), None) {
-            Ok(inspection) => {
-                if let Some(submitted_prompt) = submitted_prompt {
-                    consecutive_submitted_prompt_absences = next_prompt_absence_observations(
-                        consecutive_submitted_prompt_absences,
-                        submitted_prompt_is_still_present(submitted_prompt),
-                    );
-                }
-                let state = classify_post_submit_inspection(
-                    &inspection,
-                    expected_process_id,
-                    expected_window_title,
-                    expected_email,
-                    submitted_prompt,
-                    consecutive_submitted_prompt_absences >= 2,
+        // Native identity or AX inspection failure is indeterminate. A
+        // definitive process exit is represented by a successful inspection
+        // with process_found == false and is classified inside this branch.
+        if let Ok(inspection) = inspect_process(app_name, Some(expected_process_id), None) {
+            if let Some(submitted_prompt) = submitted_prompt {
+                consecutive_submitted_prompt_absences = next_prompt_absence_observations(
+                    consecutive_submitted_prompt_absences,
+                    submitted_prompt_presence(submitted_prompt),
                 );
-
-                if inspection.prompt.is_some() {
-                    return state.unwrap_or("prompt_gone_unknown");
-                }
-
-                if let Some(state) = state {
-                    return state;
-                }
             }
-            Err(_) => return "failed",
+            let state = classify_post_submit_inspection(
+                &inspection,
+                expected_process_id,
+                expected_window_title,
+                expected_email,
+                submitted_prompt,
+                consecutive_submitted_prompt_absences >= 2,
+            );
+
+            if inspection.prompt.is_some() {
+                return state.unwrap_or("prompt_gone_unknown");
+            }
+
+            if let Some(state) = state {
+                return state;
+            }
         }
 
         if started.elapsed() >= timeout {
@@ -1238,13 +1359,10 @@ fn classify_post_submit_inspection(
     submitted_prompt: Option<&MacosSubmittedPrompt>,
     submitted_prompt_disappearance_confirmed: bool,
 ) -> Option<&'static str> {
-    let target_running = inspection.target.as_ref().is_some_and(|target| {
-        target.process_id == expected_process_id
-            || inspection
-                .window_titles
-                .iter()
-                .any(|title| title.process_id == expected_process_id)
-    });
+    // inspect_process is scoped to expected_process_id. Native trusted-process
+    // presence remains authoritative even when AX cannot create the app
+    // element or read its windows; lack of AX data is not a process exit.
+    let target_running = inspection.process_found;
     let has_session_for_expected_process = submitted_prompt.is_some_and(|submitted_prompt| {
         submitted_prompt_disappearance_confirmed
             && submitted_prompt_matches_expected(
@@ -1275,37 +1393,69 @@ fn classify_post_submit_inspection(
     )
 }
 
-fn next_prompt_absence_observations(previous: u8, prompt_is_present: bool) -> u8 {
-    if prompt_is_present {
-        0
-    } else {
-        previous.saturating_add(1)
+fn next_prompt_absence_observations(previous: u8, prompt_is_present: Option<bool>) -> u8 {
+    match prompt_is_present {
+        Some(true) | None => 0,
+        Some(false) => previous.saturating_add(1),
     }
 }
 
-fn submitted_prompt_is_still_present(submitted_prompt: &MacosSubmittedPrompt) -> bool {
+fn submitted_prompt_presence(submitted_prompt: &MacosSubmittedPrompt) -> Option<bool> {
     if submitted_prompt.target_window.process_id() != Some(submitted_prompt.process_id)
         || submitted_prompt.prompt_container.process_id() != Some(submitted_prompt.process_id)
     {
-        return false;
+        return None;
     }
 
+    let app = AxElement::application(submitted_prompt.process_id)?;
+    let windows = app.array_attr_checked(AX_WINDOWS)?;
+    let current_target = windows
+        .iter()
+        .find(|window| window.same_element(&submitted_prompt.target_window));
+
     match submitted_prompt.origin {
-        PromptOrigin::Sheet => submitted_prompt
-            .target_window
-            .array_attr(AX_SHEETS)
-            .iter()
-            .any(|sheet| {
-                sheet.same_element(&submitted_prompt.prompt_container) && !is_hidden(sheet)
-            }),
-        PromptOrigin::Window => AxElement::application(submitted_prompt.process_id)
-            .map(|app| {
-                app.array_attr(AX_WINDOWS).iter().any(|window| {
-                    window.same_element(&submitted_prompt.prompt_container) && !is_hidden(window)
-                })
-            })
-            .unwrap_or(false),
+        PromptOrigin::Sheet => {
+            let Some(target_window) = current_target else {
+                return Some(false);
+            };
+            Some(
+                target_window
+                    .array_attr_checked(AX_SHEETS)?
+                    .iter()
+                    .any(|sheet| {
+                        sheet.same_element(&submitted_prompt.prompt_container) && !is_hidden(sheet)
+                    }),
+            )
+        }
+        PromptOrigin::Window => Some(windows.iter().any(|window| {
+            window.same_element(&submitted_prompt.prompt_container) && !is_hidden(window)
+        })),
     }
+}
+
+fn visible_session_window_titles_for_process(
+    expected_process_id: i32,
+) -> anyhow::Result<Vec<MacosWindowTitle>> {
+    let app = AxElement::application(expected_process_id)
+        .context("trusted application disappeared before submit snapshot")?;
+    if app.process_id() != Some(expected_process_id) {
+        anyhow::bail!("trusted application identity changed before submit snapshot");
+    }
+    let windows = app
+        .array_attr_checked(AX_WINDOWS)
+        .context("unable to read trusted application windows before submit")?;
+    Ok(windows
+        .into_iter()
+        .filter(|window| !is_hidden(window))
+        .filter_map(|window| {
+            let title = window.string_attr(AX_TITLE)?;
+            is_probable_session_window_title(&title).then_some(MacosWindowTitle {
+                process_id: expected_process_id,
+                title,
+                window: Some(window),
+            })
+        })
+        .collect())
 }
 
 fn classify_post_submit_prompt_candidates(
@@ -1357,16 +1507,46 @@ fn submitted_prompt_matches_session_window(
     submitted_prompt: &MacosSubmittedPrompt,
     session: &MacosWindowTitle,
 ) -> bool {
-    submitted_prompt.origin == PromptOrigin::Sheet
-        && session.process_id == submitted_prompt.process_id
-        && session
+    if submitted_prompt.origin != PromptOrigin::Sheet
+        || session.process_id != submitted_prompt.process_id
+        || !session
             .title
             .trim()
             .eq_ignore_ascii_case(submitted_prompt.window_title.trim())
-        && session
-            .window
-            .as_ref()
-            .is_some_and(|window| window.same_element(&submitted_prompt.target_window))
+        || session_window_was_present_before_submit(
+            session,
+            &submitted_prompt.pre_submit_session_windows,
+        )
+    {
+        return false;
+    }
+
+    session
+        .window
+        .as_ref()
+        .is_some_and(|window| !window.same_element(&submitted_prompt.target_window))
+}
+
+fn session_window_was_present_before_submit(
+    session: &MacosWindowTitle,
+    pre_submit_sessions: &[MacosWindowTitle],
+) -> bool {
+    pre_submit_sessions
+        .iter()
+        .any(|pre_submit| same_session_window_identity(session, pre_submit))
+}
+
+fn same_session_window_identity(left: &MacosWindowTitle, right: &MacosWindowTitle) -> bool {
+    if left.process_id != right.process_id
+        || !left.title.trim().eq_ignore_ascii_case(right.title.trim())
+    {
+        return false;
+    }
+
+    match (&left.window, &right.window) {
+        (Some(left_window), Some(right_window)) => left_window.same_element(right_window),
+        _ => true,
+    }
 }
 
 fn classify_post_submit_state(
@@ -1624,8 +1804,10 @@ fn prompt_is_frontmost_now(prompt: &MacosPrompt) -> bool {
     }
 
     let app_frontmost = app.bool_attr(AX_FRONTMOST).unwrap_or(false);
-    let visible_windows = app
-        .array_attr(AX_WINDOWS)
+    let Ok(windows) = app.array_attr_result(AX_WINDOWS) else {
+        return false;
+    };
+    let visible_windows = windows
         .into_iter()
         .filter(|window| !is_hidden(window))
         .collect::<Vec<_>>();
@@ -1653,7 +1835,10 @@ fn prompt_is_frontmost_now(prompt: &MacosPrompt) -> bool {
                 && window_should_scan_for_prompt(target_window, &prompt.target.window_title)
         }
         PromptOrigin::Sheet => {
-            let visible_sheets = sheet_candidates_for_window(target_window)
+            let Ok(sheet_candidates) = sheet_candidates_for_window(target_window) else {
+                return false;
+            };
+            let visible_sheets = sheet_candidates
                 .into_iter()
                 .filter(|sheet| !is_hidden(sheet))
                 .collect::<Vec<_>>();
@@ -1813,36 +1998,106 @@ fn set_password_value(field: &AxElement, password: &str) -> bool {
     field.set_string_attr(AX_VALUE, password)
 }
 
-fn collect_elements(root: &AxElement) -> Vec<AxElement> {
-    let mut elements = Vec::new();
+fn collect_elements(root: &AxElement) -> AxTraversal<AxElement> {
     if is_hidden(root) {
-        return elements;
+        return AxTraversal {
+            elements: Vec::new(),
+            completeness: AxTraversalCompleteness::Complete,
+        };
     }
-    collect_elements_recursive(root, 0, &mut elements);
-    elements
+
+    collect_descendants_bounded(root, AX_SEARCH_DEPTH, MAX_ELEMENT_COUNT, &mut |element| {
+        element.array_attr_result(AX_CHILDREN).map(|children| {
+            children
+                .into_iter()
+                .filter(|child| !is_hidden(child))
+                .collect()
+        })
+    })
 }
 
-fn collect_elements_recursive(root: &AxElement, depth: usize, elements: &mut Vec<AxElement>) {
-    if depth >= AX_SEARCH_DEPTH || elements.len() >= MAX_ELEMENT_COUNT {
+fn collect_descendants_bounded<T, F>(
+    root: &T,
+    max_depth: usize,
+    max_elements: usize,
+    query_children: &mut F,
+) -> AxTraversal<T>
+where
+    T: Clone,
+    F: FnMut(&T) -> anyhow::Result<Vec<T>>,
+{
+    let mut traversal = AxTraversal {
+        elements: Vec::new(),
+        completeness: AxTraversalCompleteness::Complete,
+    };
+    collect_descendants_recursive(
+        root,
+        0,
+        max_depth,
+        max_elements,
+        query_children,
+        &mut traversal,
+    );
+    traversal
+}
+
+fn collect_descendants_recursive<T, F>(
+    root: &T,
+    depth: usize,
+    max_depth: usize,
+    max_elements: usize,
+    query_children: &mut F,
+    traversal: &mut AxTraversal<T>,
+) where
+    T: Clone,
+    F: FnMut(&T) -> anyhow::Result<Vec<T>>,
+{
+    if traversal.completeness != AxTraversalCompleteness::Complete {
         return;
     }
 
-    for child in root.array_attr(AX_CHILDREN) {
-        if elements.len() >= MAX_ELEMENT_COUNT {
-            break;
+    let child_elements = match query_children(root) {
+        Ok(children) => children,
+        Err(error) => {
+            traversal.completeness = AxTraversalCompleteness::ChildQueryFailed(error.to_string());
+            return;
         }
-        if is_hidden(&child) {
-            continue;
+    };
+    if child_elements.is_empty() {
+        return;
+    }
+    if depth >= max_depth {
+        traversal.completeness = AxTraversalCompleteness::DepthLimitReached { max_depth };
+        return;
+    }
+
+    for child in child_elements {
+        if traversal.elements.len() >= max_elements {
+            traversal.completeness = AxTraversalCompleteness::ElementLimitReached { max_elements };
+            return;
         }
-        elements.push(child.clone());
-        collect_elements_recursive(&child, depth + 1, elements);
+        traversal.elements.push(child.clone());
+        collect_descendants_recursive(
+            &child,
+            depth + 1,
+            max_depth,
+            max_elements,
+            query_children,
+            traversal,
+        );
+        if traversal.completeness != AxTraversalCompleteness::Complete {
+            return;
+        }
     }
 }
 
-fn sheet_candidates_for_window(window: &AxElement) -> Vec<AxElement> {
-    let mut sheets = window.array_attr(AX_SHEETS);
+fn sheet_candidates_for_window(window: &AxElement) -> anyhow::Result<Vec<AxElement>> {
+    let mut sheets = window
+        .array_attr_result(AX_SHEETS)
+        .context("unable to enumerate credential sheets")?;
     for element in window
-        .array_attr(AX_CHILDREN)
+        .array_attr_result(AX_CHILDREN)
+        .context("unable to enumerate credential window children")?
         .into_iter()
         .filter(|element| role_matches(element, AX_SHEET_ROLE))
     {
@@ -1854,7 +2109,7 @@ fn sheet_candidates_for_window(window: &AxElement) -> Vec<AxElement> {
         }
         sheets.push(element);
     }
-    sheets
+    Ok(sheets)
 }
 
 fn window_should_scan_for_prompt(window: &AxElement, window_title: &str) -> bool {
@@ -1886,11 +2141,13 @@ fn prompt_from_elements(
     elements: &[AxElement],
     origin: PromptOrigin,
     trusted_process: &macos_identity::TrustedProcessInfo,
-) -> Option<MacosPrompt> {
+) -> anyhow::Result<Option<MacosPrompt>> {
     let prompt_body_text = collect_prompt_text("", elements);
-    let prompt_email = extract_email_like(&prompt_body_text)?;
+    let Some(prompt_email) = extract_email_like(&prompt_body_text) else {
+        return Ok(None);
+    };
     if !prompt_identity_verified(&target.window_title, &prompt_body_text, origin) {
-        return None;
+        return Ok(None);
     }
     for password_field in password_field_candidates(elements) {
         let Some((prompt_root, scoped_elements)) = select_credential_prompt_scope(
@@ -1899,7 +2156,8 @@ fn prompt_from_elements(
             &prompt_email,
             &target.window_title,
             origin,
-        ) else {
+        )?
+        else {
             continue;
         };
         let scoped_body_text = collect_prompt_text("", &scoped_elements);
@@ -1912,7 +2170,9 @@ fn prompt_from_elements(
             continue;
         }
         let submit_button = select_prompt_submit_button(&scoped_elements);
-        submit_button.as_ref()?;
+        if submit_button.is_none() {
+            return Ok(None);
+        }
         let identity_text = prompt_text_snapshots(
             &scoped_elements,
             &prompt_email,
@@ -1920,7 +2180,7 @@ fn prompt_from_elements(
             origin,
         );
 
-        return Some(MacosPrompt {
+        return Ok(Some(MacosPrompt {
             target,
             email: Some(prompt_email),
             password_field_description: element_label_text(&password_field),
@@ -1933,10 +2193,10 @@ fn prompt_from_elements(
             password_field,
             submit_button,
             identity_text,
-        });
+        }));
     }
 
-    None
+    Ok(None)
 }
 
 fn select_credential_prompt_scope(
@@ -1945,16 +2205,20 @@ fn select_credential_prompt_scope(
     prompt_email: &str,
     window_title: &str,
     origin: PromptOrigin,
-) -> Option<(AxElement, Vec<AxElement>)> {
+) -> anyhow::Result<Option<(AxElement, Vec<AxElement>)>> {
     let mut ancestor = password_field.parent();
     for _ in 0..AX_SEARCH_DEPTH {
-        let current = ancestor?;
-        let scoped_elements = collect_elements(&current);
+        let Some(current) = ancestor else {
+            return Ok(None);
+        };
+        let scoped_elements = collect_elements(&current)
+            .into_complete_elements()
+            .context("credential prompt scope AX tree traversal was incomplete")?;
         let scoped_body_text = collect_prompt_text("", &scoped_elements);
         if scoped_prompt_matches(&scoped_body_text, prompt_email, window_title, origin)
             && select_prompt_submit_button(&scoped_elements).is_some()
         {
-            return Some((current, scoped_elements));
+            return Ok(Some((current, scoped_elements)));
         }
 
         let reached_root = current.same_element(root);
@@ -1963,7 +2227,7 @@ fn select_credential_prompt_scope(
         }
         ancestor = current.parent();
     }
-    None
+    Ok(None)
 }
 
 fn scoped_prompt_matches(
@@ -2268,11 +2532,13 @@ fn role_matches(element: &AxElement, expected: &str) -> bool {
 }
 
 fn is_hidden(element: &AxElement) -> bool {
-    element.bool_attr(AX_HIDDEN).unwrap_or(false)
+    // AX query failure is indeterminate, not evidence that a sensitive
+    // control is visible. Fail closed for both discovery and side effects.
+    element.bool_attr(AX_HIDDEN) != Some(false)
 }
 
 fn element_enabled(element: &AxElement) -> bool {
-    element.bool_attr(AX_ENABLED).unwrap_or(true)
+    element.bool_attr(AX_ENABLED) == Some(true)
 }
 
 fn element_explicitly_frontmost(element: &AxElement) -> bool {
@@ -2664,10 +2930,11 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        credential_prompt_text_like, extract_email_like, normalized_submit_label,
-        prompt_identity_verified, prompt_text_element_should_contribute,
+        collect_descendants_bounded, credential_prompt_text_like, extract_email_like,
+        normalized_submit_label, prompt_identity_verified, prompt_text_element_should_contribute,
         prompt_window_title_matches, select_submit_label_for_test, submit_label_rank,
-        text_contains_password_cue, PromptOrigin, DIRECT_AXVALUE_READY_MS, FOCUS_POLL_INTERVAL_MS,
+        text_contains_password_cue, AxTraversalCompleteness, PromptOrigin, DIRECT_AXVALUE_READY_MS,
+        FOCUS_POLL_INTERVAL_MS,
     };
     use std::time::Duration;
 
@@ -2690,6 +2957,117 @@ mod tests {
             extract_email_like("user@example.com signed in as USER@example.com"),
             Some("user@example.com".to_string())
         );
+    }
+
+    #[test]
+    fn checked_ax_traversal_collects_a_complete_tree() {
+        let traversal = collect_descendants_bounded(&0_u8, 4, 8, &mut |node| {
+            Ok(match *node {
+                0 => vec![1, 2],
+                1 => vec![3],
+                _ => Vec::new(),
+            })
+        });
+
+        assert_eq!(traversal.completeness, AxTraversalCompleteness::Complete);
+        assert_eq!(traversal.into_complete_elements().unwrap(), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn checked_ax_traversal_fails_closed_on_child_query_error() {
+        let traversal = collect_descendants_bounded(&0_u8, 4, 8, &mut |node| {
+            if *node == 1 {
+                anyhow::bail!("provider denied AXChildren");
+            }
+            Ok(if *node == 0 { vec![1, 2] } else { Vec::new() })
+        });
+
+        assert!(matches!(
+            &traversal.completeness,
+            AxTraversalCompleteness::ChildQueryFailed(error)
+                if error.contains("provider denied AXChildren")
+        ));
+        assert!(traversal.into_complete_elements().is_err());
+    }
+
+    #[test]
+    fn checked_ax_traversal_fails_closed_when_depth_limit_hides_descendants() {
+        let traversal = collect_descendants_bounded(&0_u8, 2, 8, &mut |node| {
+            Ok(if *node < 3 {
+                vec![*node + 1]
+            } else {
+                Vec::new()
+            })
+        });
+
+        assert_eq!(
+            traversal.completeness,
+            AxTraversalCompleteness::DepthLimitReached { max_depth: 2 }
+        );
+        assert!(traversal.into_complete_elements().is_err());
+    }
+
+    #[test]
+    fn checked_ax_traversal_fails_closed_when_element_limit_hides_siblings() {
+        let traversal = collect_descendants_bounded(&0_u8, 4, 2, &mut |node| {
+            Ok(if *node == 0 {
+                vec![1, 2, 3]
+            } else {
+                Vec::new()
+            })
+        });
+
+        assert_eq!(
+            traversal.completeness,
+            AxTraversalCompleteness::ElementLimitReached { max_elements: 2 }
+        );
+        assert!(traversal.into_complete_elements().is_err());
+    }
+
+    #[test]
+    fn checked_ax_traversal_accepts_exact_complete_limits() {
+        let depth_boundary = collect_descendants_bounded(&0_u8, 2, 8, &mut |node| {
+            Ok(if *node < 2 {
+                vec![*node + 1]
+            } else {
+                Vec::new()
+            })
+        });
+        assert_eq!(
+            depth_boundary.completeness,
+            AxTraversalCompleteness::Complete
+        );
+
+        let element_boundary = collect_descendants_bounded(&0_u8, 4, 2, &mut |node| {
+            Ok(if *node == 0 { vec![1, 2] } else { Vec::new() })
+        });
+        assert_eq!(
+            element_boundary.completeness,
+            AxTraversalCompleteness::Complete
+        );
+    }
+
+    #[test]
+    fn prompt_discovery_consumes_only_complete_checked_ax_traversals() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let inspection = implementation
+            .split("fn inspect_process")
+            .nth(1)
+            .and_then(|tail| tail.split("fn trusted_process_infos_for_inspection").next())
+            .unwrap();
+        let scope_selection = implementation
+            .split("fn select_credential_prompt_scope")
+            .nth(1)
+            .and_then(|tail| tail.split("fn scoped_prompt_matches").next())
+            .unwrap();
+
+        assert!(inspection.matches("into_complete_elements()").count() >= 2);
+        assert!(scope_selection.contains("into_complete_elements()"));
+        assert!(!implementation.contains("fn array_attr("));
+        assert!(!implementation.contains("array_attr(AX_CHILDREN)"));
     }
 
     #[test]
@@ -2810,7 +3188,7 @@ mod tests {
         assert!(revalidation < final_frontmost_revalidation);
         assert!(final_frontmost_revalidation < write);
         let adjacent_guard = fill_verified_password[..write]
-            .rfind("guard()?")
+            .rfind("guard()")
             .expect("generation guard immediately before password write");
         assert!(final_frontmost_revalidation < adjacent_guard);
         assert!(adjacent_guard < write);
@@ -3061,6 +3439,7 @@ mod tests {
         const OTHER_PID: i32 = 202;
 
         let inspection = super::MacosInspection {
+            process_found: true,
             target: Some(super::MacosTarget {
                 process_id: EXPECTED_PID,
                 window_title: "Sign in".to_string(),
@@ -3097,6 +3476,7 @@ mod tests {
         const EXPECTED_PID: i32 = 101;
 
         let inspection = super::MacosInspection {
+            process_found: true,
             target: Some(super::MacosTarget {
                 process_id: EXPECTED_PID,
                 window_title: "Contoso Desktop".to_string(),
@@ -3129,7 +3509,53 @@ mod tests {
     }
 
     #[test]
-    fn post_submit_session_success_is_bound_to_the_submitted_sheet_parent() {
+    fn post_submit_ax_unavailable_with_native_process_running_stays_unknown() {
+        const EXPECTED_PID: i32 = 101;
+        let ax_unavailable = super::MacosInspection {
+            process_found: true,
+            ..Default::default()
+        };
+        let verified_exit = super::MacosInspection::default();
+
+        assert_eq!(
+            super::classify_post_submit_inspection(
+                &ax_unavailable,
+                EXPECTED_PID,
+                "Sign in",
+                "user@example.com",
+                None,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            super::classify_post_submit_inspection(
+                &verified_exit,
+                EXPECTED_PID,
+                "Sign in",
+                "user@example.com",
+                None,
+                false,
+            ),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn post_submit_inspection_errors_are_not_reported_as_process_exit() {
+        let implementation = include_str!("macos_ax.rs");
+        let post_check = implementation
+            .split("pub(crate) fn post_check_state")
+            .nth(1)
+            .and_then(|tail| tail.split("fn classify_post_submit_inspection").next())
+            .unwrap();
+
+        assert!(post_check.contains("if let Ok(inspection) = inspect_process"));
+        assert!(!post_check.contains("Err(_) => return \"failed\""));
+    }
+
+    #[test]
+    fn post_submit_session_success_requires_a_new_window_after_the_submitted_sheet() {
         let implementation = include_str!("macos_ax.rs");
         let matcher = implementation
             .split("fn submitted_prompt_matches_session_window")
@@ -3137,23 +3563,28 @@ mod tests {
             .and_then(|tail| tail.split("fn classify_post_submit_state").next())
             .unwrap();
 
-        assert!(matcher.contains("submitted_prompt.origin == PromptOrigin::Sheet"));
-        assert!(matcher.contains("session.process_id == submitted_prompt.process_id"));
-        assert!(matcher.contains("window.same_element(&submitted_prompt.target_window)"));
+        assert!(matcher.contains("submitted_prompt.origin != PromptOrigin::Sheet"));
+        assert!(matcher.contains("session.process_id != submitted_prompt.process_id"));
+        assert!(matcher.contains("session_window_was_present_before_submit"));
+        assert!(matcher.contains("!window.same_element(&submitted_prompt.target_window)"));
     }
 
     #[test]
     fn post_submit_requires_two_consecutive_submitted_prompt_absences() {
         let mut observations = 0;
-        observations = super::next_prompt_absence_observations(observations, false);
+        observations = super::next_prompt_absence_observations(observations, Some(false));
         assert_eq!(observations, 1);
         assert!(observations < 2);
 
-        observations = super::next_prompt_absence_observations(observations, true);
+        observations = super::next_prompt_absence_observations(observations, None);
         assert_eq!(observations, 0);
 
-        observations = super::next_prompt_absence_observations(observations, false);
-        observations = super::next_prompt_absence_observations(observations, false);
+        observations = super::next_prompt_absence_observations(observations, Some(false));
+        observations = super::next_prompt_absence_observations(observations, Some(true));
+        assert_eq!(observations, 0);
+
+        observations = super::next_prompt_absence_observations(observations, Some(false));
+        observations = super::next_prompt_absence_observations(observations, Some(false));
         assert_eq!(observations, 2);
     }
 
@@ -3161,7 +3592,7 @@ mod tests {
     fn submitted_prompt_identity_is_checked_independently_of_content_scan() {
         let implementation = include_str!("macos_ax.rs");
         let checker = implementation
-            .split("fn submitted_prompt_is_still_present")
+            .split("fn submitted_prompt_presence")
             .nth(1)
             .and_then(|tail| {
                 tail.split("fn classify_post_submit_prompt_candidates")
@@ -3170,8 +3601,28 @@ mod tests {
             .unwrap();
 
         assert!(checker.contains("prompt_container"));
-        assert!(checker.contains("array_attr(AX_SHEETS)"));
-        assert!(checker.contains("array_attr(AX_WINDOWS)"));
+        assert!(checker.contains("array_attr_checked(AX_SHEETS)"));
+        assert!(checker.contains("array_attr_checked(AX_WINDOWS)"));
+    }
+
+    #[test]
+    fn sensitive_ax_visibility_and_enabled_queries_fail_closed() {
+        let implementation = include_str!("macos_ax.rs");
+        let visibility = implementation
+            .split("fn is_hidden(element: &AxElement)")
+            .nth(1)
+            .and_then(|tail| tail.split("fn element_enabled").next())
+            .unwrap();
+        let enabled = implementation
+            .split("fn element_enabled(element: &AxElement)")
+            .nth(1)
+            .and_then(|tail| tail.split("fn element_explicitly_frontmost").next())
+            .unwrap();
+
+        assert!(visibility.contains("!= Some(false)"));
+        assert!(enabled.contains("== Some(true)"));
+        assert!(!visibility.contains("unwrap_or(false)"));
+        assert!(!enabled.contains("unwrap_or(true)"));
     }
 
     #[test]

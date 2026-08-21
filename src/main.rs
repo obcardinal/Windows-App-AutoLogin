@@ -36,7 +36,7 @@ mod user_paths;
 #[cfg(target_os = "windows")]
 mod windows_ui;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 include!(concat!(env!("OUT_DIR"), "/waal_build_metadata.rs"));
 
 use eframe::egui;

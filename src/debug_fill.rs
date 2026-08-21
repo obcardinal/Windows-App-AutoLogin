@@ -899,7 +899,21 @@ fn fill_current_prompt_once_macos(
                 "fill_duration_ms",
                 fill_start.elapsed().as_millis().to_string(),
             );
-            return log.fail(format!("fill_failed_{e}"));
+            let cleanup_confirmed = if e.cleanup_prompt().is_some() {
+                record_password_cleanup_result(
+                    &mut log,
+                    e.cleanup_prompt().map(|filled_prompt| {
+                        crate::macos_ax::clear_filled_password(app_name, filled_prompt)
+                    }),
+                )
+            } else {
+                true
+            };
+            return if cleanup_confirmed {
+                log.fail(format!("fill_failed_{e}"))
+            } else {
+                log.fail("password_cleanup_failed_after_ambiguous_fill")
+            };
         }
     };
     log.set(
@@ -1515,7 +1529,21 @@ fn fill_current_prompt_once_windows(
                 "fill_duration_ms",
                 fill_start.elapsed().as_millis().to_string(),
             );
-            return log.fail(format!("fill_script_failed_{e}"));
+            let cleanup_confirmed = if e.cleanup_prompt().is_some() {
+                record_password_cleanup_result(
+                    &mut log,
+                    e.cleanup_prompt().map(|filled_prompt| {
+                        crate::windows_ui::clear_filled_password(app_name, filled_prompt)
+                    }),
+                )
+            } else {
+                true
+            };
+            return if cleanup_confirmed {
+                log.fail(format!("fill_script_failed_{e}"))
+            } else {
+                log.fail("password_cleanup_failed_after_ambiguous_fill")
+            };
         }
     };
     log.set(
@@ -1654,6 +1682,8 @@ fn inspect_windows_prompt_for_fill(
                 has_session: false,
                 session_windows: Vec::new(),
                 password_like_plain_edit_rejected: false,
+                prompt_scan_complete: false,
+                target_process_scan_complete: false,
             })
         }
         Ok(None) => {
@@ -2792,6 +2822,61 @@ mod tests {
             "let fill_result = match fill_result {",
             "crate::windows_ui::submit_prompt(",
         );
+    }
+
+    #[test]
+    fn ambiguous_password_write_is_cleaned_after_local_password_drop() {
+        let implementation = include_str!("debug_fill.rs");
+        for (fill, cleanup_call) in [
+            (
+                source_between(
+                    implementation,
+                    "fn fill_current_prompt_once_macos(",
+                    "fn detect_current_prompt_context_macos(",
+                ),
+                "crate::macos_ax::clear_filled_password(app_name, filled_prompt)",
+            ),
+            (
+                source_between(
+                    implementation,
+                    "fn fill_current_prompt_once_windows(",
+                    "fn inspect_windows_prompt_for_fill(",
+                ),
+                "crate::windows_ui::clear_filled_password(app_name, filled_prompt)",
+            ),
+        ] {
+            let write = fill.find("let fill_result =").unwrap();
+            let drop_secret = fill[write..].find("drop(password);").unwrap() + write;
+            let ambiguous_cleanup =
+                fill[drop_secret..].find("e.cleanup_prompt()").unwrap() + drop_secret;
+            let clear_field =
+                fill[ambiguous_cleanup..].find(cleanup_call).unwrap() + ambiguous_cleanup;
+            let hard_failure = fill[clear_field..]
+                .find("password_cleanup_failed_after_ambiguous_fill")
+                .unwrap()
+                + clear_field;
+
+            assert!(write < drop_secret);
+            assert!(drop_secret < ambiguous_cleanup);
+            assert!(ambiguous_cleanup < clear_field);
+            assert!(clear_field < hard_failure);
+        }
+
+        let macos_boundary = include_str!("macos_ax.rs")
+            .split("pub(crate) fn fill_verified_password")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn ensure_verified_prompt_matches_fill_target")
+                    .next()
+            })
+            .unwrap();
+        let windows_boundary = include_str!("windows_ui.rs")
+            .split("fn set_password_value(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn set_zeroizing_password_value").next())
+            .unwrap();
+        assert!(macos_boundary.contains("MacosFillFailure::ambiguous_write"));
+        assert!(windows_boundary.contains("WindowsFillFailure::ambiguous_write"));
     }
 
     #[test]

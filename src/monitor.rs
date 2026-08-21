@@ -17,6 +17,22 @@ pub(crate) enum MonitorStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MonitorObservation {
+    pub(crate) status: MonitorStatus,
+    pub(crate) definitive_no_prompt: bool,
+}
+
+impl MonitorObservation {
+    #[allow(dead_code)]
+    pub(crate) fn indeterminate(status: MonitorStatus) -> Self {
+        Self {
+            status,
+            definitive_no_prompt: false,
+        }
+    }
+}
+
 pub(crate) struct AppMonitor {
     config: Arc<Config>,
 }
@@ -26,7 +42,7 @@ impl AppMonitor {
         Self { config }
     }
 
-    pub(crate) fn check_status(&self) -> MonitorStatus {
+    pub(crate) fn check_status(&self) -> MonitorObservation {
         #[cfg(target_os = "macos")]
         {
             check_status_macos(&self.config)
@@ -38,7 +54,7 @@ impl AppMonitor {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             tracing::trace!("Monitor stub on unsupported platform");
-            MonitorStatus::Unknown
+            MonitorObservation::indeterminate(MonitorStatus::Unknown)
         }
     }
 }
@@ -67,17 +83,22 @@ struct FormInspection {
 }
 
 #[cfg(target_os = "macos")]
-fn check_status_macos(config: &Config) -> MonitorStatus {
+fn check_status_macos(config: &Config) -> MonitorObservation {
     check_status_macos_with_inspector(config, inspect_windows_app_macos_native)
 }
 
 #[cfg(target_os = "macos")]
-fn check_status_macos_with_inspector<F>(config: &Config, inspect: F) -> MonitorStatus
+fn check_status_macos_with_inspector<F>(config: &Config, inspect: F) -> MonitorObservation
 where
     F: FnOnce(&str, bool) -> WindowInspection,
 {
     let inspection = inspect(&config.macos_app_name, true);
-    status_from_macos_inspection(&inspection)
+    let status = status_from_macos_inspection(&inspection);
+    MonitorObservation {
+        definitive_no_prompt: matches!(status, MonitorStatus::ProcessNotFound)
+            && inspection.process_found == Some(false),
+        status,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -142,7 +163,11 @@ fn inspect_windows_app_macos_native(app_name: &str, _include_form_text: bool) ->
                 prompt_origin: prompt.origin.as_str(),
             });
             WindowInspection {
-                process_found: Some(inspection.target.is_some()),
+                // A trusted process may be running even when AX refuses the
+                // application/window lookup. Keep native process presence
+                // separate from AX target/window availability so an AX error
+                // can never be mistaken for a verified process exit.
+                process_found: Some(inspection.process_found),
                 titles: inspection
                     .window_titles
                     .into_iter()
@@ -259,17 +284,53 @@ mod tests {
             macos_app_name: crate::config::TARGET_APP_NAME.to_string(),
         };
 
-        let status = check_status_macos_with_inspector(&config, |_app_name, _include_form_text| {
-            inspection(
-                vec![title(42, "Sign in")],
-                vec![form(42, "Sign in", Some("user@example.com"))],
-            )
-        });
+        let observation =
+            check_status_macos_with_inspector(&config, |_app_name, _include_form_text| {
+                inspection(
+                    vec![title(42, "Sign in")],
+                    vec![form(42, "Sign in", Some("user@example.com"))],
+                )
+            });
 
         assert_eq!(
-            status,
+            observation.status,
             login_status(42, "Sign in", Some("user@example.com"))
         );
+        assert!(!observation.definitive_no_prompt);
+    }
+
+    #[test]
+    fn macos_only_verified_native_process_absence_is_definitive() {
+        let config = Config {
+            macos_app_name: crate::config::TARGET_APP_NAME.to_string(),
+        };
+
+        let running_but_ax_unavailable =
+            check_status_macos_with_inspector(&config, |_, _| WindowInspection {
+                process_found: Some(true),
+                ..Default::default()
+            });
+        assert_eq!(running_but_ax_unavailable.status, MonitorStatus::Unknown);
+        assert!(!running_but_ax_unavailable.definitive_no_prompt);
+
+        let connected = check_status_macos_with_inspector(&config, |_, _| {
+            inspection(vec![title(42, "Finance Desktop 01")], vec![])
+        });
+        assert_eq!(connected.status, MonitorStatus::Connected);
+        assert!(!connected.definitive_no_prompt);
+
+        let native_enumeration_failed =
+            check_status_macos_with_inspector(&config, |_, _| WindowInspection::default());
+        assert_eq!(native_enumeration_failed.status, MonitorStatus::Unknown);
+        assert!(!native_enumeration_failed.definitive_no_prompt);
+
+        let verified_absence =
+            check_status_macos_with_inspector(&config, |_, _| WindowInspection {
+                process_found: Some(false),
+                ..Default::default()
+            });
+        assert_eq!(verified_absence.status, MonitorStatus::ProcessNotFound);
+        assert!(verified_absence.definitive_no_prompt);
     }
 
     #[test]
