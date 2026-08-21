@@ -510,7 +510,7 @@ fn fill_current_prompt_once_macos(
     log.set("pre_password_revalidation_attempted", "true");
     let pre_password_revalidation_start = Instant::now();
     let verified_prompt = match crate::macos_ax::preflight_password_load_prompt(
-        &app_name,
+        app_name,
         prompt.verified_prompt.as_ref(),
         prompt.process_id,
         &prompt.window_title,
@@ -646,12 +646,13 @@ fn fill_current_prompt_once_macos(
         }
     };
     if let Err(e) = guard() {
+        drop(password);
         return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
     }
 
     let fill_start = Instant::now();
-    let fill_result = match crate::macos_ax::fill_verified_password(
-        &app_name,
+    let fill_result = crate::macos_ax::fill_verified_password(
+        app_name,
         verified_prompt,
         prompt.process_id,
         &prompt.window_title,
@@ -660,7 +661,9 @@ fn fill_current_prompt_once_macos(
         password.as_str(),
         macos_fill_method(method),
         guard,
-    ) {
+    );
+    drop(password);
+    let fill_result = match fill_result {
         Ok(result) => result,
         Err(e) => {
             log.set(
@@ -682,7 +685,7 @@ fn fill_current_prompt_once_macos(
 
     let submit_start = Instant::now();
     let submit_result = match crate::macos_ax::submit_prompt_after_fill(
-        &app_name,
+        app_name,
         fill_result.filled_prompt.as_ref(),
         prompt.process_id,
         &prompt.window_title,
@@ -1244,17 +1247,20 @@ fn fill_current_prompt_once_windows(
         }
     };
     if let Err(e) = guard() {
+        drop(password);
         return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
     }
 
     let fill_start = Instant::now();
-    let fill_result = match crate::windows_ui::fill_password(
+    let fill_result = crate::windows_ui::fill_password(
         app_name,
         &prompt,
         password.as_str(),
         method.as_windows_strategy(),
         guard,
-    ) {
+    );
+    drop(password);
+    let fill_result = match fill_result {
         Ok(result) => result,
         Err(e) => {
             log.set(
@@ -1422,7 +1428,7 @@ fn runtime_status_report_macos(_settings: &AppSettings, accounts: &[Account]) ->
     };
     apply_windows_app_fields(&mut log, target);
 
-    let prompt = match crate::macos_ax::detect_visible_prompt(&app_name, None, None, None) {
+    let prompt = match crate::macos_ax::detect_visible_prompt(app_name, None, None, None) {
         Ok(prompt) => prompt,
         Err(e) => return log.fail(format!("prompt_detection_failed_{e}")),
     };
@@ -2435,6 +2441,34 @@ mod tests {
     }
 
     #[test]
+    fn loaded_password_is_dropped_before_submit_on_macos_and_windows() {
+        let implementation = include_str!("debug_fill.rs");
+        let macos_fill = source_between(
+            implementation,
+            "fn fill_current_prompt_once_macos(",
+            "fn detect_current_prompt_context_macos(",
+        );
+        let windows_fill = source_between(
+            implementation,
+            "fn fill_current_prompt_once_windows(",
+            "fn inspect_windows_prompt_for_fill(",
+        );
+
+        assert_password_lifetime_order(
+            macos_fill,
+            "crate::macos_ax::fill_verified_password(",
+            "let fill_result = match fill_result {",
+            "crate::macos_ax::submit_prompt_after_fill(",
+        );
+        assert_password_lifetime_order(
+            windows_fill,
+            "crate::windows_ui::fill_password(",
+            "let fill_result = match fill_result {",
+            "crate::windows_ui::submit_prompt(",
+        );
+    }
+
+    #[test]
     fn debug_log_path_fields_use_coarse_redaction() {
         let mut log = super::DebugLog::new("test".to_string());
         log.set(
@@ -2505,6 +2539,30 @@ mod tests {
             .map(|offset| start_index + offset)
             .expect("source end marker");
         &source[start_index..end_index]
+    }
+
+    fn assert_password_lifetime_order(
+        implementation: &str,
+        fill_marker: &str,
+        fill_result_marker: &str,
+        submit_marker: &str,
+    ) {
+        assert!(implementation.contains(
+            "if let Err(e) = guard() {\n        drop(password);\n        return log.fail(format!(\"attempt_cancelled_after_password_load_{e}\"));"
+        ));
+        let fill_index = implementation.find(fill_marker).expect("fill marker");
+        let drop_index = implementation[fill_index..]
+            .find("drop(password);")
+            .map(|offset| fill_index + offset)
+            .expect("password drop after fill");
+        let fill_result_index = implementation
+            .find(fill_result_marker)
+            .expect("fill result marker");
+        let submit_index = implementation.find(submit_marker).expect("submit marker");
+
+        assert!(fill_index < drop_index);
+        assert!(drop_index < fill_result_index);
+        assert!(fill_result_index < submit_index);
     }
 
     #[cfg(target_os = "macos")]

@@ -9,7 +9,7 @@ PRODUCTION_APP_NAME="WindowsAppAutoLogin"
 DIAGNOSTICS_APP_NAME="WindowsAppAutoLoginDiagnostics"
 APP_NAME="$PRODUCTION_APP_NAME"
 APP_DISPLAY_NAME="Windows App AutoLogin"
-DEVELOPMENT_BUNDLE_ID="dev.codex.windows-app-autologin"
+DEVELOPMENT_BUNDLE_ID="obcardinal.windows-app-autologin"
 ZIP_PATH=""
 BINARY_NAME="windows-app-autologin"
 PRODUCTION_BUNDLE_ID="${WAAL_RELEASE_BUNDLE_ID:-}"
@@ -24,6 +24,12 @@ RELEASE_DIAGNOSTICS_ARTIFACT=false
 STAGE_DIR=""
 BUILD_TARGET_DIR=""
 TARGET_EXECUTABLE=""
+RELEASE_GIT_COMMIT=""
+RELEASE_GIT_TREE=""
+RELEASE_SOURCE_ROOT=""
+RELEASE_SOURCE_DIR=""
+RELEASE_CARGO_BIN=""
+RELEASE_RUSTC_BIN=""
 CARGO_VERSION="$(waal_cargo_version "$ROOT_DIR")"
 BUILD_VERSION="$(waal_build_version "$CARGO_VERSION")"
 
@@ -61,6 +67,192 @@ valid_team_id() {
     [A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9]) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+valid_git_object_id() {
+  local value="$1"
+  [ "${#value}" -eq 40 ] || return 1
+  case "$value" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+}
+
+capture_release_provenance_for_root() {
+  local requested_root="$1"
+  local source_root
+  local git_root
+  local git_commit
+  local git_tree
+  local confirmed_commit
+  local confirmed_tree
+  local worktree_status
+
+  if ! source_root="$(cd "$requested_root" 2>/dev/null && /bin/pwd -P)"; then
+    echo "Release source directory is unavailable." >&2
+    return 1
+  fi
+  if ! git_root="$(/usr/bin/git -C "$source_root" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "Release source is not a Git checkout." >&2
+    return 1
+  fi
+  if ! git_root="$(cd "$git_root" 2>/dev/null && /bin/pwd -P)"; then
+    echo "Release Git root directory is unavailable." >&2
+    return 1
+  fi
+  if [ "$git_root" != "$source_root" ]; then
+    echo "Release source must be the root of its Git checkout." >&2
+    return 1
+  fi
+  if ! git_commit="$(/usr/bin/git -C "$source_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
+    || ! valid_git_object_id "$git_commit"; then
+    echo "Release source HEAD must resolve to an exact lowercase 40-hex commit ID." >&2
+    return 1
+  fi
+  if ! git_tree="$(/usr/bin/git -C "$source_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)" \
+    || ! valid_git_object_id "$git_tree"; then
+    echo "Release source HEAD must resolve to an exact lowercase 40-hex tree ID." >&2
+    return 1
+  fi
+  if ! worktree_status="$(/usr/bin/git -C "$source_root" status \
+    --porcelain=v1 \
+    --untracked-files=all \
+    --ignore-submodules=none 2>/dev/null)"; then
+    echo "Unable to verify release source worktree state." >&2
+    return 1
+  fi
+  if [ -n "$worktree_status" ]; then
+    echo "Release source must have no tracked or untracked worktree changes." >&2
+    return 1
+  fi
+  if ! confirmed_commit="$(/usr/bin/git -C "$source_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
+    || ! confirmed_tree="$(/usr/bin/git -C "$source_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)" \
+    || [ "$confirmed_commit" != "$git_commit" ] \
+    || [ "$confirmed_tree" != "$git_tree" ]; then
+    echo "Release source HEAD changed while provenance was being captured." >&2
+    return 1
+  fi
+
+  RELEASE_GIT_COMMIT="$git_commit"
+  RELEASE_GIT_TREE="$git_tree"
+}
+
+capture_release_provenance() {
+  capture_release_provenance_for_root "$ROOT_DIR"
+}
+
+verify_release_source_unchanged() {
+  local expected_commit="$RELEASE_GIT_COMMIT"
+  local expected_tree="$RELEASE_GIT_TREE"
+
+  if ! valid_git_object_id "$expected_commit" || ! valid_git_object_id "$expected_tree"; then
+    echo "Release source provenance was not initialized." >&2
+    return 1
+  fi
+  if ! capture_release_provenance_for_root "$ROOT_DIR"; then
+    return 1
+  fi
+  if [ "$RELEASE_GIT_COMMIT" != "$expected_commit" ] || [ "$RELEASE_GIT_TREE" != "$expected_tree" ]; then
+    echo "Release source HEAD or tree changed during packaging." >&2
+    return 1
+  fi
+}
+
+materialize_release_source_for_root() {
+  local requested_root="$1"
+  local destination="$2"
+  local expected_commit="$3"
+  local expected_tree="$4"
+  local actual_tree
+
+  if ! valid_git_object_id "$expected_commit" || ! valid_git_object_id "$expected_tree"; then
+    echo "Release source provenance must be initialized before materializing source." >&2
+    return 1
+  fi
+  if [ -e "$destination" ]; then
+    echo "Release source snapshot destination already exists." >&2
+    return 1
+  fi
+  if ! actual_tree="$(/usr/bin/git -C "$requested_root" rev-parse --verify "$expected_commit^{tree}" 2>/dev/null)" \
+    || [ "$actual_tree" != "$expected_tree" ]; then
+    echo "Release commit does not resolve to the captured source tree." >&2
+    return 1
+  fi
+
+  /bin/mkdir -p "$destination"
+  if ! /usr/bin/git -C "$requested_root" archive --format=tar "$expected_commit" \
+    | /usr/bin/tar -xf - -C "$destination"; then
+    echo "Failed to materialize the release source snapshot from Git." >&2
+    return 1
+  fi
+  for required_path in Cargo.toml Cargo.lock build.rs src assets; do
+    if [ ! -e "$destination/$required_path" ]; then
+      echo "Release source snapshot is missing required tracked path: $required_path" >&2
+      return 1
+    fi
+  done
+}
+
+materialize_release_source() {
+  RELEASE_SOURCE_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/waal-release-source.XXXXXX")"
+  RELEASE_SOURCE_DIR="$RELEASE_SOURCE_ROOT/source"
+  materialize_release_source_for_root \
+    "$ROOT_DIR" \
+    "$RELEASE_SOURCE_DIR" \
+    "$RELEASE_GIT_COMMIT" \
+    "$RELEASE_GIT_TREE"
+  CARGO_VERSION="$(waal_cargo_version "$RELEASE_SOURCE_DIR")"
+  BUILD_VERSION="$(waal_build_version "$CARGO_VERSION")"
+}
+
+release_encoded_rustflags() {
+  local source_root="${RELEASE_SOURCE_DIR:-$ROOT_DIR}"
+  local encoded="--remap-path-prefix=$source_root=."
+  if [ "$source_root" != "$ROOT_DIR" ]; then
+    encoded+=$'\x1f'
+    encoded+="--remap-path-prefix=$ROOT_DIR=."
+  fi
+  if [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/" ]; then
+    encoded+=$'\x1f'
+    encoded+="--remap-path-prefix=$HOME=~"
+  fi
+  /usr/bin/printf '%s' "$encoded"
+}
+
+run_sanitized_release_cargo() {
+  local encoded_rustflags
+  encoded_rustflags="$(release_encoded_rustflags)"
+
+  if [ -z "${HOME:-}" ] || [ "${HOME:-}" = "/" ]; then
+    echo "A non-root HOME is required for release packaging." >&2
+    return 1
+  fi
+  if [ ! -x "$RELEASE_CARGO_BIN" ] || [ ! -x "$RELEASE_RUSTC_BIN" ]; then
+    echo "Release Cargo and rustc executables must be resolved before building." >&2
+    return 1
+  fi
+  if ! valid_git_object_id "$RELEASE_GIT_COMMIT" || ! valid_git_object_id "$RELEASE_GIT_TREE"; then
+    echo "Release Git provenance must be initialized before building." >&2
+    return 1
+  fi
+
+  /usr/bin/env -i \
+    HOME="$HOME" \
+    PATH="$PATH" \
+    RUSTC="$RELEASE_RUSTC_BIN" \
+    RUSTC_WRAPPER= \
+    RUSTC_WORKSPACE_WRAPPER= \
+    CARGO_ENCODED_RUSTFLAGS="$encoded_rustflags" \
+    CARGO_TARGET_DIR="$BUILD_TARGET_DIR" \
+    CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang \
+    CC=/usr/bin/clang \
+    CXX=/usr/bin/clang++ \
+    AR=/usr/bin/ar \
+    WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
+    WAAL_DIAGNOSTICS_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID" \
+    WAAL_MACOS_TEAM_ID="$EXPECTED_TEAM_ID" \
+    WAAL_RELEASE_GIT_COMMIT="$RELEASE_GIT_COMMIT" \
+    WAAL_RELEASE_GIT_TREE="$RELEASE_GIT_TREE" \
+    "$RELEASE_CARGO_BIN" "$@"
 }
 
 validate_release_environment() {
@@ -121,45 +313,26 @@ cleanup() {
   if [ -n "${STAGE_DIR:-}" ]; then
     /bin/rm -rf "$STAGE_DIR"
   fi
+  if [ -n "${RELEASE_SOURCE_ROOT:-}" ]; then
+    /bin/rm -rf "$RELEASE_SOURCE_ROOT"
+  fi
 }
 
 build_release_executable() {
   BUILD_TARGET_DIR="$STAGE_DIR/target"
   TARGET_EXECUTABLE="$BUILD_TARGET_DIR/release/$BINARY_NAME"
-  local release_rustflags="${RUSTFLAGS:-}"
-  release_rustflags="${release_rustflags:+$release_rustflags }--remap-path-prefix=$ROOT_DIR=."
-  if [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/" ]; then
-    release_rustflags="$release_rustflags --remap-path-prefix=$HOME=~"
-  fi
 
   (
-    cd "$ROOT_DIR"
+    cd "$RELEASE_SOURCE_DIR"
     if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-      env \
-        -u CARGO_ENCODED_RUSTFLAGS \
-        -u WAAL_DEVELOPMENT_RELEASE \
-        -u WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH \
-        -u WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH \
-        WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
-        WAAL_DIAGNOSTICS_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID" \
-        WAAL_MACOS_TEAM_ID="$EXPECTED_TEAM_ID" \
-        RUSTFLAGS="$release_rustflags" \
-        CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build \
+      run_sanitized_release_cargo build \
         --locked \
         --release \
         --no-default-features \
         --features release-diagnostics \
         --bin "$BINARY_NAME"
     else
-      env \
-        -u CARGO_ENCODED_RUSTFLAGS \
-        -u WAAL_DEVELOPMENT_RELEASE \
-        -u WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH \
-        -u WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH \
-        WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
-        WAAL_MACOS_TEAM_ID="$EXPECTED_TEAM_ID" \
-        RUSTFLAGS="$release_rustflags" \
-        CARGO_TARGET_DIR="$BUILD_TARGET_DIR" cargo build --locked --release --bin "$BINARY_NAME"
+      run_sanitized_release_cargo build --locked --release --bin "$BINARY_NAME"
     fi
   )
 
@@ -167,12 +340,13 @@ build_release_executable() {
     echo "Release build did not produce expected executable: $TARGET_EXECUTABLE" >&2
     exit 1
   fi
+  verify_release_source_unchanged
 }
 
 assemble_release_bundle() {
   local bundle_dir="$1"
   waal_assemble_app_bundle \
-    "$ROOT_DIR" \
+    "$RELEASE_SOURCE_DIR" \
     "$bundle_dir" \
     "$BINARY_NAME" \
     "$TARGET_EXECUTABLE" \
@@ -372,6 +546,8 @@ verify_release_build_metadata() {
   require_metadata_field "$metadata" "debug-assertions" "false" "Release executable was built with debug assertions enabled."
   require_metadata_field "$metadata" "macos-bundle-id" "$EXPECTED_BUNDLE_ID" "Release executable runtime bundle identifier does not match $EXPECTED_BUNDLE_ID_ENV."
   require_metadata_field "$metadata" "macos-team-id" "$EXPECTED_TEAM_ID" "Release executable runtime Team ID does not match WAAL_MACOS_TEAM_ID."
+  require_metadata_field "$metadata" "source-git-commit" "$RELEASE_GIT_COMMIT" "Release executable source commit does not match the verified Git HEAD."
+  require_metadata_field "$metadata" "source-git-tree" "$RELEASE_GIT_TREE" "Release executable source tree does not match the verified Git HEAD tree."
   if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
     require_metadata_field "$metadata" "artifact-kind" "release-diagnostics" "Release diagnostics artifact metadata kind is not release-diagnostics."
     require_metadata_field "$metadata" "debug-fill" "false" "Release diagnostics artifact must not include debug-fill."
@@ -406,6 +582,7 @@ verify_no_developer_path_strings() {
 
   for pattern in \
     "$ROOT_DIR" \
+    "$RELEASE_SOURCE_DIR" \
     "${HOME:-}" \
     "/Users/" \
     "/private/var/folders/" \
@@ -557,60 +734,76 @@ extract_and_verify_archive() {
   verify_release_bundle "$extracted_bundle"
 }
 
-require_tool codesign
-require_tool ditto
-require_tool cargo
-require_tool iconutil
-require_tool lipo
-require_tool mktemp
-require_tool od
-require_tool plutil
-require_tool sips
-require_tool sort
-require_tool spctl
-require_tool strings
-require_tool tr
-require_tool unzip
-require_tool xcrun
-require_tool xattr
-require_tool zip
-require_tool zipinfo
+package_macos_main() {
+  require_tool codesign
+  require_tool ditto
+  require_tool cargo
+  require_tool git
+  require_tool iconutil
+  require_tool lipo
+  require_tool mktemp
+  require_tool od
+  require_tool plutil
+  require_tool rustc
+  require_tool sips
+  require_tool sort
+  require_tool spctl
+  require_tool strings
+  require_tool tar
+  require_tool tr
+  require_tool unzip
+  require_tool xcrun
+  require_tool xattr
+  require_tool zip
+  require_tool zipinfo
 
-validate_release_environment
+  RELEASE_CARGO_BIN="$(command -v cargo)"
+  RELEASE_RUSTC_BIN="$(command -v rustc)"
+  validate_release_environment
+  capture_release_provenance
 
-/bin/mkdir -p "$ROOT_DIR/dist"
-/bin/rm -f -- "$ZIP_PATH"
+  /bin/mkdir -p "$ROOT_DIR/dist"
+  /bin/rm -f -- "$ZIP_PATH"
 
-STAGE_DIR="$(/usr/bin/mktemp -d "$ROOT_DIR/dist/.package_macos.XXXXXX")"
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+  STAGE_DIR="$(/usr/bin/mktemp -d "$ROOT_DIR/dist/.package_macos.XXXXXX")"
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-STAGED_BUNDLE="$STAGE_DIR/$APP_NAME.app"
-TMP_ZIP="$STAGE_DIR/$(/usr/bin/basename "$ZIP_PATH")"
+  materialize_release_source
+  verify_release_source_unchanged
 
-build_release_executable
-assemble_release_bundle "$STAGED_BUNDLE"
-verify_release_build_metadata "$STAGED_BUNDLE"
-remove_signature_breaking_xattrs "$STAGED_BUNDLE"
-sign_release_bundle "$STAGED_BUNDLE"
-notarize_and_staple_bundle "$STAGED_BUNDLE"
+  STAGED_BUNDLE="$STAGE_DIR/$APP_NAME.app"
+  TMP_ZIP="$STAGE_DIR/$(/usr/bin/basename "$ZIP_PATH")"
 
-/usr/bin/find "$STAGED_BUNDLE" \( -name .DS_Store -o -name '._*' \) -type f -delete
-/usr/bin/find "$STAGED_BUNDLE" -type d -name __MACOSX -prune -exec /bin/rm -rf {} +
+  build_release_executable
+  assemble_release_bundle "$STAGED_BUNDLE"
+  verify_release_build_metadata "$STAGED_BUNDLE"
+  remove_signature_breaking_xattrs "$STAGED_BUNDLE"
+  sign_release_bundle "$STAGED_BUNDLE"
+  notarize_and_staple_bundle "$STAGED_BUNDLE"
 
-verify_release_bundle "$STAGED_BUNDLE"
+  /usr/bin/find "$STAGED_BUNDLE" \( -name .DS_Store -o -name '._*' \) -type f -delete
+  /usr/bin/find "$STAGED_BUNDLE" -type d -name __MACOSX -prune -exec /bin/rm -rf {} +
 
-(
-  cd "$STAGE_DIR"
-  COPYFILE_DISABLE=1 /usr/bin/zip -r -X "$(/usr/bin/basename "$TMP_ZIP")" "$APP_NAME.app" \
-    -x "*/.DS_Store" "*/._*" "__MACOSX/*" "*/__MACOSX/*" >/dev/null
-)
+  verify_release_bundle "$STAGED_BUNDLE"
 
-validate_archive_entries "$TMP_ZIP"
-extract_and_verify_archive "$TMP_ZIP"
+  (
+    cd "$STAGE_DIR"
+    COPYFILE_DISABLE=1 /usr/bin/zip -r -X "$(/usr/bin/basename "$TMP_ZIP")" "$APP_NAME.app" \
+      -x "*/.DS_Store" "*/._*" "__MACOSX/*" "*/__MACOSX/*" >/dev/null
+  )
 
-/bin/mv -f "$TMP_ZIP" "$ZIP_PATH"
+  validate_archive_entries "$TMP_ZIP"
+  extract_and_verify_archive "$TMP_ZIP"
+  verify_release_source_unchanged
 
-echo "$ZIP_PATH"
+  /bin/mv -f "$TMP_ZIP" "$ZIP_PATH"
+
+  echo "$ZIP_PATH"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  package_macos_main
+fi

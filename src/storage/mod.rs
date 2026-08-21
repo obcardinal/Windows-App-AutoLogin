@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 const SERVICE_NAME: &str = "WindowsAppAutoLogin";
 const FALLBACK_KEY_SERVICE_NAME: &str = "WindowsAppAutoLoginFallbackKey";
 const FALLBACK_KEY_ACCOUNT: &str = "fallback-encryption-key";
+const SCOPED_FALLBACK_KEY_ACCOUNT_PREFIX: &str = "fallback-account-key:";
 const CONFIG_FILE_NAME: &str = "config.json";
 const PASSWORD_FILE_NAME: &str = "passwords.json";
 const FALLBACK_KEY_FILE_NAME: &str = "fallback.key";
@@ -21,6 +22,7 @@ const WINDOWS_USER_BOUND_SECRET_PREFIX: &str = "waub:";
 const WINDOWS_LEGACY_WAAB_SECRET_PREFIX: &str = "waab:";
 const PASSWORD_ENVELOPE_VERSION: u8 = 1;
 const PASSWORD_ENVELOPE_V2_VERSION: u8 = 2;
+const SCOPED_FALLBACK_KEY_VERSION: u8 = 1;
 const SECURE_STORAGE_PASSWORD_PURPOSE: &str = "account-password";
 const SECURE_STORAGE_FALLBACK_KEY_PURPOSE: &str = "fallback-encryption-key";
 #[cfg(any(target_os = "windows", test))]
@@ -38,6 +40,8 @@ const MAX_PASSWORD_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_FALLBACK_KEY_FILE_BYTES: u64 = 128;
 const MAX_PENDING_STORAGE_OPERATION_FILE_BYTES: u64 = 64 * 1024;
 const MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS: usize = 16 * 1024;
+const MAX_FALLBACK_KEY_ID_CHARS: usize = 64;
+const MAX_RETIRED_FALLBACK_KEYS: usize = 4096;
 const PENDING_STORAGE_OPERATION_VERSION: u8 = 1;
 const AES_GCM_NONCE_BYTES: usize = 12;
 const AES_GCM_TAG_BYTES: usize = 16;
@@ -66,6 +70,46 @@ impl fmt::Display for StorageModeMigrationRecoveryRequired {
 }
 
 impl std::error::Error for StorageModeMigrationRecoveryRequired {}
+
+#[derive(Debug)]
+struct PrivateFileWriteCommitted {
+    source: anyhow::Error,
+}
+
+impl fmt::Display for PrivateFileWriteCommitted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("private file replacement committed, but final validation failed")
+    }
+}
+
+impl std::error::Error for PrivateFileWriteCommitted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
+struct PasswordFileWriteCommitted {
+    source: anyhow::Error,
+}
+
+impl fmt::Display for PasswordFileWriteCommitted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("password file replacement committed, but final validation failed")
+    }
+}
+
+impl std::error::Error for PasswordFileWriteCommitted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn private_file_write_committed(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<PrivateFileWriteCommitted>())
+}
 
 pub(crate) fn is_pending_storage_operation_in_progress(error: &anyhow::Error) -> bool {
     error
@@ -812,6 +856,47 @@ fn recovering_storage_operation_file_path() -> anyhow::Result<PathBuf> {
 struct PasswordFile {
     #[serde(default)]
     passwords: HashMap<String, String>,
+    /// New-format fallback entries use a distinct key for every account and
+    /// every password revision. Missing entries are legacy ciphertexts that
+    /// still use the former shared fallback key and are migrated together.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    key_ids: HashMap<AccountId, String>,
+    /// Keys are retired only after the new ciphertext map has been committed.
+    /// Keeping the references in the committed file makes a crash or a
+    /// transient Keychain/Credential Manager error recoverable on the next
+    /// fallback access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_keys: Vec<ScopedFallbackKeyRef>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    retire_legacy_shared_key: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+struct ScopedFallbackKeyRef {
+    account_id: AccountId,
+    key_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ScopedFallbackKeyEnvelope<'a> {
+    version: u8,
+    service: &'a str,
+    account_id_sha256: String,
+    key_id: &'a str,
+    key: &'a str,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ScopedFallbackKeyEnvelopeOwned {
+    version: u8,
+    service: String,
+    account_id_sha256: String,
+    key_id: String,
+    key: Zeroizing<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -1238,6 +1323,55 @@ fn validate_password_file_shape(file: &PasswordFile) -> anyhow::Result<()> {
             anyhow::bail!("password file contains oversized encrypted entry");
         }
     }
+    if file.key_ids.len() > file.passwords.len() {
+        anyhow::bail!("password file contains orphan fallback key references");
+    }
+    let mut active_key_ids = HashSet::new();
+    for (account_id, key_id) in &file.key_ids {
+        if !file.passwords.contains_key(account_id) {
+            anyhow::bail!("password file contains orphan fallback key reference");
+        }
+        validate_fallback_key_id(key_id)?;
+        if !active_key_ids.insert(key_id.as_str()) {
+            anyhow::bail!("password file reuses a scoped fallback key");
+        }
+    }
+    if file.retired_keys.len() > MAX_RETIRED_FALLBACK_KEYS {
+        anyhow::bail!("password file contains too many retired fallback keys");
+    }
+    let mut retired_key_ids = HashSet::new();
+    for retired in &file.retired_keys {
+        if retired.account_id.trim().is_empty() || retired.account_id.len() > 256 {
+            anyhow::bail!("password file contains invalid retired fallback account id");
+        }
+        validate_fallback_key_id(&retired.key_id)?;
+        if active_key_ids.contains(retired.key_id.as_str()) {
+            anyhow::bail!("password file retires an active fallback key");
+        }
+        if !retired_key_ids.insert(retired.key_id.as_str()) {
+            anyhow::bail!("password file contains duplicate retired fallback key");
+        }
+    }
+    if file.retire_legacy_shared_key
+        && file
+            .passwords
+            .keys()
+            .any(|id| !file.key_ids.contains_key(id))
+    {
+        anyhow::bail!("password file retires the shared key while legacy entries remain");
+    }
+    Ok(())
+}
+
+fn validate_fallback_key_id(key_id: &str) -> anyhow::Result<()> {
+    if key_id.is_empty() || key_id.len() > MAX_FALLBACK_KEY_ID_CHARS {
+        anyhow::bail!("password file contains invalid fallback key id");
+    }
+    let parsed = uuid::Uuid::parse_str(key_id)
+        .map_err(|_| anyhow::anyhow!("password file contains invalid fallback key id"))?;
+    if parsed.hyphenated().to_string() != key_id {
+        anyhow::bail!("password file contains non-canonical fallback key id");
+    }
     Ok(())
 }
 
@@ -1291,6 +1425,7 @@ fn validate_pending_storage_operation(operation: &PendingStorageOperation) -> an
 
 fn save_password_file(file: &PasswordFile) -> anyhow::Result<()> {
     ensure_config_dir()?;
+    validate_password_file_shape(file)?;
     let path = password_file_path()?;
     let content = match serde_json::to_string_pretty(file) {
         Ok(c) => c,
@@ -1299,9 +1434,24 @@ fn save_password_file(file: &PasswordFile) -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    write_private_file_atomic(&path, "json.tmp", content.as_bytes())?;
+    write_password_file_atomic(&path, "json.tmp", content.as_bytes())?;
     debug!(path = %redacted_path(&path), entries = file.passwords.len(), "Password file written");
     Ok(())
+}
+
+fn write_password_file_atomic(
+    path: &Path,
+    temp_extension: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    match write_private_file_atomic(path, temp_extension, bytes) {
+        Err(error) if private_file_write_committed(&error) => {
+            Err(anyhow::Error::new(PasswordFileWriteCommitted {
+                source: error,
+            }))
+        }
+        result => result,
+    }
 }
 
 fn write_private_file_atomic(
@@ -1365,7 +1515,8 @@ fn write_private_file_atomic(
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
-    secure_path_permissions(path, 0o600)?;
+    secure_path_permissions(path, 0o600)
+        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
     if let Err(e) = sync_parent_dir(path) {
         warn!(
             path = %crate::user_paths::redacted_path(&path.display().to_string()),
@@ -1521,6 +1672,115 @@ fn sync_dir(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn sync_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+fn new_scoped_fallback_key(
+    account_id: &AccountId,
+) -> anyhow::Result<(ScopedFallbackKeyRef, Zeroizing<[u8; 32]>)> {
+    if account_id.trim().is_empty() || account_id.len() > 256 {
+        anyhow::bail!("cannot create a fallback key for an invalid account id");
+    }
+    let key_ref = ScopedFallbackKeyRef {
+        account_id: account_id.clone(),
+        key_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+    };
+    let mut key = Zeroizing::new([0u8; 32]);
+    rand::thread_rng().fill(&mut *key);
+    Ok((key_ref, key))
+}
+
+fn scoped_fallback_key_account(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<String> {
+    validate_fallback_key_id(&key_ref.key_id)?;
+    Ok(format!(
+        "{SCOPED_FALLBACK_KEY_ACCOUNT_PREFIX}{}",
+        key_ref.key_id
+    ))
+}
+
+fn scoped_fallback_key_purpose(key_ref: &ScopedFallbackKeyRef) -> String {
+    let mut material = Zeroizing::new(Vec::with_capacity(
+        key_ref.account_id.len() + key_ref.key_id.len() + 1,
+    ));
+    material.extend_from_slice(key_ref.account_id.as_bytes());
+    material.push(0);
+    material.extend_from_slice(key_ref.key_id.as_bytes());
+    format!("scoped-fallback-key:{}", sha256_hex(&material))
+}
+
+fn encode_scoped_fallback_key(
+    key_ref: &ScopedFallbackKeyRef,
+    key: &[u8; 32],
+) -> anyhow::Result<Zeroizing<String>> {
+    let encoded_key = Zeroizing::new(STANDARD.encode(key));
+    let envelope = ScopedFallbackKeyEnvelope {
+        version: SCOPED_FALLBACK_KEY_VERSION,
+        service: FALLBACK_KEY_SERVICE_NAME,
+        account_id_sha256: sha256_hex(key_ref.account_id.as_bytes()),
+        key_id: &key_ref.key_id,
+        key: encoded_key.as_str(),
+    };
+    let plaintext = Zeroizing::new(serde_json::to_string(&envelope)?);
+    encode_secure_storage_secret(&scoped_fallback_key_purpose(key_ref), plaintext.as_str())
+}
+
+fn decode_scoped_fallback_key(
+    key_ref: &ScopedFallbackKeyRef,
+    stored: &str,
+) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    let decoded = decode_secure_storage_secret(&scoped_fallback_key_purpose(key_ref), stored)?;
+    let envelope: ScopedFallbackKeyEnvelopeOwned =
+        serde_json::from_str(decoded.plaintext.as_str())?;
+    if envelope.version != SCOPED_FALLBACK_KEY_VERSION
+        || envelope.service != FALLBACK_KEY_SERVICE_NAME
+        || envelope.account_id_sha256 != sha256_hex(key_ref.account_id.as_bytes())
+        || envelope.key_id != key_ref.key_id
+    {
+        anyhow::bail!("scoped fallback key binding does not match password metadata");
+    }
+    decode_fallback_encryption_key(envelope.key.trim())
+}
+
+fn save_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef, key: &[u8; 32]) -> anyhow::Result<()> {
+    let entry = keyring::Entry::new(
+        FALLBACK_KEY_SERVICE_NAME,
+        &scoped_fallback_key_account(key_ref)?,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "{} is unavailable for scoped fallback key storage: {e}",
+            native_secure_storage_name()
+        )
+    })?;
+    let payload = encode_scoped_fallback_key(key_ref, key)?;
+    entry.set_password(payload.as_str()).map_err(|e| {
+        anyhow::anyhow!(
+            "{} refused to save a scoped fallback key: {e}",
+            native_secure_storage_name()
+        )
+    })
+}
+
+fn load_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    let entry = keyring::Entry::new(
+        FALLBACK_KEY_SERVICE_NAME,
+        &scoped_fallback_key_account(key_ref)?,
+    )?;
+    let stored = Zeroizing::new(entry.get_password()?);
+    decode_scoped_fallback_key(key_ref, stored.as_str())
+}
+
+fn delete_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<()> {
+    let entry = keyring::Entry::new(
+        FALLBACK_KEY_SERVICE_NAME,
+        &scoped_fallback_key_account(key_ref)?,
+    )?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "{} refused to retire a scoped fallback key: {e}",
+            native_secure_storage_name()
+        )),
+    }
 }
 
 fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
@@ -1760,16 +2020,17 @@ fn decode_fallback_encryption_key(encoded: &str) -> anyhow::Result<Zeroizing<[u8
     Ok(key)
 }
 
-fn encrypt_password(plaintext: &str) -> anyhow::Result<String> {
-    let key = fallback_encryption_key()?;
-    let cipher = Aes256Gcm::new_from_slice(&*key)
+fn encrypt_password_with_key(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String> {
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| anyhow::anyhow!("failed to create cipher: {:?}", e))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| anyhow::anyhow!("encryption failed: {:?}", e))?;
+    let ciphertext = Zeroizing::new(
+        cipher
+            .encrypt(nonce, plaintext.as_bytes())
+            .map_err(|e| anyhow::anyhow!("encryption failed: {:?}", e))?,
+    );
     let mut combined = nonce_bytes.to_vec();
     combined.extend_from_slice(&ciphertext);
     Ok(STANDARD.encode(&combined))
@@ -1783,65 +2044,380 @@ fn decrypt_password_with_key(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Zero
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| anyhow::anyhow!("failed to create cipher: {:?}", e))?;
     let nonce = Nonce::from_slice(&data[..AES_GCM_NONCE_BYTES]);
-    let plaintext = cipher
-        .decrypt(nonce, &data[AES_GCM_NONCE_BYTES..])
-        .map_err(|e| anyhow::anyhow!("decryption failed: {:?}", e))?;
-    Ok(Zeroizing::new(String::from_utf8(plaintext)?))
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(nonce, &data[AES_GCM_NONCE_BYTES..])
+            .map_err(|e| anyhow::anyhow!("decryption failed: {:?}", e))?,
+    );
+    let plaintext_string = std::str::from_utf8(&plaintext)?.to_owned();
+    drop(plaintext);
+    Ok(Zeroizing::new(plaintext_string))
 }
 
-fn decrypt_password(b64: &str) -> anyhow::Result<(Zeroizing<String>, bool)> {
-    if b64.len() > MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS {
+fn decrypt_password_with_fallback_key(
+    key: &[u8; 32],
+    encoded: &str,
+) -> anyhow::Result<Zeroizing<String>> {
+    if encoded.len() > MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS {
         anyhow::bail!("encrypted password entry is too large");
     }
-    let data = STANDARD.decode(b64)?;
-    let key = fallback_encryption_key()?;
-    decrypt_password_with_key(&key, &data).map(|password| (password, false))
+    let data = Zeroizing::new(STANDARD.decode(encoded)?);
+    decrypt_password_with_key(key, &data)
+}
+
+fn scoped_fallback_key_ref(
+    file: &PasswordFile,
+    account_id: &AccountId,
+) -> Option<ScopedFallbackKeyRef> {
+    file.key_ids
+        .get(account_id)
+        .map(|key_id| ScopedFallbackKeyRef {
+            account_id: account_id.clone(),
+            key_id: key_id.clone(),
+        })
+}
+
+fn push_retired_fallback_key(file: &mut PasswordFile, key_ref: ScopedFallbackKeyRef) {
+    if !file.retired_keys.contains(&key_ref) {
+        file.retired_keys.push(key_ref);
+    }
+}
+
+fn install_scoped_fallback_entry(
+    file: &mut PasswordFile,
+    account_id: &AccountId,
+    key_ref: &ScopedFallbackKeyRef,
+    encrypted: String,
+) {
+    let old_key_ref = scoped_fallback_key_ref(file, account_id);
+    file.passwords.insert(account_id.clone(), encrypted);
+    file.key_ids
+        .insert(account_id.clone(), key_ref.key_id.clone());
+    if let Some(old_key_ref) = old_key_ref {
+        push_retired_fallback_key(file, old_key_ref);
+    }
+}
+
+fn remove_fallback_entry(file: &mut PasswordFile, account_id: &AccountId) -> bool {
+    if file.passwords.remove(account_id).is_none() {
+        return false;
+    }
+    if let Some(key_id) = file.key_ids.remove(account_id) {
+        push_retired_fallback_key(
+            file,
+            ScopedFallbackKeyRef {
+                account_id: account_id.clone(),
+                key_id,
+            },
+        );
+    }
+    true
+}
+
+fn stage_scoped_fallback_entry(
+    account_id: &AccountId,
+    plaintext: &str,
+) -> anyhow::Result<(ScopedFallbackKeyRef, String)> {
+    let (key_ref, key) = new_scoped_fallback_key(account_id)?;
+    let encrypted = encrypt_password_with_key(&key, plaintext)?;
+    save_scoped_fallback_key(&key_ref, &key)?;
+    Ok((key_ref, encrypted))
+}
+
+fn cleanup_uncommitted_scoped_keys(keys: &[ScopedFallbackKeyRef]) {
+    for key_ref in keys {
+        if let Err(e) = delete_scoped_fallback_key(key_ref) {
+            warn!(
+                account_id = %redacted_account_id(&key_ref.account_id),
+                error_kind = storage_error_kind(&e),
+                "Uncommitted scoped fallback key cleanup failed"
+            );
+        }
+    }
+}
+
+fn migrate_legacy_fallback_entries(
+    file: &mut PasswordFile,
+) -> anyhow::Result<Vec<ScopedFallbackKeyRef>> {
+    let legacy_account_ids = file
+        .passwords
+        .keys()
+        .filter(|account_id| !file.key_ids.contains_key(*account_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if legacy_account_ids.is_empty() {
+        file.retire_legacy_shared_key = true;
+        return Ok(Vec::new());
+    }
+
+    let shared_key = fallback_encryption_key()?;
+    migrate_legacy_fallback_entries_with_ops(
+        file,
+        &legacy_account_ids,
+        &shared_key,
+        stage_scoped_fallback_entry,
+        cleanup_uncommitted_scoped_keys,
+    )
+}
+
+fn migrate_legacy_fallback_entries_with_ops<SE, CK>(
+    file: &mut PasswordFile,
+    legacy_account_ids: &[AccountId],
+    shared_key: &[u8; 32],
+    mut stage_entry: SE,
+    mut cleanup_uncommitted: CK,
+) -> anyhow::Result<Vec<ScopedFallbackKeyRef>>
+where
+    SE: FnMut(&AccountId, &str) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
+    CK: FnMut(&[ScopedFallbackKeyRef]),
+{
+    let mut staged = Vec::<(ScopedFallbackKeyRef, String)>::new();
+    for account_id in legacy_account_ids {
+        let staged_entry = (|| {
+            let encrypted = password_entry_for_account(file, account_id)?;
+            let plaintext = decrypt_password_with_fallback_key(shared_key, encrypted)?;
+            stage_entry(account_id, plaintext.as_str())
+        })();
+        match staged_entry {
+            Ok(entry) => staged.push(entry),
+            Err(e) => {
+                let staged_keys = staged
+                    .iter()
+                    .map(|(key_ref, _)| key_ref.clone())
+                    .collect::<Vec<_>>();
+                cleanup_uncommitted(&staged_keys);
+                return Err(e);
+            }
+        }
+    }
+
+    for (key_ref, encrypted) in &staged {
+        file.passwords
+            .insert(key_ref.account_id.clone(), encrypted.clone());
+        file.key_ids
+            .insert(key_ref.account_id.clone(), key_ref.key_id.clone());
+    }
+    file.retire_legacy_shared_key = true;
+    Ok(staged.into_iter().map(|(key_ref, _)| key_ref).collect())
+}
+
+fn cleanup_retired_fallback_keys(file: &mut PasswordFile) -> anyhow::Result<bool> {
+    cleanup_retired_fallback_keys_with_ops(
+        file,
+        delete_scoped_fallback_key,
+        delete_fallback_key_material,
+    )
+}
+
+fn cleanup_retired_fallback_keys_with_ops<DS, DL>(
+    file: &mut PasswordFile,
+    mut delete_scoped: DS,
+    mut delete_legacy_shared: DL,
+) -> anyhow::Result<bool>
+where
+    DS: FnMut(&ScopedFallbackKeyRef) -> anyhow::Result<()>,
+    DL: FnMut() -> anyhow::Result<()>,
+{
+    let mut changed = false;
+    let mut failures = 0usize;
+    let mut remaining = Vec::new();
+    for key_ref in std::mem::take(&mut file.retired_keys) {
+        match delete_scoped(&key_ref) {
+            Ok(()) => changed = true,
+            Err(e) => {
+                failures += 1;
+                warn!(
+                    account_id = %redacted_account_id(&key_ref.account_id),
+                    error_kind = storage_error_kind(&e),
+                    "Retired scoped fallback key cleanup failed"
+                );
+                remaining.push(key_ref);
+            }
+        }
+    }
+    file.retired_keys = remaining;
+
+    if file.retire_legacy_shared_key {
+        match delete_legacy_shared() {
+            Ok(()) => {
+                file.retire_legacy_shared_key = false;
+                changed = true;
+            }
+            Err(e) => {
+                failures += 1;
+                warn!(
+                    error_kind = storage_error_kind(&e),
+                    "Retired shared fallback key cleanup failed"
+                );
+            }
+        }
+    }
+
+    if failures == 0 {
+        Ok(changed)
+    } else {
+        anyhow::bail!("{failures} retired fallback key cleanup attempts failed")
+    }
+}
+
+fn commit_password_file_with_staged_keys<SF, CK>(
+    file: &PasswordFile,
+    staged_keys: &[ScopedFallbackKeyRef],
+    mut save_file: SF,
+    mut cleanup_uncommitted: CK,
+) -> anyhow::Result<()>
+where
+    SF: FnMut(&PasswordFile) -> anyhow::Result<()>,
+    CK: FnMut(&[ScopedFallbackKeyRef]),
+{
+    match save_file(file) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if password_file_write_committed(&e) {
+                warn!(
+                    error_kind = storage_error_kind(&e),
+                    "Password file commit completed, but durability verification failed; staged keys remain active"
+                );
+                return Ok(());
+            }
+            cleanup_uncommitted(staged_keys);
+            Err(e)
+        }
+    }
+}
+
+fn password_file_write_committed(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<PasswordFileWriteCommitted>())
+}
+
+fn stage_and_commit_fallback_password_with_ops<SE, ML, SF, CK>(
+    file: &mut PasswordFile,
+    account: &Account,
+    password: &str,
+    mut stage_entry: SE,
+    mut migrate_legacy: ML,
+    save_file: SF,
+    mut cleanup_uncommitted: CK,
+) -> anyhow::Result<()>
+where
+    SE: FnMut(&AccountId, &str) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
+    ML: FnMut(&mut PasswordFile) -> anyhow::Result<Vec<ScopedFallbackKeyRef>>,
+    SF: FnMut(&PasswordFile) -> anyhow::Result<()>,
+    CK: FnMut(&[ScopedFallbackKeyRef]),
+{
+    let payload = encode_bound_password(account, password)?;
+    let (new_key_ref, encrypted) = stage_entry(&account.id, payload.as_str())?;
+    let mut staged_keys = vec![new_key_ref.clone()];
+    install_scoped_fallback_entry(file, &account.id, &new_key_ref, encrypted);
+    match migrate_legacy(file) {
+        Ok(mut migrated) => staged_keys.append(&mut migrated),
+        Err(e) => {
+            cleanup_uncommitted(&staged_keys);
+            return Err(e);
+        }
+    }
+    commit_password_file_with_staged_keys(file, &staged_keys, save_file, cleanup_uncommitted)
+}
+
+fn finalize_fallback_key_retirement(file: &mut PasswordFile) {
+    let before = (file.retired_keys.len(), file.retire_legacy_shared_key);
+    let cleanup_result = cleanup_retired_fallback_keys(file);
+    let after = (file.retired_keys.len(), file.retire_legacy_shared_key);
+    if before != after {
+        if let Err(e) = save_password_file(file) {
+            warn!(
+                error_kind = storage_error_kind(&e),
+                "Fallback key retirement succeeded, but cleanup metadata could not be committed"
+            );
+        }
+    }
+    if let Err(e) = cleanup_result {
+        warn!(
+            error_kind = storage_error_kind(&e),
+            "Fallback key retirement remains pending and will be retried"
+        );
+    }
 }
 
 fn save_to_file(account: &Account, password: &str) -> anyhow::Result<()> {
     let mut file = load_password_file()?;
-    let payload = encode_bound_password(account, password)?;
-    let encrypted = match encrypt_password(payload.as_str()) {
-        Ok(enc) => enc,
-        Err(e) => {
-            warn!(account_id = %redacted_account_id(&account.id), error = %e, "Failed to encrypt password");
-            return Err(e);
-        }
-    };
-    file.passwords.insert(account.id.clone(), encrypted);
-    match save_password_file(&file) {
-        Ok(()) => {}
-        Err(e) => {
-            warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_password_file failed");
-            return Err(e);
-        }
+    finalize_fallback_key_retirement(&mut file);
+    if let Err(e) = stage_and_commit_fallback_password_with_ops(
+        &mut file,
+        account,
+        password,
+        stage_scoped_fallback_entry,
+        migrate_legacy_fallback_entries,
+        save_password_file,
+        cleanup_uncommitted_scoped_keys,
+    ) {
+        warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_password_file failed");
+        return Err(e);
     }
+    finalize_fallback_key_retirement(&mut file);
     Ok(())
 }
 
 fn load_from_file(account: &Account) -> anyhow::Result<LoadedStoredPassword> {
     let mut file = load_password_file()?;
-    let encrypted = password_entry_for_account(&file, &account.id)?.to_string();
+    finalize_fallback_key_retirement(&mut file);
+    let encrypted = Zeroizing::new(password_entry_for_account(&file, &account.id)?.to_string());
     if encrypted.len() > MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS {
         anyhow::bail!("encrypted password entry is too large");
     }
-    let (stored, used_legacy_key) = decrypt_password(&encrypted)?;
+    let active_key_ref = scoped_fallback_key_ref(&file, &account.id);
+    let stored = if let Some(key_ref) = &active_key_ref {
+        let key = load_scoped_fallback_key(key_ref)?;
+        decrypt_password_with_fallback_key(&key, encrypted.as_str())?
+    } else {
+        let key = fallback_encryption_key()?;
+        decrypt_password_with_fallback_key(&key, encrypted.as_str())?
+    };
+    let used_legacy_key = active_key_ref.is_none();
     let (password, format) = decode_bound_password(account, stored.as_str())?;
 
-    if used_legacy_key || format == StoredPasswordFormat::LegacyRaw {
-        let payload = encode_bound_password(account, password.as_str())?;
-        match encrypt_password(payload.as_str()) {
-            Ok(reencrypted) => {
-                file.passwords.insert(account.id.clone(), reencrypted);
-                if let Err(e) = save_password_file(&file) {
-                    warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy fallback storage, but migration to bound storage failed");
-                } else {
-                    info!(account_id = %redacted_account_id(&account.id), "Migrated fallback password to bound storage");
-                }
+    let mut staged_keys = Vec::new();
+    let migration_result = (|| -> anyhow::Result<bool> {
+        let has_legacy_entries = file
+            .passwords
+            .keys()
+            .any(|account_id| !file.key_ids.contains_key(account_id));
+        if has_legacy_entries {
+            staged_keys.extend(migrate_legacy_fallback_entries(&mut file)?);
+        }
+
+        if format == StoredPasswordFormat::LegacyRaw {
+            let payload = encode_bound_password(account, password.as_str())?;
+            let (new_key_ref, reencrypted) =
+                stage_scoped_fallback_entry(&account.id, payload.as_str())?;
+            staged_keys.push(new_key_ref.clone());
+            install_scoped_fallback_entry(&mut file, &account.id, &new_key_ref, reencrypted);
+        }
+
+        Ok(has_legacy_entries || used_legacy_key || format == StoredPasswordFormat::LegacyRaw)
+    })();
+
+    match migration_result {
+        Ok(true) => match commit_password_file_with_staged_keys(
+            &file,
+            &staged_keys,
+            save_password_file,
+            cleanup_uncommitted_scoped_keys,
+        ) {
+            Ok(()) => {
+                finalize_fallback_key_retirement(&mut file);
+                info!(account_id = %redacted_account_id(&account.id), "Migrated fallback password to independently rotated key storage");
             }
             Err(e) => {
-                warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy fallback storage, but re-encryption failed");
+                warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy fallback storage, but migration commit failed");
             }
+        },
+        Ok(false) => finalize_fallback_key_retirement(&mut file),
+        Err(e) => {
+            cleanup_uncommitted_scoped_keys(&staged_keys);
+            warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded, but migration to independently rotated fallback key storage failed");
         }
     }
 
@@ -1863,14 +2439,30 @@ fn password_entry_for_account<'a>(
 
 fn delete_from_file(account_id: &AccountId) -> anyhow::Result<()> {
     let mut file = load_password_file()?;
-    if file.passwords.remove(account_id).is_some() {
-        save_password_file(&file)?;
+    finalize_fallback_key_retirement(&mut file);
+    if !remove_fallback_entry(&mut file, account_id) {
+        return Ok(());
     }
+    let staged_keys = migrate_legacy_fallback_entries(&mut file)?;
+    commit_password_file_with_staged_keys(
+        &file,
+        &staged_keys,
+        save_password_file,
+        cleanup_uncommitted_scoped_keys,
+    )?;
+    finalize_fallback_key_retirement(&mut file);
     Ok(())
 }
 
 pub(crate) fn cleanup_unused_fallback_key_material() -> anyhow::Result<()> {
-    let file = load_password_file()?;
+    let mut file = load_password_file()?;
+    let before = (file.retired_keys.len(), file.retire_legacy_shared_key);
+    let cleanup_result = cleanup_retired_fallback_keys(&mut file);
+    let after = (file.retired_keys.len(), file.retire_legacy_shared_key);
+    if before != after {
+        save_password_file(&file)?;
+    }
+    cleanup_result?;
     cleanup_fallback_key_if_password_file_empty(&file, delete_fallback_key_material)
 }
 
@@ -3086,28 +3678,31 @@ pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
 mod tests {
     use super::{
         backup_invalid_config_file, cleanup_fallback_key_if_password_file_empty,
-        cleanup_legacy_fallback_key_residue_files_in_dir,
+        cleanup_legacy_fallback_key_residue_files_in_dir, cleanup_retired_fallback_keys_with_ops,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
-        clear_pending_storage_operation_paths, decode_bound_password, decrypt_password_with_key,
+        clear_pending_storage_operation_paths, decode_bound_password,
+        decrypt_password_with_fallback_key, decrypt_password_with_key,
         delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
-        encode_bound_password, ensure_no_pending_storage_operation,
-        is_pending_storage_operation_in_progress, legacy_account_id_for_migrated_config,
-        legacy_migration_target_cleanup_id, legacy_password_migration_ready_to_persist,
-        load_config_file, load_pending_storage_operation_record_or_quarantine_from_paths,
-        migrate_legacy_config, normalize_config, password_entry_for_account,
+        encode_bound_password, encrypt_password_with_key, ensure_no_pending_storage_operation,
+        install_scoped_fallback_entry, is_pending_storage_operation_in_progress,
+        legacy_account_id_for_migrated_config, legacy_migration_target_cleanup_id,
+        legacy_password_migration_ready_to_persist, load_config_file,
+        load_pending_storage_operation_record_or_quarantine_from_paths, migrate_legacy_config,
+        migrate_legacy_fallback_entries_with_ops, normalize_config, password_entry_for_account,
         pending_storage_backend_to_cleanup, pending_storage_operation_account_ids_known,
         quarantine_pending_storage_operation_file, read_private_text_file,
         reconcile_account_config_save_operation_with_ops,
         reconcile_account_delete_operation_with_ops, redact_password_load_error,
-        redacted_account_id, save_pending_storage_operation_to_paths, sha256_hex,
-        storage_error_kind, validate_password_file_shape, validate_pending_storage_operation,
+        redacted_account_id, remove_fallback_entry, save_pending_storage_operation_to_paths,
+        sha256_hex, stage_and_commit_fallback_password_with_ops, storage_error_kind,
+        validate_password_file_shape, validate_pending_storage_operation,
         verify_pending_storage_surviving_backend, write_private_file_atomic,
         write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
-        LegacyPasswordMigration, PasswordFile, PasswordStorageBackend, PendingStorageOperation,
-        StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
-        PENDING_STORAGE_OPERATION_VERSION, SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
-        SECURE_STORAGE_PASSWORD_PURPOSE, WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
-        WINDOWS_USER_BOUND_SECRET_PREFIX,
+        LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted, PasswordStorageBackend,
+        PendingStorageOperation, ScopedFallbackKeyRef, StoredPasswordFormat, AES_GCM_NONCE_BYTES,
+        AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES, PENDING_STORAGE_OPERATION_VERSION,
+        SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE,
+        WINDOWS_LEGACY_WAAB_SECRET_PREFIX, WINDOWS_USER_BOUND_SECRET_PREFIX,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -3119,7 +3714,7 @@ mod tests {
     use crate::models::{Account, AppConfig, FIXED_POLL_INTERVAL_SECS};
     #[cfg(target_os = "windows")]
     use base64::Engine as _;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
     #[test]
@@ -3870,6 +4465,7 @@ mod tests {
                     "encrypted-email".to_string(),
                 ),
             ]),
+            ..PasswordFile::default()
         };
 
         assert_eq!(
@@ -4191,6 +4787,437 @@ mod tests {
     }
 
     #[test]
+    fn scoped_fallback_update_and_delete_retire_each_password_revision_key() {
+        let account_id = "account-1".to_string();
+        let first_key = ScopedFallbackKeyRef {
+            account_id: account_id.clone(),
+            key_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let second_key = ScopedFallbackKeyRef {
+            account_id: account_id.clone(),
+            key_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        };
+        let mut file = PasswordFile::default();
+
+        install_scoped_fallback_entry(
+            &mut file,
+            &account_id,
+            &first_key,
+            "first-ciphertext".to_string(),
+        );
+        install_scoped_fallback_entry(
+            &mut file,
+            &account_id,
+            &second_key,
+            "second-ciphertext".to_string(),
+        );
+
+        assert_eq!(file.key_ids.get(&account_id), Some(&second_key.key_id));
+        assert_eq!(file.retired_keys, vec![first_key.clone()]);
+        validate_password_file_shape(&file).unwrap();
+
+        assert!(remove_fallback_entry(&mut file, &account_id));
+        assert!(file.passwords.is_empty());
+        assert!(file.key_ids.is_empty());
+        assert_eq!(file.retired_keys, vec![first_key, second_key]);
+        validate_password_file_shape(&file).unwrap();
+    }
+
+    #[test]
+    fn rotated_fallback_key_cannot_decrypt_a_prior_password_revision() {
+        let prior_key = [7u8; 32];
+        let next_key = [9u8; 32];
+        let prior_ciphertext =
+            encrypt_password_with_key(&prior_key, "previous-password-envelope").unwrap();
+        let next_ciphertext =
+            encrypt_password_with_key(&next_key, "current-password-envelope").unwrap();
+
+        assert_eq!(
+            decrypt_password_with_fallback_key(&prior_key, &prior_ciphertext)
+                .unwrap()
+                .as_str(),
+            "previous-password-envelope"
+        );
+        assert!(decrypt_password_with_fallback_key(&next_key, &prior_ciphertext).is_err());
+        assert_eq!(
+            decrypt_password_with_fallback_key(&next_key, &next_ciphertext)
+                .unwrap()
+                .as_str(),
+            "current-password-envelope"
+        );
+    }
+
+    #[test]
+    fn legacy_password_file_schema_loads_without_scoped_key_metadata() {
+        let file: PasswordFile =
+            serde_json::from_str(r#"{"passwords":{"account-1":"legacy-ciphertext"}}"#).unwrap();
+
+        assert_eq!(
+            file.passwords.get("account-1").map(String::as_str),
+            Some("legacy-ciphertext")
+        );
+        assert!(file.key_ids.is_empty());
+        assert!(file.retired_keys.is_empty());
+        assert!(!file.retire_legacy_shared_key);
+        validate_password_file_shape(&file).unwrap();
+    }
+
+    #[test]
+    fn password_file_shape_rejects_malformed_or_ambiguous_scoped_key_metadata() {
+        let account_1 = "account-1".to_string();
+        let account_2 = "account-2".to_string();
+        let key_1 = "11111111-1111-4111-8111-111111111111".to_string();
+        let key_2 = "22222222-2222-4222-8222-222222222222".to_string();
+        let passwords = HashMap::from([
+            (account_1.clone(), "ciphertext-1".to_string()),
+            (account_2.clone(), "ciphertext-2".to_string()),
+        ]);
+
+        let invalid_files = [
+            PasswordFile {
+                passwords: HashMap::from([(account_1.clone(), "ciphertext".to_string())]),
+                key_ids: HashMap::from([(account_1.clone(), "not-a-key-id".to_string())]),
+                ..PasswordFile::default()
+            },
+            PasswordFile {
+                key_ids: HashMap::from([(account_1.clone(), key_1.clone())]),
+                ..PasswordFile::default()
+            },
+            PasswordFile {
+                passwords: passwords.clone(),
+                key_ids: HashMap::from([
+                    (account_1.clone(), key_1.clone()),
+                    (account_2.clone(), key_1.clone()),
+                ]),
+                ..PasswordFile::default()
+            },
+            PasswordFile {
+                passwords: HashMap::from([(account_1.clone(), "ciphertext".to_string())]),
+                key_ids: HashMap::from([(account_1.clone(), key_1.clone())]),
+                retired_keys: vec![ScopedFallbackKeyRef {
+                    account_id: account_2.clone(),
+                    key_id: key_1.clone(),
+                }],
+                ..PasswordFile::default()
+            },
+            PasswordFile {
+                retired_keys: vec![
+                    ScopedFallbackKeyRef {
+                        account_id: account_1.clone(),
+                        key_id: key_2.clone(),
+                    },
+                    ScopedFallbackKeyRef {
+                        account_id: account_2.clone(),
+                        key_id: key_2.clone(),
+                    },
+                ],
+                ..PasswordFile::default()
+            },
+            PasswordFile {
+                passwords: HashMap::from([(account_1.clone(), "legacy-ciphertext".to_string())]),
+                retire_legacy_shared_key: true,
+                ..PasswordFile::default()
+            },
+        ];
+
+        for file in invalid_files {
+            assert!(validate_password_file_shape(&file).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_shared_key_migration_preserves_every_password_entry() {
+        let shared_key = [3u8; 32];
+        let account_ids = vec!["account-1".to_string(), "account-2".to_string()];
+        let plaintexts = HashMap::from([
+            (account_ids[0].clone(), "first-bound-envelope".to_string()),
+            (account_ids[1].clone(), "second-bound-envelope".to_string()),
+        ]);
+        let scoped_keys = HashMap::from([
+            (account_ids[0].clone(), [7u8; 32]),
+            (account_ids[1].clone(), [9u8; 32]),
+        ]);
+        let scoped_key_ids = HashMap::from([
+            (
+                account_ids[0].clone(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+            ),
+            (
+                account_ids[1].clone(),
+                "22222222-2222-4222-8222-222222222222".to_string(),
+            ),
+        ]);
+        let mut file = PasswordFile {
+            passwords: plaintexts
+                .iter()
+                .map(|(account_id, plaintext)| {
+                    (
+                        account_id.clone(),
+                        encrypt_password_with_key(&shared_key, plaintext).unwrap(),
+                    )
+                })
+                .collect(),
+            ..PasswordFile::default()
+        };
+
+        let staged = migrate_legacy_fallback_entries_with_ops(
+            &mut file,
+            &account_ids,
+            &shared_key,
+            |account_id, plaintext| {
+                assert_eq!(plaintext, plaintexts[account_id]);
+                let key = scoped_keys[account_id];
+                let key_ref = ScopedFallbackKeyRef {
+                    account_id: account_id.clone(),
+                    key_id: scoped_key_ids[account_id].clone(),
+                };
+                Ok((key_ref, encrypt_password_with_key(&key, plaintext).unwrap()))
+            },
+            |_| panic!("successful migration must not clean staged keys"),
+        )
+        .unwrap();
+
+        assert_eq!(staged.len(), account_ids.len());
+        assert!(file.retire_legacy_shared_key);
+        for account_id in &account_ids {
+            assert_eq!(file.key_ids[account_id], scoped_key_ids[account_id]);
+            assert_eq!(
+                decrypt_password_with_fallback_key(
+                    &scoped_keys[account_id],
+                    &file.passwords[account_id],
+                )
+                .unwrap()
+                .as_str(),
+                plaintexts[account_id]
+            );
+        }
+        validate_password_file_shape(&file).unwrap();
+    }
+
+    #[test]
+    fn failed_legacy_migration_cleans_staged_keys_without_mutating_password_metadata() {
+        let shared_key = [3u8; 32];
+        let account_ids = vec!["account-1".to_string(), "account-2".to_string()];
+        let mut file = PasswordFile {
+            passwords: HashMap::from([
+                (
+                    account_ids[0].clone(),
+                    encrypt_password_with_key(&shared_key, "first").unwrap(),
+                ),
+                (
+                    account_ids[1].clone(),
+                    encrypt_password_with_key(&shared_key, "second").unwrap(),
+                ),
+            ]),
+            ..PasswordFile::default()
+        };
+        let original = file.clone();
+        let stage_count = Cell::new(0usize);
+        let cleaned = RefCell::new(Vec::new());
+        let first_key = ScopedFallbackKeyRef {
+            account_id: account_ids[0].clone(),
+            key_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+
+        let result = migrate_legacy_fallback_entries_with_ops(
+            &mut file,
+            &account_ids,
+            &shared_key,
+            |account_id, plaintext| {
+                let count = stage_count.get();
+                stage_count.set(count + 1);
+                if count == 1 {
+                    anyhow::bail!("second scoped key save failed");
+                }
+                assert_eq!(account_id, &account_ids[0]);
+                Ok((
+                    first_key.clone(),
+                    encrypt_password_with_key(&[7u8; 32], plaintext).unwrap(),
+                ))
+            },
+            |keys| cleaned.borrow_mut().extend_from_slice(keys),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(stage_count.get(), 2);
+        assert_eq!(&*cleaned.borrow(), &[first_key]);
+        assert_eq!(file.passwords, original.passwords);
+        assert_eq!(file.key_ids, original.key_ids);
+        assert!(!file.retire_legacy_shared_key);
+    }
+
+    #[test]
+    fn rotated_fallback_save_stages_keys_before_commit_and_cleans_only_new_keys_on_failure() {
+        let account_id = "account-1".to_string();
+        let legacy_account_id = "account-2".to_string();
+        let old_key = ScopedFallbackKeyRef {
+            account_id: account_id.clone(),
+            key_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let new_key = ScopedFallbackKeyRef {
+            account_id: account_id.clone(),
+            key_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        };
+        let migrated_key = ScopedFallbackKeyRef {
+            account_id: legacy_account_id.clone(),
+            key_id: "33333333-3333-4333-8333-333333333333".to_string(),
+        };
+        let pending_retirement = ScopedFallbackKeyRef {
+            account_id: "already-retired".to_string(),
+            key_id: "44444444-4444-4444-8444-444444444444".to_string(),
+        };
+        let mut file = PasswordFile {
+            passwords: HashMap::from([
+                (account_id.clone(), "old-ciphertext".to_string()),
+                (legacy_account_id.clone(), "legacy-ciphertext".to_string()),
+            ]),
+            key_ids: HashMap::from([(account_id.clone(), old_key.key_id.clone())]),
+            retired_keys: vec![pending_retirement.clone()],
+            ..PasswordFile::default()
+        };
+        let committed_file = RefCell::new(file.clone());
+        let events = RefCell::new(Vec::<&'static str>::new());
+        let cleaned = RefCell::new(Vec::new());
+        let mut account = Account::new("user@example.com");
+        account.id = account_id.clone();
+
+        let result = stage_and_commit_fallback_password_with_ops(
+            &mut file,
+            &account,
+            "new-password",
+            |received_account_id, plaintext| {
+                events.borrow_mut().push("stage-active-key");
+                assert_eq!(received_account_id, &account_id);
+                assert!(!plaintext.is_empty());
+                Ok((new_key.clone(), "new-ciphertext".to_string()))
+            },
+            |candidate| {
+                events.borrow_mut().push("stage-legacy-keys");
+                candidate
+                    .passwords
+                    .insert(legacy_account_id.clone(), "migrated-ciphertext".to_string());
+                candidate
+                    .key_ids
+                    .insert(legacy_account_id.clone(), migrated_key.key_id.clone());
+                candidate.retire_legacy_shared_key = true;
+                Ok(vec![migrated_key.clone()])
+            },
+            |candidate| {
+                events.borrow_mut().push("commit-password-file");
+                assert_eq!(candidate.key_ids[&account_id], new_key.key_id);
+                assert!(candidate.retired_keys.contains(&old_key));
+                anyhow::bail!("atomic password file commit failed")
+            },
+            |keys| {
+                events.borrow_mut().push("cleanup-staged-keys");
+                cleaned.borrow_mut().extend_from_slice(keys);
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "stage-active-key",
+                "stage-legacy-keys",
+                "commit-password-file",
+                "cleanup-staged-keys",
+            ]
+        );
+        assert_eq!(&*cleaned.borrow(), &[new_key, migrated_key]);
+        assert!(!cleaned.borrow().contains(&old_key));
+        assert!(!cleaned.borrow().contains(&pending_retirement));
+        assert_eq!(committed_file.borrow().key_ids[&account_id], old_key.key_id);
+        assert_eq!(
+            committed_file.borrow().passwords[&account_id],
+            "old-ciphertext"
+        );
+    }
+
+    #[test]
+    fn committed_password_file_error_never_deletes_keys_referenced_by_the_new_file() {
+        let key_ref = ScopedFallbackKeyRef {
+            account_id: "account-1".to_string(),
+            key_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let file = PasswordFile {
+            passwords: HashMap::from([(key_ref.account_id.clone(), "new-ciphertext".to_string())]),
+            key_ids: HashMap::from([(key_ref.account_id.clone(), key_ref.key_id.clone())]),
+            ..PasswordFile::default()
+        };
+        let cleanup_calls = Cell::new(0usize);
+
+        super::commit_password_file_with_staged_keys(
+            &file,
+            std::slice::from_ref(&key_ref),
+            |_| {
+                Err(anyhow::Error::new(PasswordFileWriteCommitted {
+                    source: anyhow::anyhow!("permission verification failed after rename"),
+                }))
+            },
+            |_| cleanup_calls.set(cleanup_calls.get() + 1),
+        )
+        .unwrap();
+
+        assert_eq!(cleanup_calls.get(), 0);
+    }
+
+    #[test]
+    fn failed_retired_key_cleanup_keeps_retry_metadata_until_success() {
+        let first = ScopedFallbackKeyRef {
+            account_id: "account-1".to_string(),
+            key_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let second = ScopedFallbackKeyRef {
+            account_id: "account-2".to_string(),
+            key_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        };
+        let mut file = PasswordFile {
+            retired_keys: vec![first.clone(), second.clone()],
+            retire_legacy_shared_key: true,
+            ..PasswordFile::default()
+        };
+        let attempts = RefCell::new(HashMap::<String, usize>::new());
+
+        let first_result = cleanup_retired_fallback_keys_with_ops(
+            &mut file,
+            |key_ref| {
+                *attempts
+                    .borrow_mut()
+                    .entry(key_ref.key_id.clone())
+                    .or_default() += 1;
+                if key_ref == &first {
+                    anyhow::bail!("transient scoped key delete failure");
+                }
+                Ok(())
+            },
+            || anyhow::bail!("transient shared key delete failure"),
+        );
+
+        assert!(first_result.is_err());
+        assert_eq!(file.retired_keys, vec![first.clone()]);
+        assert!(file.retire_legacy_shared_key);
+
+        let second_result = cleanup_retired_fallback_keys_with_ops(
+            &mut file,
+            |key_ref| {
+                *attempts
+                    .borrow_mut()
+                    .entry(key_ref.key_id.clone())
+                    .or_default() += 1;
+                Ok(())
+            },
+            || Ok(()),
+        );
+
+        assert!(second_result.unwrap());
+        assert!(file.retired_keys.is_empty());
+        assert!(!file.retire_legacy_shared_key);
+        assert_eq!(attempts.borrow()[&first.key_id], 2);
+        assert_eq!(attempts.borrow()[&second.key_id], 1);
+    }
+
+    #[test]
     fn stale_backend_cleanup_failure_after_save_returns_warning() {
         let account_id = "account-1".to_string();
 
@@ -4420,6 +5447,7 @@ mod tests {
             (
                 PasswordFile {
                     passwords: HashMap::from([("account-1".to_string(), "encrypted".to_string())]),
+                    ..PasswordFile::default()
                 },
                 0,
             ),
@@ -4449,6 +5477,7 @@ mod tests {
                 "account-1".to_string(),
                 "x".repeat(super::MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS + 1),
             )]),
+            ..PasswordFile::default()
         };
 
         assert!(validate_password_file_shape(&file).is_err());
@@ -4458,6 +5487,7 @@ mod tests {
     fn password_file_shape_rejects_invalid_account_ids() {
         let file = PasswordFile {
             passwords: HashMap::from([("".to_string(), "encrypted".to_string())]),
+            ..PasswordFile::default()
         };
 
         assert!(validate_password_file_shape(&file).is_err());

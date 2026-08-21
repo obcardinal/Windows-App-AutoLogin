@@ -1,7 +1,7 @@
 pub(crate) const APP_NAME: &str = env!("WAAL_APP_NAME");
 
 #[cfg(target_os = "macos")]
-const DEVELOPMENT_MACOS_BUNDLE_ID: &str = "dev.codex.windows-app-autologin";
+const DEVELOPMENT_MACOS_BUNDLE_ID: &str = "obcardinal.windows-app-autologin";
 
 #[cfg(target_os = "macos")]
 pub(crate) const TRUSTED_MACOS_BUNDLE_PATH: &str = env!("WAAL_TRUSTED_MACOS_BUNDLE_PATH");

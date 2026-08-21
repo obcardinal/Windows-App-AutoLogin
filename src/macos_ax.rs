@@ -46,6 +46,9 @@ const AX_TEXT_FIELD_ROLE: &str = "AXTextField";
 const AX_SECURE_TEXT_FIELD_ROLE: &str = "AXSecureTextField";
 const AX_STATIC_TEXT_ROLE: &str = "AXStaticText";
 const AX_SHEET_ROLE: &str = "AXSheet";
+const AX_WINDOW_ROLE: &str = "AXWindow";
+const AX_DIALOG_SUBROLE: &str = "AXDialog";
+const AX_SYSTEM_DIALOG_SUBROLE: &str = "AXSystemDialog";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MacosInspection {
@@ -99,6 +102,7 @@ pub(crate) struct MacosPrompt {
     pub(crate) origin: PromptOrigin,
     trusted_process: macos_identity::TrustedProcessInfo,
     target_window: AxElement,
+    native_container: AxElement,
     prompt_root: AxElement,
     password_field: AxElement,
     submit_button: Option<AxElement>,
@@ -526,7 +530,8 @@ fn inspect_process(
             });
         }
 
-        for (window_index, window) in visible_windows.into_iter().enumerate() {
+        let visible_window_count = visible_windows.len();
+        for window in visible_windows {
             let window_title = window.string_attr(AX_TITLE).unwrap_or_default();
             inspection.window_titles.push(MacosWindowTitle {
                 process_id: process.pid,
@@ -541,7 +546,7 @@ fn inspect_process(
 
             let window_frontmost = window_is_frontmost_for_app(
                 app_frontmost,
-                window_index,
+                visible_window_count,
                 any_explicit_frontmost_window,
                 element_explicitly_frontmost(window),
             );
@@ -556,16 +561,22 @@ fn inspect_process(
                 inspection.target = Some(target.clone());
             }
 
+            let visible_sheets = sheet_candidates_for_window(window)
+                .into_iter()
+                .filter(|sheet| !is_hidden(sheet))
+                .collect::<Vec<_>>();
+            let visible_sheet_count = visible_sheets.len();
+            let any_explicit_frontmost_sheet =
+                visible_sheets.iter().any(element_explicitly_frontmost);
             let mut found_sheet_prompt = false;
-            for sheet in sheet_candidates_for_window(window) {
-                if is_hidden(&sheet) {
-                    continue;
-                }
+            for sheet in visible_sheets {
                 let sheet_elements = collect_elements(&sheet);
                 let sheet_target = MacosTarget {
                     frontmost: sheet_is_frontmost_for_app(
                         app_frontmost,
                         target.frontmost,
+                        visible_sheet_count,
+                        any_explicit_frontmost_sheet,
                         element_explicitly_frontmost(&sheet),
                     ),
                     ..target.clone()
@@ -592,7 +603,7 @@ fn inspect_process(
                     window: Some(window.clone()),
                 });
             }
-            if found_sheet_prompt || !window_should_scan_for_prompt(&target, &window_title) {
+            if found_sheet_prompt || !window_should_scan_for_prompt(window, &window_title) {
                 continue;
             }
 
@@ -639,7 +650,10 @@ pub(crate) fn detect_visible_prompt(
         expected_process_id,
         None,
         expected_email,
-    );
+    )
+    .into_iter()
+    .filter(|prompt| prompt.target.frontmost)
+    .collect::<Vec<_>>();
     let prompts = if expected_window_title.is_some() {
         prompts
             .iter()
@@ -702,6 +716,7 @@ fn same_prompt_candidate(left: &MacosPrompt, right: &MacosPrompt) -> bool {
         && left.email.as_deref().map(normalized_prompt_email)
             == right.email.as_deref().map(normalized_prompt_email)
         && left.target_window.same_element(&right.target_window)
+        && left.native_container.same_element(&right.native_container)
         && left.prompt_root.same_element(&right.prompt_root)
         && left.password_field.same_element(&right.password_field)
         && same_optional_element(left.submit_button.as_ref(), right.submit_button.as_ref())
@@ -716,18 +731,22 @@ fn same_optional_element(left: Option<&AxElement>, right: Option<&AxElement>) ->
 }
 
 fn preferred_unique_prompt(prompts: &[MacosPrompt]) -> Option<&MacosPrompt> {
-    let frontmost = prompts
-        .iter()
-        .filter(|prompt| prompt.target.frontmost)
-        .collect::<Vec<_>>();
-    match frontmost.as_slice() {
-        [prompt] => Some(*prompt),
-        [] => match prompts {
-            [prompt] => Some(prompt),
-            _ => None,
-        },
-        _ => None,
+    unique_frontmost_index(prompts.iter().map(|prompt| prompt.target.frontmost))
+        .map(|index| &prompts[index])
+}
+
+fn unique_frontmost_index(frontmost_states: impl IntoIterator<Item = bool>) -> Option<usize> {
+    let mut selected = None;
+    for (index, frontmost) in frontmost_states.into_iter().enumerate() {
+        if !frontmost {
+            continue;
+        }
+        if selected.is_some() {
+            return None;
+        }
+        selected = Some(index);
     }
+    selected
 }
 
 fn matching_prompt_candidates<'a>(
@@ -876,6 +895,12 @@ pub(crate) fn fill_verified_password(
         expected_prompt_origin,
         expected_email,
     )?;
+    let password_field_role = verified_prompt.prompt.password_field_role.clone();
+    let password_field_description_present = !verified_prompt
+        .prompt
+        .password_field_description
+        .trim()
+        .is_empty();
     let prepared = revalidate_prepared_prompt_for_fill(
         app_name,
         &verified_prompt,
@@ -883,14 +908,15 @@ pub(crate) fn fill_verified_password(
         expected_window_title,
         expected_email,
     )?;
-    let prompt = verified_prompt.prompt;
-    let password_field_role = prompt.password_field_role.clone();
-    let password_field_description_present = !prompt.password_field_description.trim().is_empty();
 
     let submit_button_ready_after_fill = false;
     let password_field_focused = false;
     let method_used = match method {
         MacosFillMethod::DirectAxValue => {
+            ensure_revalidated_frontmost(
+                prompt_is_frontmost_now(&verified_prompt.prompt),
+                "password insertion",
+            )?;
             if set_password_value(&prepared.password_field, password) {
                 "axvalue"
             } else {
@@ -900,6 +926,7 @@ pub(crate) fn fill_verified_password(
             }
         }
     };
+    let prompt = verified_prompt.prompt;
 
     Ok(MacosFillResult {
         fill_method: method_used,
@@ -1398,10 +1425,7 @@ fn revalidate_prompt(
     if prompt.target.process_id != expected_process_id {
         anyhow::bail!("credential prompt process changed before automation");
     }
-    if !prompt.target.frontmost {
-        raise_prompt(&prompt);
-        thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
-    }
+    ensure_prompt_frontmost_for_automation(&prompt, "automation")?;
     if !prompt
         .target
         .window_title
@@ -1450,6 +1474,7 @@ fn revalidate_prepared_prompt_for_fill(
         &prompt.prompt_root,
         "password field",
     )?;
+    ensure_prompt_frontmost_for_automation(prompt, "password insertion")?;
     if is_hidden(&prompt.target_window)
         || is_hidden(&prompt.prompt_root)
         || is_hidden(&prompt.password_field)
@@ -1478,6 +1503,7 @@ fn revalidate_prepared_prompt_for_fill(
         &verified_prompt.trusted_process,
         "credential prompt process identity changed before password insertion",
     )?;
+    ensure_revalidated_frontmost(prompt_is_frontmost_now(prompt), "password insertion")?;
     Ok(PreparedPromptForFill {
         password_field: prompt.password_field.clone(),
         trusted_process,
@@ -1557,7 +1583,87 @@ fn raise_prompt(prompt: &MacosPrompt) {
     }
     let _ = prompt.target_window.perform_action(AX_RAISE);
     let _ = prompt.target_window.set_bool_attr(AX_MAIN, true);
-    let _ = prompt.prompt_root.perform_action(AX_RAISE);
+    let _ = prompt.native_container.perform_action(AX_RAISE);
+}
+
+fn ensure_prompt_frontmost_for_automation(
+    prompt: &MacosPrompt,
+    action: &str,
+) -> anyhow::Result<()> {
+    if !prompt_is_frontmost_now(prompt) {
+        raise_prompt(prompt);
+        thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
+    }
+    ensure_revalidated_frontmost(prompt_is_frontmost_now(prompt), action)
+}
+
+fn ensure_revalidated_frontmost(frontmost: bool, action: &str) -> anyhow::Result<()> {
+    if frontmost {
+        Ok(())
+    } else {
+        anyhow::bail!("credential prompt is not frontmost before {action}")
+    }
+}
+
+fn prompt_is_frontmost_now(prompt: &MacosPrompt) -> bool {
+    let Some(app) = AxElement::application(prompt.target.process_id) else {
+        return false;
+    };
+    if app.process_id() != Some(prompt.target.process_id) {
+        return false;
+    }
+
+    let app_frontmost = app.bool_attr(AX_FRONTMOST).unwrap_or(false);
+    let visible_windows = app
+        .array_attr(AX_WINDOWS)
+        .into_iter()
+        .filter(|window| !is_hidden(window))
+        .collect::<Vec<_>>();
+    let any_explicit_frontmost_window = visible_windows.iter().any(element_explicitly_frontmost);
+    let Some(target_window) = visible_windows
+        .iter()
+        .find(|window| window.same_element(&prompt.target_window))
+    else {
+        return false;
+    };
+    let target_window_frontmost = window_is_frontmost_for_app(
+        app_frontmost,
+        visible_windows.len(),
+        any_explicit_frontmost_window,
+        element_explicitly_frontmost(target_window),
+    );
+    if !app_frontmost || !element_has_ancestor(&prompt.prompt_root, &prompt.native_container) {
+        return false;
+    }
+
+    match prompt.origin {
+        PromptOrigin::Window => {
+            target_window_frontmost
+                && prompt.native_container.same_element(target_window)
+                && window_should_scan_for_prompt(target_window, &prompt.target.window_title)
+        }
+        PromptOrigin::Sheet => {
+            let visible_sheets = sheet_candidates_for_window(target_window)
+                .into_iter()
+                .filter(|sheet| !is_hidden(sheet))
+                .collect::<Vec<_>>();
+            let any_explicit_frontmost_sheet =
+                visible_sheets.iter().any(element_explicitly_frontmost);
+            let Some(sheet) = visible_sheets
+                .iter()
+                .find(|sheet| sheet.same_element(&prompt.native_container))
+            else {
+                return false;
+            };
+            sheet_is_frontmost_for_app(
+                app_frontmost,
+                target_window_frontmost,
+                visible_sheets.len(),
+                any_explicit_frontmost_sheet,
+                element_explicitly_frontmost(sheet),
+            )
+        }
+    }
 }
 
 fn current_trusted_process_info(
@@ -1671,10 +1777,26 @@ fn sheet_candidates_for_window(window: &AxElement) -> Vec<AxElement> {
     sheets
 }
 
-fn window_should_scan_for_prompt(target: &MacosTarget, window_title: &str) -> bool {
-    target.frontmost
-        || login_title_like(window_title)
-        || is_probable_session_window_title(window_title)
+fn window_should_scan_for_prompt(window: &AxElement, window_title: &str) -> bool {
+    let identity = window.string_attrs(&[AX_ROLE, AX_SUBROLE]);
+    native_credential_window_identity(
+        identity.first().and_then(Option::as_deref),
+        identity.get(1).and_then(Option::as_deref),
+        window_title,
+    )
+}
+
+fn native_credential_window_identity(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    window_title: &str,
+) -> bool {
+    role.is_some_and(|role| role.eq_ignore_ascii_case(AX_WINDOW_ROLE))
+        && subrole.is_some_and(|subrole| {
+            subrole.eq_ignore_ascii_case(AX_DIALOG_SUBROLE)
+                || subrole.eq_ignore_ascii_case(AX_SYSTEM_DIALOG_SUBROLE)
+        })
+        && login_title_like(window_title)
 }
 
 fn prompt_from_elements(
@@ -1711,14 +1833,6 @@ fn prompt_from_elements(
         }
         let submit_button = select_prompt_submit_button(&scoped_elements);
         submit_button.as_ref()?;
-        let target = MacosTarget {
-            frontmost: target.frontmost
-                || element_explicitly_frontmost(&password_field)
-                || scoped_elements
-                    .iter()
-                    .any(|element| element_explicitly_frontmost(element)),
-            ..target.clone()
-        };
         let identity_text = prompt_text_snapshots(
             &scoped_elements,
             &prompt_email,
@@ -1734,6 +1848,7 @@ fn prompt_from_elements(
             origin,
             trusted_process: trusted_process.clone(),
             target_window: target_window.clone(),
+            native_container: root.clone(),
             prompt_root,
             password_field,
             submit_button,
@@ -2084,21 +2199,27 @@ fn element_explicitly_frontmost(element: &AxElement) -> bool {
 
 fn window_is_frontmost_for_app(
     app_frontmost: bool,
-    visible_window_index: usize,
+    visible_window_count: usize,
     any_explicit_frontmost_window: bool,
     window_explicitly_frontmost: bool,
 ) -> bool {
     app_frontmost
         && (window_explicitly_frontmost
-            || (!any_explicit_frontmost_window && visible_window_index == 0))
+            || (!any_explicit_frontmost_window && visible_window_count == 1))
 }
 
 fn sheet_is_frontmost_for_app(
     app_frontmost: bool,
     parent_window_frontmost: bool,
+    visible_sheet_count: usize,
+    any_explicit_frontmost_sheet: bool,
     sheet_explicitly_frontmost: bool,
 ) -> bool {
-    app_frontmost && (parent_window_frontmost || sheet_explicitly_frontmost)
+    app_frontmost
+        && (sheet_explicitly_frontmost
+            || (parent_window_frontmost
+                && !any_explicit_frontmost_sheet
+                && visible_sheet_count == 1))
 }
 
 fn login_title_like(title: &str) -> bool {
@@ -2122,9 +2243,7 @@ fn sheet_credential_prompt_text_like(text: &str) -> bool {
 fn prompt_identity_verified(window_title: &str, body_text: &str, origin: PromptOrigin) -> bool {
     match origin {
         PromptOrigin::Window => {
-            credential_prompt_text_like(body_text)
-                && (login_title_like(window_title)
-                    || is_probable_session_window_title(window_title))
+            credential_prompt_text_like(body_text) && login_title_like(window_title)
         }
         PromptOrigin::Sheet => sheet_credential_prompt_text_like(body_text),
     }
@@ -2588,11 +2707,64 @@ mod tests {
         let revalidation = fill_verified_password
             .find("revalidate_prepared_prompt_for_fill")
             .unwrap();
+        let final_frontmost_revalidation = fill_verified_password
+            .find("ensure_revalidated_frontmost(")
+            .unwrap();
         let write = fill_verified_password
             .find("set_password_value(&prepared.password_field, password)")
             .unwrap();
 
         assert!(revalidation < write);
+        assert!(revalidation < final_frontmost_revalidation);
+        assert!(final_frontmost_revalidation < write);
+
+        let prepared_revalidation = implementation
+            .split("fn revalidate_prepared_prompt_for_fill")
+            .nth(1)
+            .and_then(|tail| tail.split("fn ensure_trusted_process_matches").next())
+            .unwrap();
+        assert!(prepared_revalidation.contains(
+            "ensure_revalidated_frontmost(prompt_is_frontmost_now(prompt), \"password insertion\")"
+        ));
+    }
+
+    #[test]
+    fn sole_background_prompt_is_never_selected() {
+        assert_eq!(super::unique_frontmost_index([false]), None);
+        assert_eq!(super::unique_frontmost_index([false, true]), Some(1));
+        assert_eq!(super::unique_frontmost_index([true, true]), None);
+
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let detector = implementation
+            .split("pub(crate) fn detect_visible_prompt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn record_prompt_candidate").next())
+            .unwrap();
+        assert!(detector.contains(".filter(|prompt| prompt.target.frontmost)"));
+    }
+
+    #[test]
+    fn failed_raise_revalidation_fails_closed() {
+        assert!(super::ensure_revalidated_frontmost(false, "password insertion").is_err());
+        assert!(super::ensure_revalidated_frontmost(true, "password insertion").is_ok());
+
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let focus_revalidation = implementation
+            .split("fn ensure_prompt_frontmost_for_automation")
+            .nth(1)
+            .and_then(|tail| tail.split("fn ensure_revalidated_frontmost").next())
+            .unwrap();
+        let raise = focus_revalidation.find("raise_prompt(prompt)").unwrap();
+        let recheck = focus_revalidation
+            .rfind("prompt_is_frontmost_now(prompt)")
+            .unwrap();
+        assert!(raise < recheck);
     }
 
     #[test]
@@ -2895,17 +3067,63 @@ mod tests {
     }
 
     #[test]
-    fn window_frontmost_falls_back_to_first_visible_window_only_without_explicit_signal() {
-        assert!(super::window_is_frontmost_for_app(true, 0, false, false));
-        assert!(!super::window_is_frontmost_for_app(true, 1, false, false));
+    fn window_frontmost_falls_back_only_for_one_unambiguous_visible_window() {
+        assert!(super::window_is_frontmost_for_app(true, 1, false, false));
+        assert!(!super::window_is_frontmost_for_app(true, 2, false, false));
     }
 
     #[test]
-    fn sheet_frontmost_can_come_from_parent_window_or_focused_sheet() {
-        assert!(super::sheet_is_frontmost_for_app(true, true, false));
-        assert!(super::sheet_is_frontmost_for_app(true, false, true));
-        assert!(!super::sheet_is_frontmost_for_app(false, true, true));
-        assert!(!super::sheet_is_frontmost_for_app(true, false, false));
+    fn sheet_frontmost_requires_an_exact_focused_sheet_or_unambiguous_foreground_parent() {
+        assert!(super::sheet_is_frontmost_for_app(
+            true, true, 1, false, false
+        ));
+        assert!(super::sheet_is_frontmost_for_app(true, true, 2, true, true));
+        assert!(!super::sheet_is_frontmost_for_app(
+            false, true, 1, false, false
+        ));
+        assert!(super::sheet_is_frontmost_for_app(
+            true, false, 1, true, true
+        ));
+        assert!(!super::sheet_is_frontmost_for_app(
+            true, true, 2, false, false
+        ));
+    }
+
+    #[test]
+    fn generic_session_window_is_not_scanned_as_a_credential_dialog() {
+        let body = "Enter Your Credentials These credentials will be used to connect to \
+                    rdgateway.example.com Username: user@example.com Password:";
+
+        assert!(!super::native_credential_window_identity(
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+            "Contoso Desktop"
+        ));
+        assert!(!super::native_credential_window_identity(
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+            "Sign in"
+        ));
+        assert!(!prompt_identity_verified(
+            "Contoso Desktop",
+            body,
+            PromptOrigin::Window
+        ));
+        assert!(prompt_identity_verified(
+            "Contoso Desktop",
+            body,
+            PromptOrigin::Sheet
+        ));
+        assert!(super::native_credential_window_identity(
+            Some("AXWindow"),
+            Some("AXDialog"),
+            "Sign in"
+        ));
+        assert!(super::native_credential_window_identity(
+            Some("AXWindow"),
+            Some("AXSystemDialog"),
+            "Authentication"
+        ));
     }
 
     #[test]
@@ -2964,7 +3182,7 @@ mod tests {
                 "Azure DevDesktop - Windows 11",
                 "Enter Your Credentials These credentials will be used to connect to rdgateway.example.com Username: user@example.com Password:",
                 PromptOrigin::Window,
-                true,
+                false,
             ),
             (
                 "Connection Center",

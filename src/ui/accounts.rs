@@ -23,6 +23,7 @@ const ACCOUNT_EDITOR_PASSWORD_WIDTH: f32 = 286.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
 const ACTION_ICON_SIZE: f32 = 17.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
+const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
 const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
 const EYE_OFF_ICON: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
 const PENCIL_ICON: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
@@ -48,7 +49,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                 )
                 .clicked()
             {
-                open_account_editor(app, Account::new(""));
+                open_account_editor(ui.ctx(), app, Account::new(""));
             }
         },
     );
@@ -68,7 +69,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                     )
                     .clicked()
                 {
-                    open_account_editor(app, Account::new(""));
+                    open_account_editor(ui.ctx(), app, Account::new(""));
                 }
             });
         });
@@ -100,7 +101,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     }
 
     if let Some(account) = edit_account {
-        open_account_editor(app, account);
+        open_account_editor(ui.ctx(), app, account);
     }
 
     if let Some(account_id) = confirm_delete_account {
@@ -428,8 +429,12 @@ fn account_columns(width: f32) -> AccountColumns {
     }
 }
 
-fn open_account_editor(app: &mut AutoLoginApp, account: Account) {
+fn open_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp, account: Account) {
     tracing::info!("Opening account editor");
+    if let Some(previous_account) = app.editing_account.as_ref() {
+        forget_password_editor_state(ctx, password_editor_id(&previous_account.id));
+    }
+    forget_password_editor_state(ctx, password_editor_id(&account.id));
     app.editing_account = Some(account);
     clear_temp_password(app);
     app.show_password = false;
@@ -437,6 +442,26 @@ fn open_account_editor(app: &mut AutoLoginApp, account: Account) {
 
 fn clear_temp_password(app: &mut AutoLoginApp) {
     app.temp_password = Zeroizing::new(String::new());
+}
+
+fn password_editor_id(account_id: &str) -> egui::Id {
+    egui::Id::new((PASSWORD_EDITOR_ID_SALT, account_id))
+}
+
+fn prepare_password_editor_state(ctx: &egui::Context, id: egui::Id) {
+    let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    state.set_undoer(egui::util::undoer::Undoer::with_settings(
+        egui::util::undoer::Settings {
+            max_undos: 0,
+            ..Default::default()
+        },
+    ));
+    state.store(ctx, id);
+}
+
+fn forget_password_editor_state(ctx: &egui::Context, id: egui::Id) {
+    ctx.memory_mut(|memory| memory.surrender_focus(id));
+    ctx.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id));
 }
 
 fn suppress_password_clipboard_output(ctx: &egui::Context, password_field_has_focus: bool) {
@@ -522,6 +547,8 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let mut open = true;
     let mut close_editor = false;
     let mut account_to_save: Option<Account> = None;
+    let password_editor_id = password_editor_id(&account_snapshot.id);
+    prepare_password_editor_state(ui.ctx(), password_editor_id);
     egui::Window::new(title)
         .open(&mut open)
         .resizable(false)
@@ -544,6 +571,7 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                         ui.label("Password");
                         ui.horizontal(|ui| {
                             let password_edit = egui::TextEdit::singleline(&mut *app.temp_password)
+                                .id(password_editor_id)
                                 .hint_text(if is_existing {
                                     "Leave blank to keep saved password"
                                 } else {
@@ -607,6 +635,7 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let was_editing = app.editing_account.is_some();
     app.editing_account = editing;
     if was_editing && app.editing_account.is_none() {
+        forget_password_editor_state(ui.ctx(), password_editor_id);
         clear_temp_password(app);
     }
 }
@@ -1010,7 +1039,8 @@ mod tests {
     use super::enabled_account_conflicts_with_candidate;
     use super::{
         account_saved_status, clear_account_journal_after_terminal_result_with,
-        delete_account_transaction, suppress_password_clipboard_output,
+        delete_account_transaction, forget_password_editor_state, password_editor_id,
+        prepare_password_editor_state, suppress_password_clipboard_output,
     };
     use crate::models::{Account, AppConfig};
     use crate::storage::{PasswordStorageBackend, StaleBackendCleanupWarning};
@@ -1272,6 +1302,71 @@ mod tests {
                 expected_copy_text
             );
         }
+    }
+
+    #[test]
+    fn password_editor_state_never_keeps_undo_or_redo_text() {
+        let ctx = egui::Context::default();
+        let id = password_editor_id("account-1");
+        let cursor = egui::text::CCursorRange::default();
+        let mut prior_undoer = egui::util::undoer::Undoer::default();
+        prior_undoer.add_undo(&(cursor, "prior-placeholder".to_string()));
+        let mut prior_state = egui::text_edit::TextEditState::default();
+        prior_state.set_undoer(prior_undoer);
+        prior_state.store(&ctx, id);
+
+        prepare_password_editor_state(&ctx, id);
+
+        let state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        let mut undoer = state.undoer();
+        let first_frame = (cursor, "first-placeholder".to_string());
+        let second_frame = (cursor, "second-placeholder".to_string());
+        undoer.feed_state(0.0, &first_frame);
+        undoer.feed_state(2.0, &second_frame);
+        assert!(!undoer.has_undo(&first_frame));
+        assert!(!undoer.has_undo(&second_frame));
+        assert!(!undoer.has_redo(&first_frame));
+        assert!(!undoer.has_redo(&second_frame));
+    }
+
+    #[test]
+    fn closing_password_editor_removes_state_and_focus() {
+        let ctx = egui::Context::default();
+        let id = password_editor_id("account-1");
+        egui::text_edit::TextEditState::default().store(&ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        forget_password_editor_state(&ctx, id);
+
+        assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+        assert!(!ctx.memory(|memory| memory.has_focus(id)));
+    }
+
+    #[test]
+    fn password_editor_lifecycle_wires_stable_state_cleanup() {
+        assert_eq!(
+            password_editor_id("account-1"),
+            password_editor_id("account-1")
+        );
+        assert_ne!(
+            password_editor_id("account-1"),
+            password_editor_id("account-2")
+        );
+
+        let implementation = include_str!("accounts.rs");
+        let editor_start = implementation
+            .find("fn show_account_editor(")
+            .expect("account editor start");
+        let editor_end = implementation[editor_start..]
+            .find("enum AccountActionIcon")
+            .map(|offset| editor_start + offset)
+            .expect("account editor end");
+        let editor = &implementation[editor_start..editor_end];
+
+        assert!(editor.contains("prepare_password_editor_state(ui.ctx(), password_editor_id);"));
+        assert!(editor.contains(".id(password_editor_id)"));
+        assert!(editor.contains("forget_password_editor_state(ui.ctx(), password_editor_id);"));
+        assert!(editor.contains("clear_temp_password(app);"));
     }
 
     fn config_with_account(has_saved_password: bool) -> AppConfig {

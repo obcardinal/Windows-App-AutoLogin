@@ -2471,7 +2471,7 @@ mod tests {
         assert!(!macos_process_identity_matches_current_app(
             &path,
             &path,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |_bundle_path, _bundle_id| true,
             |_bundle_path, _bundle_id, _team_id| {
@@ -2489,7 +2489,7 @@ mod tests {
         assert!(macos_process_identity_matches_current_app(
             &path,
             &path,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |_bundle_path, _bundle_id| true,
             |_bundle_path, _bundle_id, _team_id| false,
@@ -2508,7 +2508,7 @@ mod tests {
         assert!(!macos_process_identity_matches_current_app(
             &path,
             &path,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |bundle_path, bundle_id| {
                 bundle_identifier_args = Some((bundle_path.to_path_buf(), bundle_id.to_string()));
@@ -2523,7 +2523,7 @@ mod tests {
             bundle_identifier_args,
             Some((
                 PathBuf::from("/Applications/WindowsAppAutoLogin.app"),
-                "dev.codex.windows-app-autologin".to_string(),
+                "obcardinal.windows-app-autologin".to_string(),
             ))
         );
     }
@@ -2543,7 +2543,7 @@ mod tests {
         assert!(!macos_process_identity_matches_current_app(
             &hardlink,
             &executable,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |_bundle_path, _bundle_id| true,
             |_bundle_path, _bundle_id, _team_id| true,
@@ -2570,7 +2570,7 @@ mod tests {
         assert!(!macos_process_identity_matches_current_app(
             &linked_executable,
             &linked_executable,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |_bundle_path, _bundle_id| true,
             |_bundle_path, _bundle_id, _team_id| true,
@@ -2597,7 +2597,7 @@ mod tests {
         assert!(!macos_process_identity_matches_current_app(
             &linked_executable,
             &linked_executable,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |_bundle_path, _bundle_id| true,
             |_bundle_path, _bundle_id, _team_id| true,
@@ -2615,7 +2615,7 @@ mod tests {
         assert!(!macos_process_identity_matches_current_app(
             &path,
             &path,
-            "dev.codex.windows-app-autologin",
+            "obcardinal.windows-app-autologin",
             None,
             |_bundle_path, _bundle_id| true,
             |_bundle_path, _bundle_id, _team_id| true,

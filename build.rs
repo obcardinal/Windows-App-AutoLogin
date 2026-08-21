@@ -5,9 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const DEVELOPMENT_MACOS_BUNDLE_ID: &str = "dev.codex.windows-app-autologin";
+const DEVELOPMENT_MACOS_BUNDLE_ID: &str = "obcardinal.windows-app-autologin";
 const PRODUCTION_APP_NAME: &str = "WindowsAppAutoLogin";
 const DIAGNOSTICS_APP_NAME: &str = "WindowsAppAutoLoginDiagnostics";
+const RELEASE_GIT_COMMIT_ENV: &str = "WAAL_RELEASE_GIT_COMMIT";
+const RELEASE_GIT_TREE_ENV: &str = "WAAL_RELEASE_GIT_TREE";
 
 fn main() {
     let icon = Path::new("assets/icon.png");
@@ -23,6 +25,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WAAL_DEVELOPMENT_RELEASE");
     println!("cargo:rerun-if-env-changed=WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH");
     println!("cargo:rerun-if-env-changed=WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH");
+    println!("cargo:rerun-if-env-changed={RELEASE_GIT_COMMIT_ENV}");
+    println!("cargo:rerun-if-env-changed={RELEASE_GIT_TREE_ENV}");
     println!("cargo:rustc-check-cfg=cfg(waal_release_profile)");
     if env::var("PROFILE").as_deref() == Ok("release") {
         println!("cargo:rustc-cfg=waal_release_profile");
@@ -32,6 +36,7 @@ fn main() {
     let macos_identity = macos_identity();
     let macos_bundle_id = macos_identity.bundle_id.clone();
     let macos_team_id = macos_team_id();
+    let release_provenance = release_provenance();
     let app_name = app_name();
     let trusted_bundle_path = format!("/Applications/{app_name}.app");
     let development_bundle_path =
@@ -49,7 +54,7 @@ fn main() {
         .join(":");
 
     println!("cargo:rustc-env=WAAL_ICON_ASSET_FINGERPRINT={fingerprint}");
-    write_build_metadata(&macos_identity, &macos_team_id);
+    write_build_metadata(&macos_identity, &macos_team_id, &release_provenance);
 }
 
 fn embed_windows_resources(icon: &Path) -> Result<(), Box<dyn Error>> {
@@ -107,9 +112,15 @@ struct MacosIdentity {
     non_production_identity: bool,
 }
 
+struct ReleaseProvenance {
+    git_commit: String,
+    git_tree: String,
+}
+
 fn build_metadata(
     macos_identity: &MacosIdentity,
     macos_team_id: &str,
+    release_provenance: &ReleaseProvenance,
     debug_assertions: bool,
 ) -> String {
     let artifact_kind = if env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some() {
@@ -120,7 +131,7 @@ fn build_metadata(
         "release"
     };
     format!(
-        "WAAL_BUILD_METADATA_V1;artifact-kind={};profile={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};",
+        "WAAL_BUILD_METADATA_V1;artifact-kind={};profile={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};source-git-commit={};source-git-tree={};",
         artifact_kind,
         env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string()),
         debug_assertions,
@@ -132,19 +143,25 @@ fn build_metadata(
         macos_identity.production_bundle_id.as_str(),
         macos_identity.non_production_identity,
         macos_team_id,
+        release_provenance.git_commit,
+        release_provenance.git_tree,
     )
 }
 
-fn write_build_metadata(macos_identity: &MacosIdentity, macos_team_id: &str) {
+fn write_build_metadata(
+    macos_identity: &MacosIdentity,
+    macos_team_id: &str,
+    release_provenance: &ReleaseProvenance,
+) {
     // Keep the marker separated from neighboring printable constants after LTO so
     // release packaging can reliably extract it with `strings`.
     let debug_metadata = format!(
         "\0{}\0",
-        build_metadata(macos_identity, macos_team_id, true)
+        build_metadata(macos_identity, macos_team_id, release_provenance, true)
     );
     let release_metadata = format!(
         "\0{}\0",
-        build_metadata(macos_identity, macos_team_id, false)
+        build_metadata(macos_identity, macos_team_id, release_provenance, false)
     );
     let debug_bytes = rust_byte_array(&debug_metadata);
     let release_bytes = rust_byte_array(&release_metadata);
@@ -179,6 +196,37 @@ fn rust_byte_array(value: &str) -> String {
         .map(u8::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn release_provenance() -> ReleaseProvenance {
+    let git_commit = trimmed_env(RELEASE_GIT_COMMIT_ENV);
+    let git_tree = trimmed_env(RELEASE_GIT_TREE_ENV);
+    let provenance_required = is_macos_release_profile() && !development_release_allowed();
+
+    if provenance_required && (git_commit.is_none() || git_tree.is_none()) {
+        panic!(
+            "{RELEASE_GIT_COMMIT_ENV} and {RELEASE_GIT_TREE_ENV} must be set by the macOS release packager"
+        );
+    }
+    if git_commit.is_some() != git_tree.is_some() {
+        panic!(
+            "{RELEASE_GIT_COMMIT_ENV} and {RELEASE_GIT_TREE_ENV} must either both be set or both be absent"
+        );
+    }
+
+    let git_commit = git_commit.unwrap_or_default();
+    let git_tree = git_tree.unwrap_or_default();
+    if !git_commit.is_empty() && !valid_git_sha1(&git_commit) {
+        panic!("{RELEASE_GIT_COMMIT_ENV} must be an exact lowercase 40-hex Git object ID");
+    }
+    if !git_tree.is_empty() && !valid_git_sha1(&git_tree) {
+        panic!("{RELEASE_GIT_TREE_ENV} must be an exact lowercase 40-hex Git object ID");
+    }
+
+    ReleaseProvenance {
+        git_commit,
+        git_tree,
+    }
 }
 
 fn macos_identity() -> MacosIdentity {
@@ -341,6 +389,13 @@ fn valid_team_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn valid_git_sha1(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn asset_fingerprint(path: &Path) -> String {

@@ -14,6 +14,8 @@ use windows_registry::{Type, CURRENT_USER};
 const APP_NAME: &str = crate::app_identity::APP_NAME;
 #[cfg(target_os = "macos")]
 const MACOS_TRUSTED_AUTOSTART_BUNDLE: &str = "/Applications/WindowsAppAutoLogin.app";
+#[cfg(target_os = "macos")]
+const PREVIOUS_DEVELOPMENT_MACOS_BUNDLE_ID: &str = "dev.codex.windows-app-autologin";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(target_os = "windows")]
@@ -46,7 +48,7 @@ fn build_for_path(app_path: &str) -> anyhow::Result<auto_launch::AutoLaunch> {
         .set_app_name(APP_NAME)
         .set_app_path(&auto_launch_path)
         .set_macos_launch_mode(macos_launch_mode_for_path(app_path))
-        .set_bundle_identifiers(&["dev.codex.windows-app-autologin"]);
+        .set_bundle_identifiers(&["obcardinal.windows-app-autologin"]);
 
     #[cfg(target_os = "windows")]
     builder.set_windows_enable_mode(auto_launch::WindowsEnableMode::CurrentUser);
@@ -106,7 +108,7 @@ fn enable() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         remove_macos_login_items_by_name()?;
-        remove_legacy_launch_agent_file()?;
+        remove_legacy_launch_agent_files()?;
         write_macos_launch_agent(&app_path)?;
         if !launch_agent_matches_current_exe() {
             let _ = remove_launch_agent_file();
@@ -142,7 +144,7 @@ fn disable() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         remove_launch_agent_file()?;
-        remove_legacy_launch_agent_file()?;
+        remove_legacy_launch_agent_files()?;
         remove_macos_login_items_by_name()?;
         return Ok(());
     }
@@ -207,7 +209,7 @@ pub(crate) fn cleanup_stale() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         remove_macos_login_items_by_name()?;
-        remove_legacy_launch_agent_file()?;
+        remove_legacy_launch_agent_files()?;
         if !launch_agent_matches_current_exe() || !current_autostart_path_is_stable() {
             remove_launch_agent_file()?;
         }
@@ -307,8 +309,8 @@ fn macos_launch_agent_label() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
-fn legacy_macos_launch_agent_label() -> &'static str {
-    APP_NAME
+fn legacy_macos_launch_agent_labels() -> [&'static str; 2] {
+    [APP_NAME, PREVIOUS_DEVELOPMENT_MACOS_BUNDLE_ID]
 }
 
 #[cfg(target_os = "macos")]
@@ -390,8 +392,11 @@ fn launch_agent_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn legacy_launch_agent_path() -> Option<PathBuf> {
-    launch_agent_path_for_label(legacy_macos_launch_agent_label())
+fn legacy_launch_agent_paths() -> Option<[PathBuf; 2]> {
+    crate::user_paths::home_dir().map(|home| {
+        legacy_macos_launch_agent_labels()
+            .map(|label| launch_agent_path_for_home_and_label(&home, label))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -562,17 +567,19 @@ fn remove_launch_agent_file() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn remove_legacy_launch_agent_file() -> anyhow::Result<()> {
-    let Some(path) = legacy_launch_agent_path() else {
+fn remove_legacy_launch_agent_files() -> anyhow::Result<()> {
+    let Some(paths) = legacy_launch_agent_paths() else {
         return Ok(());
     };
     let Some(current_path) = launch_agent_path() else {
         return Ok(());
     };
-    if path == current_path {
-        return Ok(());
+    for path in paths {
+        if path != current_path {
+            remove_launch_agent_file_at(&path)?;
+        }
     }
-    remove_launch_agent_file_at(&path)
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1189,6 +1196,19 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some("WindowsAppAutoLogin.plist")
         );
+
+        let legacy_paths = legacy_macos_launch_agent_labels()
+            .map(|label| launch_agent_path_for_home_and_label(home, label));
+        assert_eq!(
+            legacy_paths,
+            [
+                home.join("Library")
+                    .join("LaunchAgents")
+                    .join(format!("{APP_NAME}.plist")),
+                home.join("Library/LaunchAgents/dev.codex.windows-app-autologin.plist"),
+            ]
+        );
+        assert!(legacy_paths.iter().all(|legacy| legacy != &path));
     }
 
     #[cfg(target_os = "macos")]
