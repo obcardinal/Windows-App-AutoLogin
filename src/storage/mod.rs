@@ -541,12 +541,17 @@ fn migrate_legacy_passwords(
             }
         };
 
-        if let Err(e) = save_password_to_backend(
+        let save_result = save_password_to_backend(
             account,
             password.as_str(),
             config.settings.use_keyring,
             false,
-        ) {
+        );
+        // The source plaintext is no longer needed after the target write.
+        // Wipe it before target verification or any recovery I/O can block on
+        // Keychain/Credential Manager UI.
+        drop(password);
+        if let Err(e) = save_result {
             warn!(
                 account_id = %redacted_account_id(&account.id),
                 error = %e,
@@ -3200,8 +3205,12 @@ pub(crate) fn migrate_storage_mode(
             }
         };
 
-        if let Err(e) = save_password_to_backend(account, password.as_str(), to_use_keyring, false)
-        {
+        let save_result =
+            save_password_to_backend(account, password.as_str(), to_use_keyring, false);
+        // Do not retain the source plaintext while target verification or
+        // rollback performs additional secure-storage operations.
+        drop(password);
+        if let Err(e) = save_result {
             let recovery_error = storage_mode_migration_recovery_required_error(format!(
                 "storage migration target write failed and may need recovery cleanup: {e}"
             ));
