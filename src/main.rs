@@ -388,9 +388,6 @@ impl LightweightSupervisor {
                     self.update_tray_status();
                 }
                 background::WorkerEvent::FillAttemptReport(report) => {
-                    if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
-                        tracing::warn!("Could not persist last fill attempt report: {e}");
-                    }
                     if let Some(tray) = &self.tray {
                         tray.set_last_result(&fill_result_label(&report));
                     }

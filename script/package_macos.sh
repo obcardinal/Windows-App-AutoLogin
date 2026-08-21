@@ -497,7 +497,7 @@ verify_release_bundle() {
   /usr/bin/codesign --verify --strict --deep --test-requirement "$requirement" "$bundle_dir"
 
   local signature
-  signature="$(/usr/bin/codesign -dv "$bundle_dir" 2>&1)"
+  signature="$(/usr/bin/codesign -dv --verbose=4 "$bundle_dir" 2>&1)"
   if echo "$signature" | /usr/bin/grep -q 'Signature=adhoc'; then
     echo "Release bundle is ad-hoc signed." >&2
     exit 1

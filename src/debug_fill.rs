@@ -7,6 +7,8 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(target_os = "macos")]
@@ -1921,28 +1923,100 @@ fn bundle_identifier(bundle_path: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct CurrentProcessDiagnosticFields {
+    executable_path: PathBuf,
+    bundle_path: Option<PathBuf>,
+    bundle_id: Option<String>,
+    launch_kind: &'static str,
+    is_running_from_target_debug: bool,
+    is_running_from_dist_app: bool,
+    signing: CurrentSigningInfo,
+}
+
+#[cfg(target_os = "macos")]
+static CURRENT_PROCESS_DIAGNOSTIC_FIELDS: OnceLock<CurrentProcessDiagnosticFields> =
+    OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn current_process_diagnostic_fields() -> &'static CurrentProcessDiagnosticFields {
+    // Diagnostics only: authorization must continue to use live AX/TCC and target-signature checks.
+    diagnostic_fields_from_cache(
+        &CURRENT_PROCESS_DIAGNOSTIC_FIELDS,
+        collect_current_process_diagnostic_fields,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn diagnostic_fields_from_cache(
+    cache: &OnceLock<CurrentProcessDiagnosticFields>,
+    collect: impl FnOnce() -> CurrentProcessDiagnosticFields,
+) -> &CurrentProcessDiagnosticFields {
+    cache.get_or_init(collect)
+}
+
+#[cfg(target_os = "macos")]
+fn collect_current_process_diagnostic_fields() -> CurrentProcessDiagnosticFields {
+    let executable_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<unknown>"));
+    let executable_text = executable_path.to_string_lossy();
+    let bundle_path = containing_app_bundle(&executable_path);
+    let bundle_id = bundle_path
+        .as_deref()
+        .map(|bundle| bundle_identifier(bundle).unwrap_or_default());
+    let launch_kind = if bundle_path.is_some() {
+        "app_bundle"
+    } else {
+        "cargo_or_raw_binary"
+    };
+    let signing = current_signing_info(&executable_path);
+    let is_running_from_target_debug = executable_text.contains("/target/debug/");
+    let is_running_from_dist_app = executable_text.contains("/dist/WindowsAppAutoLogin.app/");
+
+    CurrentProcessDiagnosticFields {
+        executable_path,
+        bundle_path,
+        bundle_id,
+        launch_kind,
+        is_running_from_target_debug,
+        is_running_from_dist_app,
+        signing,
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn apply_current_process_fields(log: &mut DebugLog) -> PathBuf {
-    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<unknown>"));
-    log.set("current_process_path", current_exe.display().to_string());
-    log.set("executable_path", current_exe.display().to_string());
-    apply_current_identity_fields(log, &current_exe);
-    let current_bundle = containing_app_bundle(&current_exe);
-    if let Some(bundle) = current_bundle.as_deref() {
+    let fields = current_process_diagnostic_fields();
+    log.set(
+        "current_process_path",
+        fields.executable_path.display().to_string(),
+    );
+    log.set(
+        "executable_path",
+        fields.executable_path.display().to_string(),
+    );
+    log.set(
+        "is_running_from_target_debug",
+        fields.is_running_from_target_debug.to_string(),
+    );
+    log.set(
+        "is_running_from_dist_app",
+        fields.is_running_from_dist_app.to_string(),
+    );
+    if let Some(bundle) = fields.bundle_path.as_deref() {
         log.set("app_bundle_path", bundle.display().to_string());
         log.set(
             "current_bundle_id",
-            bundle_identifier(bundle).unwrap_or_default(),
+            fields.bundle_id.clone().unwrap_or_default(),
         );
     }
+    log.set("current_launch_kind", fields.launch_kind);
+    log.set("current_signing_identity", fields.signing.identity.clone());
     log.set(
-        "current_launch_kind",
-        if current_bundle.is_some() {
-            "app_bundle"
-        } else {
-            "cargo_or_raw_binary"
-        },
+        "current_signing_identifier",
+        fields.signing.identifier.clone(),
     );
-    current_exe
+    log.set("current_team_id", fields.signing.team_id.clone());
+    fields.executable_path.clone()
 }
 
 #[cfg(target_os = "windows")]
@@ -2022,26 +2096,7 @@ fn windows_activation_error_kind(error: &anyhow::Error) -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_current_identity_fields(log: &mut DebugLog, exe_path: &Path) {
-    let exe_text = exe_path.to_string_lossy();
-    log.set(
-        "is_running_from_target_debug",
-        exe_text.contains("/target/debug/").to_string(),
-    );
-    log.set(
-        "is_running_from_dist_app",
-        exe_text
-            .contains("/dist/WindowsAppAutoLogin.app/")
-            .to_string(),
-    );
-
-    let signing = current_signing_info(exe_path);
-    log.set("current_signing_identity", signing.identity);
-    log.set("current_signing_identifier", signing.identifier);
-    log.set("current_team_id", signing.team_id);
-}
-
-#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
 struct CurrentSigningInfo {
     identity: String,
     identifier: String,
@@ -2465,6 +2520,38 @@ mod tests {
         assert!(!info.identity.contains("Jane"));
         assert!(!info.identifier.contains("com.jane"));
         assert!(!info.team_id.contains("ABCDE12345"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_process_diagnostic_collection_is_cached() {
+        let cache = std::sync::OnceLock::new();
+        let collection_count = std::sync::atomic::AtomicUsize::new(0);
+        let collect = || {
+            collection_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            super::CurrentProcessDiagnosticFields {
+                executable_path: std::path::PathBuf::from("/Applications/Test.app/test"),
+                bundle_path: Some(std::path::PathBuf::from("/Applications/Test.app")),
+                bundle_id: Some("present".to_string()),
+                launch_kind: "app_bundle",
+                is_running_from_target_debug: false,
+                is_running_from_dist_app: false,
+                signing: super::CurrentSigningInfo {
+                    identity: "developer_id_application".to_string(),
+                    identifier: "present".to_string(),
+                    team_id: "present".to_string(),
+                },
+            }
+        };
+
+        let first = super::diagnostic_fields_from_cache(&cache, collect);
+        let second = super::diagnostic_fields_from_cache(&cache, collect);
+
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(
+            collection_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[cfg(all(

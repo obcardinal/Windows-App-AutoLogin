@@ -3,7 +3,9 @@ use crate::autologin::{
     AccessibilityStatus,
 };
 use crate::background::{WorkerCommand, WorkerEvent};
-use crate::debug_fill::{self, FillAttemptReport};
+#[cfg(any(not(test), feature = "diagnostics-ui"))]
+use crate::debug_fill;
+use crate::debug_fill::FillAttemptReport;
 use crate::models::{
     Account, AccountId, AppConfig, AppSettings, LogEntry, LogLevel, Tab, WorkerStatus,
 };
@@ -349,13 +351,6 @@ impl AutoLoginApp {
                     self.add_log(entry);
                 }
                 WorkerEvent::FillAttemptReport(report) => {
-                    if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
-                        self.add_log(LogEntry {
-                            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
-                            level: LogLevel::Warn,
-                            message: format!("Could not persist last fill attempt report: {e}"),
-                        });
-                    }
                     self.last_fill_report = Some(report);
                 }
             }

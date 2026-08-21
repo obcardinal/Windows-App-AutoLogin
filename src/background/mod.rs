@@ -54,6 +54,7 @@ const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const UNKNOWN_POLL_BACKOFF_MAX: Duration = Duration::from_secs(3);
 const MAX_RECENT_PROMPT_ATTEMPTS: usize = 32;
 const PROMPT_ATTEMPT_RETENTION: Duration = Duration::from_secs(3);
+const PRE_PASSWORD_REPORT_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 struct FlagGuard {
     flag: Arc<AtomicBool>,
@@ -345,14 +346,93 @@ fn clear_recent_prompt_attempts(
     }
 }
 
+#[derive(Default)]
+struct PrePasswordReportPersistence {
+    last_attempted_at_by_key: HashMap<String, Instant>,
+    observed_this_tick: bool,
+    persisted_this_tick: bool,
+}
+
+fn pre_password_persistence_key(reason: &str) -> &str {
+    match reason {
+        // The monitor cannot distinguish "no enabled account" from "matching
+        // account has no saved password", while the macOS fallback can. Both
+        // describe the same stable pre-password state and must not alternate
+        // writes on every poll tick.
+        "visible_prompt_email_matches_no_enabled_account"
+        | "visible_prompt_email_matches_no_saved_password" => {
+            "visible_prompt_email_has_no_usable_saved_password"
+        }
+        reason if reason.starts_with("prompt_detection_failed_") => "prompt_detection_failed",
+        reason if reason.starts_with("attempt_cancelled_") => "attempt_cancelled",
+        _ => reason,
+    }
+}
+
+impl PrePasswordReportPersistence {
+    fn should_persist(
+        &mut self,
+        reason: &str,
+        _fields: &[(&'static str, String)],
+        now: Instant,
+    ) -> bool {
+        self.observed_this_tick = true;
+        let key = pre_password_persistence_key(reason);
+        self.last_attempted_at_by_key.retain(|_, attempted_at| {
+            now.saturating_duration_since(*attempted_at) < PRE_PASSWORD_REPORT_PERSIST_INTERVAL
+        });
+        if self.persisted_this_tick
+            || self.last_attempted_at_by_key.get(key).is_some_and(|last| {
+                now.saturating_duration_since(*last) < PRE_PASSWORD_REPORT_PERSIST_INTERVAL
+            })
+        {
+            return false;
+        }
+
+        self.last_attempted_at_by_key.insert(key.to_string(), now);
+        self.persisted_this_tick = true;
+        true
+    }
+
+    fn begin_poll_tick(&mut self) {
+        self.observed_this_tick = false;
+        self.persisted_this_tick = false;
+    }
+
+    fn observe_monitor_status(&mut self, status: &MonitorStatus, connected_is_definitive: bool) {
+        if matches!(status, MonitorStatus::ProcessNotFound)
+            || (connected_is_definitive && matches!(status, MonitorStatus::Connected))
+        {
+            self.observe_no_prompt();
+        }
+    }
+
+    fn observe_no_prompt(&mut self) {
+        if !self.observed_this_tick {
+            self.last_attempted_at_by_key.clear();
+        }
+    }
+
+    fn reset_observed_state(&mut self) {
+        self.last_attempted_at_by_key.clear();
+        self.observed_this_tick = false;
+        self.persisted_this_tick = false;
+    }
+}
+
 fn emit_pre_password_skip_report(
     event_tx: &Sender<WorkerEvent>,
+    persistence: &mut PrePasswordReportPersistence,
     reason: impl Into<String>,
     fields: &[(&'static str, String)],
 ) {
+    let reason = reason.into();
+    let should_persist = persistence.should_persist(&reason, fields, Instant::now());
     let report = debug_fill::pre_password_skip_report(reason, fields);
-    if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
-        warn!("Could not persist pre-password skip report: {e}");
+    if should_persist {
+        if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
+            warn!("Could not persist pre-password skip report: {e}");
+        }
     }
     let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
 }
@@ -574,6 +654,8 @@ pub(crate) fn spawn(
         #[cfg(target_os = "macos")]
         let mut last_macos_prompt_probe: Option<Instant> = None;
         let mut poll_cadence = PollCadence::default();
+        let mut pre_password_report_persistence = PrePasswordReportPersistence::default();
+        let mut pre_password_generation = generation.load(Ordering::SeqCst);
 
         loop {
             drain_commands(
@@ -588,6 +670,7 @@ pub(crate) fn spawn(
             .await;
 
             if !running {
+                pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
                     IDLE_SLEEP,
                     &mut cmd_rx,
@@ -606,6 +689,10 @@ pub(crate) fn spawn(
             }
 
             let current_generation = generation.load(Ordering::SeqCst);
+            if current_generation != pre_password_generation {
+                pre_password_report_persistence.reset_observed_state();
+                pre_password_generation = current_generation;
+            }
 
             if automation_in_progress.load(Ordering::SeqCst) {
                 poll_cadence = PollCadence::default();
@@ -631,6 +718,7 @@ pub(crate) fn spawn(
             });
 
             if !has_enabled_account {
+                pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
                     fixed_poll_interval(),
                     &mut cmd_rx,
@@ -686,6 +774,9 @@ pub(crate) fn spawn(
             let mut force_macos_prompt_probe = false;
             #[cfg(target_os = "macos")]
             let mut prompt_attempt_started = false;
+            pre_password_report_persistence.begin_poll_tick();
+            pre_password_report_persistence
+                .observe_monitor_status(&status, cfg!(not(target_os = "macos")));
 
             match status {
                 MonitorStatus::Connected => {
@@ -745,6 +836,7 @@ pub(crate) fn spawn(
                                 fields.push(("selected_account_id", account.id.clone()));
                                 emit_pre_password_skip_report(
                                     &event_tx,
+                                    &mut pre_password_report_persistence,
                                     "prompt_retry_suppressed",
                                     &fields,
                                 );
@@ -759,6 +851,7 @@ pub(crate) fn spawn(
                                     #[cfg(target_os = "windows")]
                                     monitor_check_ms,
                                 };
+                                pre_password_report_persistence.reset_observed_state();
                                 let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
                                     trigger: FillTrigger::Automatic,
                                     settings: settings.clone(),
@@ -793,6 +886,7 @@ pub(crate) fn spawn(
                             let fields = monitor_prompt_fields(process_id, None, &prompt_origin);
                             emit_pre_password_skip_report(
                                 &event_tx,
+                                &mut pre_password_report_persistence,
                                 "visible_prompt_email_missing",
                                 &fields,
                             );
@@ -808,6 +902,7 @@ pub(crate) fn spawn(
                             );
                             emit_pre_password_skip_report(
                                 &event_tx,
+                                &mut pre_password_report_persistence,
                                 "visible_prompt_email_matches_no_saved_password",
                                 &fields,
                             );
@@ -823,6 +918,7 @@ pub(crate) fn spawn(
                             );
                             emit_pre_password_skip_report(
                                 &event_tx,
+                                &mut pre_password_report_persistence,
                                 "visible_prompt_email_matches_multiple_enabled_accounts",
                                 &fields,
                             );
@@ -867,6 +963,7 @@ pub(crate) fn spawn(
                                 debug!("macOS fallback prompt retry suppressed for recent prompt");
                                 emit_pre_password_skip_report(
                                     &event_tx,
+                                    &mut pre_password_report_persistence,
                                     "prompt_retry_suppressed",
                                     &[
                                         (
@@ -885,6 +982,7 @@ pub(crate) fn spawn(
                                     ],
                                 );
                             } else {
+                                pre_password_report_persistence.reset_observed_state();
                                 let started = spawn_current_prompt_attempt(CurrentPromptAttempt {
                                     trigger: FillTrigger::Automatic,
                                     settings: settings.clone(),
@@ -919,19 +1017,14 @@ pub(crate) fn spawn(
                             }
                         }
                         Ok(None) => {
-                            emit_pre_password_skip_report(
-                                &event_tx,
-                                "visible_credential_prompt_not_detected",
-                                &[(
-                                    "prompt_context_source",
-                                    "macos_fallback_preflight".to_string(),
-                                )],
-                            );
+                            pre_password_report_persistence.observe_no_prompt();
+                            trace!("macOS fallback preflight found no credential prompt");
                         }
                         Err(reason) => {
                             debug!(reason = %reason, "macOS fallback prompt preflight skipped");
                             emit_pre_password_skip_report(
                                 &event_tx,
+                                &mut pre_password_report_persistence,
                                 reason,
                                 &[(
                                     "prompt_context_source",
@@ -987,8 +1080,9 @@ mod tests {
         fill_attempt_should_suppress_same_prompt_retry, handle_command,
         prompt_account_decision_allows_macos_probe, prompt_retry_is_suppressed,
         record_prompt_retry_suppression, wait_or_handle_command, LoginPromptKey, MonitorStatus,
-        PollCadence, PromptAccountDecision, PromptRetrySuppression, WorkerCommand, WorkerEvent,
-        MACOS_FALLBACK_PROMPT_PROBE_INTERVAL, MAX_RECENT_PROMPT_ATTEMPTS, PROMPT_ATTEMPT_RETENTION,
+        PollCadence, PrePasswordReportPersistence, PromptAccountDecision, PromptRetrySuppression,
+        WorkerCommand, WorkerEvent, MACOS_FALLBACK_PROMPT_PROBE_INTERVAL,
+        MAX_RECENT_PROMPT_ATTEMPTS, PRE_PASSWORD_REPORT_PERSIST_INTERVAL, PROMPT_ATTEMPT_RETENTION,
         PROMPT_STATUS_POLL_INTERVAL,
     };
     use crate::debug_fill;
@@ -1073,6 +1167,166 @@ mod tests {
         ));
         assert!(prompt_account_decision_allows_macos_probe(
             &PromptAccountDecision::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn pre_password_reports_are_deduplicated_and_rate_limited() {
+        let mut persistence = PrePasswordReportPersistence::default();
+        let now = Instant::now();
+        let first_fields = [("prompt_context_source", "monitor".to_string())];
+        let second_fields = [("prompt_context_source", "fallback".to_string())];
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("first_reason", &first_fields, now));
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist(
+            "first_reason",
+            &first_fields,
+            now + PRE_PASSWORD_REPORT_PERSIST_INTERVAL - Duration::from_millis(1),
+        ));
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist(
+            "first_reason",
+            &first_fields,
+            now + PRE_PASSWORD_REPORT_PERSIST_INTERVAL,
+        ));
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist(
+            "second_reason",
+            &second_fields,
+            now + PRE_PASSWORD_REPORT_PERSIST_INTERVAL + Duration::from_millis(1),
+        ));
+
+        persistence.reset_observed_state();
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist(
+            "second_reason",
+            &second_fields,
+            now + PRE_PASSWORD_REPORT_PERSIST_INTERVAL + Duration::from_millis(2),
+        ));
+    }
+
+    #[test]
+    fn alternating_skip_states_are_rate_limited_per_key_and_once_per_tick() {
+        let mut persistence = PrePasswordReportPersistence::default();
+        let now = Instant::now();
+        let fields = [("prompt_context_source", "monitor".to_string())];
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("reason_a", &fields, now));
+        assert!(!persistence.should_persist(
+            "prompt_detection_failed_first detail",
+            &fields,
+            now + Duration::from_millis(1),
+        ));
+
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist("reason_a", &fields, now + Duration::from_secs(1),));
+        assert!(persistence.should_persist(
+            "prompt_detection_failed_second detail",
+            &fields,
+            now + Duration::from_secs(1) + Duration::from_millis(1),
+        ));
+
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist("reason_a", &fields, now + Duration::from_secs(2),));
+        assert!(!persistence.should_persist(
+            "prompt_detection_failed_third detail",
+            &fields,
+            now + Duration::from_secs(2) + Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn equivalent_account_miss_reasons_cannot_alternate_persisted_reports() {
+        let mut persistence = PrePasswordReportPersistence::default();
+        let now = Instant::now();
+        let monitor_fields = [("prompt_context_source", "monitor".to_string())];
+        let fallback_fields = [("prompt_context_source", "fallback".to_string())];
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist(
+            "visible_prompt_email_matches_no_saved_password",
+            &monitor_fields,
+            now,
+        ));
+        assert!(!persistence.should_persist(
+            "visible_prompt_email_matches_no_enabled_account",
+            &fallback_fields,
+            now + Duration::from_millis(1),
+        ));
+
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist(
+            "visible_prompt_email_matches_no_saved_password",
+            &monitor_fields,
+            now + Duration::from_secs(1),
+        ));
+        assert!(!persistence.should_persist(
+            "visible_prompt_email_matches_no_enabled_account",
+            &fallback_fields,
+            now + Duration::from_secs(1) + Duration::from_millis(1),
+        ));
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist(
+            "visible_prompt_email_matches_no_enabled_account",
+            &fallback_fields,
+            now + PRE_PASSWORD_REPORT_PERSIST_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn no_prompt_resets_only_when_the_tick_had_no_skip_state() {
+        let mut persistence = PrePasswordReportPersistence::default();
+        let now = Instant::now();
+        let fields = [("prompt_context_source", "monitor".to_string())];
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("missing_email", &fields, now));
+        persistence.observe_no_prompt();
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist(
+            "missing_email",
+            &fields,
+            now + Duration::from_secs(1),
+        ));
+
+        persistence.begin_poll_tick();
+        persistence.observe_no_prompt();
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("missing_email", &fields, now + Duration::from_secs(2),));
+    }
+
+    #[test]
+    fn explicit_no_prompt_status_makes_reappearing_failure_reportable() {
+        let mut persistence = PrePasswordReportPersistence::default();
+        let now = Instant::now();
+        let fields = [("prompt_context_source", "monitor".to_string())];
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("missing_email", &fields, now));
+
+        persistence.begin_poll_tick();
+        persistence.observe_monitor_status(&MonitorStatus::ProcessNotFound, false);
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("missing_email", &fields, now + Duration::from_secs(2),));
+
+        persistence.begin_poll_tick();
+        persistence.observe_monitor_status(&MonitorStatus::Connected, true);
+
+        persistence.begin_poll_tick();
+        assert!(persistence.should_persist("missing_email", &fields, now + Duration::from_secs(4),));
+
+        persistence.begin_poll_tick();
+        persistence.observe_monitor_status(&MonitorStatus::Connected, false);
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist(
+            "missing_email",
+            &fields,
+            now + Duration::from_secs(5),
         ));
     }
 
