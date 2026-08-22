@@ -210,7 +210,6 @@ ARCHIVE_SESSION_ACTIVE=false
 ARCHIVE_SESSION_PATH=""
 ARCHIVE_SESSION_IDENTITY=""
 RELEASE_BUNDLE_PAYLOAD_SHA256=""
-RELEASE_NOTARY_TICKET_STAPLED=false
 CARGO_VERSION=""
 BUILD_VERSION=""
 
@@ -3359,27 +3358,18 @@ canonical_unsigned_macho_sha256() {
 
 release_bundle_payload_sha256() {
   local bundle_dir="$1"
+  local ticket_mode="${2:-include-ticket}"
   local bundle_executable
   local executable
   local executable_sha256
-  local notary_ticket="$bundle_dir/Contents/CodeResources"
   local first_identity
   local second_identity
   local digest
 
-  case "$RELEASE_NOTARY_TICKET_STAPLED" in
-    true)
-      require_single_link_regular_file "$notary_ticket" \
-        "Stapled notarization ticket" || return 1
-      require_no_acl "$notary_ticket" "Stapled notarization ticket" || return 1
-      if [ "$(/usr/bin/stat -f '%Mp%Lp' "$notary_ticket")" != 0644 ]; then
-        echo "Stapled notarization ticket must have mode 0644." >&2
-        return 1
-      fi
-      ;;
-    false) ;;
+  case "$ticket_mode" in
+    include-ticket|normalize-stapled-ticket) ;;
     *)
-      echo "Invalid stapled notarization ticket state." >&2
+      echo "Invalid release payload notarization-ticket mode." >&2
       return 1
       ;;
   esac
@@ -3404,8 +3394,9 @@ release_bundle_payload_sha256() {
         use strict;
         use warnings;
         use bytes;
-        my ($root, $main_relative, $main_sha256, $ticket_stapled) = @ARGV;
+        my ($root, $main_relative, $main_sha256, $ticket_mode) = @ARGV;
         my @records;
+        my $normalized_ticket_count = 0;
         File::Find::find({
           no_chdir => 1,
           follow => 0,
@@ -3416,14 +3407,6 @@ release_bundle_payload_sha256() {
             if ($relative eq "Contents/_CodeSignature"
                 || index($relative, "Contents/_CodeSignature/") == 0) {
               $File::Find::prune = 1 if -d $path;
-              return;
-            }
-            # `stapler` adds the Apple-validated ticket at this one exact path.
-            # It is absent from the pre-signing baseline, so omit it only after
-            # a successful `stapler validate`; every other resource remains in
-            # the original payload digest.
-            if ($ticket_stapled eq "true"
-                && $relative eq "Contents/CodeResources") {
               return;
             }
             my @before = lstat($path);
@@ -3454,9 +3437,20 @@ release_bundle_payload_sha256() {
                     && $before[$index] == $after[$index];
               }
             }
+            if ($ticket_mode eq "normalize-stapled-ticket"
+                && $relative eq "Contents/CodeResources") {
+              die "stapled ticket has an unsafe mode or empty payload\n"
+                unless (($before[2] & 07777) == 0644) && $before[7] > 0;
+              ++$normalized_ticket_count;
+              return;
+            }
             push @records, [$relative, "file", sprintf("%o", $before[2]), $file_sha256];
           },
         }, $root);
+        if ($ticket_mode eq "normalize-stapled-ticket") {
+          die "expected exactly one structurally valid stapled ticket\n"
+            unless $normalized_ticket_count == 1;
+        }
         @records = sort { $a->[0] cmp $b->[0] } @records;
         my $aggregate = Digest::SHA->new(256);
         for my $record (@records) {
@@ -3465,7 +3459,7 @@ release_bundle_payload_sha256() {
         }
         print $aggregate->hexdigest, "\n";
       ' -- "$bundle_dir" "Contents/MacOS/$bundle_executable" \
-        "$executable_sha256" "$RELEASE_NOTARY_TICKET_STAPLED"
+        "$executable_sha256" "$ticket_mode"
   )" || ! valid_sha256 "$digest"; then
     echo "Unable to hash the canonical release bundle payload tree." >&2
     return 1
@@ -3505,6 +3499,70 @@ verify_release_bundle_payload_baseline() {
   fi
 }
 
+verify_stapled_notary_ticket_transition() {
+  local actual_digest
+
+  if ! valid_sha256 "$RELEASE_BUNDLE_PAYLOAD_SHA256"; then
+    echo "Release bundle signing payload baseline is not initialized." >&2
+    return 1
+  fi
+  actual_digest="$(
+    release_bundle_payload_sha256 "$1" normalize-stapled-ticket
+  )" || return 1
+  if [ "$actual_digest" != "$RELEASE_BUNDLE_PAYLOAD_SHA256" ]; then
+    echo "Stapler changed executable or resource payload beyond its validated ticket." >&2
+    return 1
+  fi
+}
+
+adopt_stapled_notary_ticket_baseline() {
+  local bundle_dir="$1"
+  local previous_digest="$RELEASE_BUNDLE_PAYLOAD_SHA256"
+  local first_full_digest
+  local second_full_digest
+
+  # Keep comparing against the pre-staple baseline while the complete opaque
+  # ticket is captured. The second normalized comparison prevents an unrelated
+  # payload mutation between the first transition check and the first full
+  # digest from being adopted as trusted state. Matching full digests then
+  # bracket ticket changes, too.
+  verify_stapled_notary_ticket_transition "$bundle_dir" || return 1
+  first_full_digest="$(release_bundle_payload_sha256 "$bundle_dir")" || return 1
+  verify_stapled_notary_ticket_transition "$bundle_dir" || return 1
+  second_full_digest="$(release_bundle_payload_sha256 "$bundle_dir")" || return 1
+  if [ "$first_full_digest" != "$second_full_digest" ]; then
+    echo "Release bundle payload changed while the stapled ticket baseline was adopted." >&2
+    return 1
+  fi
+
+  RELEASE_BUNDLE_PAYLOAD_SHA256="$first_full_digest"
+  if ! verify_release_bundle_payload_baseline "$bundle_dir"; then
+    RELEASE_BUNDLE_PAYLOAD_SHA256="$previous_digest"
+    return 1
+  fi
+}
+
+require_unstapled_notary_ticket_absent() {
+  local ticket_path="$1/Contents/CodeResources"
+
+  if [ -e "$ticket_path" ] || [ -L "$ticket_path" ]; then
+    echo "Release bundle contains a notarization ticket before stapling." >&2
+    return 1
+  fi
+}
+
+verify_release_stapled_notarization() {
+  local bundle_dir="$1"
+
+  # This helper is deliberately fail-closed even when its caller is evaluated
+  # by `if`/`!`, a context in which Bash otherwise suppresses `set -e` inside
+  # shell functions.
+  verify_release_notarization_tools_integrity || return 1
+  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    "$RELEASE_STAPLER_BIN" validate "$bundle_dir" || return 1
+  verify_release_notarization_tools_integrity || return 1
+}
+
 sign_release_bundle() {
   local bundle_dir="$1"
   verify_release_bundle_payload_baseline "$bundle_dir" || return 1
@@ -3521,6 +3579,7 @@ notarize_and_staple_bundle() {
   local bundle_dir="$1"
   local notary_zip="$STAGE_DIR/notary-submit.zip"
 
+  require_unstapled_notary_ticket_absent "$bundle_dir" || return 1
   verify_release_bundle_payload_baseline "$bundle_dir" || return 1
   (
     cd "$STAGE_DIR"
@@ -3529,20 +3588,27 @@ notarize_and_staple_bundle() {
   ) || return 1
   verify_release_bundle_payload_baseline "$bundle_dir" || return 1
 
-  verify_release_notarization_tools_integrity
+  verify_release_notarization_tools_integrity || return 1
   verify_release_bundle_payload_baseline "$bundle_dir" || return 1
   DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
     "$RELEASE_NOTARYTOOL_BIN" submit "$notary_zip" --keychain-profile "$NOTARY_PROFILE" --wait \
     || return 1
   verify_release_bundle_payload_baseline "$bundle_dir" || return 1
-  verify_release_notarization_tools_integrity
+  verify_release_notarization_tools_integrity || return 1
+  require_unstapled_notary_ticket_absent "$bundle_dir" || return 1
   DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
     "$RELEASE_STAPLER_BIN" staple "$bundle_dir" || return 1
-  verify_release_notarization_tools_integrity
+  verify_release_notarization_tools_integrity || return 1
   DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
     "$RELEASE_STAPLER_BIN" validate "$bundle_dir" || return 1
-  verify_release_notarization_tools_integrity
-  RELEASE_NOTARY_TICKET_STAPLED=true
+  verify_release_notarization_tools_integrity || return 1
+  # From this point onward the complete opaque ticket bytes are part of the
+  # ordinary payload baseline. Any later ticket mutation or removal therefore
+  # fails exactly like a resource mutation.
+  adopt_stapled_notary_ticket_baseline "$bundle_dir" || return 1
+  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    "$RELEASE_STAPLER_BIN" validate "$bundle_dir" || return 1
+  verify_release_notarization_tools_integrity || return 1
   verify_release_bundle_payload_baseline "$bundle_dir" || return 1
 }
 
@@ -3579,12 +3645,12 @@ verify_release_entitlements() {
   fi
 
   if [ ! -s "$actual_raw" ]; then
-    write_empty_entitlements_plist >"$actual_raw"
+    write_empty_entitlements_plist >"$actual_raw" || return 1
   fi
-  write_empty_entitlements_plist >"$expected_raw"
+  write_empty_entitlements_plist >"$expected_raw" || return 1
 
-  /usr/bin/plutil -convert xml1 -o "$actual_norm" -- "$actual_raw"
-  /usr/bin/plutil -convert xml1 -o "$expected_norm" -- "$expected_raw"
+  /usr/bin/plutil -convert xml1 -o "$actual_norm" -- "$actual_raw" || return 1
+  /usr/bin/plutil -convert xml1 -o "$expected_norm" -- "$expected_raw" || return 1
 
   if ! /usr/bin/cmp -s "$expected_norm" "$actual_norm"; then
     echo "Release bundle entitlements do not match allowlist; no entitlements are expected." >&2
@@ -3613,21 +3679,24 @@ append_nested_code_candidate() {
   local nested_list="$3"
 
   if [ "$candidate" != "$main_executable" ]; then
-    /usr/bin/printf '%s\n' "$candidate" >>"$nested_list"
+    /usr/bin/printf '%s\n' "$candidate" >>"$nested_list" || return 1
   fi
 }
 
 verify_no_nested_code() {
   local bundle_dir="$1"
   local bundle_executable
-  bundle_executable="$(/usr/bin/plutil -extract CFBundleExecutable raw "$bundle_dir/Contents/Info.plist")"
+  bundle_executable="$(
+    /usr/bin/plutil -extract CFBundleExecutable raw \
+      "$bundle_dir/Contents/Info.plist"
+  )" || return 1
   local main_executable="$bundle_dir/Contents/MacOS/$bundle_executable"
   local raw_nested="$STAGE_DIR/nested-code.raw.txt"
   local nested_list="$STAGE_DIR/nested-code.txt"
   local structural_candidates="$STAGE_DIR/nested-code-structural-candidates.bin"
   local macho_candidates="$STAGE_DIR/nested-code-macho-candidates.bin"
 
-  : >"$raw_nested"
+  : >"$raw_nested" || return 1
 
   if ! /usr/bin/find "$bundle_dir" -mindepth 1 \
     \( -type d \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.bundle' -o -name '*.plugin' -o -name '*.qlgenerator' -o -name '*.mdimporter' -o -name '*.saver' -o -name '*.prefPane' \) -print0 -prune \) -o \
@@ -3638,7 +3707,8 @@ verify_no_nested_code() {
   fi
 
   while IFS= read -r -d '' candidate; do
-    append_nested_code_candidate "$candidate" "$main_executable" "$raw_nested"
+    append_nested_code_candidate \
+      "$candidate" "$main_executable" "$raw_nested" || return 1
   done <"$structural_candidates"
 
   if ! /usr/bin/find "$bundle_dir" -mindepth 1 \
@@ -3650,7 +3720,8 @@ verify_no_nested_code() {
 
   while IFS= read -r -d '' candidate; do
     if file_has_macho_magic "$candidate"; then
-      append_nested_code_candidate "$candidate" "$main_executable" "$raw_nested"
+      append_nested_code_candidate \
+        "$candidate" "$main_executable" "$raw_nested" || return 1
     fi
   done <"$macho_candidates"
 
@@ -3721,15 +3792,18 @@ verify_release_build_metadata() {
 verify_no_developer_path_strings() {
   local bundle_dir="$1"
   local bundle_executable
-  bundle_executable="$(/usr/bin/plutil -extract CFBundleExecutable raw "$bundle_dir/Contents/Info.plist")"
+  bundle_executable="$(
+    /usr/bin/plutil -extract CFBundleExecutable raw \
+      "$bundle_dir/Contents/Info.plist"
+  )" || return 1
   local executable="$bundle_dir/Contents/MacOS/$bundle_executable"
   local strings_file="$STAGE_DIR/release-executable-strings.txt"
   local findings_file="$STAGE_DIR/release-developer-path-strings.txt"
   local unique_findings="$STAGE_DIR/release-developer-path-strings.unique.txt"
   local pattern
 
-  /usr/bin/strings -a "$executable" >"$strings_file"
-  : >"$findings_file"
+  /usr/bin/strings -a "$executable" >"$strings_file" || return 1
+  : >"$findings_file" || return 1
 
   for pattern in \
     "$ROOT_DIR" \
@@ -3741,11 +3815,19 @@ verify_no_developer_path_strings() {
     "CARGO_MANIFEST_DIR" \
     "WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH"; do
     if [ -n "$pattern" ]; then
-      /usr/bin/grep -F "$pattern" "$strings_file" >>"$findings_file" || true
+      local grep_status
+      if /usr/bin/grep -F "$pattern" "$strings_file" >>"$findings_file"; then
+        grep_status=0
+      else
+        grep_status=$?
+      fi
+      if [ "$grep_status" -ne 0 ] && [ "$grep_status" -ne 1 ]; then
+        return 1
+      fi
     fi
   done
 
-  LC_ALL=C /usr/bin/sort -u "$findings_file" >"$unique_findings"
+  LC_ALL=C /usr/bin/sort -u "$findings_file" >"$unique_findings" || return 1
   if [ -s "$unique_findings" ]; then
     echo "Release executable contains developer-local path strings:" >&2
     /usr/bin/head -n 20 "$unique_findings" >&2
@@ -3868,78 +3950,84 @@ verify_bundle_tree_entry_safety() {
 verify_release_bundle() {
   local bundle_dir="$1"
 
-  require_tool codesign
-  require_tool lipo
-  require_tool plutil
-  require_tool spctl
-  verify_bundle_tree_entry_safety "$bundle_dir"
+  require_tool codesign || return 1
+  require_tool lipo || return 1
+  require_tool plutil || return 1
+  require_tool spctl || return 1
+  verify_bundle_tree_entry_safety "$bundle_dir" || return 1
   if valid_sha256 "$RELEASE_BUNDLE_PAYLOAD_SHA256"; then
-    verify_release_bundle_payload_baseline "$bundle_dir"
+    verify_release_bundle_payload_baseline "$bundle_dir" || return 1
   fi
 
   local bundle_id
-  bundle_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$bundle_dir/Contents/Info.plist")"
+  bundle_id="$(
+    /usr/bin/plutil -extract CFBundleIdentifier raw \
+      "$bundle_dir/Contents/Info.plist"
+  )" || return 1
   if [ "$bundle_id" = "$DEVELOPMENT_BUNDLE_ID" ]; then
     echo "Release bundle uses the development CFBundleIdentifier $DEVELOPMENT_BUNDLE_ID." >&2
-    exit 1
+    return 1
   fi
   if [ "$bundle_id" != "$EXPECTED_BUNDLE_ID" ]; then
     echo "Unexpected CFBundleIdentifier: $bundle_id" >&2
-    exit 1
+    return 1
   fi
-  require_info_plist_string "$bundle_dir" NSAppleEventsUsageDescription
+  require_info_plist_string "$bundle_dir" NSAppleEventsUsageDescription || return 1
 
   local bundle_executable
   local executable
   local architectures
-  bundle_executable="$(/usr/bin/plutil -extract CFBundleExecutable raw "$bundle_dir/Contents/Info.plist")"
+  bundle_executable="$(
+    /usr/bin/plutil -extract CFBundleExecutable raw \
+      "$bundle_dir/Contents/Info.plist"
+  )" || return 1
   executable="$bundle_dir/Contents/MacOS/$bundle_executable"
   if ! architectures="$(/usr/bin/lipo -archs "$executable" 2>/dev/null)"; then
     echo "Unable to inspect release executable architecture: $executable" >&2
-    exit 1
+    return 1
   fi
   if [ "$architectures" != "arm64" ]; then
     echo "Release executable must contain exactly the arm64 architecture; found: $architectures" >&2
-    exit 1
+    return 1
   fi
 
   local requirement
   requirement="=anchor apple generic and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and identifier \"$EXPECTED_BUNDLE_ID\""
-  /usr/bin/codesign --verify --strict --deep --test-requirement "$requirement" "$bundle_dir"
+  /usr/bin/codesign --verify --strict --deep \
+    --test-requirement "$requirement" "$bundle_dir" || return 1
 
   local signature
-  signature="$(/usr/bin/codesign -dv --verbose=4 "$bundle_dir" 2>&1)"
+  signature="$(/usr/bin/codesign -dv --verbose=4 "$bundle_dir" 2>&1)" \
+    || return 1
   if echo "$signature" | /usr/bin/grep -q 'Signature=adhoc'; then
     echo "Release bundle is ad-hoc signed." >&2
-    exit 1
+    return 1
   fi
   if ! echo "$signature" | /usr/bin/grep -q 'Authority=Developer ID Application:'; then
     echo "Release bundle is not signed with Developer ID Application." >&2
-    exit 1
+    return 1
   fi
   if ! echo "$signature" | /usr/bin/grep -q "TeamIdentifier=$EXPECTED_TEAM_ID"; then
     echo "Release bundle TeamIdentifier does not match WAAL_MACOS_TEAM_ID." >&2
-    exit 1
+    return 1
   fi
   if ! echo "$signature" | /usr/bin/grep -Eq 'flags=.*runtime'; then
     echo "Release bundle is missing hardened runtime." >&2
-    exit 1
+    return 1
   fi
 
-  verify_release_build_metadata "$bundle_dir"
-  verify_macos_release_provenance "$bundle_dir"
-  verify_no_developer_path_strings "$bundle_dir"
-  verify_no_nested_code "$bundle_dir"
-  verify_release_entitlements "$bundle_dir"
+  verify_release_build_metadata "$bundle_dir" || return 1
+  verify_macos_release_provenance "$bundle_dir" || return 1
+  verify_no_developer_path_strings "$bundle_dir" || return 1
+  verify_no_nested_code "$bundle_dir" || return 1
+  verify_release_entitlements "$bundle_dir" || return 1
 
-  /usr/sbin/spctl --assess --type execute --verbose "$bundle_dir"
-  verify_release_notarization_tools_integrity
-  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
-    "$RELEASE_STAPLER_BIN" validate "$bundle_dir"
-  verify_release_notarization_tools_integrity
+  /usr/sbin/spctl --assess --type execute --verbose "$bundle_dir" || return 1
+  verify_release_stapled_notarization "$bundle_dir" || return 1
   if valid_sha256 "$RELEASE_BUNDLE_PAYLOAD_SHA256"; then
-    verify_release_bundle_payload_baseline "$bundle_dir"
+    verify_release_bundle_payload_baseline "$bundle_dir" || return 1
   fi
+  return 0
 }
 
 archive_session_rewind() {

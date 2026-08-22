@@ -2162,28 +2162,130 @@ verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE"
 [ "$(canonical_unsigned_macho_sha256 \
   "$BUNDLE_GUARD_BUNDLE/Contents/MacOS/BundleGuard")" = "$BUNDLE_GUARD_CANONICAL_A" ] \
   || fail "codesign changed executable bytes outside normalized signature metadata"
+if verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "missing notarization ticket passed the one-shot staple transition"
+fi
+/usr/bin/printf '' >"$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "empty notarization ticket passed the one-shot staple transition"
+fi
+/bin/rm -f -- "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+/bin/ln -s Resources/payload.txt "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "symbolic-link notarization ticket passed the one-shot staple transition"
+fi
+/bin/rm -f -- "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+/bin/ln "$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt" \
+  "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "hard-linked notarization ticket passed the one-shot staple transition"
+fi
+/bin/rm -f -- "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
 /usr/bin/printf 'stapled ticket fixture\n' \
   >"$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
-if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
-  fail "notarization ticket path was ignored before validated staple state"
+/bin/chmod 600 "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "wrong-mode notarization ticket passed the one-shot staple transition"
 fi
-RELEASE_NOTARY_TICKET_STAPLED=true
-verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" \
-  || fail "validated staple ticket was treated as unsigned resource mutation"
+/bin/chmod 644 "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  || fail "exact notarization-ticket transition changed another payload record"
 /usr/bin/printf 'mutated after staple\n' \
   >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
-if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
-  fail "resource mutation was hidden by notarization ticket allowance"
+if verify_stapled_notary_ticket_transition "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "resource mutation was hidden by one-shot notarization-ticket transition"
 fi
 /usr/bin/printf 'payload resource\n' \
   >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
+SAVED_RELEASE_BUNDLE_PAYLOAD_FUNCTION="$(declare -f release_bundle_payload_sha256)"
+eval "$(
+  /usr/bin/printf '%s\n' "$SAVED_RELEASE_BUNDLE_PAYLOAD_FUNCTION" \
+    | /usr/bin/sed \
+      '1s/^release_bundle_payload_sha256 /bundle_guard_original_release_bundle_payload_sha256 /'
+)"
+BUNDLE_GUARD_ADOPTION_COUNTER="$TEST_ROOT/bundle-guard-adoption-race.count"
+BUNDLE_GUARD_ADOPTION_INJECT_ON=1
+release_bundle_payload_sha256() {
+  local ticket_mode="${2:-include-ticket}"
+  local include_count
+
+  if [ "$ticket_mode" = include-ticket ]; then
+    include_count=0
+    if [ -f "$BUNDLE_GUARD_ADOPTION_COUNTER" ]; then
+      include_count="$(/bin/cat "$BUNDLE_GUARD_ADOPTION_COUNTER")"
+    fi
+    include_count=$((include_count + 1))
+    /usr/bin/printf '%s\n' "$include_count" \
+      >"$BUNDLE_GUARD_ADOPTION_COUNTER"
+    if [ "$include_count" -eq "$BUNDLE_GUARD_ADOPTION_INJECT_ON" ]; then
+      /usr/bin/printf 'mutated during ticket adoption\n' \
+        >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
+    fi
+  fi
+  bundle_guard_original_release_bundle_payload_sha256 "$@"
+}
+if adopt_stapled_notary_ticket_baseline "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "unrelated payload mutation was adopted with the stapled ticket"
+fi
+[ "$RELEASE_BUNDLE_PAYLOAD_SHA256" = "$BUNDLE_GUARD_BASELINE" ] \
+  || fail "failed ticket adoption replaced the pre-staple payload baseline"
+/usr/bin/printf 'payload resource\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
+/bin/rm -f -- "$BUNDLE_GUARD_ADOPTION_COUNTER"
+BUNDLE_GUARD_ADOPTION_INJECT_ON=2
+if adopt_stapled_notary_ticket_baseline "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "late payload mutation was adopted with the stapled ticket"
+fi
+[ "$RELEASE_BUNDLE_PAYLOAD_SHA256" = "$BUNDLE_GUARD_BASELINE" ] \
+  || fail "late failed ticket adoption replaced the pre-staple payload baseline"
+unset -f release_bundle_payload_sha256 bundle_guard_original_release_bundle_payload_sha256
+eval "$SAVED_RELEASE_BUNDLE_PAYLOAD_FUNCTION"
+/usr/bin/printf 'payload resource\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
+adopt_stapled_notary_ticket_baseline "$BUNDLE_GUARD_BUNDLE"
+verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE"
+/usr/bin/printf 'mutated stapled ticket\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
+  fail "post-transition notarization-ticket mutation escaped the full baseline"
+fi
+/usr/bin/printf 'stapled ticket fixture\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE"
 /bin/rm -f -- "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
 if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
-  fail "validated staple state accepted a missing notarization ticket"
+  fail "post-transition baseline accepted a missing notarization ticket"
 fi
-RELEASE_NOTARY_TICKET_STAPLED=false
 RELEASE_BUNDLE_PAYLOAD_SHA256=""
 BINARY_NAME="$SAVED_BINARY_NAME"
+
+FAILING_STAPLER="$TEST_ROOT/failing-stapler"
+/usr/bin/printf '%s\n' '#!/bin/sh' 'exit 73' >"$FAILING_STAPLER"
+/bin/chmod 755 "$FAILING_STAPLER"
+SAVED_RELEASE_STAPLER_BIN="$RELEASE_STAPLER_BIN"
+SAVED_RELEASE_DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR"
+SAVED_NOTARIZATION_INTEGRITY_FUNCTION="$(
+  declare -f verify_release_notarization_tools_integrity
+)"
+RELEASE_STAPLER_BIN="$FAILING_STAPLER"
+RELEASE_DEVELOPER_DIR="$REAL_DEVELOPER_DIR"
+verify_release_notarization_tools_integrity() { return 0; }
+if verify_release_stapled_notarization "$BUNDLE_GUARD_BUNDLE" \
+  >/dev/null 2>&1; then
+  fail "conditional stapler validation failure was masked by a later success"
+fi
+unset -f verify_release_notarization_tools_integrity
+eval "$SAVED_NOTARIZATION_INTEGRITY_FUNCTION"
+RELEASE_STAPLER_BIN="$SAVED_RELEASE_STAPLER_BIN"
+RELEASE_DEVELOPER_DIR="$SAVED_RELEASE_DEVELOPER_DIR"
 
 [ "$(/usr/bin/head -n 1 "$ROOT_DIR/script/package_macos.sh")" = '#!/bin/bash -p' ] \
   || fail "macOS local packager does not enter privileged Bash through an absolute shebang"
@@ -2321,11 +2423,61 @@ if ! /usr/bin/perl -0777 -e '
   my $stapler = index($staple, q{"$RELEASE_STAPLER_BIN" staple});
   my $validate = index(
     $staple, q{"$RELEASE_STAPLER_BIN" validate}, $stapler + 1);
-  my $allow_ticket = index($staple, "RELEASE_NOTARY_TICKET_STAPLED=true", $validate + 1);
+  my $ticket_adoption = index(
+    $staple, "adopt_stapled_notary_ticket_baseline", $validate + 1);
+  my $second_validate = index(
+    $staple, q{"$RELEASE_STAPLER_BIN" validate}, $ticket_adoption + 1);
   my $post_staple_guard = index(
-    $staple, "verify_release_bundle_payload_baseline", $allow_ticket + 1);
+    $staple, "verify_release_bundle_payload_baseline", $second_validate + 1);
   exit 1 unless $stapler >= 0 && $validate > $stapler
-    && $allow_ticket > $validate && $post_staple_guard > $allow_ticket;
+    && $ticket_adoption > $validate
+    && $second_validate > $ticket_adoption
+    && $post_staple_guard > $second_validate;
+
+  my $verify_start = index($text, "verify_release_bundle() {");
+  my $verify_end = index($text, "archive_session_rewind() {", $verify_start);
+  exit 1 if $verify_start < 0 || $verify_end <= $verify_start;
+  my $verify = substr($text, $verify_start, $verify_end - $verify_start);
+  my @fail_closed = (
+    qr/require_tool codesign \|\| return 1/,
+    qr/require_tool lipo \|\| return 1/,
+    qr/require_tool plutil \|\| return 1/,
+    qr/require_tool spctl \|\| return 1/,
+    qr/verify_bundle_tree_entry_safety "\$bundle_dir" \|\| return 1/,
+    qr/--test-requirement "\$requirement" "\$bundle_dir" \|\| return 1/,
+    qr/require_info_plist_string "\$bundle_dir" NSAppleEventsUsageDescription \|\| return 1/,
+    qr/verify_release_build_metadata "\$bundle_dir" \|\| return 1/,
+    qr/verify_macos_release_provenance "\$bundle_dir" \|\| return 1/,
+    qr/verify_no_developer_path_strings "\$bundle_dir" \|\| return 1/,
+    qr/verify_no_nested_code "\$bundle_dir" \|\| return 1/,
+    qr/verify_release_entitlements "\$bundle_dir" \|\| return 1/,
+    qr/spctl --assess --type execute --verbose "\$bundle_dir" \|\| return 1/,
+    qr/verify_release_stapled_notarization "\$bundle_dir" \|\| return 1/
+  );
+  for my $contract (@fail_closed) {
+    exit 1 unless $verify =~ $contract;
+  }
+  my $payload_guard_count = () = $verify =~
+    /verify_release_bundle_payload_baseline "\$bundle_dir" \|\| return 1/g;
+  exit 1 unless $payload_guard_count == 2;
+  my @exact_guarded_fragments = (
+    q{bundle_id="$(
+    /usr/bin/plutil -extract CFBundleIdentifier raw \
+      "$bundle_dir/Contents/Info.plist"
+  )" || return 1},
+    q{bundle_executable="$(
+    /usr/bin/plutil -extract CFBundleExecutable raw \
+      "$bundle_dir/Contents/Info.plist"
+  )" || return 1},
+    q{signature="$(/usr/bin/codesign -dv --verbose=4 "$bundle_dir" 2>&1)" \
+    || return 1}
+  );
+  for my $fragment (@exact_guarded_fragments) {
+    exit 1 unless index($verify, $fragment) >= 0;
+  }
+  exit 1 unless index(
+    $text,
+    q{[ "$status" -eq 0 ] && ! verify_release_bundle "$extracted_bundle"}) >= 0;
 ' "$ROOT_DIR/script/package_macos.sh"; then
   fail "macOS tool execution or bundle signing is no longer enclosed by exact guards"
 fi
