@@ -210,6 +210,7 @@ ARCHIVE_SESSION_ACTIVE=false
 ARCHIVE_SESSION_PATH=""
 ARCHIVE_SESSION_IDENTITY=""
 RELEASE_BUNDLE_PAYLOAD_SHA256=""
+RELEASE_NOTARY_TICKET_STAPLED=false
 CARGO_VERSION=""
 BUILD_VERSION=""
 
@@ -3361,10 +3362,27 @@ release_bundle_payload_sha256() {
   local bundle_executable
   local executable
   local executable_sha256
+  local notary_ticket="$bundle_dir/Contents/CodeResources"
   local first_identity
   local second_identity
   local digest
 
+  case "$RELEASE_NOTARY_TICKET_STAPLED" in
+    true)
+      require_single_link_regular_file "$notary_ticket" \
+        "Stapled notarization ticket" || return 1
+      require_no_acl "$notary_ticket" "Stapled notarization ticket" || return 1
+      if [ "$(/usr/bin/stat -f '%Mp%Lp' "$notary_ticket")" != 0644 ]; then
+        echo "Stapled notarization ticket must have mode 0644." >&2
+        return 1
+      fi
+      ;;
+    false) ;;
+    *)
+      echo "Invalid stapled notarization ticket state." >&2
+      return 1
+      ;;
+  esac
   verify_bundle_tree_entry_safety "$bundle_dir" || return 1
   bundle_executable="$(
     /usr/bin/plutil -extract CFBundleExecutable raw \
@@ -3386,7 +3404,7 @@ release_bundle_payload_sha256() {
         use strict;
         use warnings;
         use bytes;
-        my ($root, $main_relative, $main_sha256) = @ARGV;
+        my ($root, $main_relative, $main_sha256, $ticket_stapled) = @ARGV;
         my @records;
         File::Find::find({
           no_chdir => 1,
@@ -3398,6 +3416,14 @@ release_bundle_payload_sha256() {
             if ($relative eq "Contents/_CodeSignature"
                 || index($relative, "Contents/_CodeSignature/") == 0) {
               $File::Find::prune = 1 if -d $path;
+              return;
+            }
+            # `stapler` adds the Apple-validated ticket at this one exact path.
+            # It is absent from the pre-signing baseline, so omit it only after
+            # a successful `stapler validate`; every other resource remains in
+            # the original payload digest.
+            if ($ticket_stapled eq "true"
+                && $relative eq "Contents/CodeResources") {
               return;
             }
             my @before = lstat($path);
@@ -3438,7 +3464,8 @@ release_bundle_payload_sha256() {
             $record->[2], "\0", $record->[3], "\0");
         }
         print $aggregate->hexdigest, "\n";
-      ' -- "$bundle_dir" "Contents/MacOS/$bundle_executable" "$executable_sha256"
+      ' -- "$bundle_dir" "Contents/MacOS/$bundle_executable" \
+        "$executable_sha256" "$RELEASE_NOTARY_TICKET_STAPLED"
   )" || ! valid_sha256 "$digest"; then
     echo "Unable to hash the canonical release bundle payload tree." >&2
     return 1
@@ -3511,8 +3538,12 @@ notarize_and_staple_bundle() {
   verify_release_notarization_tools_integrity
   DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
     "$RELEASE_STAPLER_BIN" staple "$bundle_dir" || return 1
-  verify_release_bundle_payload_baseline "$bundle_dir" || return 1
   verify_release_notarization_tools_integrity
+  DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR" \
+    "$RELEASE_STAPLER_BIN" validate "$bundle_dir" || return 1
+  verify_release_notarization_tools_integrity
+  RELEASE_NOTARY_TICKET_STAPLED=true
+  verify_release_bundle_payload_baseline "$bundle_dir" || return 1
 }
 
 sanitized_zip() (

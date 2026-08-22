@@ -2162,6 +2162,26 @@ verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE"
 [ "$(canonical_unsigned_macho_sha256 \
   "$BUNDLE_GUARD_BUNDLE/Contents/MacOS/BundleGuard")" = "$BUNDLE_GUARD_CANONICAL_A" ] \
   || fail "codesign changed executable bytes outside normalized signature metadata"
+/usr/bin/printf 'stapled ticket fixture\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
+  fail "notarization ticket path was ignored before validated staple state"
+fi
+RELEASE_NOTARY_TICKET_STAPLED=true
+verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" \
+  || fail "validated staple ticket was treated as unsigned resource mutation"
+/usr/bin/printf 'mutated after staple\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
+if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
+  fail "resource mutation was hidden by notarization ticket allowance"
+fi
+/usr/bin/printf 'payload resource\n' \
+  >"$BUNDLE_GUARD_BUNDLE/Contents/Resources/payload.txt"
+/bin/rm -f -- "$BUNDLE_GUARD_BUNDLE/Contents/CodeResources"
+if verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE" >/dev/null 2>&1; then
+  fail "validated staple state accepted a missing notarization ticket"
+fi
+RELEASE_NOTARY_TICKET_STAPLED=false
 RELEASE_BUNDLE_PAYLOAD_SHA256=""
 BINARY_NAME="$SAVED_BINARY_NAME"
 
@@ -2293,6 +2313,19 @@ if ! /usr/bin/perl -0777 -e '
   my $sign_guard_after = index($sign, "verify_release_bundle_payload_baseline", $sign_guard_before + 1);
   exit 1 unless $sign_guard_before >= 0 && $codesign > $sign_guard_before
     && $sign_guard_after > $codesign;
+
+  my $staple_start = index($text, "notarize_and_staple_bundle() {");
+  my $staple_end = index($text, "sanitized_zip() (", $staple_start);
+  exit 1 if $staple_start < 0 || $staple_end <= $staple_start;
+  my $staple = substr($text, $staple_start, $staple_end - $staple_start);
+  my $stapler = index($staple, q{"$RELEASE_STAPLER_BIN" staple});
+  my $validate = index(
+    $staple, q{"$RELEASE_STAPLER_BIN" validate}, $stapler + 1);
+  my $allow_ticket = index($staple, "RELEASE_NOTARY_TICKET_STAPLED=true", $validate + 1);
+  my $post_staple_guard = index(
+    $staple, "verify_release_bundle_payload_baseline", $allow_ticket + 1);
+  exit 1 unless $stapler >= 0 && $validate > $stapler
+    && $allow_ticket > $validate && $post_staple_guard > $allow_ticket;
 ' "$ROOT_DIR/script/package_macos.sh"; then
   fail "macOS tool execution or bundle signing is no longer enclosed by exact guards"
 fi
