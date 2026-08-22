@@ -393,6 +393,23 @@ struct PreparedPromptForFill {
     trusted_process: macos_identity::TrustedProcessInfo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AxForegroundState {
+    focused: Option<bool>,
+    main: Option<bool>,
+}
+
+fn zeroizing_utf16_buffer(value: &str) -> Zeroizing<Vec<u16>> {
+    // A UTF-8 byte string can never encode to more UTF-16 code units than its
+    // byte length. Reserve that upper bound before writing any plaintext so
+    // Vec growth cannot free unzeroized password prefixes.
+    let mut utf16 = Zeroizing::new(Vec::with_capacity(value.len()));
+    let initial_capacity = utf16.capacity();
+    utf16.extend(value.encode_utf16());
+    debug_assert_eq!(utf16.capacity(), initial_capacity);
+    utf16
+}
+
 impl Clone for AxElement {
     fn clone(&self) -> Self {
         unsafe {
@@ -513,7 +530,7 @@ impl AxElement {
 
     fn set_string_attr(&self, attr: &'static str, value: &str) -> bool {
         let attr = CFString::from_static_string(attr);
-        let mut utf16 = Zeroizing::new(value.encode_utf16().collect::<Vec<u16>>());
+        let mut utf16 = zeroizing_utf16_buffer(value);
         let value_ref = unsafe {
             CFStringCreateWithCharactersNoCopy(
                 std::ptr::null(),
@@ -605,7 +622,7 @@ fn inspect_process(
         if app.process_id() != Some(process.pid) {
             continue;
         }
-        let app_frontmost = app.bool_attr(AX_FRONTMOST).unwrap_or(false);
+        let app_frontmost = app.bool_attr(AX_FRONTMOST) == Some(true);
         let windows = app
             .array_attr_result(AX_WINDOWS)
             .context("unable to enumerate trusted application windows")?;
@@ -613,9 +630,12 @@ fn inspect_process(
             .iter()
             .filter(|window| !is_hidden(window))
             .collect::<Vec<_>>();
-        let any_explicit_frontmost_window = visible_windows
+        let window_foreground_states = visible_windows
             .iter()
-            .any(|window| element_explicitly_frontmost(window));
+            .map(|window| element_foreground_state(window))
+            .collect::<Vec<_>>();
+        let selected_window_index =
+            select_unique_foreground_index(app_frontmost, &window_foreground_states);
 
         if inspection.target.is_none() {
             inspection.target = Some(MacosTarget {
@@ -625,8 +645,7 @@ fn inspect_process(
             });
         }
 
-        let visible_window_count = visible_windows.len();
-        for window in visible_windows {
+        for (window_index, window) in visible_windows.into_iter().enumerate() {
             let window_title = window.string_attr(AX_TITLE).unwrap_or_default();
             inspection.window_titles.push(MacosWindowTitle {
                 process_id: process.pid,
@@ -639,12 +658,7 @@ fn inspect_process(
                 continue;
             }
 
-            let window_frontmost = window_is_frontmost_for_app(
-                app_frontmost,
-                visible_window_count,
-                any_explicit_frontmost_window,
-                element_explicitly_frontmost(window),
-            );
+            let window_frontmost = selected_window_index == Some(window_index);
             let target = MacosTarget {
                 process_id: process.pid,
                 window_title: window_title.clone(),
@@ -663,39 +677,35 @@ fn inspect_process(
             let visible_sheets = if window_frontmost {
                 sheet_candidates_for_window(window)?
                     .into_iter()
-                    .filter(|sheet| !is_hidden(sheet))
+                    .filter(|sheet| !is_hidden(sheet) && element_is_direct_child_of(sheet, window))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
-            let visible_sheet_count = visible_sheets.len();
-            let any_explicit_frontmost_sheet =
-                visible_sheets.iter().any(element_explicitly_frontmost);
-            let mut found_sheet_prompt = false;
-            for sheet in visible_sheets {
-                let sheet_elements = collect_elements(&sheet)
+            let has_visible_sheet = !visible_sheets.is_empty();
+            let sheet_foreground_states = visible_sheets
+                .iter()
+                .map(element_foreground_state)
+                .collect::<Vec<_>>();
+            let selected_sheet_index =
+                select_unique_sheet_index(window_frontmost, &sheet_foreground_states);
+            if let Some(sheet) = selected_sheet_index.and_then(|index| visible_sheets.get(index)) {
+                let sheet_elements = collect_elements(sheet)
                     .into_complete_elements()
                     .context("credential sheet AX tree traversal was incomplete")?;
                 let sheet_target = MacosTarget {
-                    frontmost: sheet_is_frontmost_for_app(
-                        app_frontmost,
-                        target.frontmost,
-                        visible_sheet_count,
-                        any_explicit_frontmost_sheet,
-                        element_explicitly_frontmost(&sheet),
-                    ),
+                    frontmost: true,
                     ..target.clone()
                 };
                 if let Some(prompt) = prompt_from_elements(
                     sheet_target,
                     window,
-                    &sheet,
+                    sheet,
                     &sheet_elements,
                     PromptOrigin::Sheet,
                     &process,
                 )? {
                     record_prompt_candidate(&mut inspection, prompt);
-                    found_sheet_prompt = true;
                 }
             }
 
@@ -708,7 +718,7 @@ fn inspect_process(
                     window: Some(window.clone()),
                 });
             }
-            if found_sheet_prompt
+            if has_visible_sheet
                 || !window_frontmost
                 || !window_should_scan_for_prompt(window, &window_title)
             {
@@ -1803,7 +1813,7 @@ fn prompt_is_frontmost_now(prompt: &MacosPrompt) -> bool {
         return false;
     }
 
-    let app_frontmost = app.bool_attr(AX_FRONTMOST).unwrap_or(false);
+    let app_frontmost = app.bool_attr(AX_FRONTMOST) == Some(true);
     let Ok(windows) = app.array_attr_result(AX_WINDOWS) else {
         return false;
     };
@@ -1811,27 +1821,25 @@ fn prompt_is_frontmost_now(prompt: &MacosPrompt) -> bool {
         .into_iter()
         .filter(|window| !is_hidden(window))
         .collect::<Vec<_>>();
-    let any_explicit_frontmost_window = visible_windows.iter().any(element_explicitly_frontmost);
-    let Some(target_window) = visible_windows
+    let window_foreground_states = visible_windows
         .iter()
-        .find(|window| window.same_element(&prompt.target_window))
+        .map(element_foreground_state)
+        .collect::<Vec<_>>();
+    let Some(target_window) =
+        select_unique_foreground_index(app_frontmost, &window_foreground_states)
+            .and_then(|index| visible_windows.get(index))
     else {
         return false;
     };
-    let target_window_frontmost = window_is_frontmost_for_app(
-        app_frontmost,
-        visible_windows.len(),
-        any_explicit_frontmost_window,
-        element_explicitly_frontmost(target_window),
-    );
-    if !app_frontmost || !element_has_ancestor(&prompt.prompt_root, &prompt.native_container) {
+    if !target_window.same_element(&prompt.target_window)
+        || !element_has_ancestor(&prompt.prompt_root, &prompt.native_container)
+    {
         return false;
     }
 
     match prompt.origin {
         PromptOrigin::Window => {
-            target_window_frontmost
-                && prompt.native_container.same_element(target_window)
+            prompt.native_container.same_element(target_window)
                 && window_should_scan_for_prompt(target_window, &prompt.target.window_title)
         }
         PromptOrigin::Sheet => {
@@ -1840,23 +1848,20 @@ fn prompt_is_frontmost_now(prompt: &MacosPrompt) -> bool {
             };
             let visible_sheets = sheet_candidates
                 .into_iter()
-                .filter(|sheet| !is_hidden(sheet))
+                .filter(|sheet| {
+                    !is_hidden(sheet) && element_is_direct_child_of(sheet, target_window)
+                })
                 .collect::<Vec<_>>();
-            let any_explicit_frontmost_sheet =
-                visible_sheets.iter().any(element_explicitly_frontmost);
-            let Some(sheet) = visible_sheets
+            let sheet_foreground_states = visible_sheets
                 .iter()
-                .find(|sheet| sheet.same_element(&prompt.native_container))
+                .map(element_foreground_state)
+                .collect::<Vec<_>>();
+            let Some(sheet) = select_unique_sheet_index(true, &sheet_foreground_states)
+                .and_then(|index| visible_sheets.get(index))
             else {
                 return false;
             };
-            sheet_is_frontmost_for_app(
-                app_frontmost,
-                target_window_frontmost,
-                visible_sheets.len(),
-                any_explicit_frontmost_sheet,
-                element_explicitly_frontmost(sheet),
-            )
+            sheet.same_element(&prompt.native_container)
         }
     }
 }
@@ -2541,33 +2546,71 @@ fn element_enabled(element: &AxElement) -> bool {
     element.bool_attr(AX_ENABLED) == Some(true)
 }
 
-fn element_explicitly_frontmost(element: &AxElement) -> bool {
-    element.bool_attr(AX_MAIN).unwrap_or(false) || element.bool_attr(AX_FOCUSED).unwrap_or(false)
+fn element_foreground_state(element: &AxElement) -> AxForegroundState {
+    AxForegroundState {
+        focused: element.bool_attr(AX_FOCUSED),
+        main: element.bool_attr(AX_MAIN),
+    }
 }
 
-fn window_is_frontmost_for_app(
+fn select_unique_foreground_index(
     app_frontmost: bool,
-    visible_window_count: usize,
-    any_explicit_frontmost_window: bool,
-    window_explicitly_frontmost: bool,
-) -> bool {
-    app_frontmost
-        && (window_explicitly_frontmost
-            || (!any_explicit_frontmost_window && visible_window_count == 1))
+    states: &[AxForegroundState],
+) -> Option<usize> {
+    if !app_frontmost
+        || states.is_empty()
+        || states
+            .iter()
+            .any(|state| state.focused.is_none() || state.main.is_none())
+    {
+        return None;
+    }
+
+    match unique_true_index(
+        states
+            .iter()
+            .map(|state| state.focused == Some(true) || state.main == Some(true)),
+    ) {
+        UniqueTrueIndex::One(index) => Some(index),
+        UniqueTrueIndex::None | UniqueTrueIndex::Multiple => None,
+    }
 }
 
-fn sheet_is_frontmost_for_app(
-    app_frontmost: bool,
-    parent_window_frontmost: bool,
-    visible_sheet_count: usize,
-    any_explicit_frontmost_sheet: bool,
-    sheet_explicitly_frontmost: bool,
-) -> bool {
-    app_frontmost
-        && (sheet_explicitly_frontmost
-            || (parent_window_frontmost
-                && !any_explicit_frontmost_sheet
-                && visible_sheet_count == 1))
+fn select_unique_sheet_index(
+    parent_window_selected: bool,
+    states: &[AxForegroundState],
+) -> Option<usize> {
+    if !parent_window_selected {
+        return None;
+    }
+    select_unique_foreground_index(true, states)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UniqueTrueIndex {
+    None,
+    One(usize),
+    Multiple,
+}
+
+fn unique_true_index(states: impl IntoIterator<Item = bool>) -> UniqueTrueIndex {
+    let mut selected = None;
+    for (index, state) in states.into_iter().enumerate() {
+        if !state {
+            continue;
+        }
+        if selected.is_some() {
+            return UniqueTrueIndex::Multiple;
+        }
+        selected = Some(index);
+    }
+    selected.map_or(UniqueTrueIndex::None, UniqueTrueIndex::One)
+}
+
+fn element_is_direct_child_of(element: &AxElement, expected_parent: &AxElement) -> bool {
+    element
+        .parent()
+        .is_some_and(|parent| parent.same_element(expected_parent))
 }
 
 fn login_title_like(title: &str) -> bool {
@@ -3214,8 +3257,15 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("fn perform_action").next())
             .unwrap();
+        let encoder = implementation
+            .split("fn zeroizing_utf16_buffer")
+            .nth(1)
+            .and_then(|tail| tail.split("impl Clone for AxElement").next())
+            .unwrap();
 
-        assert!(setter.contains("Zeroizing::new"));
+        assert!(setter.contains("zeroizing_utf16_buffer(value)"));
+        assert!(encoder.contains("Zeroizing::new"));
+        assert!(encoder.contains("Vec::with_capacity(value.len())"));
         assert!(setter.contains("CFStringCreateWithCharactersNoCopy"));
         assert!(setter.contains("kCFAllocatorNull"));
         assert!(setter.contains("drop(cf_value)"));
@@ -3616,13 +3666,30 @@ mod tests {
         let enabled = implementation
             .split("fn element_enabled(element: &AxElement)")
             .nth(1)
-            .and_then(|tail| tail.split("fn element_explicitly_frontmost").next())
+            .and_then(|tail| tail.split("fn element_foreground_state").next())
             .unwrap();
 
         assert!(visibility.contains("!= Some(false)"));
         assert!(enabled.contains("== Some(true)"));
         assert!(!visibility.contains("unwrap_or(false)"));
         assert!(!enabled.contains("unwrap_or(true)"));
+    }
+
+    #[test]
+    fn password_utf16_buffer_is_preallocated_before_plaintext_encoding() {
+        let value = "ASCII-paßword-🔐";
+        let encoded = super::zeroizing_utf16_buffer(value);
+        assert!(encoded.iter().copied().eq(value.encode_utf16()));
+
+        let implementation = include_str!("macos_ax.rs")
+            .split("fn zeroizing_utf16_buffer")
+            .nth(1)
+            .and_then(|tail| tail.split("impl Clone for AxElement").next())
+            .unwrap();
+        assert!(implementation.contains("Vec::with_capacity(value.len())"));
+        assert!(implementation.contains("utf16.extend(value.encode_utf16())"));
+        assert!(implementation.contains("debug_assert_eq!(utf16.capacity(), initial_capacity)"));
+        assert!(!implementation.contains("collect::<Vec<u16>>"));
     }
 
     #[test]
@@ -3682,33 +3749,160 @@ mod tests {
     }
 
     #[test]
-    fn window_frontmost_prefers_explicit_main_or_focused_over_first_window_fallback() {
-        assert!(!super::window_is_frontmost_for_app(true, 0, true, false));
-        assert!(super::window_is_frontmost_for_app(true, 1, true, true));
-        assert!(!super::window_is_frontmost_for_app(false, 1, true, true));
+    fn foreground_window_selection_requires_one_affirmative_candidate() {
+        use super::AxForegroundState as State;
+
+        let states = [
+            State {
+                focused: Some(false),
+                main: Some(false),
+            },
+            State {
+                focused: Some(true),
+                main: Some(true),
+            },
+        ];
+        assert_eq!(
+            super::select_unique_foreground_index(true, &states),
+            Some(1)
+        );
+        assert_eq!(super::select_unique_foreground_index(false, &states), None);
+
+        let unique_main = [
+            State {
+                focused: Some(false),
+                main: Some(false),
+            },
+            State {
+                focused: Some(false),
+                main: Some(true),
+            },
+        ];
+        assert_eq!(
+            super::select_unique_foreground_index(true, &unique_main),
+            Some(1)
+        );
     }
 
     #[test]
-    fn window_frontmost_falls_back_only_for_one_unambiguous_visible_window() {
-        assert!(super::window_is_frontmost_for_app(true, 1, false, false));
-        assert!(!super::window_is_frontmost_for_app(true, 2, false, false));
+    fn foreground_window_selection_fails_closed_on_ambiguous_or_unknown_state() {
+        use super::AxForegroundState as State;
+
+        let two_focused = [
+            State {
+                focused: Some(true),
+                main: Some(false),
+            },
+            State {
+                focused: Some(true),
+                main: Some(true),
+            },
+        ];
+        let two_main = [
+            State {
+                focused: Some(false),
+                main: Some(true),
+            },
+            State {
+                focused: Some(false),
+                main: Some(true),
+            },
+        ];
+        let conflicting_focus_and_main = [
+            State {
+                focused: Some(false),
+                main: Some(true),
+            },
+            State {
+                focused: Some(true),
+                main: Some(false),
+            },
+        ];
+        let unknown_focus = [
+            State {
+                focused: None,
+                main: Some(false),
+            },
+            State {
+                focused: Some(false),
+                main: Some(true),
+            },
+        ];
+        let unknown_main = [State {
+            focused: Some(false),
+            main: None,
+        }];
+
+        assert_eq!(
+            super::select_unique_foreground_index(true, &two_focused),
+            None
+        );
+        assert_eq!(super::select_unique_foreground_index(true, &two_main), None);
+        assert_eq!(
+            super::select_unique_foreground_index(true, &conflicting_focus_and_main),
+            None
+        );
+        assert_eq!(
+            super::select_unique_foreground_index(true, &unknown_focus),
+            None
+        );
+        assert_eq!(
+            super::select_unique_foreground_index(true, &unknown_main),
+            None
+        );
     }
 
     #[test]
-    fn sheet_frontmost_requires_an_exact_focused_sheet_or_unambiguous_foreground_parent() {
-        assert!(super::sheet_is_frontmost_for_app(
-            true, true, 1, false, false
-        ));
-        assert!(super::sheet_is_frontmost_for_app(true, true, 2, true, true));
-        assert!(!super::sheet_is_frontmost_for_app(
-            false, true, 1, false, false
-        ));
-        assert!(super::sheet_is_frontmost_for_app(
-            true, false, 1, true, true
-        ));
-        assert!(!super::sheet_is_frontmost_for_app(
-            true, true, 2, false, false
-        ));
+    fn foreground_window_selection_rejects_a_single_known_background_window() {
+        use super::AxForegroundState as State;
+
+        let one = [State {
+            focused: Some(false),
+            main: Some(false),
+        }];
+        let two = [one[0], one[0]];
+        assert_eq!(super::select_unique_foreground_index(true, &one), None);
+        assert_eq!(super::select_unique_foreground_index(true, &two), None);
+        assert_eq!(super::select_unique_foreground_index(true, &[]), None);
+    }
+
+    #[test]
+    fn foreground_sheet_selection_requires_selected_parent_and_is_unique() {
+        use super::AxForegroundState as State;
+
+        let one = [State {
+            focused: Some(true),
+            main: Some(false),
+        }];
+        let ambiguous = [one[0], one[0]];
+        let background = [State {
+            focused: Some(false),
+            main: Some(false),
+        }];
+        assert_eq!(super::select_unique_sheet_index(true, &one), Some(0));
+        assert_eq!(super::select_unique_sheet_index(false, &one), None);
+        assert_eq!(super::select_unique_sheet_index(true, &ambiguous), None);
+        assert_eq!(super::select_unique_sheet_index(true, &background), None);
+    }
+
+    #[test]
+    fn inspection_selects_one_sheet_before_recursive_traversal() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("fn inspect_process")
+            .nth(1)
+            .and_then(|tail| tail.split("fn trusted_process_infos_for_inspection").next())
+            .unwrap();
+        let selection = implementation
+            .find("select_unique_sheet_index")
+            .expect("sheet selection");
+        let traversal = implementation
+            .find("collect_elements(sheet)")
+            .expect("selected sheet traversal");
+
+        assert!(selection < traversal);
+        assert_eq!(implementation.matches("collect_elements(sheet)").count(), 1);
+        assert!(implementation.contains("if let Some(sheet) = selected_sheet_index"));
+        assert!(implementation.contains("if has_visible_sheet"));
     }
 
     #[test]

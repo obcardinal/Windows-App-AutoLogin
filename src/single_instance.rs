@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::time::Duration;
-#[cfg(target_os = "windows")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "macos")]
 use std::{
@@ -18,7 +16,7 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
     ERROR_LOCK_VIOLATION, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_PIPE_LISTENING, ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE, HLOCAL,
+    ERROR_PIPE_LISTENING, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
     INVALID_HANDLE_VALUE,
 };
 #[cfg(target_os = "windows")]
@@ -33,13 +31,13 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS, OPEN_EXISTING,
-    PIPE_ACCESS_INBOUND,
+    PIPE_ACCESS_DUPLEX,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+    GetNamedPipeServerProcessId, SetNamedPipeHandleState, WaitNamedPipeW, NAMED_PIPE_MODE,
+    PIPE_NOWAIT, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
@@ -50,8 +48,10 @@ use windows::Win32::System::IO::OVERLAPPED;
 
 #[cfg(not(target_os = "windows"))]
 const LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.lock";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const FULL_UI_LOCK_DIR_NAME: &str = "WindowsAppAutoLogin.full-ui.lock";
+const SETTINGS_SESSION_LOCK_FILE_NAME: &str = "settings-session.lock";
+const MAX_SETTINGS_SESSION_TOKEN_BYTES: u64 = 64;
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 const ACTIVATION_FILE_NAME: &str = "activate";
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -61,10 +61,11 @@ const MONITOR_STATUS_FILE_NAME: &str = "monitor-status";
 const LOCK_OWNER_FILE_NAME: &str = "owner";
 const MONITOR_COMMAND_START: &str = "start_monitor";
 const MONITOR_COMMAND_STOP: &str = "stop_monitor";
+const MONITOR_COMMAND_STORAGE_RECOVERY_BLOCKED: &str = "storage_recovery_blocked";
 #[cfg(not(target_os = "macos"))]
 const MONITOR_COMMAND_RELOAD_CONFIG: &str = "reload_config";
 const ALREADY_RUNNING_MESSAGE: &str = "Windows App AutoLogin is already running";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const FULL_UI_ALREADY_RUNNING_MESSAGE: &str = "Windows App AutoLogin window is already open";
 #[cfg(not(target_os = "windows"))]
 const MAX_LOCK_OWNER_BYTES: u64 = 256;
@@ -83,14 +84,22 @@ const WINDOWS_LOCAL_IPC_MAX_BYTES: usize = 128;
 const WINDOWS_LOCAL_IPC_CONNECT_TIMEOUT_MS: u32 = 750;
 #[cfg(target_os = "macos")]
 const IPC_SOCKET_FILE_NAME: &str = "ipc.sock";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
+const MACOS_LOCAL_IPC_MAX_BYTES: usize = 128;
+#[cfg(target_os = "macos")]
 const MAX_IPC_COMMANDS_PER_TICK: usize = 16;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_ACTIVATE: &str = "activate";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+const IPC_COMMAND_SETTINGS_BOOTSTRAP: &str = "settings:bootstrap";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_MONITOR_PREFIX: &str = "monitor:";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_RELOAD_CONFIG: &str = "config:reload";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SETTINGS_BOOTSTRAP_MAX_ATTEMPTS: usize = 4;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SETTINGS_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "windows")]
 const WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME: &str = "single-instance.lock";
 #[cfg(target_os = "macos")]
@@ -120,6 +129,22 @@ pub(crate) struct FullUiInstanceGuard {
     _lock_file: std::fs::File,
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) struct FullUiInstanceGuard {
+    _lock_file: std::fs::File,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SettingsSessionToken(String);
+
+pub(crate) struct SettingsSessionLease {
+    _lock_file: std::fs::File,
+}
+
+pub(crate) struct SettingsRecoveryLease {
+    lock_file: std::fs::File,
+}
+
 pub(crate) struct LocalIpcServer {
     #[cfg(target_os = "macos")]
     listener: UnixListener,
@@ -139,15 +164,43 @@ pub(crate) struct LocalIpcServer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalIpcCommand {
     Activate,
+    SettingsBootstrap,
     ReloadConfig,
     Monitor(MonitorControlCommand),
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct PeerLocalIpcCommand {
     pub(crate) peer_pid: u32,
     pub(crate) command: LocalIpcCommand,
+    #[cfg(target_os = "macos")]
+    acknowledgement: Option<UnixStream>,
+    #[cfg(target_os = "windows")]
+    acknowledgement: Option<WindowsPipeHandle>,
+}
+
+#[cfg(target_os = "macos")]
+impl PeerLocalIpcCommand {
+    pub(crate) fn acknowledge(mut self) -> anyhow::Result<()> {
+        let mut stream = self
+            .acknowledgement
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("macOS local IPC acknowledgement stream is missing"))?;
+        stream.write_all(b"ok\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl PeerLocalIpcCommand {
+    pub(crate) fn acknowledge(mut self) -> anyhow::Result<()> {
+        let pipe = self.acknowledgement.take().ok_or_else(|| {
+            anyhow::anyhow!("Windows local IPC acknowledgement handle is missing")
+        })?;
+        write_windows_local_ipc_ack(pipe.0)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -159,6 +212,7 @@ struct LocalIpcSocketIdentity {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
 struct WindowsPipeHandle(HANDLE);
 
 #[cfg(target_os = "windows")]
@@ -178,13 +232,14 @@ impl Drop for LocalSecurityDescriptor {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) struct FullUiInstanceGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MonitorControlCommand {
     Start,
     Stop,
+    StorageRecoveryBlocked,
     #[cfg(not(target_os = "macos"))]
     ReloadConfig,
 }
@@ -194,6 +249,7 @@ impl MonitorControlCommand {
         match self {
             Self::Start => MONITOR_COMMAND_START,
             Self::Stop => MONITOR_COMMAND_STOP,
+            Self::StorageRecoveryBlocked => MONITOR_COMMAND_STORAGE_RECOVERY_BLOCKED,
             #[cfg(not(target_os = "macos"))]
             Self::ReloadConfig => MONITOR_COMMAND_RELOAD_CONFIG,
         }
@@ -226,6 +282,7 @@ impl MonitorControlCommand {
         match command {
             MONITOR_COMMAND_START => Some(Self::Start),
             MONITOR_COMMAND_STOP => Some(Self::Stop),
+            MONITOR_COMMAND_STORAGE_RECOVERY_BLOCKED => Some(Self::StorageRecoveryBlocked),
             #[cfg(not(target_os = "macos"))]
             MONITOR_COMMAND_RELOAD_CONFIG => Some(Self::ReloadConfig),
             _ => None,
@@ -242,11 +299,11 @@ pub(crate) struct MonitorCommandWatcher {
 pub(crate) fn is_already_running_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message == ALREADY_RUNNING_MESSAGE || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             message == FULL_UI_ALREADY_RUNNING_MESSAGE
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             false
         }
@@ -285,8 +342,68 @@ impl FullUiInstanceGuard {
             })
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            let root = lock_root()?;
+            prepare_lock_root(&root)?;
+            Ok(Self {
+                _lock_file: acquire_windows_named_file_lock(
+                    &root,
+                    FULL_UI_LOCK_DIR_NAME,
+                    FULL_UI_ALREADY_RUNNING_MESSAGE,
+                )?,
+            })
+        }
+
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         Ok(Self)
+    }
+}
+
+impl SettingsSessionToken {
+    pub(crate) fn generate() -> Self {
+        Self(random_nonce())
+    }
+
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        let value = value.trim();
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("invalid settings session token");
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl SettingsRecoveryLease {
+    pub(crate) fn try_acquire() -> anyhow::Result<Option<Self>> {
+        try_acquire_settings_recovery_lease_in_root(&lock_root()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire_in_root(root: &Path) -> anyhow::Result<Option<Self>> {
+        try_acquire_settings_recovery_lease_in_root(root)
+    }
+
+    pub(crate) fn establish_session(&mut self, token: &SettingsSessionToken) -> anyhow::Result<()> {
+        write_settings_session_token(&mut self.lock_file, token)
+    }
+}
+
+impl SettingsSessionLease {
+    pub(crate) fn acquire(token: &SettingsSessionToken) -> anyhow::Result<Self> {
+        acquire_settings_session_lease_in_root(&lock_root()?, token)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_in_root(
+        root: &Path,
+        token: &SettingsSessionToken,
+    ) -> anyhow::Result<Self> {
+        acquire_settings_session_lease_in_root(root, token)
     }
 }
 
@@ -401,13 +518,124 @@ fn prepare_lock_root(root: &Path) -> std::io::Result<()> {
         }
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => {
-            std::fs::remove_file(root).or_else(|_| std::fs::remove_dir_all(root))?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "lock root must be a directory",
+            ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
     std::fs::create_dir_all(root)?;
     secure_dir_permissions(root)
+}
+
+fn try_acquire_settings_recovery_lease_in_root(
+    root: &Path,
+) -> anyhow::Result<Option<SettingsRecoveryLease>> {
+    let lock_file = open_settings_session_lock_file_in_root(root)?;
+    match lock_file.try_lock() {
+        Ok(()) => Ok(Some(SettingsRecoveryLease { lock_file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn acquire_settings_session_lease_in_root(
+    root: &Path,
+    token: &SettingsSessionToken,
+) -> anyhow::Result<SettingsSessionLease> {
+    let mut lock_file = open_settings_session_lock_file_in_root(root)?;
+    match lock_file.try_lock_shared() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("password storage recovery is in progress")
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+
+    let established = read_settings_session_token(&mut lock_file)?;
+    if established.as_ref() != Some(token) {
+        anyhow::bail!("settings session is no longer authorized");
+    }
+
+    Ok(SettingsSessionLease {
+        _lock_file: lock_file,
+    })
+}
+
+fn write_settings_session_token(
+    lock_file: &mut std::fs::File,
+    token: &SettingsSessionToken,
+) -> anyhow::Result<()> {
+    use std::io::{Seek, Write};
+
+    lock_file.set_len(0)?;
+    lock_file.seek(std::io::SeekFrom::Start(0))?;
+    lock_file.write_all(token.as_str().as_bytes())?;
+    lock_file.write_all(b"\n")?;
+    lock_file.flush()?;
+    lock_file.sync_data()?;
+    Ok(())
+}
+
+fn read_settings_session_token(
+    lock_file: &mut std::fs::File,
+) -> anyhow::Result<Option<SettingsSessionToken>> {
+    use std::io::{Read, Seek};
+
+    let length = lock_file.metadata()?.len();
+    if length == 0 || length > MAX_SETTINGS_SESSION_TOKEN_BYTES {
+        return Ok(None);
+    }
+    lock_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    lock_file
+        .take(MAX_SETTINGS_SESSION_TOKEN_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS_SESSION_TOKEN_BYTES {
+        return Ok(None);
+    }
+    let value = std::str::from_utf8(&bytes)?;
+    Ok(SettingsSessionToken::parse(value).ok())
+}
+
+#[cfg(unix)]
+fn open_settings_session_lock_file_in_root(root: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    prepare_lock_root(root)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join(SETTINGS_SESSION_LOCK_FILE_NAME))?;
+    secure_file_handle_permissions(&lock_file, 0o600)?;
+    Ok(lock_file)
+}
+
+#[cfg(target_os = "windows")]
+fn open_settings_session_lock_file_in_root(root: &Path) -> anyhow::Result<std::fs::File> {
+    prepare_lock_root(root)?;
+    open_windows_private_lock_file(
+        &root.join(SETTINGS_SESSION_LOCK_FILE_NAME),
+        "settings session lock",
+    )
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn open_settings_session_lock_file_in_root(root: &Path) -> anyhow::Result<std::fs::File> {
+    prepare_lock_root(root)?;
+    let path = root.join(SETTINGS_SESSION_LOCK_FILE_NAME);
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)?;
+    secure_file_permissions(&path, 0o600)?;
+    Ok(lock_file)
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -443,17 +671,60 @@ fn acquire_windows_single_instance() -> anyhow::Result<SingleInstanceGuard> {
 
 #[cfg(target_os = "windows")]
 fn acquire_windows_single_instance_file_lock(root: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    acquire_windows_named_file_lock(
+        root,
+        WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME,
+        ALREADY_RUNNING_MESSAGE,
+    )
+}
 
-    let path = root.join(WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME);
+#[cfg(target_os = "windows")]
+fn acquire_windows_named_file_lock(
+    root: &Path,
+    file_name: &str,
+    already_running_message: &str,
+) -> anyhow::Result<std::fs::File> {
+    let file = open_windows_private_lock_file(&root.join(file_name), "instance lock")?;
+
+    use std::os::windows::io::AsRawHandle;
+
+    let mut overlapped = OVERLAPPED::default();
+    let lock_result = unsafe {
+        LockFileEx(
+            HANDLE(file.as_raw_handle()),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            None,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    match lock_result {
+        Ok(()) => Ok(file),
+        Err(error) => {
+            let last_error = unsafe { GetLastError() };
+            if last_error == ERROR_LOCK_VIOLATION || last_error == ERROR_SHARING_VIOLATION {
+                anyhow::bail!("{}", already_running_message);
+            }
+            Err(anyhow::anyhow!(
+                "failed to lock Windows instance file: {error}"
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_private_lock_file(path: &Path, label: &str) -> anyhow::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+
     let wide_path = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     if wide_path[..wide_path.len().saturating_sub(1)].contains(&0) {
-        anyhow::bail!("Windows single-instance lock path contains an interior NUL byte");
+        anyhow::bail!("Windows {label} path contains an interior NUL byte");
     }
 
     let security_descriptor = windows_local_ipc_security_descriptor()?;
@@ -473,39 +744,13 @@ fn acquire_windows_single_instance_file_lock(root: &Path) -> anyhow::Result<std:
             None,
         )
     }
-    .map_err(|error| {
-        anyhow::anyhow!("failed to open Windows single-instance lock file: {error}")
-    })?;
+    .map_err(|error| anyhow::anyhow!("failed to open Windows {label} file: {error}"))?;
     let file = unsafe { std::fs::File::from_raw_handle(handle.0) };
 
-    secure_file_permissions(&path, 0o600)?;
-    crate::private_permissions::validate_windows_private_file_handle(&file).map_err(|error| {
-        anyhow::anyhow!("Windows single-instance lock file is not private: {error}")
-    })?;
-
-    let mut overlapped = OVERLAPPED::default();
-    let lock_result = unsafe {
-        LockFileEx(
-            HANDLE(file.as_raw_handle()),
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            None,
-            1,
-            0,
-            &mut overlapped,
-        )
-    };
-    match lock_result {
-        Ok(()) => Ok(file),
-        Err(error) => {
-            let last_error = unsafe { GetLastError() };
-            if last_error == ERROR_LOCK_VIOLATION || last_error == ERROR_SHARING_VIOLATION {
-                anyhow::bail!("{}", ALREADY_RUNNING_MESSAGE);
-            }
-            Err(anyhow::anyhow!(
-                "failed to lock Windows single-instance file: {error}"
-            ))
-        }
-    }
+    secure_file_permissions(path, 0o600)?;
+    crate::private_permissions::validate_windows_private_file_handle(&file)
+        .map_err(|error| anyhow::anyhow!("Windows {label} file is not private: {error}"))?;
+    Ok(file)
 }
 
 #[cfg(target_os = "windows")]
@@ -534,6 +779,42 @@ pub(crate) fn request_activation() -> anyhow::Result<()> {
             &format!("{}:{nonce}:{current_exe}\n", std::process::id()),
         )
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn request_settings_bootstrap() -> anyhow::Result<()> {
+    request_settings_bootstrap_with_retry(
+        || send_local_ipc_command(IPC_COMMAND_SETTINGS_BOOTSTRAP),
+        || std::thread::sleep(SETTINGS_BOOTSTRAP_RETRY_INTERVAL),
+    )
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+pub(crate) fn request_settings_bootstrap() -> anyhow::Result<()> {
+    anyhow::bail!("settings bootstrap requires authenticated local IPC")
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn request_settings_bootstrap_with_retry(
+    mut request: impl FnMut() -> anyhow::Result<()>,
+    mut wait_before_retry: impl FnMut(),
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..SETTINGS_BOOTSTRAP_MAX_ATTEMPTS {
+        match request() {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if attempt + 1 < SETTINGS_BOOTSTRAP_MAX_ATTEMPTS {
+            wait_before_retry();
+        }
+    }
+
+    anyhow::bail!(
+        "settings bootstrap was not acknowledged by the supervisor after {} attempts: {}",
+        SETTINGS_BOOTSTRAP_MAX_ATTEMPTS,
+        last_error.as_deref().unwrap_or("local IPC is unavailable")
+    )
 }
 
 pub(crate) fn request_monitor_command(command: MonitorControlCommand) -> anyhow::Result<()> {
@@ -746,19 +1027,15 @@ impl LocalIpcServer {
     }
 
     pub(crate) fn consume_commands(&mut self) -> Vec<PeerLocalIpcCommand> {
-        let mut commands = Vec::new();
-        for _ in 0..MAX_IPC_COMMANDS_PER_TICK {
-            match self.consume_one_command() {
-                Ok(Some(command)) => commands.push(command),
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::debug!(%error, "Windows local IPC command read failed");
-                    self.reset_pipe();
-                    break;
-                }
+        match self.consume_one_command() {
+            Ok(Some(command)) => vec![command],
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::debug!(%error, "Windows local IPC command read failed");
+                self.reset_pipe();
+                Vec::new()
             }
         }
-        commands
     }
 
     fn consume_one_command(&mut self) -> anyhow::Result<Option<PeerLocalIpcCommand>> {
@@ -798,9 +1075,14 @@ impl LocalIpcServer {
                 Ok(None)
             }
             WindowsPipeReadState::Message(message) => {
-                self.reset_pipe();
-                Ok(parse_local_ipc_command(&message)
-                    .map(|command| PeerLocalIpcCommand { peer_pid, command }))
+                let command = parse_local_ipc_command(&message);
+                let acknowledgement = self.pipe.take();
+                self.connected = false;
+                Ok(command.map(|command| PeerLocalIpcCommand {
+                    peer_pid,
+                    command,
+                    acknowledgement,
+                }))
             }
         }
     }
@@ -837,7 +1119,7 @@ fn create_windows_local_ipc_pipe(pipe_name: &str) -> anyhow::Result<WindowsPipeH
         lpSecurityDescriptor: security_descriptor.0 .0,
         bInheritHandle: BOOL(0),
     };
-    let open_mode = PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE;
+    let open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE;
     let pipe_mode =
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS;
     let handle = unsafe {
@@ -930,6 +1212,19 @@ fn read_windows_local_ipc_message(pipe: HANDLE) -> anyhow::Result<WindowsPipeRea
     Ok(WindowsPipeReadState::Message(
         String::from_utf8_lossy(&buffer[..bytes_read as usize]).to_string(),
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn write_windows_local_ipc_ack(pipe: HANDLE) -> anyhow::Result<()> {
+    const ACK: &[u8] = b"ok\n";
+    let mut bytes_written = 0_u32;
+    unsafe { WriteFile(pipe, Some(ACK), Some(&mut bytes_written), None) }.map_err(|error| {
+        anyhow::anyhow!("failed to acknowledge Windows local IPC command: {error}")
+    })?;
+    if bytes_written as usize != ACK.len() {
+        anyhow::bail!("Windows local IPC acknowledgement was only partially written");
+    }
+    Ok(())
 }
 
 impl Drop for SingleInstanceGuard {
@@ -1061,7 +1356,43 @@ fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let challenge = read_local_ipc_challenge(&mut stream)?;
     stream.write_all(format!("{}:{}\n", challenge, command.trim()).as_bytes())?;
-    let _ = stream.shutdown(Shutdown::Write);
+    stream.shutdown(Shutdown::Write)?;
+    read_macos_local_ipc_ack(&mut stream)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_local_ipc_ack(stream: &mut UnixStream) -> anyhow::Result<()> {
+    stream.set_nonblocking(true)?;
+    let started = Instant::now();
+    let mut acknowledgement = Vec::with_capacity(4);
+    while acknowledgement.len() < 4 {
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(1) => acknowledgement.push(byte[0]),
+            Ok(_) => unreachable!("single-byte local IPC acknowledgement read"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if started.elapsed() >= Duration::from_secs(2) {
+                    anyhow::bail!("macOS local IPC acknowledgement timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read macOS local IPC acknowledgement: {error}"
+                ))
+            }
+        }
+    }
+    if acknowledgement != b"ok\n" {
+        anyhow::bail!("macOS local IPC acknowledgement is invalid");
+    }
     Ok(())
 }
 
@@ -1090,6 +1421,50 @@ fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
     if bytes_written as usize != command.len() {
         anyhow::bail!("Windows local IPC command was only partially written");
     }
+    read_windows_local_ipc_ack(pipe.0)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_local_ipc_ack(pipe: HANDLE) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let mut ack = [0_u8; 3];
+    let mut received = 0_usize;
+    while received < ack.len() {
+        let mut bytes_read = 0_u32;
+        match unsafe {
+            ReadFile(
+                pipe,
+                Some(&mut ack[received..]),
+                Some(&mut bytes_read),
+                None,
+            )
+        } {
+            Ok(()) if bytes_read > 0 => received += bytes_read as usize,
+            Ok(()) => {}
+            Err(error) => match unsafe { GetLastError() } {
+                ERROR_NO_DATA | ERROR_PIPE_LISTENING => {}
+                ERROR_BROKEN_PIPE => {
+                    anyhow::bail!("Windows local IPC server closed without acknowledgement")
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "failed to read Windows local IPC acknowledgement: {error}"
+                    ))
+                }
+            },
+        }
+        if received == ack.len() {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            anyhow::bail!("Windows local IPC acknowledgement timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if &ack != b"ok\n" {
+        anyhow::bail!("Windows local IPC acknowledgement is invalid");
+    }
     Ok(())
 }
 
@@ -1101,7 +1476,7 @@ fn open_windows_local_ipc_pipe(pipe_name: &str) -> anyhow::Result<WindowsPipeHan
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(pipe_name.as_ptr()),
-                GENERIC_WRITE.0,
+                (GENERIC_READ | GENERIC_WRITE).0,
                 FILE_SHARE_MODE(0),
                 None,
                 OPEN_EXISTING,
@@ -1110,6 +1485,14 @@ fn open_windows_local_ipc_pipe(pipe_name: &str) -> anyhow::Result<WindowsPipeHan
             )
         };
         if let Ok(handle) = handle {
+            let mode = NAMED_PIPE_MODE(PIPE_READMODE_MESSAGE.0 | PIPE_NOWAIT.0);
+            if let Err(error) = unsafe { SetNamedPipeHandleState(handle, Some(&mode), None, None) }
+            {
+                let _ = unsafe { CloseHandle(handle) };
+                anyhow::bail!(
+                    "failed to configure Windows local IPC acknowledgement channel: {error}"
+                );
+            }
             return Ok(WindowsPipeHandle(handle));
         }
 
@@ -1230,17 +1613,54 @@ fn local_ipc_command_from_validated_stream(
         return Ok(None);
     }
 
-    let mut buffer = [0_u8; 128];
-    match stream.read(&mut buffer) {
-        Ok(0) => Ok(None),
-        Ok(len) => {
-            let message = String::from_utf8_lossy(&buffer[..len]);
-            Ok(parse_local_ipc_challenge_response(&message, &challenge)
-                .map(|command| PeerLocalIpcCommand { peer_pid, command }))
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(250))
+        .ok_or_else(|| anyhow::anyhow!("local IPC read deadline is unavailable"))?;
+    stream.set_nonblocking(true)?;
+    let mut message = Vec::with_capacity(MACOS_LOCAL_IPC_MAX_BYTES);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(None);
+        };
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) => {
+                if message.len() == MACOS_LOCAL_IPC_MAX_BYTES {
+                    return Ok(None);
+                }
+                message.push(byte[0]);
+            }
+            Ok(_) => unreachable!("single-byte local IPC command read"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(remaining.min(Duration::from_millis(2)));
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e.into()),
     }
+    if message.is_empty() {
+        return Ok(None);
+    }
+    let Ok(message) = std::str::from_utf8(&message) else {
+        return Ok(None);
+    };
+    stream.set_nonblocking(false)?;
+    Ok(
+        parse_local_ipc_challenge_response(message, &challenge).map(|command| {
+            PeerLocalIpcCommand {
+                peer_pid,
+                command,
+                acknowledgement: Some(stream),
+            }
+        }),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1281,6 +1701,10 @@ fn parse_local_ipc_command(message: &str) -> Option<LocalIpcCommand> {
     let message = message.trim();
     if message == IPC_COMMAND_ACTIVATE {
         return Some(LocalIpcCommand::Activate);
+    }
+
+    if message == IPC_COMMAND_SETTINGS_BOOTSTRAP {
+        return Some(LocalIpcCommand::SettingsBootstrap);
     }
 
     if message == IPC_COMMAND_RELOAD_CONFIG {
@@ -1649,7 +2073,6 @@ fn lock_owner(lock_dir: &Path) -> Option<LockOwner> {
     })
 }
 
-#[cfg(not(target_os = "windows"))]
 fn random_nonce() -> String {
     use rand::RngCore;
 
@@ -2219,6 +2642,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn settings_session_shared_lease_blocks_recovery_until_drop() {
+        let root = temp_test_root("settings-session-shared-blocks-recovery");
+        let token = SettingsSessionToken::generate();
+        let mut recovery = try_acquire_settings_recovery_lease_in_root(&root)
+            .unwrap()
+            .expect("initial recovery lease");
+        recovery.establish_session(&token).unwrap();
+        drop(recovery);
+
+        let session = acquire_settings_session_lease_in_root(&root, &token).unwrap();
+        assert!(try_acquire_settings_recovery_lease_in_root(&root)
+            .unwrap()
+            .is_none());
+
+        drop(session);
+        assert!(try_acquire_settings_recovery_lease_in_root(&root)
+            .unwrap()
+            .is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_recovery_exclusive_lease_blocks_child_session() {
+        let root = temp_test_root("settings-recovery-blocks-child");
+        let token = SettingsSessionToken::generate();
+        let mut recovery = try_acquire_settings_recovery_lease_in_root(&root)
+            .unwrap()
+            .expect("initial recovery lease");
+        recovery.establish_session(&token).unwrap();
+
+        let Err(error) = acquire_settings_session_lease_in_root(&root, &token) else {
+            panic!("settings session acquired while recovery held the exclusive lease");
+        };
+        assert!(error.to_string().contains("recovery is in progress"));
+
+        drop(recovery);
+        assert!(acquire_settings_session_lease_in_root(&root, &token).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rotating_settings_session_rejects_a_late_child() {
+        let root = temp_test_root("settings-session-rotation-rejects-late-child");
+        let stale_token = SettingsSessionToken::generate();
+        let fresh_token = SettingsSessionToken::generate();
+        assert_ne!(stale_token.as_str(), fresh_token.as_str());
+
+        let mut recovery = try_acquire_settings_recovery_lease_in_root(&root)
+            .unwrap()
+            .expect("initial recovery lease");
+        recovery.establish_session(&stale_token).unwrap();
+        recovery.establish_session(&fresh_token).unwrap();
+        drop(recovery);
+
+        let Err(error) = acquire_settings_session_lease_in_root(&root, &stale_token) else {
+            panic!("stale settings session token was accepted");
+        };
+        assert!(error.to_string().contains("no longer authorized"));
+        assert!(acquire_settings_session_lease_in_root(&root, &fresh_token).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn lock_drop_only_removes_current_pid_lock() {
@@ -2246,7 +2732,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn stale_lock_entries_are_reclaimed() {
-        for case in ["dead-pid", "lock-file", "root-file"] {
+        for case in ["dead-pid", "lock-file"] {
             let root = temp_test_root(&format!("stale-lock-{case}-reclaimed"));
             match case {
                 "dead-pid" => {
@@ -2258,10 +2744,6 @@ mod tests {
                     std::fs::create_dir_all(&root).unwrap();
                     std::fs::write(root.join(LOCK_DIR_NAME), "not-a-lock-directory").unwrap();
                 }
-                "root-file" => {
-                    let _ = std::fs::remove_dir_all(&root);
-                    std::fs::write(&root, "not-a-lock-root-directory").unwrap();
-                }
                 _ => unreachable!(),
             }
 
@@ -2271,6 +2753,24 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn lock_root_regular_file_is_rejected_and_preserved() {
+        let root = temp_test_root("lock-root-regular-file");
+        let _ = std::fs::remove_dir_all(&root);
+        let original = b"not-a-lock-root-directory";
+        std::fs::write(&root, original).unwrap();
+
+        let error = prepare_lock_root(&root).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&root).unwrap(), original);
+        assert!(std::fs::symlink_metadata(&root)
+            .unwrap()
+            .file_type()
+            .is_file());
+
+        let _ = std::fs::remove_file(root);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -2301,6 +2801,10 @@ mod tests {
 
         let error = prepare_lock_root(&root).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(std::fs::symlink_metadata(&root)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(target.exists());
 
         let _ = std::fs::remove_file(root);
@@ -2904,7 +3408,21 @@ mod tests {
 
         write_test_private_text(
             &path,
-            monitor_command_request_for_test(MonitorControlCommand::ReloadConfig, "3", &auth_token),
+            monitor_command_request_for_test(
+                MonitorControlCommand::StorageRecoveryBlocked,
+                "3",
+                &auth_token,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            consume_monitor_command_for_test(&mut watcher),
+            Some(MonitorControlCommand::StorageRecoveryBlocked)
+        );
+
+        write_test_private_text(
+            &path,
+            monitor_command_request_for_test(MonitorControlCommand::ReloadConfig, "4", &auth_token),
         )
         .unwrap();
         assert_eq!(
@@ -2972,10 +3490,268 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_local_ipc_client_waits_for_supervisor_acknowledgement() {
+        let implementation = include_str!("single_instance.rs");
+        let send_command = source_between(
+            implementation,
+            "#[cfg(target_os = \"windows\")]\nfn send_local_ipc_command(command: &str)",
+            "#[cfg(target_os = \"windows\")]\nfn read_windows_local_ipc_ack",
+        );
+        let consume_command = source_between(
+            implementation,
+            "fn consume_one_command(&mut self)",
+            "fn reset_pipe(&mut self)",
+        );
+        let main_source = include_str!("main.rs");
+        let supervisor_dispatch = source_between(
+            main_source,
+            "fn process_local_ipc_commands(&mut self)",
+            "fn handle_authorized_local_ipc_command",
+        );
+
+        assert!(send_command.contains("read_windows_local_ipc_ack(pipe.0)?;"));
+        assert!(
+            send_command.find("WriteFile(").unwrap()
+                < send_command
+                    .find("read_windows_local_ipc_ack(pipe.0)?;")
+                    .unwrap()
+        );
+        assert!(consume_command.contains("let acknowledgement = self.pipe.take();"));
+        let commit = supervisor_dispatch
+            .find("if !self.handle_authorized_local_ipc_command(peer_command.command)")
+            .unwrap();
+        let reject_without_ack = commit + supervisor_dispatch[commit..].find("continue;").unwrap();
+        let acknowledge = reject_without_ack
+            + supervisor_dispatch[reject_without_ack..]
+                .find("peer_command.acknowledge()")
+                .unwrap();
+        assert!(
+            commit < reject_without_ack && reject_without_ack < acknowledge,
+            "failed local IPC commit must be dropped before acknowledgement"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_local_ipc_client_waits_for_authorized_supervisor_commit() {
+        let implementation = include_str!("single_instance.rs");
+        let send_command = source_between(
+            implementation,
+            "#[cfg(target_os = \"macos\")]\nfn send_local_ipc_command(command: &str)",
+            "#[cfg(target_os = \"macos\")]\nfn read_macos_local_ipc_ack",
+        );
+        let consume_command = source_between(
+            implementation,
+            "fn local_ipc_command_from_validated_stream(",
+            "fn read_local_ipc_challenge(",
+        );
+        let main_source = include_str!("main.rs");
+        let supervisor_dispatch = source_between(
+            main_source,
+            "fn process_local_ipc_commands(&mut self)",
+            "fn handle_authorized_local_ipc_command",
+        );
+
+        assert!(send_command.contains("read_macos_local_ipc_ack(&mut stream)?;"));
+        assert!(
+            send_command.find("stream.write_all(").unwrap()
+                < send_command
+                    .find("read_macos_local_ipc_ack(&mut stream)?;")
+                    .unwrap()
+        );
+        assert!(consume_command.contains("acknowledgement: Some(stream)"));
+
+        let commit = supervisor_dispatch
+            .find("if !self.handle_authorized_local_ipc_command(peer_command.command)")
+            .unwrap();
+        let reject_without_ack = commit + supervisor_dispatch[commit..].find("continue;").unwrap();
+        let acknowledge = reject_without_ack
+            + supervisor_dispatch[reject_without_ack..]
+                .find("peer_command.acknowledge()")
+                .unwrap();
+        assert!(commit < reject_without_ack);
+        assert!(reject_without_ack < acknowledge);
+    }
+
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn macos_fragmented_local_ipc_command_is_reassembled_before_parsing() {
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let client = std::thread::spawn(move || {
+            let challenge = read_local_ipc_challenge(&mut client_stream).unwrap();
+            let response = format!("{challenge}:{IPC_COMMAND_ACTIVATE}\n");
+            for chunk in response.as_bytes().chunks(3) {
+                client_stream.write_all(chunk).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            read_macos_local_ipc_ack(&mut client_stream).unwrap();
+        });
+
+        let peer_command =
+            local_ipc_command_from_validated_stream(server_stream, std::process::id())
+                .unwrap()
+                .expect("fragmented validated local IPC command");
+        assert_eq!(peer_command.command, LocalIpcCommand::Activate);
+        peer_command.acknowledge().unwrap();
+        client.join().unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn macos_local_ipc_rejects_an_overlong_fragmented_command() {
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let client = std::thread::spawn(move || {
+            let _ = read_local_ipc_challenge(&mut client_stream).unwrap();
+            let response = [b'x'; MACOS_LOCAL_IPC_MAX_BYTES + 1];
+            for chunk in response.chunks(7) {
+                client_stream.write_all(chunk).unwrap();
+            }
+        });
+
+        assert!(
+            local_ipc_command_from_validated_stream(server_stream, std::process::id())
+                .unwrap()
+                .is_none()
+        );
+        client.join().unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn macos_immediate_child_exit_waits_until_supervisor_acknowledgement() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            client_stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client_stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let result = (|| {
+                let challenge = read_local_ipc_challenge(&mut client_stream).map_err(|error| {
+                    anyhow::anyhow!("could not read test IPC challenge: {error}")
+                })?;
+                client_stream
+                    .write_all(format!("{challenge}:{IPC_COMMAND_ACTIVATE}\n").as_bytes())
+                    .map_err(|error| {
+                        anyhow::anyhow!("could not write test IPC command: {error}")
+                    })?;
+                client_stream.shutdown(Shutdown::Write).map_err(|error| {
+                    anyhow::anyhow!("could not shut down test IPC command stream: {error}")
+                })?;
+                read_macos_local_ipc_ack(&mut client_stream)
+                    .map_err(|error| anyhow::anyhow!("could not read test IPC ack: {error}"))
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
+            result_tx.send(result).unwrap();
+        });
+
+        let peer_command =
+            local_ipc_command_from_validated_stream(server_stream, std::process::id())
+                .unwrap()
+                .expect("validated local IPC command");
+        assert_eq!(peer_command.peer_pid, std::process::id());
+        assert_eq!(peer_command.command, LocalIpcCommand::Activate);
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        peer_command.acknowledge().unwrap();
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("macOS local IPC client did not finish after acknowledgement");
+        assert!(result.is_ok(), "macOS local IPC client failed: {result:?}");
+        client.join().unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn macos_rejected_command_drop_cannot_report_acknowledged_success() {
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            client_stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let result = (|| {
+                let challenge = read_local_ipc_challenge(&mut client_stream)?;
+                client_stream
+                    .write_all(format!("{challenge}:{IPC_COMMAND_ACTIVATE}\n").as_bytes())?;
+                client_stream.shutdown(Shutdown::Write)?;
+                read_macos_local_ipc_ack(&mut client_stream)
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
+            result_tx.send(result).unwrap();
+        });
+
+        let peer_command =
+            local_ipc_command_from_validated_stream(server_stream, std::process::id())
+                .unwrap()
+                .expect("validated local IPC command");
+        drop(peer_command);
+
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("macOS local IPC client remained blocked after rejection")
+            .is_err());
+        client.join().unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_local_ipc_send_cannot_succeed_before_supervisor_acknowledgement() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let mut server = LocalIpcServer::bind().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let result =
+                send_local_ipc_command(IPC_COMMAND_ACTIVATE).map_err(|error| error.to_string());
+            result_tx.send(result).unwrap();
+        });
+
+        let started = Instant::now();
+        let peer_command = loop {
+            if let Some(command) = server.consume_commands().into_iter().next() {
+                break command;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "Windows local IPC server did not receive the test command"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(peer_command.command, LocalIpcCommand::Activate);
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        peer_command.acknowledge().unwrap();
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Windows local IPC client did not finish after acknowledgement")
+            .is_ok());
+        client.join().unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn windows_local_ipc_rejects_legacy_monitor_file_payloads() {
         assert_eq!(
             parse_local_ipc_command("monitor:start_monitor"),
             Some(LocalIpcCommand::Monitor(MonitorControlCommand::Start))
+        );
+        assert_eq!(
+            parse_local_ipc_command("monitor:storage_recovery_blocked"),
+            Some(LocalIpcCommand::Monitor(
+                MonitorControlCommand::StorageRecoveryBlocked
+            ))
         );
         assert_eq!(
             parse_local_ipc_command("config:reload"),
@@ -3158,8 +3934,18 @@ mod tests {
             Some(LocalIpcCommand::Activate)
         );
         assert_eq!(
+            parse_local_ipc_command("settings:bootstrap\n"),
+            Some(LocalIpcCommand::SettingsBootstrap)
+        );
+        assert_eq!(
             parse_local_ipc_command("monitor:start_monitor"),
             Some(LocalIpcCommand::Monitor(MonitorControlCommand::Start))
+        );
+        assert_eq!(
+            parse_local_ipc_command("monitor:storage_recovery_blocked"),
+            Some(LocalIpcCommand::Monitor(
+                MonitorControlCommand::StorageRecoveryBlocked
+            ))
         );
         assert_eq!(
             parse_local_ipc_command("config:reload"),
@@ -3167,10 +3953,56 @@ mod tests {
         );
         assert_eq!(parse_local_ipc_command("config:reload:old-token"), None);
         assert_eq!(
+            parse_local_ipc_command("settings:bootstrap:copied-token"),
+            None
+        );
+        assert_eq!(
             parse_local_ipc_command("monitor:start_monitor:old-token"),
             None
         );
         assert_eq!(parse_local_ipc_command("start_monitor:123:nonce"), None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn settings_bootstrap_retries_a_registration_race_but_remains_bounded() {
+        let attempts = std::cell::Cell::new(0);
+        let waits = std::cell::Cell::new(0);
+        request_settings_bootstrap_with_retry(
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt < 3 {
+                    anyhow::bail!("child handle is not registered yet")
+                }
+                Ok(())
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .unwrap();
+
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(waits.get(), 2);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn settings_bootstrap_fails_closed_when_local_ipc_never_acknowledges() {
+        let attempts = std::cell::Cell::new(0);
+        let waits = std::cell::Cell::new(0);
+        let error = request_settings_bootstrap_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                anyhow::bail!("local IPC is unavailable")
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), SETTINGS_BOOTSTRAP_MAX_ATTEMPTS);
+        assert_eq!(waits.get(), SETTINGS_BOOTSTRAP_MAX_ATTEMPTS - 1);
+        assert!(error.to_string().contains("was not acknowledged"));
+        assert!(error.to_string().contains("local IPC is unavailable"));
     }
 
     #[cfg(target_os = "macos")]
@@ -3217,13 +4049,13 @@ mod tests {
             .write_all(format!("{challenge}:activate\n").as_bytes())
             .unwrap();
 
-        assert_eq!(
-            server.join().unwrap().unwrap(),
-            Some(PeerLocalIpcCommand {
-                peer_pid: std::process::id(),
-                command: LocalIpcCommand::Activate,
-            })
-        );
+        let peer_command = server
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("validated local IPC command");
+        assert_eq!(peer_command.peer_pid, std::process::id());
+        assert_eq!(peer_command.command, LocalIpcCommand::Activate);
     }
 
     #[cfg(all(target_os = "macos", unix))]
@@ -3235,13 +4067,14 @@ mod tests {
         let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
         client_stream.write_all(b"activate\n").unwrap();
 
-        assert_eq!(
-            local_ipc_command_from_validated_stream(server_stream, std::process::id()).unwrap(),
-            None
+        assert!(
+            local_ipc_command_from_validated_stream(server_stream, std::process::id())
+                .unwrap()
+                .is_none()
         );
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_index = source.find(start).expect("source start marker");
         let end_index = source[start_index..]

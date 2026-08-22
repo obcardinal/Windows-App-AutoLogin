@@ -2,7 +2,7 @@ use crate::autologin::{
     accessibility_status, open_accessibility_settings, request_accessibility_access_prompt,
     AccessibilityStatus,
 };
-use crate::background::{WorkerCommand, WorkerEvent};
+use crate::background::{WorkerCommand, WorkerEvent, WorkerPauseLatch};
 #[cfg(any(not(test), feature = "diagnostics-ui"))]
 use crate::debug_fill;
 use crate::debug_fill::FillAttemptReport;
@@ -29,6 +29,7 @@ pub(crate) struct AutoLoginApp {
     pub(crate) logs: VecDeque<LogEntry>,
     pub(crate) worker_status: WorkerStatus,
     pub(crate) worker_tx: TokioSender<WorkerCommand>,
+    worker_pause_latch: WorkerPauseLatch,
     pub(crate) tray_rx: std::sync::mpsc::Receiver<TrayCommand>,
     pub(crate) worker_event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
 
@@ -39,6 +40,7 @@ pub(crate) struct AutoLoginApp {
     pub(crate) show_password: bool,
     pub(crate) status_message: Option<(String, f64)>,
     pub(crate) last_fill_report: Option<FillAttemptReport>,
+    storage_recovery_blocked: bool,
     quit_requested: bool,
 
     #[cfg(feature = "diagnostics-ui")]
@@ -64,6 +66,7 @@ pub(crate) struct AutoLoginApp {
 impl AutoLoginApp {
     pub(crate) fn new(
         worker_tx: TokioSender<WorkerCommand>,
+        worker_pause_latch: WorkerPauseLatch,
         tray_rx: std::sync::mpsc::Receiver<TrayCommand>,
         worker_event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
         config: AppConfig,
@@ -89,6 +92,7 @@ impl AutoLoginApp {
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             worker_status,
             worker_tx,
+            worker_pause_latch,
             tray_rx,
             worker_event_rx,
             editing_account: None,
@@ -98,6 +102,7 @@ impl AutoLoginApp {
             show_password: false,
             status_message: None,
             last_fill_report,
+            storage_recovery_blocked: !storage_recovery_is_clear(),
             quit_requested: false,
             #[cfg(feature = "diagnostics-ui")]
             diagnose_running: false,
@@ -118,6 +123,10 @@ impl AutoLoginApp {
             monitor_status_last_poll: Instant::now(),
         };
 
+        if app.storage_recovery_blocked {
+            app.worker_pause_latch.pause();
+        }
+
         app.log_accessibility_event(
             "accessibility_check_result",
             if app.accessibility_status.trusted {
@@ -135,6 +144,24 @@ impl AutoLoginApp {
         app
     }
 
+    pub(crate) fn with_storage_recovery_state(mut self, recovery_ready: bool) -> Self {
+        if !recovery_ready {
+            self.storage_recovery_blocked = true;
+            self.worker_pause_latch.pause();
+        }
+        self
+    }
+
+    pub(crate) fn account_mutations_ready(&self) -> bool {
+        !self.storage_recovery_blocked && storage_recovery_is_clear()
+    }
+
+    fn automation_start_ready(&self) -> bool {
+        !self.storage_recovery_blocked
+            && !self.worker_pause_latch.is_paused()
+            && storage_recovery_is_clear()
+    }
+
     fn add_log(&mut self, entry: LogEntry) {
         push_bounded_log(&mut self.logs, entry);
     }
@@ -145,6 +172,13 @@ impl AutoLoginApp {
 
     pub(crate) fn send_worker_command(&mut self, cmd: WorkerCommand) {
         if self.settings_window_mode {
+            return;
+        }
+        if matches!(cmd, WorkerCommand::Start) && !self.automation_start_ready() {
+            self.worker_status = WorkerStatus::Idle;
+            self.set_status(
+                "Monitor remains stopped until password storage recovery completes after restart.",
+            );
             return;
         }
         if let Err(e) = self.worker_tx.try_send(cmd) {
@@ -164,16 +198,25 @@ impl AutoLoginApp {
     }
 
     pub(crate) fn sync_saved_config_to_worker(&mut self, refresh_passwords: bool) {
+        if self.storage_recovery_blocked || !storage_recovery_is_clear() {
+            self.stop_monitor_for_pending_storage_recovery();
+            return;
+        }
         if self.settings_window_mode {
             let _ = self.request_supervisor_config_reload();
             return;
         }
 
-        if let Err(e) = self.worker_tx.try_send(WorkerCommand::ApplyConfig {
-            settings: self.config.settings.clone(),
-            accounts: self.config.accounts.clone(),
+        let start_monitor = self.worker_status == WorkerStatus::Running;
+        let pause_epoch = self.worker_pause_latch.pause_with_epoch();
+        let apply_command = self.worker_pause_latch.apply_config_command(
+            pause_epoch,
+            self.config.settings.clone(),
+            self.config.accounts.clone(),
             refresh_passwords,
-        }) {
+            start_monitor,
+        );
+        if let Err(e) = self.worker_tx.try_send(apply_command) {
             self.worker_status = WorkerStatus::Idle;
             self.set_status(format!(
                 "Saved, but monitor was stopped because it could not reload safely: {e}"
@@ -181,7 +224,49 @@ impl AutoLoginApp {
         }
     }
 
+    pub(crate) fn stop_monitor_for_pending_storage_recovery(&mut self) {
+        // Sticky for this UI process. A failed journal unlink/directory fsync
+        // can make the pathname temporarily disappear even though power loss
+        // may restore it, so only a fresh startup recovery may clear this gate.
+        self.storage_recovery_blocked = true;
+        self.worker_pause_latch.pause();
+        self.worker_status = WorkerStatus::Idle;
+        #[cfg(not(test))]
+        {
+            if let Err(error) = crate::storage::mark_storage_recovery_blocked() {
+                tracing::error!(
+                    error = %error,
+                    "Password storage recovery block could not be persisted; process-local pause remains active"
+                );
+            }
+        }
+        if self.settings_window_mode {
+            if let Err(stop_error) = single_instance::request_monitor_command(
+                MonitorControlCommand::StorageRecoveryBlocked,
+            ) {
+                tracing::error!(
+                    error = %stop_error,
+                    "Password storage recovery is pending, but the supervisor recovery-block request failed"
+                );
+            }
+            return;
+        }
+        if let Err(e) = self.worker_tx.try_send(WorkerCommand::Stop) {
+            tracing::error!(
+                error = %e,
+                "Password storage recovery is pending, but the local monitor stop could not be queued"
+            );
+        }
+    }
+
     fn send_monitor_control_command(&mut self, command: MonitorControlCommand) {
+        if command == MonitorControlCommand::Start && !self.automation_start_ready() {
+            self.worker_status = WorkerStatus::Idle;
+            self.set_status(
+                "Monitor remains stopped until password storage recovery completes after restart.",
+            );
+            return;
+        }
         if self.settings_window_mode {
             if let Err(e) = single_instance::request_monitor_command(command) {
                 self.set_status(format!("Monitor command failed: {e}"));
@@ -192,6 +277,9 @@ impl AutoLoginApp {
         match command {
             MonitorControlCommand::Start => self.send_worker_command(WorkerCommand::Start),
             MonitorControlCommand::Stop => self.send_worker_command(WorkerCommand::Stop),
+            MonitorControlCommand::StorageRecoveryBlocked => {
+                self.stop_monitor_for_pending_storage_recovery()
+            }
             #[cfg(not(target_os = "macos"))]
             MonitorControlCommand::ReloadConfig => self.sync_saved_config_to_worker(true),
         }
@@ -264,11 +352,16 @@ impl AutoLoginApp {
     fn apply_accessibility_granted_status(&mut self, status: AccessibilityStatus) {
         self.accessibility_status = status;
         self.log_accessibility_event("accessibility_granted", LogLevel::Info);
-        self.status_message = Some((
-            "Accessibility permission granted. Starting monitor.".to_string(),
-            5.0,
-        ));
-        if self.worker_status == WorkerStatus::Idle {
+        if self.settings_window_mode {
+            // The supervisor owns desired monitor intent. Its independent
+            // Accessibility poll will start only when no later explicit Stop
+            // has cancelled that intent; a child must not resurrect it.
+            self.status_message = Some(("Accessibility permission granted.".to_string(), 5.0));
+        } else if self.worker_status == WorkerStatus::Idle {
+            self.status_message = Some((
+                "Accessibility permission granted. Starting monitor.".to_string(),
+                5.0,
+            ));
             self.send_monitor_control_command(MonitorControlCommand::Start);
         }
     }
@@ -388,6 +481,13 @@ impl AutoLoginApp {
             self.last_fill_report = Some(report);
         }
     }
+}
+
+fn storage_recovery_is_clear() -> bool {
+    matches!(
+        crate::storage::pending_storage_recovery_is_clear(),
+        Ok(true)
+    ) && matches!(crate::storage::storage_recovery_block_is_clear(), Ok(true))
 }
 
 fn redact_sensitive_log_text(message: &str) -> String {
@@ -860,10 +960,15 @@ mod tests {
         WorkerCommand, MAX_LOG_ENTRIES,
     };
     use crate::autologin::AccessibilityStatus;
+    use crate::background::{WorkerInvalidator, WorkerPauseLatch};
     use crate::models::{AppConfig, LogEntry, LogLevel, Tab, WorkerStatus};
     use std::collections::VecDeque;
     use std::sync::mpsc::channel as std_channel;
     use tokio::sync::mpsc::channel as tokio_channel;
+
+    fn test_pause_latch() -> WorkerPauseLatch {
+        WorkerInvalidator::new().pause_latch()
+    }
 
     #[test]
     fn log_redaction_removes_email_addresses_and_secret_assignments() {
@@ -1012,6 +1117,7 @@ mod tests {
         let (_tray_tx, tray_rx) = std_channel();
         let mut app = AutoLoginApp::new(
             worker_tx,
+            test_pause_latch(),
             tray_rx,
             worker_event_rx,
             AppConfig::default(),
@@ -1036,5 +1142,201 @@ mod tests {
             WorkerCommand::Start => {}
             other => panic!("expected Start, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_child_accessibility_grant_does_not_override_supervisor_stop_intent() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            test_pause_latch(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            true,
+            Tab::Accounts,
+        );
+        app.worker_status = WorkerStatus::Idle;
+
+        app.apply_accessibility_granted_status(AccessibilityStatus {
+            trusted: true,
+            raw_trusted: true,
+            identity_trusted: true,
+            current_process_path: "/Applications/WindowsAppAutoLogin.app".to_string(),
+            app_bundle_path: "/Applications/WindowsAppAutoLogin.app".to_string(),
+        });
+
+        assert!(app.accessibility_status.trusted);
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message == "Accessibility permission granted."));
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_storage_recovery_queues_stop_even_when_cached_status_is_idle() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let pause_latch = test_pause_latch();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            pause_latch.clone(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        );
+        app.worker_status = WorkerStatus::Idle;
+
+        app.stop_monitor_for_pending_storage_recovery();
+
+        assert!(!app.account_mutations_ready());
+        assert!(pause_latch.is_paused());
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::Stop => {}
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+    }
+
+    #[test]
+    fn pending_storage_recovery_rejects_every_local_start_path() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let pause_latch = test_pause_latch();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            pause_latch.clone(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        )
+        .with_storage_recovery_state(false);
+
+        app.apply_accessibility_granted_status(AccessibilityStatus {
+            trusted: true,
+            raw_trusted: true,
+            identity_trusted: true,
+            current_process_path: "/Applications/WindowsAppAutoLogin.app".to_string(),
+            app_bundle_path: "/Applications/WindowsAppAutoLogin.app".to_string(),
+        });
+        app.send_worker_command(WorkerCommand::Start);
+
+        assert!(pause_latch.is_paused());
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_apply_queue_leaves_worker_synchronously_paused() {
+        let (worker_tx, mut worker_rx) = tokio_channel(1);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let pause_latch = test_pause_latch();
+        worker_tx.try_send(WorkerCommand::Start).unwrap();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            pause_latch.clone(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        );
+        app.worker_status = WorkerStatus::Running;
+
+        app.sync_saved_config_to_worker(true);
+
+        assert!(pause_latch.is_paused());
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Start)));
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sticky_recovery_never_queues_a_config_release() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let pause_latch = test_pause_latch();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            pause_latch.clone(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        )
+        .with_storage_recovery_state(false);
+        app.worker_status = WorkerStatus::Running;
+
+        app.sync_saved_config_to_worker(true);
+
+        assert!(pause_latch.is_paused());
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn successful_local_apply_releases_only_its_pause_epoch() {
+        let (worker_tx, mut worker_rx) = tokio_channel(2);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let pause_latch = test_pause_latch();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            pause_latch.clone(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        );
+        app.worker_status = WorkerStatus::Running;
+
+        app.sync_saved_config_to_worker(true);
+
+        assert!(pause_latch.is_paused());
+        match worker_rx.try_recv().unwrap() {
+            WorkerCommand::ApplyConfigAndReleasePause {
+                refresh_passwords,
+                start_monitor,
+                pause_epoch,
+                ..
+            } => {
+                assert!(refresh_passwords);
+                assert!(start_monitor);
+                assert_eq!(pause_epoch, pause_latch.current_epoch());
+            }
+            other => panic!("expected atomic config apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn startup_recovery_failure_keeps_account_mutations_sticky_blocked() {
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let app = AutoLoginApp::new(
+            worker_tx,
+            test_pause_latch(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            false,
+            Tab::Accounts,
+        )
+        .with_storage_recovery_state(false);
+
+        assert!(!app.account_mutations_ready());
     }
 }

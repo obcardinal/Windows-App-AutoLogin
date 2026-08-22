@@ -20,6 +20,11 @@ struct PromptInfo {
 const LAST_FILL_ATTEMPT_REPORT_FILE: &str = "last-fill-attempt.json";
 static REPORT_TEMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn password_storage_recovery_is_clear() -> bool {
+    matches!(storage::pending_storage_recovery_is_clear(), Ok(true))
+        && matches!(storage::storage_recovery_block_is_clear(), Ok(true))
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct VerifiedPromptContext {
@@ -604,13 +609,42 @@ pub(crate) fn run_from_args(args: &[String]) -> anyhow::Result<()> {
 ))]
 fn run_platform(args: &[String]) -> anyhow::Result<()> {
     let method = FillMethod::parse(args)?;
-    let config = storage::load_config();
-    let report = fill_current_prompt_once(&config.settings, &config.accounts, method);
+    let report = with_exclusive_settings_recovery_lease(
+        crate::single_instance::SettingsRecoveryLease::try_acquire,
+        |_recovery_lease| {
+            let config = storage::load_config();
+            fill_current_prompt_once(&config.settings, &config.accounts, method)
+        },
+    )?;
     report.print();
     if let Some(reason) = report.failure_reason {
         anyhow::bail!(reason);
     }
     Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "macos", target_os = "windows"),
+        feature = "debug-fill",
+        debug_assertions,
+        not(waal_release_profile)
+    )
+))]
+fn with_exclusive_settings_recovery_lease<Lease, Output>(
+    acquire_lease: impl FnOnce() -> anyhow::Result<Option<Lease>>,
+    operation: impl FnOnce(&mut Lease) -> Output,
+) -> anyhow::Result<Output> {
+    let Some(mut lease) = acquire_lease()? else {
+        anyhow::bail!(
+            "debug-fill-once cannot run while a settings session or password recovery/fill operation is active"
+        );
+    };
+
+    let output = operation(&mut lease);
+    drop(lease);
+    Ok(output)
 }
 
 #[cfg_attr(
@@ -772,6 +806,9 @@ fn fill_current_prompt_once_macos(
     if let Err(e) = guard() {
         return log.fail(format!("attempt_cancelled_{e}"));
     }
+    if !password_storage_recovery_is_clear() {
+        return log.fail("password_storage_recovery_pending");
+    }
 
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
@@ -877,6 +914,10 @@ fn fill_current_prompt_once_macos(
     if let Err(e) = guard() {
         drop(password);
         return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
+    }
+    if !password_storage_recovery_is_clear() {
+        drop(password);
+        return log.fail("password_storage_recovery_started_after_password_load");
     }
 
     let fill_start = Instant::now();
@@ -1430,6 +1471,9 @@ fn fill_current_prompt_once_windows(
     if let Err(e) = guard() {
         return log.fail(format!("attempt_cancelled_{e}"));
     }
+    if !password_storage_recovery_is_clear() {
+        return log.fail("password_storage_recovery_pending");
+    }
 
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
@@ -1511,6 +1555,10 @@ fn fill_current_prompt_once_windows(
     if let Err(e) = guard() {
         drop(password);
         return log.fail(format!("attempt_cancelled_after_password_load_{e}"));
+    }
+    if !password_storage_recovery_is_clear() {
+        drop(password);
+        return log.fail("password_storage_recovery_started_after_password_load");
     }
 
     let fill_start = Instant::now();
@@ -2598,6 +2646,8 @@ mod tests {
         not(target_os = "windows")
     ))]
     use super::FillMethod;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn private_report_test_dir(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2607,6 +2657,49 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn debug_fill_skips_operation_without_exclusive_settings_recovery_lease() {
+        let operation_called = Cell::new(false);
+
+        let result = super::with_exclusive_settings_recovery_lease(
+            || Ok(None::<()>),
+            |_| operation_called.set(true),
+        );
+
+        assert!(result.is_err());
+        assert!(!operation_called.get());
+    }
+
+    #[test]
+    fn debug_fill_holds_exclusive_settings_recovery_lease_through_operation() {
+        struct TestLease {
+            held: Rc<Cell<bool>>,
+        }
+
+        impl Drop for TestLease {
+            fn drop(&mut self) {
+                self.held.set(false);
+            }
+        }
+
+        let held = Rc::new(Cell::new(false));
+        let observed = held.clone();
+        let result = super::with_exclusive_settings_recovery_lease(
+            || {
+                held.set(true);
+                Ok(Some(TestLease { held: held.clone() }))
+            },
+            |_lease| {
+                assert!(observed.get());
+                "operation-complete"
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "operation-complete");
+        assert!(!observed.get());
     }
 
     #[test]

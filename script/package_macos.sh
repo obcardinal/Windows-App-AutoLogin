@@ -1,7 +1,32 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
 # Release packaging never searches a user-controlled HOME for executables.
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+# A process running as the current user cannot prove that another same-user
+# process did not replace Cargo output before Developer ID signing. Refuse the
+# old publishable entry points before resolving Git, Cargo, signing identities,
+# or notarization credentials. The local signed mode below is intentionally
+# non-publishable and disclaims producer attribution in both embedded and
+# signed bundle metadata.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    --release|--release-diagnostics-artifact)
+      echo "Publishable macOS packaging is disabled in the local packager. Use an isolated authenticated builder; use --local-signed-release only for an explicitly non-publishable local artifact." >&2
+      exit 1
+      ;;
+    --local-signed-release)
+      if [ "$#" -ne 1 ]; then
+        echo "Usage: script/package_macos.sh --local-signed-release" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "Usage: script/package_macos.sh --local-signed-release" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 RELEASE_SNAPSHOT_REEXECUTED=false
 if [ "${1:-}" = --internal-committed-snapshot ]; then
@@ -31,7 +56,7 @@ if [ "${1:-}" = --internal-committed-snapshot ]; then
   shift
   PACKAGE_MACOS_SOURCE_PATH="${BASH_SOURCE[0]}"
   case "$ROOT_DIR:$EXECUTION_SOURCE_ROOT:$PACKAGE_MACOS_SOURCE_PATH:$REEXEC_RELEASE_ARGUMENT" in
-    /*:/*:/dev/fd/8:--release|/*:/*:/dev/fd/8:--release-diagnostics-artifact) ;;
+    /*:/*:/dev/fd/8:--local-signed-release) ;;
     *) echo "Invalid paths for macOS release snapshot execution." >&2; exit 1 ;;
   esac
   # Do not interpret the helper yet. Its FD is authenticated against the
@@ -101,7 +126,6 @@ fi
 readonly LOADED_PACKAGE_MACOS_OID
 readonly LOADED_MACOS_BUNDLE_OID
 PRODUCTION_APP_NAME="WindowsAppAutoLogin"
-DIAGNOSTICS_APP_NAME="WindowsAppAutoLoginDiagnostics"
 APP_NAME="$PRODUCTION_APP_NAME"
 APP_DISPLAY_NAME="Windows App AutoLogin"
 DEVELOPMENT_BUNDLE_ID="obcardinal.windows-app-autologin"
@@ -110,14 +134,13 @@ ZIP_SHA256_PATH=""
 RELEASE_ARCHIVE_BASE=""
 BINARY_NAME="windows-app-autologin"
 PRODUCTION_BUNDLE_ID="${WAAL_RELEASE_BUNDLE_ID:-}"
-DIAGNOSTICS_BUNDLE_ID="${WAAL_DIAGNOSTICS_BUNDLE_ID:-}"
 EXPECTED_BUNDLE_ID=""
 EXPECTED_BUNDLE_ID_ENV=""
 EXPECTED_TEAM_ID="${WAAL_MACOS_TEAM_ID:-}"
 CODESIGN_IDENTITY="${WAAL_CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${WAAL_NOTARY_PROFILE:-}"
 RELEASE=false
-RELEASE_DIAGNOSTICS_ARTIFACT=false
+LOCAL_SIGNED_RELEASE=false
 RELEASE_PRIVATE_ROOT=""
 RELEASE_PRIVATE_ROOT_PARENT=""
 RELEASE_PRIVATE_ROOT_ID=""
@@ -192,24 +215,19 @@ BUILD_VERSION=""
 
 for arg in "$@"; do
   case "$arg" in
-    --release) RELEASE=true ;;
-    --release-diagnostics-artifact) RELEASE=true; RELEASE_DIAGNOSTICS_ARTIFACT=true ;;
+    --local-signed-release) RELEASE=true; LOCAL_SIGNED_RELEASE=true ;;
+    --release|--release-diagnostics-artifact)
+      echo "Publishable macOS packaging is disabled in the local packager. Use an isolated authenticated builder." >&2
+      exit 1
+      ;;
     *) echo "Unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
 
-if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-  APP_NAME="$DIAGNOSTICS_APP_NAME"
-  APP_DISPLAY_NAME="Windows App AutoLogin Diagnostics"
-  RELEASE_ARCHIVE_BASE="$APP_NAME-macos-release-diagnostics"
-  EXPECTED_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID"
-  EXPECTED_BUNDLE_ID_ENV="WAAL_DIAGNOSTICS_BUNDLE_ID"
-else
-  APP_NAME="$PRODUCTION_APP_NAME"
-  RELEASE_ARCHIVE_BASE="$APP_NAME-macos"
-  EXPECTED_BUNDLE_ID="$PRODUCTION_BUNDLE_ID"
-  EXPECTED_BUNDLE_ID_ENV="WAAL_RELEASE_BUNDLE_ID"
-fi
+APP_NAME="$PRODUCTION_APP_NAME"
+RELEASE_ARCHIVE_BASE="$APP_NAME-macos-local-signed"
+EXPECTED_BUNDLE_ID="$PRODUCTION_BUNDLE_ID"
+EXPECTED_BUNDLE_ID_ENV="WAAL_RELEASE_BUNDLE_ID"
 
 require_tool() {
   if ! declare -F waal_require_tool >/dev/null; then
@@ -1889,9 +1907,9 @@ run_sanitized_release_cargo() {
       CXX="$RELEASE_CLANGXX_BIN" \
       AR="$RELEASE_AR_BIN" \
       LD="$RELEASE_LD_BIN" \
-      WAAL_PUBLISHABLE_RELEASE=1 \
+      WAAL_PUBLISHABLE_RELEASE=0 \
+      WAAL_LOCAL_SIGNED_RELEASE=1 \
       WAAL_RELEASE_BUNDLE_ID="$PRODUCTION_BUNDLE_ID" \
-      WAAL_DIAGNOSTICS_BUNDLE_ID="$DIAGNOSTICS_BUNDLE_ID" \
       WAAL_MACOS_TEAM_ID="$EXPECTED_TEAM_ID" \
       WAAL_RELEASE_GIT_COMMIT="$RELEASE_GIT_COMMIT" \
       WAAL_RELEASE_GIT_TREE="$RELEASE_GIT_TREE" \
@@ -1944,9 +1962,9 @@ verify_release_dependency_graph() {
 }
 
 validate_release_environment() {
-  if [ "$RELEASE" != true ]; then
-    echo "Refusing to create macOS ZIP without --release." >&2
-    echo "Local ad-hoc bundles are for development only; release packaging must pass signing and notarization checks." >&2
+  if [ "$RELEASE" != true ] || [ "$LOCAL_SIGNED_RELEASE" != true ]; then
+    echo "Refusing to create a local signed macOS ZIP without --local-signed-release." >&2
+    echo "The local packager never produces a publishable or producer-attested artifact." >&2
     exit 1
   fi
   if [ -z "$EXPECTED_TEAM_ID" ]; then
@@ -1976,24 +1994,6 @@ validate_release_environment() {
   if [ "$EXPECTED_BUNDLE_ID" = "$DEVELOPMENT_BUNDLE_ID" ]; then
     echo "$EXPECTED_BUNDLE_ID_ENV must not use the development bundle identifier $DEVELOPMENT_BUNDLE_ID." >&2
     exit 1
-  fi
-  if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-    if [ -z "$PRODUCTION_BUNDLE_ID" ]; then
-      echo "WAAL_RELEASE_BUNDLE_ID must be set so diagnostics packaging can verify it is separate from production." >&2
-      exit 1
-    fi
-    if ! valid_bundle_id "$PRODUCTION_BUNDLE_ID"; then
-      echo "WAAL_RELEASE_BUNDLE_ID is not a valid bundle identifier." >&2
-      exit 1
-    fi
-    if [ "$PRODUCTION_BUNDLE_ID" = "$DEVELOPMENT_BUNDLE_ID" ]; then
-      echo "WAAL_RELEASE_BUNDLE_ID must not use the development bundle identifier $DEVELOPMENT_BUNDLE_ID." >&2
-      exit 1
-    fi
-    if [ "$EXPECTED_BUNDLE_ID" = "$PRODUCTION_BUNDLE_ID" ]; then
-      echo "WAAL_DIAGNOSTICS_BUNDLE_ID must differ from WAAL_RELEASE_BUNDLE_ID for release diagnostics artifacts." >&2
-      exit 1
-    fi
   fi
 }
 
@@ -3062,23 +3062,12 @@ build_release_executable() {
   TARGET_EXECUTABLE="$BUILD_TARGET_DIR/aarch64-apple-darwin/release/$BINARY_NAME"
 
   verify_release_dependency_graph
-  if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-    run_sanitized_release_cargo build \
-      --locked \
-      --release \
-      --target aarch64-apple-darwin \
-      --manifest-path "$RELEASE_SOURCE_DIR/Cargo.toml" \
-      --no-default-features \
-      --features release-diagnostics \
-      --bin "$BINARY_NAME"
-  else
-    run_sanitized_release_cargo build \
-      --locked \
-      --release \
-      --target aarch64-apple-darwin \
-      --manifest-path "$RELEASE_SOURCE_DIR/Cargo.toml" \
-      --bin "$BINARY_NAME"
-  fi
+  run_sanitized_release_cargo build \
+    --locked \
+    --release \
+    --target aarch64-apple-darwin \
+    --manifest-path "$RELEASE_SOURCE_DIR/Cargo.toml" \
+    --bin "$BINARY_NAME"
 
   if [ ! -x "$TARGET_EXECUTABLE" ]; then
     echo "Release build did not produce expected executable: $TARGET_EXECUTABLE" >&2
@@ -3113,34 +3102,37 @@ assemble_release_bundle() {
 
 macos_release_provenance_contents() {
   /usr/bin/printf '%s\n' \
-    'WAAL_MACOS_BUILD_PROVENANCE_V1' \
-    "source-git-commit=$RELEASE_GIT_COMMIT" \
-    "source-git-tree=$RELEASE_GIT_TREE" \
-    "git-sha256=$RELEASE_GIT_SHA256" \
-    "cargo-version=$RELEASE_CARGO_VERSION" \
-    "cargo-sha256=$RELEASE_CARGO_SHA256" \
-    "rustc-version=$RELEASE_RUSTC_VERSION" \
-    "rustc-sha256=$RELEASE_RUSTC_SHA256" \
-    "rust-sysroot-sha256=$RELEASE_RUST_SYSROOT_SHA256" \
-    "native-toolchain-sha256=$RELEASE_NATIVE_TOOLCHAIN_SHA256" \
-    "release-materials-sha256=$RELEASE_MATERIALS_SHA256" \
-    "clang-sha256=$RELEASE_CLANG_SHA256" \
-    "clangxx-sha256=$RELEASE_CLANGXX_SHA256" \
-    "ar-sha256=$RELEASE_AR_SHA256" \
-    "ld-sha256=$RELEASE_LD_SHA256" \
-    "ld-libtapi-sha256=$RELEASE_LD_TAPI_SHA256" \
-    "ld-libcodedirectory-sha256=$RELEASE_LD_CODEDIRECTORY_SHA256" \
-    "ld-liblto-sha256=$RELEASE_LD_LTO_SHA256" \
-    "ld-libswift-demangle-sha256=$RELEASE_LD_SWIFT_DEMANGLE_SHA256" \
-    "notarytool-sha256=$RELEASE_NOTARYTOOL_SHA256" \
-    "stapler-sha256=$RELEASE_STAPLER_SHA256" \
-    "macos-sdk-sha256=$RELEASE_MACOS_SDK_SHA256" \
-    "clang-resource-dir-sha256=$RELEASE_CLANG_RESOURCE_DIR_SHA256"
+    'WAAL_MACOS_LOCAL_SIGNED_BUILD_INFO_V1' \
+    'publishable=false' \
+    'attestation=none-local-shared-security-context' \
+    'producer-attribution=unavailable-local-shared-security-context' \
+    "captured-source-git-commit=$RELEASE_GIT_COMMIT" \
+    "captured-source-git-tree=$RELEASE_GIT_TREE" \
+    "observed-git-sha256=$RELEASE_GIT_SHA256" \
+    "observed-cargo-version=$RELEASE_CARGO_VERSION" \
+    "observed-cargo-sha256=$RELEASE_CARGO_SHA256" \
+    "observed-rustc-version=$RELEASE_RUSTC_VERSION" \
+    "observed-rustc-sha256=$RELEASE_RUSTC_SHA256" \
+    "observed-rust-sysroot-sha256=$RELEASE_RUST_SYSROOT_SHA256" \
+    "observed-native-toolchain-sha256=$RELEASE_NATIVE_TOOLCHAIN_SHA256" \
+    "observed-materials-sha256=$RELEASE_MATERIALS_SHA256" \
+    "observed-clang-sha256=$RELEASE_CLANG_SHA256" \
+    "observed-clangxx-sha256=$RELEASE_CLANGXX_SHA256" \
+    "observed-ar-sha256=$RELEASE_AR_SHA256" \
+    "observed-ld-sha256=$RELEASE_LD_SHA256" \
+    "observed-ld-libtapi-sha256=$RELEASE_LD_TAPI_SHA256" \
+    "observed-ld-libcodedirectory-sha256=$RELEASE_LD_CODEDIRECTORY_SHA256" \
+    "observed-ld-liblto-sha256=$RELEASE_LD_LTO_SHA256" \
+    "observed-ld-libswift-demangle-sha256=$RELEASE_LD_SWIFT_DEMANGLE_SHA256" \
+    "observed-notarytool-sha256=$RELEASE_NOTARYTOOL_SHA256" \
+    "observed-stapler-sha256=$RELEASE_STAPLER_SHA256" \
+    "observed-macos-sdk-sha256=$RELEASE_MACOS_SDK_SHA256" \
+    "observed-clang-resource-dir-sha256=$RELEASE_CLANG_RESOURCE_DIR_SHA256"
 }
 
 write_macos_release_provenance() {
   local bundle_dir="$1"
-  local provenance_file="$bundle_dir/Contents/Resources/BUILD-PROVENANCE.txt"
+  local provenance_file="$bundle_dir/Contents/Resources/BUILD-INFO.txt"
 
   if [ -L "$provenance_file" ]; then
     echo "Refusing to replace a symlinked macOS provenance file." >&2
@@ -3152,16 +3144,16 @@ write_macos_release_provenance() {
 
 verify_macos_release_provenance() {
   local bundle_dir="$1"
-  local provenance_file="$bundle_dir/Contents/Resources/BUILD-PROVENANCE.txt"
-  local expected_file="$STAGE_DIR/macos-build-provenance.expected.txt"
+  local provenance_file="$bundle_dir/Contents/Resources/BUILD-INFO.txt"
+  local expected_file="$STAGE_DIR/macos-local-signed-build-info.expected.txt"
 
   if [ ! -f "$provenance_file" ] || [ -L "$provenance_file" ]; then
-    echo "Release bundle is missing its regular BUILD-PROVENANCE.txt file." >&2
+    echo "Local signed bundle is missing its regular BUILD-INFO.txt file." >&2
     exit 1
   fi
   macos_release_provenance_contents >"$expected_file"
   if ! /usr/bin/cmp -s "$expected_file" "$provenance_file"; then
-    echo "Release bundle provenance does not match the pinned source and toolchain." >&2
+    echo "Local signed bundle information does not match the captured source and observed toolchain." >&2
     exit 1
   fi
 }
@@ -3602,23 +3594,17 @@ verify_release_build_metadata() {
   require_metadata_field "$metadata" "release-rust-sysroot-sha256" "$RELEASE_RUST_SYSROOT_SHA256" "Release executable Rust sysroot hash does not match the verified toolchain."
   require_metadata_field "$metadata" "release-native-toolchain-sha256" "$RELEASE_NATIVE_TOOLCHAIN_SHA256" "Release executable native toolchain hash does not match the verified toolchain."
   require_metadata_field "$metadata" "release-materials-sha256" "$RELEASE_MATERIALS_SHA256" "Release executable materials aggregate does not match the verified release inputs."
-  if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-    require_metadata_field "$metadata" "artifact-kind" "release-diagnostics" "Release diagnostics artifact metadata kind is not release-diagnostics."
-    require_metadata_field "$metadata" "debug-fill" "false" "Release diagnostics artifact must not include debug-fill."
-    require_metadata_field "$metadata" "dev-tools" "false" "Release diagnostics artifact must not include dev-tools."
-    require_metadata_field "$metadata" "diagnostics-ui" "true" "Release diagnostics artifact requires diagnostics-ui metadata."
-    require_metadata_field "$metadata" "release-diagnostics" "true" "Release diagnostics artifact requires release-diagnostics metadata."
-    require_metadata_field "$metadata" "production-macos-bundle-id" "$PRODUCTION_BUNDLE_ID" "Release diagnostics artifact metadata does not record WAAL_RELEASE_BUNDLE_ID."
-    require_metadata_field "$metadata" "non-production-macos-identity" "true" "Release diagnostics artifact must prove it uses a non-production macOS identity."
-  else
-    require_metadata_field "$metadata" "artifact-kind" "release" "Publishable release bundle metadata kind is not release."
-    require_metadata_field "$metadata" "debug-fill" "false" "Publishable release bundle was built with debug-fill enabled."
-    require_metadata_field "$metadata" "dev-tools" "false" "Publishable release bundle was built with dev-tools enabled."
-    require_metadata_field "$metadata" "diagnostics-ui" "false" "Publishable release bundle was built with diagnostics-ui enabled."
-    require_metadata_field "$metadata" "release-diagnostics" "false" "Publishable release bundle was built with release-diagnostics enabled."
-    require_metadata_field "$metadata" "production-macos-bundle-id" "$EXPECTED_BUNDLE_ID" "Publishable release metadata production bundle ID does not match WAAL_RELEASE_BUNDLE_ID."
-    require_metadata_field "$metadata" "non-production-macos-identity" "false" "Publishable release bundle must not be built with a non-production macOS identity."
-  fi
+  require_metadata_field "$metadata" "artifact-kind" "local-signed-release" "Local signed bundle metadata kind is not local-signed-release."
+  require_metadata_field "$metadata" "publishable" "false" "Local signed bundle must not carry a publishable marker."
+  require_metadata_field "$metadata" "attestation" "none-local-shared-security-context" "Local signed bundle must disclaim build attestation."
+  require_metadata_field "$metadata" "producer-attribution" "unavailable-local-shared-security-context" "Local signed bundle must disclaim producer attribution."
+  require_metadata_field "$metadata" "debug-fill" "false" "Local signed bundle was built with debug-fill enabled."
+  require_metadata_field "$metadata" "dev-tools" "false" "Local signed bundle was built with dev-tools enabled."
+  require_metadata_field "$metadata" "diagnostics-ui" "false" "Local signed bundle was built with diagnostics-ui enabled."
+  require_metadata_field "$metadata" "release-diagnostics" "false" "Local signed bundle was built with release-diagnostics enabled."
+  require_metadata_field "$metadata" "production-macos-bundle-id" "$EXPECTED_BUNDLE_ID" "Local signed metadata production bundle ID does not match WAAL_RELEASE_BUNDLE_ID."
+  require_metadata_field "$metadata" "non-production-macos-identity" "false" "Local signed bundle must use the intended production runtime identity."
+  require_canonical_release_metadata "$metadata"
 }
 
 verify_no_developer_path_strings() {
@@ -3670,6 +3656,28 @@ require_metadata_field() {
       exit 1
       ;;
   esac
+}
+
+require_canonical_release_metadata() {
+  local metadata="$1"
+  local expected_metadata
+
+  # Presence checks alone are insufficient here: a substituted Cargo output
+  # could carry both the required local-only disclaimer and a contradictory
+  # duplicate claim. Match the complete build.rs schema, including order and
+  # the empty macOS-inapplicable Authenticode fields, so duplicates, omissions,
+  # additions, and unknown keys all fail closed before signing.
+  expected_metadata="WAAL_BUILD_METADATA_V1;artifact-kind=local-signed-release;publishable=false;attestation=none-local-shared-security-context;producer-attribution=unavailable-local-shared-security-context;"
+  expected_metadata+="profile=release;target-os=macos;target-arch=aarch64;debug-assertions=false;debug-fill=false;dev-tools=false;diagnostics-ui=false;release-diagnostics=false;"
+  expected_metadata+="macos-bundle-id=$EXPECTED_BUNDLE_ID;production-macos-bundle-id=$EXPECTED_BUNDLE_ID;non-production-macos-identity=false;macos-team-id=$EXPECTED_TEAM_ID;"
+  expected_metadata+="windows-authenticode-publisher=;windows-authenticode-cert-sha256=;"
+  expected_metadata+="source-git-commit=$RELEASE_GIT_COMMIT;source-git-tree=$RELEASE_GIT_TREE;release-cargo-version=$RELEASE_CARGO_VERSION;release-rustc-version=$RELEASE_RUSTC_VERSION;"
+  expected_metadata+="release-cargo-sha256=$RELEASE_CARGO_SHA256;release-rustc-sha256=$RELEASE_RUSTC_SHA256;release-rust-sysroot-sha256=$RELEASE_RUST_SYSROOT_SHA256;release-native-toolchain-sha256=$RELEASE_NATIVE_TOOLCHAIN_SHA256;release-materials-sha256=$RELEASE_MATERIALS_SHA256;"
+
+  if [ "$metadata" != "$expected_metadata" ]; then
+    echo "Release executable build metadata does not match the exact canonical local-signed schema." >&2
+    exit 1
+  fi
 }
 
 require_info_plist_string() {
@@ -4272,7 +4280,7 @@ extract_and_verify_archive() {
 reexecute_release_from_materialized_snapshot() {
   local reexec_script="$RELEASE_SOURCE_DIR/script/package_macos.sh"
   local reexec_bundle="$RELEASE_SOURCE_DIR/script/macos_bundle.sh"
-  local reexec_argument="--release"
+  local reexec_argument="--local-signed-release"
   local package_memory_sha256
   local bundle_memory_sha256
   local committed_package_oid
@@ -4286,10 +4294,11 @@ reexecute_release_from_materialized_snapshot() {
   local bundle_descriptor_path
   local -a clean_child_environment
 
-  verify_release_snapshot_unchanged || return 1
-  if [ "$RELEASE_DIAGNOSTICS_ARTIFACT" = true ]; then
-    reexec_argument="--release-diagnostics-artifact"
+  if [ "$RELEASE" != true ] || [ "$LOCAL_SIGNED_RELEASE" != true ]; then
+    echo "Refusing macOS snapshot re-execution without explicit --local-signed-release opt-in." >&2
+    return 1
   fi
+  verify_release_snapshot_unchanged || return 1
   if [ ! -f "$reexec_script" ] || [ -L "$reexec_script" ] \
     || [ ! -f "$reexec_bundle" ] || [ -L "$reexec_bundle" ]; then
     echo "Materialized release scripts are unavailable for pinned re-execution." >&2
@@ -4399,7 +4408,6 @@ reexecute_release_from_materialized_snapshot() {
     "HOME=${HOME:-/var/empty}"
     "WAAL_BUILD_VERSION=${WAAL_BUILD_VERSION:-}"
     "WAAL_RELEASE_BUNDLE_ID=${WAAL_RELEASE_BUNDLE_ID:-}"
-    "WAAL_DIAGNOSTICS_BUNDLE_ID=${WAAL_DIAGNOSTICS_BUNDLE_ID:-}"
     "WAAL_MACOS_TEAM_ID=${WAAL_MACOS_TEAM_ID:-}"
     "WAAL_CODESIGN_IDENTITY=${WAAL_CODESIGN_IDENTITY:-}"
     "WAAL_NOTARY_PROFILE=${WAAL_NOTARY_PROFILE:-}"
@@ -4602,7 +4610,7 @@ package_macos_main() {
     archive-only|complete)
       finalize_release_source_identity_guard
       repair_or_adopt_existing_release "$EXISTING_PUBLICATION_STATE"
-      /usr/bin/printf 'Release ZIP: %s\nSHA-256 sidecar: %s\nSHA-256: %s\n' \
+      /usr/bin/printf 'Local signed ZIP (NOT PUBLISHABLE): %s\nSHA-256 sidecar: %s\nSHA-256: %s\n' \
         "$ZIP_PATH" "$ZIP_SHA256_PATH" "$PUBLISHED_ZIP_SHA256"
       return 0
       ;;
@@ -4655,7 +4663,7 @@ package_macos_main() {
   verify_release_source_unchanged
   verify_release_build_toolchain_guard
 
-  /usr/bin/printf 'Release ZIP: %s\nSHA-256 sidecar: %s\nSHA-256: %s\n' \
+  /usr/bin/printf 'Local signed ZIP (NOT PUBLISHABLE): %s\nSHA-256 sidecar: %s\nSHA-256: %s\n' \
     "$ZIP_PATH" "$ZIP_SHA256_PATH" "$PUBLISHED_ZIP_SHA256"
 }
 

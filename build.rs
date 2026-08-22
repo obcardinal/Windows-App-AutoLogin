@@ -44,6 +44,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed={RELEASE_MATERIALS_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed=WAAL_PUBLISHABLE_RELEASE");
+    println!("cargo:rerun-if-env-changed=WAAL_LOCAL_SIGNED_RELEASE");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_PUBLISHER_ENV}");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_CERT_SHA256_ENV}");
     println!("cargo:rustc-check-cfg=cfg(waal_release_profile)");
@@ -170,16 +171,22 @@ fn build_metadata(
     debug_assertions: bool,
 ) -> String {
     let publishable_release = publishable_release_requested();
+    let local_signed_release = local_signed_release_requested();
     let artifact_kind = if env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some() {
         "release-diagnostics"
-    } else if publishable_release || !macos_identity.non_production_identity {
-        "release"
+    } else if local_signed_release && !macos_identity.non_production_identity {
+        "local-signed-release"
     } else {
         "development"
     };
+    let attestation = "none-local-shared-security-context";
+    let producer_attribution = "unavailable-local-shared-security-context";
     format!(
-        "WAAL_BUILD_METADATA_V1;artifact-kind={};profile={};target-os={};target-arch={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};windows-authenticode-publisher={};windows-authenticode-cert-sha256={};source-git-commit={};source-git-tree={};release-cargo-version={};release-rustc-version={};release-cargo-sha256={};release-rustc-sha256={};release-rust-sysroot-sha256={};release-native-toolchain-sha256={};release-materials-sha256={};",
+        "WAAL_BUILD_METADATA_V1;artifact-kind={};publishable={};attestation={};producer-attribution={};profile={};target-os={};target-arch={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};windows-authenticode-publisher={};windows-authenticode-cert-sha256={};source-git-commit={};source-git-tree={};release-cargo-version={};release-rustc-version={};release-cargo-sha256={};release-rustc-sha256={};release-rust-sysroot-sha256={};release-native-toolchain-sha256={};release-materials-sha256={};",
         artifact_kind,
+        publishable_release,
+        attestation,
+        producer_attribution,
         env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string()),
         metadata_component_env("CARGO_CFG_TARGET_OS"),
         metadata_component_env("CARGO_CFG_TARGET_ARCH"),
@@ -283,8 +290,27 @@ fn release_provenance() -> ReleaseProvenance {
     let native_toolchain_sha256 = trimmed_env(RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV);
     let materials_sha256 = trimmed_env(RELEASE_MATERIALS_SHA256_ENV);
     let publishable_release = publishable_release_requested();
-    if publishable_release && development_release_allowed() {
-        panic!("WAAL_PUBLISHABLE_RELEASE and WAAL_DEVELOPMENT_RELEASE are mutually exclusive");
+    let local_signed_release = local_signed_release_requested();
+    let release_diagnostics = env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some();
+    if publishable_release && (development_release_allowed() || local_signed_release) {
+        panic!("WAAL_PUBLISHABLE_RELEASE is mutually exclusive with local development or signed-release modes");
+    }
+    if local_signed_release && development_release_allowed() {
+        panic!("WAAL_LOCAL_SIGNED_RELEASE and WAAL_DEVELOPMENT_RELEASE are mutually exclusive");
+    }
+    if local_signed_release && (!is_macos_release_profile() || release_diagnostics) {
+        panic!(
+            "WAAL_LOCAL_SIGNED_RELEASE is accepted only for production-identity macOS release-profile builds"
+        );
+    }
+    if is_macos_release_profile()
+        && !development_release_allowed()
+        && !publishable_release
+        && !local_signed_release
+    {
+        panic!(
+            "production-identity macOS release-profile builds must explicitly select an authenticated publishable builder or WAAL_LOCAL_SIGNED_RELEASE"
+        );
     }
     let provenance_required =
         (is_macos_release_profile() && !development_release_allowed()) || publishable_release;
@@ -305,7 +331,7 @@ fn release_provenance() -> ReleaseProvenance {
         .any(|value| value.is_none())
     {
         panic!(
-            "publishable release provenance must include Git commit/tree and Cargo/rustc version/hash fields"
+            "release build observations must include Git commit/tree and Cargo/rustc version/hash fields"
         );
     }
     let supplied_count = [
@@ -380,7 +406,16 @@ fn release_provenance() -> ReleaseProvenance {
 }
 
 fn publishable_release_requested() -> bool {
-    truthy_env("WAAL_PUBLISHABLE_RELEASE")
+    if truthy_env("WAAL_PUBLISHABLE_RELEASE") {
+        panic!(
+            "WAAL_PUBLISHABLE_RELEASE is disabled: source-controlled build metadata cannot authenticate its own producer; publishability requires detached verification from an isolated authenticated builder"
+        );
+    }
+    false
+}
+
+fn local_signed_release_requested() -> bool {
+    truthy_env("WAAL_LOCAL_SIGNED_RELEASE")
 }
 
 fn windows_authenticode_publisher() -> String {

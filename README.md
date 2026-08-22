@@ -75,12 +75,12 @@ Other app names, copied bundles, unsigned bundles, modified bundles, or unexpect
 - macOS Accessibility permission for the exact app or binary you launch on macOS.
 - macOS may also ask for Automation permission to control System Events; approve it only for the expected Windows App AutoLogin bundle.
 - For macOS bundle creation: `sips` and `iconutil`.
-- For macOS release packaging: a Developer ID Application signing identity available to `codesign`, plus a `notarytool` keychain profile.
-- For a publishable Windows distribution: an x64 MSVC Rust toolchain, a Visual Studio Developer PowerShell environment with `cl.exe`, `lib.exe`, `link.exe`, and `rc.exe`, Windows SDK `signtool.exe`, and a code-signing certificate with an accessible private key installed in `Cert:\CurrentUser\My`.
+- For the non-publishable local signed macOS artifact: a Developer ID Application signing identity available to `codesign`, plus a `notarytool` keychain profile.
+- For the unsigned Windows VM-test artifact: an x64 MSVC Rust toolchain and a Visual Studio Developer PowerShell environment with `cl.exe`, `lib.exe`, `link.exe`, and `rc.exe`.
 
 ## Build
 
-Create a production macOS release ZIP with a freshly built, signed, notarized, and stapled app bundle:
+Create a non-publishable local macOS ZIP with a release-profile app bundle that uses the production bundle identity and is Developer ID signed, notarized, and stapled:
 
 ```bash
 RELEASE_CARGO="$(rustup which cargo)"
@@ -116,14 +116,16 @@ export WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256=<reviewed-sysroot-tree-sha256>
 export WAAL_RELEASE_EXPECTED_MACOS_SDK_SHA256=<reviewed-sdk-tree-sha256>
 export WAAL_RELEASE_EXPECTED_CLANG_RESOURCE_DIR_SHA256=<reviewed-clang-resource-tree-sha256>
 export WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256=<reviewed-native-aggregate-sha256>
-WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
+WAAL_RELEASE_BUNDLE_ID=com.obcardinal.WindowsAppAutoLogin \
 WAAL_MACOS_TEAM_ID=ABCDE12345 \
 WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
 WAAL_NOTARY_PROFILE=your-notary-profile \
-script/package_macos.sh --release
+script/package_macos.sh --local-signed-release
 ```
 
-The verified files are published as `dist/WindowsAppAutoLogin-macos-<40-hex-commit>.zip` and the commit-addressed `*.zip.sha256` sidecar. Publication uses a same-volume atomic no-replace APFS clone followed by descriptor-bound verification and candidate cleanup: an existing artifact is never unlinked or overwritten, and older commit artifacts are preserved.
+The files are written as `dist/WindowsAppAutoLogin-macos-local-signed-<40-hex-captured-commit>.zip` and a matching `*.zip.sha256` sidecar. The commit and tree are captured for traceability, but the local shared user security context cannot prove that Cargo produced the Mach-O from that commit before the Developer ID signer signed it. The bundle therefore records `publishable=false`, `attestation=none-local-shared-security-context`, and `producer-attribution=unavailable-local-shared-security-context` in its executable metadata and `Contents/Resources/BUILD-INFO.txt`. Do not publish it as a release.
+
+Local invocations with `--release` or `--release-diagnostics-artifact` fail closed. The only local signed packaging entry point is `--local-signed-release`. A future publishable macOS artifact must be produced by a separately isolated builder and returned over an authenticated channel. Local publication still uses a same-volume atomic no-replace APFS clone followed by descriptor-bound verification and candidate cleanup: an existing artifact is never unlinked or overwritten, and older commit-labelled artifacts are preserved. These controls protect the selected package bytes; they do not provide producer attribution.
 
 For a local macOS development bundle, use `./script/build_and_run.sh --verify` instead.
 
@@ -133,47 +135,17 @@ Build-check the Windows implementation from another host when the target is inst
 cargo check --target x86_64-pc-windows-gnu --all-targets --all-features
 ```
 
-Create a publishable Windows x86-64 distribution from a Visual Studio Developer PowerShell prompt. The certificate thumbprint is not a password or private key:
+Local publishable Windows packaging is intentionally disabled. Cargo and path-based signing tools running under the same Windows security context cannot prove which process produced the bytes or prevent use of the signer as an oracle. An invocation without `-Development`, or with any certificate or timestamp input, therefore fails before Git, Cargo, certificates, or native tools are resolved.
 
-```powershell
-$env:WAAL_WINDOWS_SIGN_CERT_THUMBPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
-$env:WAAL_WINDOWS_RELEASE_GIT_PATH = "C:\Program Files\Git\mingw64\bin\git.exe"
-$env:WAAL_WINDOWS_RELEASE_GIT_ROOT = "C:\Program Files\Git"
-$env:WAAL_WINDOWS_RELEASE_TAR_PATH = "C:\Windows\System32\tar.exe"
-$env:WAAL_WINDOWS_RELEASE_CODEDOM_CSC_PATH = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-$env:WAAL_WINDOWS_RELEASE_CODEDOM_RUNTIME = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
-$env:WAAL_RELEASE_CARGO_PATH = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
-$env:WAAL_RELEASE_RUSTC_PATH = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
-$env:WAAL_RELEASE_RUST_SYSROOT = "C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc"
-$env:WAAL_WINDOWS_RELEASE_CL_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\cl.exe"
-$env:WAAL_WINDOWS_RELEASE_LIB_EXE_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\lib.exe"
-$env:WAAL_WINDOWS_RELEASE_LINK_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64\link.exe"
-$env:WAAL_WINDOWS_RELEASE_MSVC_BIN = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\<version>\bin\Hostx64\x64"
-$env:WAAL_WINDOWS_RELEASE_RC_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\rc.exe"
-$env:WAAL_WINDOWS_RELEASE_SDK_BIN = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64"
-$env:WAAL_WINDOWS_RELEASE_SIGNTOOL_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\signtool.exe"
-$env:WAAL_WINDOWS_RELEASE_LIB = "<reviewed semicolon-separated absolute MSVC/SDK library directories>"
-$env:WAAL_WINDOWS_RELEASE_INCLUDE = "<reviewed semicolon-separated absolute MSVC/SDK include directories>"
-$env:WAAL_WINDOWS_RELEASE_LIBPATH = "<reviewed semicolon-separated absolute MSVC/SDK reference directories>"
-# Load the corresponding lowercase hashes from a separately reviewed pin
-# manifest. File pins use SHA-256; directory and directory-list pins use the
-# deterministic contracts documented below.
-.\script\build_windows_dist.ps1
-```
-
-The corresponding Windows hash variables are `WAAL_WINDOWS_RELEASE_EXPECTED_GIT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_GIT_ROOT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_TAR_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_CODEDOM_CSC_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_CODEDOM_RUNTIME_SHA256`, `WAAL_RELEASE_EXPECTED_CARGO_SHA256`, `WAAL_RELEASE_EXPECTED_RUSTC_SHA256`, `WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_CL_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LIB_EXE_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LINK_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_MSVC_BIN_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_RC_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_SDK_BIN_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_SIGNTOOL_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LIB_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_INCLUDE_SHA256`, `WAAL_WINDOWS_RELEASE_EXPECTED_LIBPATH_SHA256`, and `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256`.
-
-The default Windows command is fail-closed: it requires a clean Git checkout, rejects links/gitlinks in the committed source tree, streams the already parsed packager logic—not a reopened script pathname—into its clean child, and binds that exact logic to the captured commit. It builds and repeatedly re-verifies a fresh self-contained snapshot with an isolated Cargo home, verifies the locked dependency graph and every pinned build/materialization/signing tool, and sanitizes Git protocol/transport/configuration inputs plus generic and target-qualified MSVC injection variables. The physical Git executable and its reported `--exec-path` must remain inside the pinned Git runtime tree; `tar.exe` must be the pinned physical executable in the trusted Windows System32 directory; and `rc.exe` plus `signtool.exe` must remain inside the pinned Windows SDK executable tree. Reviewed Git, tar, CodeDom, Rust, MSVC, SDK, `LIB`, `INCLUDE`, and `LIBPATH` file identities are retained with non-write-sharing handles through packaging; every such file must be regular, non-reparse, and single-link once the authenticated native helper is available. The build embeds the exact Git commit/tree, release-materials aggregate, signer name, and certificate SHA-256 fingerprint, signs and RFC 3161 timestamps the executable, proves that signing changed only the PE checksum/certificate-table fields and appended certificate table, verifies Authenticode against that exact certificate, and writes `SHA256SUMS.txt` covering the executable, documentation, example config, and `BUILD-PROVENANCE.txt`. Publication uses a handle-relative same-volume atomic no-replace rename to a commit-addressed directory such as `dist/WindowsAppAutoLogin-windows-x86_64-<40-hex-commit>`; all six exact payload identities and hashes remain pinned across activation and final verification. Older committed packages are never renamed or recursively deleted, so a crash cannot remove the previous package.
-
-The Windows packager-source digest is SHA-256 over the ASCII bytes of the executing root `ScriptBlockAst.Extent.Text`. The extent must be non-empty and contain neither NUL nor non-ASCII characters; CRLF and lone CR are canonicalized to LF before hashing. The clean child runs a fixed UTF-16LE `-EncodedCommand` bootstrap. A `ProcessStartInfo` invocation writes the captured ASCII bytes directly to the redirected stdin pipe's base stream, without an encoding preamble or pipeline-added newline; the bootstrap consumes the entire stream with `ReadToEnd()`, creates exactly one root `ScriptBlock`, and invokes it with a whitelist-validated argument hashtable decoded from a canonical UTF-8/Base64 payload. The child verifies that payload, the exact engine argument vector, trusted module path, nonce, and parent source digest before using the explicitly passed physical repository root. It never uses Windows PowerShell 5.1's statement-at-a-time `-File -` mode or the .NET Core-only `ProcessStartInfo.StandardInputEncoding` property. The committed snapshot must likewise be ASCII without a BOM. It is read into one byte buffer, verified against its exact Git blob ID, parsed by the executing PowerShell engine, and its root AST extent is hashed with the same algorithm. That comparison completes before `rustup`, Cargo, rustc, or native build-tool resolution. Publishable packaging requires Windows PowerShell 5.1 Desktop; its exact CLR `csc.exe` and runtime tree are pinned before compiling the handle helper. The source digest and CodeDom hashes are included in `BUILD-PROVENANCE.txt` and in the Windows release-materials aggregate.
-
-The Windows PowerShell 5.1 clean-shell runtime check must be run on the Windows test machine before a release. From a local checkout, invoke `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\script\build_windows_dist.ps1 -Development -ReuseBuild -SkipTests -TimestampUrl https://timestamp.example.invalid`. The expected result is a nonzero exit that includes the intentional `-ReuseBuild is incompatible with provenance-safe distribution builds` guard from inside the clean child; the outer process can additionally report that its clean subprocess failed. A parser error, unknown-parameter error, missing AST/source error, or `-File -` prompt behavior is a failure. This probe stops before Git/toolchain resolution and performs no application build. Repeat once with `WAAL_INTERNAL_CLEAN_SHELL_ARGUMENTS` preset to a nonempty value and require rejection of reserved bootstrap state before any child starts.
-
-For an unsigned local VM test artifact only, opt in explicitly. This uses a separate directory name and is never a publishable release:
+For an optimized unsigned local VM-test artifact, opt in explicitly from a Visual Studio Developer PowerShell prompt:
 
 ```powershell
 .\script\build_windows_dist.ps1 -Development
 ```
+
+The development package is commit-addressed for traceability, but it is not an attested release. `BUILD-METADATA.txt` records `publishable=false`, `attestation=none-local-shared-security-context`, the captured commit/tree, observed tool hashes, and payload hashes; `SHA256SUMS.txt` protects the selected package bytes. Do not publish this artifact. A future publishable Windows pipeline must run in a separately isolated builder and return output over an authenticated channel.
+
+The Windows packager still uses a clean PowerShell child, an isolated Cargo home, a freshly materialized committed source snapshot, retained directory/file handles, and no-replace publication for the development package. Cargo is allowed to create and uplift its normal executable destination; after Cargo exits, the packager opens the exact child relative to the retained output directory, verifies that it is a non-empty regular single-link file, and denies further writes or replacement while copying it. These controls keep the selected VM-test payload internally consistent; they deliberately do not claim producer attribution against another process running as the same user.
 
 Build and launch the local macOS development app bundle. This path uses the development bundle identity and ad-hoc signing; it is not a production release build:
 
@@ -333,7 +305,7 @@ The diagnostic binary prints JSON describing visible target processes, windows, 
 
 Diagnostic target discovery uses the same trusted-target constraints as autofill: supported Microsoft identity, expected install path, signing identity, and verified live PID. App names, process names, and window titles are treated only as report labels; they are not enough to select or traverse an arbitrary process.
 
-`release-diagnostics` is reserved for intentional support artifacts, not general releases. Diagnostic output is redacted and capped; signing identities, signing identifiers, Team IDs, and app bundle IDs are reduced to coarse status values before display or export. It can still include process IDs and timing data; review it before sharing with support.
+`release-diagnostics` is reserved for a future intentional support artifact produced by an isolated authenticated builder, not for the local packager or general releases. Diagnostic output is redacted and capped; signing identities, signing identifiers, Team IDs, and app bundle IDs are reduced to coarse status values before display or export. It can still include process IDs and timing data; review it before sharing with support.
 
 Run one guarded fill attempt from a development build compiled with `debug-fill` or `dev-tools` and launched from the trusted app bundle:
 
@@ -357,16 +329,16 @@ Optional features:
 debug-fill
 diagnostics-ui
 dev-tools (enables debug-fill and diagnostics-ui)
-release-diagnostics (explicitly permits diagnostics-ui in release support artifacts)
+release-diagnostics (reserved for isolated release support-artifact builders)
 ```
 
-Build and launch the full UI with diagnostics enabled:
+Build a debug-only local bundle and launch its full UI with diagnostics enabled:
 
 ```bash
 ./script/build_and_run.sh --dev-ui
 ```
 
-Launch the packaged app directly into the full settings UI:
+Start the packaged supervisor and have it open an authorized full settings UI:
 
 ```bash
 ./script/build_and_run.sh --full-ui
@@ -404,28 +376,21 @@ obcardinal.windows-app-autologin
 
 The development script does not perform Developer ID signing or notarization. It opts into `WAAL_DEVELOPMENT_RELEASE=1` only for local non-production release-profile bundles.
 
-Use `script/package_macos.sh --release` only for a publishable macOS zip. The package script requires the Git checkout to have no tracked, non-ignored untracked, assume-unchanged, or skip-worktree changes; records the exact 40-hex `HEAD` commit and tree IDs; materializes an isolated source snapshot directly from that commit; independently verifies every materialized file byte and executable mode against its Git blob before and after each Cargo invocation and bundle assembly; and rechecks the checkout, snapshot, and embedded values before publishing. Git uses the explicitly pinned physical Xcode executable with ambient Git configuration, replacement refs, hooks, and local filesystem-monitor execution disabled; tracked archive attributes remain harmless because the extracted file set and every byte are compared with the Git tree. Cargo runs with a new packager-owned `HOME`, `CARGO_HOME`, temporary directory, target directory, fixed system-tool path, explicit `DEVELOPER_DIR` and `SDKROOT`, and no Cargo configuration in its working-directory ancestors. The dependency graph must contain only the archived root package and locked crates.io packages—external path, Git, alternate-registry, and source-replacement inputs are rejected. Cargo, rustc, the complete Rust sysroot, physical Xcode Git, `clang`, `clang++`, `ar`, `ld`, the four Xcode linker runtime libraries, the selected macOS SDK tree, Clang resource directory, `notarytool`, and `stapler` must match separately reviewed SHA-256 pins; `/usr/bin` developer-tool shims are not release inputs. The Rust/native build inputs are copied into a private single-link snapshot, made read-only and immutable, and checked by exact tree identity before and after Cargo. Their hashes are bound into the release-materials aggregate embedded in the executable and into signed `BUILD-PROVENANCE.txt`. Before signing, the packager captures a canonical digest of the full bundle payload; the main Mach-O digest normalizes only the terminal code-signature blob and its corresponding load-command/`__LINKEDIT` size fields. That payload digest is rechecked around `codesign`, notarization, stapling, final verification, and archive creation, so a replacement binary cannot be silently signed. The script signs with `WAAL_CODESIGN_IDENTITY`, notarizes with `WAAL_NOTARY_PROFILE`, staples the ticket, and zips only the verified staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs, and `dist` must be a real directory rather than a symlink.
+Local `script/package_macos.sh --release` and `script/package_macos.sh --release-diagnostics-artifact` invocations fail closed because this packager cannot create a publishable or producer-attested macOS artifact. Use `script/package_macos.sh --local-signed-release` only for the explicitly non-publishable local signed ZIP.
 
-The Rust sysroot tree digest is SHA-256 over ordinal byte-sorted regular-file entries encoded as `relative/path`, NUL, lowercase file SHA-256, NUL; symbolic links and special nodes are rejected. The Xcode SDK/resource-tree digest additionally supports only non-broken symbolic links whose resolved targets remain inside the same pinned root; it encodes each ordinal byte-sorted regular file as `relative/path`, NUL, `file`, NUL, lowercase file SHA-256, NUL and each link as `relative/path`, NUL, `link`, NUL, exact link text, NUL. The macOS native aggregate is SHA-256 over NUL-terminated lowercase hashes, in this exact order: `clang`, `clang++`, `ar`, `ld`, `libtapi.dylib`, `libcodedirectory.dylib`, `libLTO.dylib`, `libswiftDemangle.dylib`, the macOS SDK tree, and the Clang resource directory. The macOS release-materials aggregate applies the same rule in this exact order: physical Xcode Git, Cargo, rustc, the Rust sysroot aggregate, the native-toolchain aggregate, `notarytool`, and `stapler`. The Windows directory-tree digest uses the Rust-sysroot file contract, but hashes each file through its retained non-write-sharing handle and rechecks the exact ordinal path set. A Windows `LIB`, `INCLUDE`, or `LIBPATH` list digest first hashes each semicolon-ordered directory tree, then hashes those lowercase tree hashes with a NUL after each. The publishable Windows native aggregate uses the same NUL-terminated-hash rule in this exact order: `cl.exe`, `lib.exe`, `link.exe`, the MSVC compiler-bin directory tree, `rc.exe`, the Windows SDK executable tree, and `signtool.exe`. The Windows release-materials aggregate applies the rule in this exact order: normalized parsed executing-packager source, Git executable, Git runtime tree, `tar`, CodeDom `csc.exe`, CodeDom runtime tree, Cargo, rustc, Rust sysroot, native-toolchain aggregate, approved `LIB` content, approved `INCLUDE` content, and approved `LIBPATH` content. These ordered native aggregate values are the `WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256` pins; each derived release-materials value is passed to Cargo as `WAAL_RELEASE_MATERIALS_SHA256` and verified in embedded metadata.
+The local signed path requires the Git checkout to have no tracked, non-ignored untracked, assume-unchanged, or skip-worktree changes; captures the exact 40-hex `HEAD` commit and tree IDs; materializes an isolated source snapshot from that commit; verifies every materialized file byte and executable mode against its Git blob before and after Cargo and bundle assembly; and rechecks the checkout, snapshot, and embedded observations before writing the package. Git uses the explicitly pinned physical Xcode executable with ambient Git configuration, replacement refs, hooks, and local filesystem-monitor execution disabled; tracked archive attributes remain harmless because the extracted file set and every byte are compared with the Git tree. Cargo runs with a new packager-owned `HOME`, `CARGO_HOME`, temporary directory, target directory, fixed system-tool path, explicit `DEVELOPER_DIR` and `SDKROOT`, and no Cargo configuration in its working-directory ancestors. The dependency graph must contain only the archived root package and locked crates.io packages—external path, Git, alternate-registry, and source-replacement inputs are rejected. Cargo, rustc, the complete Rust sysroot, physical Xcode Git, `clang`, `clang++`, `ar`, `ld`, the four Xcode linker runtime libraries, the selected macOS SDK tree, Clang resource directory, `notarytool`, and `stapler` must match separately reviewed SHA-256 pins; `/usr/bin` developer-tool shims are not packaging inputs. The Rust/native build inputs are copied into a private single-link snapshot, made read-only and immutable, and checked by exact tree identity before and after Cargo. Their observed hashes and the captured source identifiers are recorded in the executable metadata and signed `BUILD-INFO.txt`.
 
-The current release pipeline intentionally produces an ARM64 macOS binary. `CFBundleVersion` defaults to the numeric Cargo package version and can be overridden with a valid one-to-three-component `WAAL_BUILD_VERSION`.
+Before signing, the packager captures a canonical digest of the full bundle payload; the main Mach-O digest normalizes only the terminal code-signature blob and its corresponding load-command/`__LINKEDIT` size fields. That payload digest is rechecked around `codesign`, notarization, stapling, final verification, and archive creation. The script uses the production bundle identity and release Cargo profile, signs with `WAAL_CODESIGN_IDENTITY`, notarizes with `WAAL_NOTARY_PROFILE`, staples the ticket, and zips only the selected staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs, and `dist` must be a real directory rather than a symlink. These checks establish package consistency and record observed inputs, but a process running as the same user can still substitute Cargo output before signing. The local signature, notarization, commit-labelled filename, captured identifiers, and payload hashes therefore do not attest which producer created the Mach-O or prove a producer-attested relationship to the commit.
 
-Packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the release bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata was compiled with the same bundle ID, Team ID, source commit/tree, target, toolchain hashes, and release-materials aggregate, and the bundle passes production trust checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, validates the staged bundle and extracted ZIP, publishes the ZIP and SHA-256 sidecar under immutable commit-addressed names without replacing prior files, then re-hashes and fully verifies the final destination archive.
+The Rust sysroot tree digest is SHA-256 over ordinal byte-sorted regular-file entries encoded as `relative/path`, NUL, lowercase file SHA-256, NUL; symbolic links and special nodes are rejected. The Xcode SDK/resource-tree digest additionally supports only non-broken symbolic links whose resolved targets remain inside the same pinned root; it encodes each ordinal byte-sorted regular file as `relative/path`, NUL, `file`, NUL, lowercase file SHA-256, NUL and each link as `relative/path`, NUL, `link`, NUL, exact link text, NUL. The macOS native aggregate is SHA-256 over NUL-terminated lowercase hashes, in this exact order: `clang`, `clang++`, `ar`, `ld`, `libtapi.dylib`, `libcodedirectory.dylib`, `libLTO.dylib`, `libswiftDemangle.dylib`, the macOS SDK tree, and the Clang resource directory. The macOS observed-materials aggregate applies the same rule in this exact order: physical Xcode Git, Cargo, rustc, the Rust sysroot aggregate, the native-toolchain aggregate, `notarytool`, and `stapler`. Windows development metadata likewise records observed deterministic hashes for local tool and directory inputs. These local observations are not a producer attestation or a publishable release-materials claim.
+
+The current local signed macOS path intentionally produces an ARM64 binary. `CFBundleVersion` defaults to the numeric Cargo package version and can be overridden with a valid one-to-three-component `WAAL_BUILD_VERSION`.
+
+Local signed packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the production bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata contains the same expected bundle ID, Team ID, captured source commit/tree, target, observed toolchain hashes, and observed materials aggregate, and the bundle passes production identity checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, validates the staged bundle and extracted ZIP, writes the ZIP and SHA-256 sidecar under immutable commit-labelled names without replacing prior files, then re-hashes and verifies the final destination archive. Those labels and metadata remain traceability observations, not producer attribution.
 
 The project previously used development bundle ID `dev.codex.windows-app-autologin`; the current ID is `obcardinal.windows-app-autologin`. Release and development scripts do not reset privacy databases or alter Keychain access lists automatically. If an obsolete grant remains, remove only the old app entry from **System Settings → Privacy & Security → Accessibility** and **Automation**. If you deliberately want command-line cleanup, run the bundle-scoped `tccutil reset Accessibility dev.codex.windows-app-autologin` and `tccutil reset AppleEvents dev.codex.windows-app-autologin` yourself after reviewing the target. In Keychain Access, inspect the `WindowsAppAutoLogin` and `WindowsAppAutoLoginFallbackKey` items and remove only a stale application entry from Access Control; do not delete password items or the fallback key while fallback records exist. For the current ad-hoc development ID, prefer removing and re-adding the exact rebuilt app in System Settings rather than resetting unrelated applications.
 
-Use `script/package_macos.sh --release-diagnostics-artifact` only for an intentional support artifact. A release diagnostics artifact is built by the package script with `--features release-diagnostics`, a separate `WAAL_DIAGNOSTICS_BUNDLE_ID`, and the diagnostics app name `WindowsAppAutoLoginDiagnostics.app`; the package script requires both `WAAL_RELEASE_BUNDLE_ID` and `WAAL_DIAGNOSTICS_BUNDLE_ID` and refuses to package if the diagnostics bundle ID matches the production or development bundle ID. `script/build_and_run.sh --dev-ui` is not a release diagnostics path because it builds `dev-tools`, which includes `debug-fill` and is rejected by packaging.
-
-Example release diagnostics packaging command:
-
-```bash
-WAAL_RELEASE_BUNDLE_ID=com.example.WindowsAppAutoLogin \
-WAAL_DIAGNOSTICS_BUNDLE_ID=com.example.WindowsAppAutoLogin.Diagnostics \
-WAAL_MACOS_TEAM_ID=ABCDE12345 \
-WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
-WAAL_NOTARY_PROFILE=your-notary-profile \
-script/package_macos.sh --release-diagnostics-artifact
-```
+`script/package_macos.sh --release-diagnostics-artifact` is intentionally disabled locally and fails closed, just like `--release`. `script/build_and_run.sh --dev-ui` remains a local development diagnostics path; it builds `dev-tools`, includes `debug-fill`, uses the development identity, and must not be treated as a signed support or release artifact. Any future publishable diagnostics artifact must use a separate diagnostics identity and be produced by the isolated authenticated builder.
 
 The app bundle sets `LSUIElement=true`, so it behaves like a menu-bar utility rather than a Dock-first application.
 

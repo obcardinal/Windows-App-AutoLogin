@@ -15,6 +15,22 @@ param(
 Microsoft.PowerShell.Core\Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Local path-based Cargo and signtool transitions cannot attribute bytes to a
+# producer or signer against another process running in the same Windows
+# security context. Reject publishable mode and all signing inputs before even
+# validating or spawning the clean PowerShell child. Publishable Windows
+# releases require a separately isolated builder with an authenticated output
+# channel; this local script intentionally produces only unsigned VM-test
+# artifacts.
+if (-not $Development) {
+    throw "Publishable Windows packaging is disabled in the local packager. Use an isolated authenticated builder; pass -Development only for an explicitly unsigned local VM artifact."
+}
+if ($SigningCertificateThumbprint -or $TimestampUrl -or
+    $env:WAAL_WINDOWS_SIGN_CERT_THUMBPRINT -or
+    $env:WAAL_WINDOWS_TIMESTAMP_URL) {
+    throw "The development-only Windows packager rejects certificate and timestamp inputs."
+}
+
 # Capture the source text already parsed into this process. Reading
 # $PSCommandPath later would only observe the then-current worktree file and
 # could therefore bind an A-loaded packager to a concurrently checked-out B
@@ -485,23 +501,13 @@ $ExecutingPackagerSourceSha256 = $loadedPackagerSourceSha256
 $loadedPackagerSourceSha256 = $null
 $executingPackagerSource = $null
 
-# Fail before the first external provenance tool is resolved or executed. The
-# Desktop CLR/CodeDom implementation is itself a publishable release input and
-# cannot be substituted by a PowerShell 7 runtime later in the flow.
-if (-not $Development -and
-    ($PSVersionTable.PSEdition -cne "Desktop" -or
-     $PSVersionTable.PSVersion.Major -ne 5 -or
-     $PSVersionTable.PSVersion.Minor -ne 1)) {
-    throw "Publishable Windows packaging requires Windows PowerShell 5.1 Desktop."
-}
-
 $RootDir = $verifiedRepositoryRoot
 $BinaryName = "windows-app-autologin"
 $ExeName = "WindowsAppAutoLogin.exe"
 $TargetTriple = "x86_64-pc-windows-msvc"
 $ProductionDistName = "WindowsAppAutoLogin-windows-x86_64"
 $DevelopmentDistName = "WindowsAppAutoLogin-windows-x86_64-development"
-$DistName = if ($Development) { $DevelopmentDistName } else { $ProductionDistName }
+$DistName = $DevelopmentDistName
 $DistRoot = Microsoft.PowerShell.Management\Join-Path $RootDir "dist"
 $DistDir = $null
 $ReleaseRoot = $null
@@ -572,6 +578,12 @@ $GitRuntimeLockState = $null
 $TarLockState = $null
 $ToolchainDirectoryLocks = @{}
 $UnsignedExecutableBytes = $null
+$BuiltExecutableHandle = $null
+$BuiltExecutableDirectoryHandle = $null
+$StagedExecutableHandle = $null
+$StagedExecutableSha256 = $null
+$StagedPayloadHandles = @()
+$CommittedPayloadHashes = $null
 $CodeDomCompiler = $null
 $CodeDomCompilerSha256 = $null
 $CodeDomRuntime = $null
@@ -583,19 +595,8 @@ $AmbientLibPath = [Environment]::GetEnvironmentVariable("LIBPATH", "Process")
 $AmbientSystemRoot = [Environment]::GetEnvironmentVariable("SYSTEMROOT", "Process")
 $AmbientWinDir = [Environment]::GetEnvironmentVariable("WINDIR", "Process")
 
-if (-not $SigningCertificateThumbprint -and $env:WAAL_WINDOWS_SIGN_CERT_THUMBPRINT) {
-    $SigningCertificateThumbprint = $env:WAAL_WINDOWS_SIGN_CERT_THUMBPRINT
-}
-if (-not $TimestampUrl) {
-    $TimestampUrl = if ($env:WAAL_WINDOWS_TIMESTAMP_URL) {
-        $env:WAAL_WINDOWS_TIMESTAMP_URL
-    }
-    else {
-        "http://timestamp.digicert.com"
-    }
-}
 if ($ReuseBuild) {
-    throw "-ReuseBuild is incompatible with provenance-safe distribution builds. Every dist artifact is rebuilt from a fresh Git snapshot."
+    throw "-ReuseBuild is incompatible with fresh-snapshot development builds. Every local test artifact is rebuilt from a fresh captured Git snapshot."
 }
 
 function Normalize-Path {
@@ -1045,6 +1046,21 @@ function Copy-SingleLinkFile {
     )
 }
 
+function Copy-SingleLinkFileFromHandle {
+    param(
+        [Parameter(Mandatory = $true)]$SourceHandle,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Destination) {
+        throw "Single-link copy destination already exists: $Destination"
+    }
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::CopyTrackedRegularSingleLink(
+        $SourceHandle,
+        $Destination
+    )
+}
+
 function Copy-SingleLinkExecutableAndCaptureBytes {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -1060,6 +1076,25 @@ function Copy-SingleLinkExecutableAndCaptureBytes {
     )
     if ($null -eq $bytes -or $bytes.GetType() -ne [byte[]] -or $bytes.Length -eq 0) {
         throw "Executable copy did not return one exact non-empty byte snapshot."
+    }
+    return ,$bytes
+}
+
+function Copy-SingleLinkExecutableFromHandleAndCaptureBytes {
+    param(
+        [Parameter(Mandatory = $true)]$SourceHandle,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Destination) {
+        throw "Executable copy destination already exists: $Destination"
+    }
+    $bytes = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::CopyTrackedRegularSingleLinkAndCaptureBytes(
+        $SourceHandle,
+        $Destination
+    )
+    if ($null -eq $bytes -or $bytes.GetType() -ne [byte[]] -or $bytes.Length -eq 0) {
+        throw "Handle-bound executable copy did not return one exact non-empty byte snapshot."
     }
     return ,$bytes
 }
@@ -1839,7 +1874,17 @@ function Restore-PublicationAfterFailure {
     }
 }
 
-function Complete-Publication {
+function Complete-DevelopmentPublication {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)]$ExpectedPayloadHashes,
+        [Parameter(Mandatory = $true)][string]$ExpectedMetadata
+    )
+
+    # Re-enumerate the exact six-file set at the completion boundary. The
+    # resulting directory remains a mutable, non-attested development output;
+    # consumers must validate SHA256SUMS.txt again before using its payload.
+    Assert-WindowsDistribution $Directory $ExpectedPayloadHashes $ExpectedMetadata
     $script:PublicationComplete = $true
 }
 
@@ -2650,6 +2695,88 @@ namespace Obcardinal.WindowsAppAutoLogin
             }
         }
 
+        public static SafeFileHandle OpenTrackedRegularSingleLink(
+            SafeFileHandle directory,
+            string leafName)
+        {
+            SafeFileHandle handle = OpenChildNoFollow(
+                directory,
+                leafName,
+                GenericRead | FileReadAttributes | Synchronize,
+                FileShareRead);
+            try
+            {
+                Identity identity = GetIdentity(handle, "identify a tracked-directory file");
+                if (identity.IsDirectory || identity.IsReparsePoint || identity.NumberOfLinks != 1)
+                {
+                    throw new IOException(
+                        "Tracked-directory file must be regular, non-reparse, and single-link.");
+                }
+                return handle;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+
+        public static SafeFileHandle LockTrackedBuildOutputAfterBuild(
+            SafeFileHandle directory,
+            string leafName)
+        {
+            if (directory == null || directory.IsInvalid || directory.IsClosed)
+            {
+                throw new InvalidOperationException("Tracked build-output directory is unavailable.");
+            }
+            ValidateLeafName(leafName);
+            Identity directoryBefore = GetIdentity(
+                directory,
+                "identify the tracked build-output directory before locking its child");
+            if (!directoryBefore.IsDirectory || directoryBefore.IsReparsePoint ||
+                directoryBefore.NumberOfLinks != 1)
+            {
+                throw new IOException("Tracked build-output directory is unsafe.");
+            }
+
+            // Cargo must be free to create, remove, and uplift its normal
+            // top-level destination while it runs. Once Cargo exits, open the
+            // exact child relative to the retained directory and deny write
+            // and delete sharing. This either selects and locks one completed
+            // object atomically or fails while a writer/replacer remains open.
+            SafeFileHandle locked = OpenChildNoFollow(
+                directory,
+                leafName,
+                GenericRead | FileReadAttributes | Synchronize,
+                FileShareRead);
+            try
+            {
+                Identity output = GetIdentity(locked, "identify the locked build output");
+                if (output.IsDirectory || output.IsReparsePoint || output.NumberOfLinks != 1 ||
+                    output.FileSize == 0)
+                {
+                    throw new IOException(
+                        "Cargo output must be a non-empty regular single-link file.");
+                }
+                Identity directoryAfter = GetIdentity(
+                    directory,
+                    "re-identify the tracked build-output directory after locking its child");
+                if (!directoryBefore.SameObjectAndKind(directoryAfter) ||
+                    !directoryAfter.IsDirectory || directoryAfter.IsReparsePoint ||
+                    directoryAfter.NumberOfLinks != 1)
+                {
+                    throw new IOException(
+                        "Build-output directory changed while locking the completed child.");
+                }
+                return locked;
+            }
+            catch
+            {
+                locked.Dispose();
+                throw;
+            }
+        }
+
         public static void AssertRegularSingleLink(SafeFileHandle handle)
         {
             if (handle == null || handle.IsInvalid || handle.IsClosed)
@@ -2741,6 +2868,76 @@ namespace Obcardinal.WindowsAppAutoLogin
             }
         }
 
+        public static string HashTrackedRegularSingleLinkGitBlobSha1(SafeFileHandle handle)
+        {
+            if (handle == null || handle.IsInvalid || handle.IsClosed)
+            {
+                throw new InvalidOperationException("Tracked Git-blob input handle is unavailable.");
+            }
+            Identity before = GetIdentity(handle, "identify a tracked Git-blob input");
+            if (before.IsDirectory || before.IsReparsePoint || before.NumberOfLinks != 1)
+            {
+                throw new IOException("Tracked Git-blob input is not a regular single-link file.");
+            }
+
+            bool referenceAdded = false;
+            IntPtr duplicateRaw = IntPtr.Zero;
+            try
+            {
+                handle.DangerousAddRef(ref referenceAdded);
+                IntPtr process = GetCurrentProcess();
+                if (!DuplicateHandle(
+                    process,
+                    handle.DangerousGetHandle(),
+                    process,
+                    out duplicateRaw,
+                    0,
+                    false,
+                    DuplicateSameAccess))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Unable to duplicate a tracked Git-blob input handle.");
+                }
+            }
+            finally
+            {
+                if (referenceAdded)
+                {
+                    handle.DangerousRelease();
+                }
+            }
+
+            using (SafeFileHandle duplicate = new SafeFileHandle(duplicateRaw, true))
+            using (FileStream stream = new FileStream(duplicate, FileAccess.Read, 65536, false))
+            using (SHA1 sha1 = SHA1.Create())
+            {
+                stream.Position = 0;
+                try
+                {
+                    byte[] header = Encoding.ASCII.GetBytes("blob " + before.FileSize + "\0");
+                    sha1.TransformBlock(header, 0, header.Length, header, 0);
+                    byte[] buffer = new byte[1048576];
+                    int read;
+                    while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        sha1.TransformBlock(buffer, 0, read, buffer, 0);
+                    }
+                    sha1.TransformFinalBlock(new byte[0], 0, 0);
+                }
+                finally
+                {
+                    // DuplicateHandle shares the file pointer with the
+                    // retained source handle. Keep every verification pass
+                    // independent by rewinding it before returning.
+                    stream.Position = 0;
+                }
+                Identity after = GetIdentity(handle, "re-identify a tracked Git-blob input");
+                EnsureStableSingleLinkFile(before, after, "tracked Git-blob input");
+                return ToLowerHex(sha1.Hash);
+            }
+        }
+
         public static void AssertPhysicalDirectory(SafeFileHandle handle)
         {
             if (handle == null || handle.IsInvalid || handle.IsClosed)
@@ -2751,6 +2948,34 @@ namespace Obcardinal.WindowsAppAutoLogin
             if (!identity.IsDirectory || identity.IsReparsePoint || identity.NumberOfLinks != 1)
             {
                 throw new IOException("Tracked directory identity is no longer safe.");
+            }
+        }
+
+        public static void AssertTrackedDirectoryPath(string path, SafeFileHandle expectedHandle)
+        {
+            if (expectedHandle == null || expectedHandle.IsInvalid || expectedHandle.IsClosed)
+            {
+                throw new InvalidOperationException("Tracked directory handle is unavailable.");
+            }
+            Identity expected = GetIdentity(expectedHandle, "identify a tracked directory path");
+            SafeFileHandle opened = CreateFile(
+                path,
+                FileReadAttributes | Synchronize,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                IntPtr.Zero);
+            EnsureValid(opened, "reopen a tracked directory path");
+            using (opened)
+            {
+                Identity actual = GetIdentity(opened, "reopen a tracked directory path");
+                if (!expected.SameObjectAndKind(actual) || !expected.IsDirectory ||
+                    expected.IsReparsePoint || expected.NumberOfLinks != 1 ||
+                    actual.NumberOfLinks != 1)
+                {
+                    throw new IOException("Tracked directory pathname changed identity.");
+                }
             }
         }
 
@@ -2766,14 +2991,16 @@ namespace Obcardinal.WindowsAppAutoLogin
             }
             Identity expected = GetIdentity(expectedChild, "identify an anchored compiler child");
             // The anchor is still held for read/write with write/delete
-            // sharing denied. Reopen only for identity attributes, while this
-            // verifier shares the original handle's write access; the original
+            // sharing denied and FILE_FLAG_DELETE_ON_CLOSE. Reopen only for
+            // identity attributes. This verifier must share the original
+            // handle's read/write/delete accesses so Windows accepts the open;
+            // it requests no write or delete access itself, and the original
             // handle continues to deny every competing writer or replacement.
             using (SafeFileHandle opened = OpenChildNoFollow(
                 directory,
                 leafName,
                 FileReadAttributes | Synchronize,
-                FileShareRead | FileShareWrite))
+                FileShareRead | FileShareWrite | FileShareDelete))
             {
                 Identity actual = GetIdentity(opened, "re-open an anchored compiler child");
                 if (!expected.SameObjectAndKind(actual) || expected.IsDirectory ||
@@ -2854,6 +3081,73 @@ namespace Obcardinal.WindowsAppAutoLogin
         {
             using (SafeFileHandle source = OpenRegularSingleLink(sourcePath))
             {
+                return CopyTrackedRegularSingleLinkCore(
+                    source,
+                    destinationPath,
+                    captureDestination);
+            }
+        }
+
+        public static void CopyTrackedRegularSingleLink(
+            SafeFileHandle source,
+            string destinationPath)
+        {
+            CopyTrackedRegularSingleLinkCore(source, destinationPath, false);
+        }
+
+        public static byte[] CopyTrackedRegularSingleLinkAndCaptureBytes(
+            SafeFileHandle source,
+            string destinationPath)
+        {
+            return CopyTrackedRegularSingleLinkCore(source, destinationPath, true);
+        }
+
+        private static byte[] CopyTrackedRegularSingleLinkCore(
+            SafeFileHandle source,
+            string destinationPath,
+            bool captureDestination)
+        {
+            if (source == null || source.IsInvalid || source.IsClosed)
+            {
+                throw new InvalidOperationException("Tracked copy-source handle is unavailable.");
+            }
+            Identity sourceBefore = GetIdentity(source, "identify a tracked single-link copy source");
+            if (sourceBefore.IsDirectory || sourceBefore.IsReparsePoint ||
+                sourceBefore.NumberOfLinks != 1)
+            {
+                throw new IOException("Tracked copy source is not a regular single-link file.");
+            }
+
+            bool referenceAdded = false;
+            IntPtr duplicateRaw = IntPtr.Zero;
+            try
+            {
+                source.DangerousAddRef(ref referenceAdded);
+                IntPtr process = GetCurrentProcess();
+                if (!DuplicateHandle(
+                    process,
+                    source.DangerousGetHandle(),
+                    process,
+                    out duplicateRaw,
+                    0,
+                    false,
+                    DuplicateSameAccess))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Unable to duplicate a tracked single-link copy source.");
+                }
+            }
+            finally
+            {
+                if (referenceAdded)
+                {
+                    source.DangerousRelease();
+                }
+            }
+
+            using (SafeFileHandle duplicate = new SafeFileHandle(duplicateRaw, true))
+            {
                 SafeFileHandle destination = CreateFile(
                     destinationPath,
                     GenericRead | GenericWrite | FileReadAttributes | Synchronize,
@@ -2862,49 +3156,70 @@ namespace Obcardinal.WindowsAppAutoLogin
                     CreateNew,
                     FileAttributeNormal | FileFlagOpenReparsePoint,
                     IntPtr.Zero);
-                EnsureValid(destination, "create a single-link copy destination");
+                EnsureValid(destination, "create a tracked single-link copy destination");
                 using (destination)
-                using (FileStream sourceStream = new FileStream(source, FileAccess.Read, 65536, false))
+                using (FileStream sourceStream = new FileStream(duplicate, FileAccess.Read, 65536, false))
                 using (FileStream destinationStream = new FileStream(destination, FileAccess.ReadWrite, 65536, false))
                 using (SHA256 sourceSha256 = SHA256.Create())
                 using (SHA256 destinationSha256 = SHA256.Create())
                 {
-                    Identity sourceBefore = GetIdentity(source, "identify a single-link copy source");
-                    Identity destinationBefore = GetIdentity(destination, "identify a single-link copy destination");
-                    if (destinationBefore.IsDirectory || destinationBefore.IsReparsePoint ||
-                        destinationBefore.NumberOfLinks != 1)
+                    Identity destinationCreated = GetIdentity(destination, "identify a new single-link copy destination");
+                    if (destinationCreated.IsDirectory || destinationCreated.IsReparsePoint ||
+                        destinationCreated.NumberOfLinks != 1 || destinationCreated.FileSize != 0)
                     {
-                        throw new IOException("Copy destination is not a regular single-link file.");
+                        throw new IOException("New copy destination is not an empty regular single-link file.");
                     }
-                    sourceStream.CopyTo(destinationStream);
-                    destinationStream.Flush(true);
                     sourceStream.Position = 0;
-                    destinationStream.Position = 0;
-                    byte[] sourceDigest = sourceSha256.ComputeHash(sourceStream);
-                    byte[] destinationDigest = destinationSha256.ComputeHash(destinationStream);
-                    Identity sourceAfter = GetIdentity(source, "re-identify a single-link copy source");
-                    Identity destinationAfter = GetIdentity(destination, "re-identify a single-link copy destination");
-                    EnsureStableSingleLinkFile(sourceBefore, sourceAfter, "copy source");
-                    EnsureStableSingleLinkFile(destinationBefore, destinationAfter, "copy destination");
-                    if (!ConstantTimeEquals(sourceDigest, destinationDigest))
+                    try
                     {
-                        throw new IOException("Single-link copy did not preserve exact file bytes.");
-                    }
-                    if (captureDestination)
-                    {
-                        destinationStream.Position = 0;
-                        using (MemoryStream captured = new MemoryStream())
+                        sourceStream.CopyTo(destinationStream);
+                        destinationStream.Flush(true);
+                        Identity destinationWritten = GetIdentity(
+                            destination,
+                            "identify the written single-link copy destination");
+                        EnsureSameSingleLinkFileIdentity(
+                            destinationCreated,
+                            destinationWritten,
+                            "copy destination write transition");
+                        if (destinationWritten.FileSize != sourceBefore.FileSize)
                         {
-                            destinationStream.CopyTo(captured);
-                            Identity destinationCaptured = GetIdentity(
-                                destination,
-                                "re-identify a captured copy destination");
-                            EnsureStableSingleLinkFile(
-                                destinationBefore,
-                                destinationCaptured,
-                                "captured copy destination");
-                            return captured.ToArray();
+                            throw new IOException("Copy destination size does not match its source.");
                         }
+                        sourceStream.Position = 0;
+                        destinationStream.Position = 0;
+                        byte[] sourceDigest = sourceSha256.ComputeHash(sourceStream);
+                        byte[] destinationDigest = destinationSha256.ComputeHash(destinationStream);
+                        Identity sourceAfter = GetIdentity(source, "re-identify a tracked single-link copy source");
+                        Identity destinationAfter = GetIdentity(destination, "re-identify a single-link copy destination");
+                        EnsureStableSingleLinkFile(sourceBefore, sourceAfter, "tracked copy source");
+                        EnsureStableSingleLinkFile(destinationWritten, destinationAfter, "copy destination");
+                        if (!ConstantTimeEquals(sourceDigest, destinationDigest))
+                        {
+                            throw new IOException("Tracked single-link copy did not preserve exact file bytes.");
+                        }
+                        if (captureDestination)
+                        {
+                            destinationStream.Position = 0;
+                            using (MemoryStream captured = new MemoryStream())
+                            {
+                                destinationStream.CopyTo(captured);
+                                Identity destinationCaptured = GetIdentity(
+                                    destination,
+                                    "re-identify a captured copy destination");
+                                EnsureStableSingleLinkFile(
+                                    destinationWritten,
+                                    destinationCaptured,
+                                    "captured copy destination");
+                                return captured.ToArray();
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        // DuplicateHandle shares the retained source handle's
+                        // file pointer. Leave it rewound so later exact-handle
+                        // identity/hash checks remain independent of this copy.
+                        sourceStream.Position = 0;
                     }
                 }
             }
@@ -3276,6 +3591,18 @@ namespace Obcardinal.WindowsAppAutoLogin
             }
         }
 
+        private static void EnsureSameSingleLinkFileIdentity(
+            Identity before,
+            Identity after,
+            string description)
+        {
+            if (!before.SameObjectAndKind(after) || before.IsDirectory || before.IsReparsePoint ||
+                before.NumberOfLinks != 1 || after.NumberOfLinks != 1)
+            {
+                throw new IOException("A regular single-link " + description + " changed identity.");
+            }
+        }
+
         private static bool ConstantTimeEquals(byte[] left, byte[] right)
         {
             if (left == null || right == null || left.Length != right.Length)
@@ -3391,42 +3718,47 @@ function New-ReleaseRoot {
     # delete sharing is held throughout compilation; after the helper loads,
     # handle-relative reopening must prove that TEMP/TMP still names the
     # directory containing that exact sentinel before cleanup is allowed.
-    $compilerDirectory = [IO.Directory]::CreateDirectory($compilerTemp, $acl)
-    Assert-RealDirectory $compilerTemp
-    $compilerAcl = $compilerDirectory.GetAccessControl(
-        [Security.AccessControl.AccessControlSections]::Owner -bor
-        [Security.AccessControl.AccessControlSections]::Access
-    )
-    $compilerRules = @($compilerAcl.GetAccessRules(
-        $true,
-        $false,
-        [Security.Principal.SecurityIdentifier]
-    ))
-    if (-not $compilerAcl.AreAccessRulesProtected -or
-        -not $compilerAcl.GetOwner([Security.Principal.SecurityIdentifier]).Equals($identity.User) -or
-        $compilerRules.Count -ne 2) {
-        throw "Cleanup-helper compiler temp owner or ACL protection could not be established."
-    }
-    foreach ($rule in $compilerRules) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
-            (-not $rule.IdentityReference.Equals($identity.User) -and
-             -not $rule.IdentityReference.Equals($systemSid))) {
-            throw "Cleanup-helper compiler temp contains an unexpected access-control entry."
-        }
-    }
     $compilerSentinelName = ".compiler-anchor"
     $compilerSentinelPath = Microsoft.PowerShell.Management\Join-Path `
         $compilerTemp `
         $compilerSentinelName
-    $compilerSentinel = [IO.File]::Open(
-        $compilerSentinelPath,
-        [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::ReadWrite,
-        [IO.FileShare]::Read
-    )
+    $compilerDirectoryCreated = $false
+    $compilerSentinel = $null
     $compilerDirectoryHandle = $null
     $compilerAnchorVerified = $false
     try {
+        $compilerDirectory = [IO.Directory]::CreateDirectory($compilerTemp, $acl)
+        $compilerDirectoryCreated = $true
+        Assert-RealDirectory $compilerTemp
+        $compilerAcl = $compilerDirectory.GetAccessControl(
+            [Security.AccessControl.AccessControlSections]::Owner -bor
+            [Security.AccessControl.AccessControlSections]::Access
+        )
+        $compilerRules = @($compilerAcl.GetAccessRules(
+            $true,
+            $false,
+            [Security.Principal.SecurityIdentifier]
+        ))
+        if (-not $compilerAcl.AreAccessRulesProtected -or
+            -not $compilerAcl.GetOwner([Security.Principal.SecurityIdentifier]).Equals($identity.User) -or
+            $compilerRules.Count -ne 2) {
+            throw "Cleanup-helper compiler temp owner or ACL protection could not be established."
+        }
+        foreach ($rule in $compilerRules) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                (-not $rule.IdentityReference.Equals($identity.User) -and
+                 -not $rule.IdentityReference.Equals($systemSid))) {
+                throw "Cleanup-helper compiler temp contains an unexpected access-control entry."
+            }
+        }
+        $compilerSentinel = [IO.FileStream]::new(
+            $compilerSentinelPath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::Read,
+            4096,
+            [IO.FileOptions]::DeleteOnClose
+        )
         $anchorBytes = [Text.Encoding]::ASCII.GetBytes([Guid]::NewGuid().ToString("N"))
         $compilerSentinel.Write($anchorBytes, 0, $anchorBytes.Length)
         $compilerSentinel.Flush($true)
@@ -3442,7 +3774,15 @@ function New-ReleaseRoot {
         $compilerAnchorVerified = $true
     }
     finally {
-        $compilerSentinel.Dispose()
+        if ($compilerSentinel) {
+            try {
+                $compilerSentinel.Dispose()
+            }
+            catch {
+                Microsoft.PowerShell.Utility\Write-Warning `
+                    "Unable to close cleanup compiler sentinel: $($_.Exception.Message)"
+            }
+        }
         try {
             if ($compilerDirectoryHandle -and $compilerAnchorVerified) {
                 [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::DeleteTrackedTree(
@@ -3456,6 +3796,33 @@ function New-ReleaseRoot {
                 $compilerDirectoryHandle = $null
                 Microsoft.PowerShell.Utility\Write-Warning `
                     "Leaving unverified cleanup compiler directory in place: $compilerTemp"
+            }
+            elseif ($compilerDirectoryCreated -and
+                [IO.Directory]::Exists($compilerTemp) -and
+                ("Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner" -as [type])) {
+                # The helper may have loaded before a later integrity or
+                # handle-setup check failed. Recover a native root handle and
+                # still perform non-following recursive cleanup.
+                $compilerDirectoryHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(
+                    $compilerTemp
+                )
+                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::DeleteTrackedTree(
+                    $compilerDirectoryHandle
+                )
+                $compilerDirectoryHandle.Dispose()
+                $compilerDirectoryHandle = $null
+            }
+            elseif ($compilerDirectoryCreated -and
+                [IO.Directory]::Exists($compilerTemp) -and
+                [IO.Directory]::GetFileSystemEntries($compilerTemp).Length -eq 0) {
+                # Before the native helper exists, use only non-recursive
+                # deletion of an empty, cryptographically named directory.
+                # Never path-traverse compiler output after a helper failure.
+                [IO.Directory]::Delete($compilerTemp, $false)
+            }
+            elseif ($compilerDirectoryCreated -and [IO.Directory]::Exists($compilerTemp)) {
+                Microsoft.PowerShell.Utility\Write-Warning `
+                    "Leaving non-empty unverified cleanup compiler directory in place: $compilerTemp"
             }
         }
         catch {
@@ -3509,33 +3876,90 @@ function Remove-ReleaseRootSafely {
         if ($ReleaseRoot) {
             Microsoft.PowerShell.Utility\Write-Warning "The private release root has no tracked cleanup handle; leaving it in place: $ReleaseRoot"
         }
-        if ($ReleaseSourceHandle -and -not $ReleaseSourceHandle.IsClosed) {
-            $ReleaseSourceHandle.Dispose()
+        $untrackedCleanupFailure = $null
+        try {
+            if ($ReleaseSourceHandle -and -not $ReleaseSourceHandle.IsClosed) {
+                $ReleaseSourceHandle.Dispose()
+            }
+        }
+        catch {
+            $untrackedCleanupFailure = $_
         }
         $script:ReleaseSourceHandle = $null
-        if ($ReleaseRootParentHandle -and -not $ReleaseRootParentHandle.IsClosed) {
-            $ReleaseRootParentHandle.Dispose()
+        try {
+            if ($ReleaseRootParentHandle -and -not $ReleaseRootParentHandle.IsClosed) {
+                $ReleaseRootParentHandle.Dispose()
+            }
+        }
+        catch {
+            if (-not $untrackedCleanupFailure) { $untrackedCleanupFailure = $_ }
+            else {
+                Microsoft.PowerShell.Utility\Write-Warning `
+                    "Release-root parent-handle disposal also failed: $($_.Exception.Message)"
+            }
         }
         $script:ReleaseRootParentHandle = $null
+        if ($untrackedCleanupFailure) { throw $untrackedCleanupFailure }
         return
     }
     try {
+        $cleanupFailure = $null
         if ($ReleaseSourceHandle -and -not $ReleaseSourceHandle.IsClosed) {
-            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertPhysicalDirectory(
-                $ReleaseSourceHandle
-            )
-            $ReleaseSourceHandle.Dispose()
-            $script:ReleaseSourceHandle = $null
+            try {
+                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertPhysicalDirectory(
+                    $ReleaseSourceHandle
+                )
+            }
+            catch {
+                $cleanupFailure = $_
+            }
+            finally {
+                try {
+                    $ReleaseSourceHandle.Dispose()
+                }
+                catch {
+                    if (-not $cleanupFailure) { $cleanupFailure = $_ }
+                    else {
+                        Microsoft.PowerShell.Utility\Write-Warning `
+                            "Release-source handle disposal also failed: $($_.Exception.Message)"
+                    }
+                }
+                $script:ReleaseSourceHandle = $null
+            }
         }
-        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::DeleteTrackedTree($ReleaseRootHandle)
+        try {
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::DeleteTrackedTree(
+                $ReleaseRootHandle
+            )
+        }
+        catch {
+            if (-not $cleanupFailure) { $cleanupFailure = $_ }
+            else {
+                Microsoft.PowerShell.Utility\Write-Warning `
+                    "Tracked release-root deletion also failed: $($_.Exception.Message)"
+            }
+        }
+        if ($cleanupFailure) { throw $cleanupFailure }
     }
     finally {
-        if ($ReleaseRootHandle -and -not $ReleaseRootHandle.IsClosed) {
-            $ReleaseRootHandle.Dispose()
+        try {
+            if ($ReleaseRootHandle -and -not $ReleaseRootHandle.IsClosed) {
+                $ReleaseRootHandle.Dispose()
+            }
+        }
+        catch {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Release-root handle disposal failed: $($_.Exception.Message)"
         }
         $script:ReleaseRootHandle = $null
-        if ($ReleaseRootParentHandle -and -not $ReleaseRootParentHandle.IsClosed) {
-            $ReleaseRootParentHandle.Dispose()
+        try {
+            if ($ReleaseRootParentHandle -and -not $ReleaseRootParentHandle.IsClosed) {
+                $ReleaseRootParentHandle.Dispose()
+            }
+        }
+        catch {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Release-root parent-handle disposal failed: $($_.Exception.Message)"
         }
         $script:ReleaseRootParentHandle = $null
     }
@@ -3732,16 +4156,28 @@ function Assert-MaterializedReleaseSource {
 function Open-MaterializedReleaseSourceHandles {
     $handles = [System.Collections.Generic.List[object]]::new()
     try {
-        foreach ($directory in Microsoft.PowerShell.Management\Get-ChildItem `
-            -LiteralPath $ReleaseSourceDir `
-            -Recurse `
-            -Force `
-            -Directory) {
+        $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal
+        )
+        foreach ($entry in $ReleaseTreeEntries) {
+            $segments = $entry.Path.Split('/')
+            for ($segmentCount = 1; $segmentCount -lt $segments.Length; $segmentCount++) {
+                $relativeDirectory = ($segments[0..($segmentCount - 1)] -join '/')
+                $null = $expectedDirectories.Add($relativeDirectory)
+            }
+        }
+        foreach ($relativeDirectory in @($expectedDirectories | Microsoft.PowerShell.Utility\Sort-Object)) {
+            $path = Microsoft.PowerShell.Management\Join-Path `
+                $ReleaseSourceDir `
+                ($relativeDirectory.Replace('/', '\'))
             $null = $handles.Add([PSCustomObject]@{
                 Handle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(
-                    $directory.FullName
+                    $path
                 )
                 Directory = $true
+                Path = $path
+                RelativePath = $relativeDirectory
+                ExpectedBlob = $null
             })
         }
         foreach ($entry in $ReleaseTreeEntries) {
@@ -3751,9 +4187,14 @@ function Open-MaterializedReleaseSourceHandles {
             $null = $handles.Add([PSCustomObject]@{
                 Handle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink($path)
                 Directory = $false
+                Path = $path
+                RelativePath = $entry.Path
+                ExpectedBlob = $entry.Blob
             })
         }
-        return $handles.ToArray()
+        $result = $handles.ToArray()
+        Assert-MaterializedReleaseSourceHandleState $result
+        return $result
     }
     catch {
         foreach ($state in $handles) {
@@ -3763,27 +4204,97 @@ function Open-MaterializedReleaseSourceHandles {
     }
 }
 
+function Assert-MaterializedReleaseSourceHandleState {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()]$Handles)
+
+    $expectedFiles = [System.Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $expectedDirectories = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    foreach ($entry in $ReleaseTreeEntries) {
+        $expectedFiles.Add($entry.Path, $entry.Blob)
+        $segments = $entry.Path.Split('/')
+        for ($segmentCount = 1; $segmentCount -lt $segments.Length; $segmentCount++) {
+            $relativeDirectory = ($segments[0..($segmentCount - 1)] -join '/')
+            $null = $expectedDirectories.Add($relativeDirectory)
+        }
+    }
+
+    if ($Handles.Count -ne ($expectedFiles.Count + $expectedDirectories.Count)) {
+        throw "Tracked release source handle count does not match the complete Git tree."
+    }
+    $seenFiles = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $seenDirectories = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($state in $Handles) {
+        $relativePath = [string]$state.RelativePath
+        if ([string]::IsNullOrEmpty($relativePath)) {
+            throw "Tracked release source handle is missing its Git-relative path."
+        }
+        $expectedPath = Microsoft.PowerShell.Management\Join-Path `
+            $ReleaseSourceDir `
+            ($relativePath.Replace('/', '\'))
+        if ((Normalize-Path ([string]$state.Path)) -cne (Normalize-Path $expectedPath)) {
+            throw "Tracked release source handle path does not match its Git-relative path: $relativePath"
+        }
+        if ($state.Directory) {
+            if (-not $expectedDirectories.Contains($relativePath) -or
+                -not $seenDirectories.Add($relativePath) -or
+                $null -ne $state.ExpectedBlob) {
+                throw "Tracked release source directory set does not match the complete Git tree: $relativePath"
+            }
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertPhysicalDirectory(
+                $state.Handle
+            )
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryPath(
+                $state.Path,
+                $state.Handle
+            )
+        }
+        else {
+            if (-not $expectedFiles.ContainsKey($relativePath) -or
+                -not $seenFiles.Add($relativePath) -or
+                ([string]$state.ExpectedBlob) -cne $expectedFiles[$relativePath]) {
+                throw "Tracked release source file set does not match the complete Git tree: $relativePath"
+            }
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertRegularSingleLink(
+                $state.Handle
+            )
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+                $state.Path,
+                $state.Handle
+            )
+            $handleBlob = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkGitBlobSha1(
+                $state.Handle
+            )
+            if ($handleBlob -cne $expectedFiles[$relativePath]) {
+                throw "Tracked release source handle does not match its exact Git blob: $relativePath"
+            }
+        }
+    }
+    if ($seenFiles.Count -ne $expectedFiles.Count -or
+        $seenDirectories.Count -ne $expectedDirectories.Count) {
+        throw "Tracked release source handles do not cover the complete Git tree."
+    }
+
+    # This pathname walk rejects missing and additional files while the exact
+    # expected file objects above are still pinned against writes/replacement.
+    Assert-MaterializedReleaseSource
+}
+
 function Assert-AndCloseMaterializedReleaseSourceHandles {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()]$Handles)
 
     $failure = $null
+    try {
+        Assert-MaterializedReleaseSourceHandleState $Handles
+    }
+    catch {
+        $failure = $_
+    }
     foreach ($state in $Handles) {
         $stateFailure = $null
-        try {
-            if ($state.Directory) {
-                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertPhysicalDirectory(
-                    $state.Handle
-                )
-            }
-            else {
-                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertRegularSingleLink(
-                    $state.Handle
-                )
-            }
-        }
-        catch {
-            $stateFailure = $_
-        }
         try {
             $state.Handle.Dispose()
         }
@@ -3792,6 +4303,233 @@ function Assert-AndCloseMaterializedReleaseSourceHandles {
         }
         if ($stateFailure -and -not $failure) { $failure = $stateFailure }
     }
+    if ($failure) { throw $failure }
+}
+
+function Copy-CommittedReleasePayloadFiles {
+    param([Parameter(Mandatory = $true)][string]$DestinationDirectory)
+
+    Assert-RealDirectory $DestinationDirectory
+    $fileNames = @("README.md", "LICENSE", "config.example.json")
+    $states = [System.Collections.Generic.List[object]]::new()
+    $expectedHashes = [ordered]@{}
+    $operationFailure = $null
+    $closeFailures = [System.Collections.Generic.List[object]]::new()
+    $destinationHandles = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($fileName in $fileNames) {
+            $matches = @($ReleaseTreeEntries | Microsoft.PowerShell.Core\Where-Object {
+                $_.Path -ceq $fileName
+            })
+            if ($matches.Count -ne 1) {
+                throw "Captured release commit must contain exactly one payload blob: $fileName"
+            }
+            $sourcePath = Microsoft.PowerShell.Management\Join-Path `
+                $ReleaseSourceDir `
+                $fileName
+            $committedBytes = Invoke-SanitizedGit @(
+                "cat-file", "blob", ([string]$matches[0].Blob)
+            ) -RawBytes
+            if ($null -eq $committedBytes -or $committedBytes.GetType() -ne [byte[]] -or
+                (Get-GitBlobSha1FromBytes $committedBytes) -cne ([string]$matches[0].Blob)) {
+                throw "Pinned Git did not return the exact committed payload blob: $fileName"
+            }
+            $committedSha256 = Get-ByteArraySha256 $committedBytes
+            $committedBytes = $null
+            $handle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(
+                $sourcePath
+            )
+            $state = [PSCustomObject]@{
+                Name = $fileName
+                Path = $sourcePath
+                ExpectedBlob = [string]$matches[0].Blob
+                ExpectedSha256 = $committedSha256
+                SourceSha256 = $null
+                Handle = $handle
+            }
+            $null = $states.Add($state)
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+                $state.Path,
+                $state.Handle
+            )
+            $sourceBlob = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkGitBlobSha1(
+                $state.Handle
+            )
+            if ($sourceBlob -cne $state.ExpectedBlob) {
+                throw "Payload source handle does not match its blob in captured commit ${ReleaseGitCommit}: $fileName"
+            }
+            $state.SourceSha256 = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+                $state.Handle
+            )
+            if ($state.SourceSha256 -cne $state.ExpectedSha256) {
+                throw "Payload source bytes differ from the exact blob returned by pinned Git: $fileName"
+            }
+            $expectedHashes[$fileName] = $state.ExpectedSha256
+        }
+
+        # Reject additions/removals elsewhere in the snapshot while all three
+        # exact payload objects remain pinned without write/delete sharing.
+        Assert-MaterializedReleaseSource
+        foreach ($state in $states) {
+            $destinationPath = Microsoft.PowerShell.Management\Join-Path `
+                $DestinationDirectory `
+                $state.Name
+            Copy-SingleLinkFileFromHandle $state.Handle $destinationPath
+            if ((Get-SingleLinkGitBlobSha1 $destinationPath) -cne $state.ExpectedBlob) {
+                throw "Copied payload does not match its exact committed Git blob: $($state.Name)"
+            }
+            if ((Get-SingleLinkSha256 $destinationPath) -cne $state.SourceSha256) {
+                throw "Copied payload SHA-256 does not match its retained source handle: $($state.Name)"
+            }
+            if ((Get-SingleLinkSha256 $destinationPath) -cne $state.ExpectedSha256) {
+                throw "Copied payload SHA-256 does not match the exact committed Git bytes: $($state.Name)"
+            }
+            $destinationHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(
+                $destinationPath
+            )
+            $null = $destinationHandles.Add([PSCustomObject]@{
+                Name = $state.Name
+                Handle = $destinationHandle
+                ExpectedHash = $state.ExpectedSha256
+            })
+        }
+
+        foreach ($state in $states) {
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+                $state.Path,
+                $state.Handle
+            )
+            if ([Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkGitBlobSha1(
+                $state.Handle
+            ) -cne $state.ExpectedBlob) {
+                throw "Committed payload source changed during handle-bound copy: $($state.Name)"
+            }
+            if ([Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+                $state.Handle
+            ) -cne $state.SourceSha256) {
+                throw "Committed payload source SHA-256 changed during handle-bound copy: $($state.Name)"
+            }
+        }
+        Assert-MaterializedReleaseSource
+    }
+    catch {
+        $operationFailure = $_
+    }
+    finally {
+        foreach ($state in $states) {
+            try {
+                if ($state.Handle -and -not $state.Handle.IsClosed) {
+                    $state.Handle.Dispose()
+                }
+            }
+            catch {
+                $null = $closeFailures.Add($_)
+            }
+        }
+    }
+    if ($operationFailure -or $closeFailures.Count -gt 0 -or
+        $expectedHashes.Count -ne $fileNames.Count) {
+        foreach ($destinationState in $destinationHandles) {
+            try {
+                if ($destinationState.Handle -and -not $destinationState.Handle.IsClosed) {
+                    $destinationState.Handle.Dispose()
+                }
+            }
+            catch {
+                $null = $closeFailures.Add($_)
+            }
+        }
+    }
+    if ($operationFailure) {
+        foreach ($closeFailure in $closeFailures) {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Payload-source handle cleanup also failed: $($closeFailure.Exception.Message)"
+        }
+        throw $operationFailure
+    }
+    if ($closeFailures.Count -gt 0) {
+        for ($index = 1; $index -lt $closeFailures.Count; $index++) {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Additional payload-source handle cleanup failure: $($closeFailures[$index].Exception.Message)"
+        }
+        throw $closeFailures[0]
+    }
+    if ($expectedHashes.Count -ne $fileNames.Count) {
+        throw "Committed payload hash set is incomplete."
+    }
+    return [PSCustomObject]@{
+        ExpectedHashes = $expectedHashes
+        Handles = $destinationHandles.ToArray()
+    }
+}
+
+function Assert-CommittedReleasePayloadHashes {
+    param(
+        [Parameter(Mandatory = $true)]$ActualHashes,
+        [Parameter(Mandatory = $true)]$ExpectedHashes
+    )
+
+    $fileNames = @("README.md", "LICENSE", "config.example.json")
+    if ($ExpectedHashes.Count -ne $fileNames.Count) {
+        throw "Expected committed payload hash set is incomplete."
+    }
+    foreach ($fileName in $fileNames) {
+        if (-not $ActualHashes.Contains($fileName) -or
+            -not $ExpectedHashes.Contains($fileName) -or
+            $ActualHashes[$fileName] -cne $ExpectedHashes[$fileName]) {
+            throw "Distribution payload is not the exact file from captured commit ${ReleaseGitCommit}: $fileName"
+        }
+    }
+}
+
+function Assert-StagedPayloadHandles {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()]$Handles,
+        [Parameter(Mandatory = $true)]$ExpectedHashes
+    )
+
+    $fileNames = @("README.md", "LICENSE", "config.example.json")
+    if ($Handles.Count -ne $fileNames.Count -or $ExpectedHashes.Count -ne $fileNames.Count) {
+        throw "Staged committed-payload handle set is incomplete."
+    }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($state in $Handles) {
+        if ($state.Name -cnotin $fileNames -or -not $seen.Add($state.Name) -or
+            -not $ExpectedHashes.Contains($state.Name) -or
+            $state.ExpectedHash -cne $ExpectedHashes[$state.Name]) {
+            throw "Staged committed-payload handle set is invalid: $($state.Name)"
+        }
+        $path = Microsoft.PowerShell.Management\Join-Path $Directory $state.Name
+        try {
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+                $path,
+                $state.Handle
+            )
+        }
+        catch {
+            throw "Staged committed payload path changed identity while retained: $($state.Name)"
+        }
+        $handleHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+            $state.Handle
+        )
+        if ($handleHash -cne $ExpectedHashes[$state.Name]) {
+            throw "Exact staged payload handle no longer matches its committed bytes: $($state.Name)"
+        }
+    }
+}
+
+function Close-StagedPayloadHandles {
+    $failure = $null
+    foreach ($state in $StagedPayloadHandles) {
+        try {
+            if ($state.Handle -and -not $state.Handle.IsClosed) { $state.Handle.Dispose() }
+        }
+        catch {
+            if (-not $failure) { $failure = $_ }
+        }
+    }
+    $script:StagedPayloadHandles = @()
     if ($failure) { throw $failure }
 }
 
@@ -4385,13 +5123,37 @@ function Prepare-IsolatedBuildEnvironment {
 function Invoke-SanitizedCargo {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [switch]$CaptureOutput
+        [switch]$CaptureOutput,
+        [string]$RetainBuiltExecutablePath = "",
+        $RetainBuiltExecutableDirectoryHandle = $null
     )
 
+    if ($CaptureOutput -and $RetainBuiltExecutablePath) {
+        throw "Cargo output capture and executable-handle retention are mutually exclusive."
+    }
+    if ([bool]$RetainBuiltExecutablePath -ne [bool]$RetainBuiltExecutableDirectoryHandle) {
+        throw "Cargo executable retention requires its exact tracked output directory."
+    }
+    if ($RetainBuiltExecutablePath) {
+        Assert-AbsoluteLocalPath $RetainBuiltExecutablePath
+        $retainedOutputParent = Microsoft.PowerShell.Management\Split-Path `
+            -Parent `
+            $RetainBuiltExecutablePath
+        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryPath(
+            $retainedOutputParent,
+            $RetainBuiltExecutableDirectoryHandle
+        )
+        $retainedOutputLeaf = Microsoft.PowerShell.Management\Split-Path `
+            -Leaf `
+            $RetainBuiltExecutablePath
+        if ($retainedOutputLeaf -cne "$BinaryName.exe") {
+            throw "Cargo executable retention received an unexpected output leaf name."
+        }
+    }
     Assert-NoCargoConfigInAncestors $CargoWorkingDir
-    Assert-MaterializedReleaseSource
     Assert-ReleaseToolchainIntegrity
     $sourceHandles = @()
+    $retainedOutputHandle = $null
     $existingEnvironment = [Environment]::GetEnvironmentVariables("Process")
     $managedNames = @()
     $captured = $null
@@ -4479,12 +5241,7 @@ function Invoke-SanitizedCargo {
         }
         $controlled["RC_$TargetTriple"] = $ResourceCompiler
         $controlled["RC_$targetEnvironmentTriple"] = $ResourceCompiler
-        if ($Development) {
-            $controlled.WAAL_DEVELOPMENT_RELEASE = "1"
-        }
-        else {
-            $controlled.WAAL_PUBLISHABLE_RELEASE = "1"
-        }
+        $controlled.WAAL_DEVELOPMENT_RELEASE = "1"
         foreach ($name in $controlled.Keys) {
             if ($name -notin $managedNames) {
                 $managedNames += [string]$name
@@ -4509,6 +5266,17 @@ function Invoke-SanitizedCargo {
         }
         else {
             Invoke-Checked $Cargo $Arguments
+            if ($RetainBuiltExecutablePath) {
+                $retainedOutputHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::LockTrackedBuildOutputAfterBuild(
+                    $RetainBuiltExecutableDirectoryHandle,
+                    $retainedOutputLeaf
+                )
+                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+                    $RetainBuiltExecutableDirectoryHandle,
+                    $retainedOutputLeaf,
+                    $retainedOutputHandle
+                )
+            }
         }
     }
     catch {
@@ -4547,6 +5315,10 @@ function Invoke-SanitizedCargo {
         }
     }
     if ($operationFailure) {
+        if ($retainedOutputHandle -and -not $retainedOutputHandle.IsClosed) {
+            $retainedOutputHandle.Dispose()
+            $retainedOutputHandle = $null
+        }
         foreach ($cleanupFailure in $cleanupFailures) {
             Microsoft.PowerShell.Utility\Write-Warning `
                 "Cargo cleanup also failed after the primary error: $($cleanupFailure.Exception.Message)"
@@ -4554,15 +5326,47 @@ function Invoke-SanitizedCargo {
         throw $operationFailure
     }
     if ($cleanupFailures.Count -gt 0) {
+        if ($retainedOutputHandle -and -not $retainedOutputHandle.IsClosed) {
+            $retainedOutputHandle.Dispose()
+            $retainedOutputHandle = $null
+        }
         for ($index = 1; $index -lt $cleanupFailures.Count; $index++) {
             Microsoft.PowerShell.Utility\Write-Warning `
                 "Additional Cargo cleanup failure: $($cleanupFailures[$index].Exception.Message)"
         }
         throw $cleanupFailures[0]
     }
-    Assert-MaterializedReleaseSource
-    Assert-ReleaseToolchainIntegrity
+    try {
+        Assert-ReleaseToolchainIntegrity
+        if ($RetainBuiltExecutablePath) {
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryPath(
+                $retainedOutputParent,
+                $RetainBuiltExecutableDirectoryHandle
+            )
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+                $RetainBuiltExecutableDirectoryHandle,
+                $retainedOutputLeaf,
+                $retainedOutputHandle
+            )
+        }
+    }
+    catch {
+        if ($retainedOutputHandle -and -not $retainedOutputHandle.IsClosed) {
+            $retainedOutputHandle.Dispose()
+            $retainedOutputHandle = $null
+        }
+        throw
+    }
     if ($CaptureOutput) { return $captured }
+    if ($RetainBuiltExecutablePath) {
+        if (-not $retainedOutputHandle -or $retainedOutputHandle.IsInvalid -or
+            $retainedOutputHandle.IsClosed) {
+            throw "Cargo completed without returning a retained executable handle."
+        }
+        return [PSCustomObject]@{
+            Handle = $retainedOutputHandle
+        }
+    }
 }
 
 function Verify-ReleaseDependencyGraph {
@@ -4584,30 +5388,171 @@ function Verify-ReleaseDependencyGraph {
     }
 }
 
+# Cargo output is not producer-attributed in this local security context. Treat
+# its embedded marker as hostile input: every key must have one unambiguous
+# value before the packager relies on the mandatory local-only disclaimers.
+function ConvertFrom-ExecutableBuildMetadata {
+    param([Parameter(Mandatory = $true)][string]$Metadata)
+
+    $prefix = "WAAL_BUILD_METADATA_V1;"
+    if (-not $Metadata.StartsWith($prefix, [StringComparison]::Ordinal) -or
+        -not $Metadata.EndsWith(";", [StringComparison]::Ordinal)) {
+        throw "Executable build metadata has an invalid envelope."
+    }
+
+    $fieldText = $Metadata.Substring(
+        $prefix.Length,
+        $Metadata.Length - $prefix.Length - 1
+    )
+    if ([string]::IsNullOrEmpty($fieldText)) {
+        throw "Executable build metadata contains no fields."
+    }
+
+    $fields = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $allowedFields = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    foreach ($allowedName in @(
+        "artifact-kind", "publishable", "attestation", "producer-attribution",
+        "profile", "target-os", "target-arch", "debug-assertions", "debug-fill",
+        "dev-tools", "diagnostics-ui", "release-diagnostics", "macos-bundle-id",
+        "production-macos-bundle-id", "non-production-macos-identity", "macos-team-id",
+        "windows-authenticode-publisher", "windows-authenticode-cert-sha256",
+        "source-git-commit", "source-git-tree", "release-cargo-version",
+        "release-rustc-version", "release-cargo-sha256", "release-rustc-sha256",
+        "release-rust-sysroot-sha256", "release-native-toolchain-sha256",
+        "release-materials-sha256"
+    )) {
+        $null = $allowedFields.Add($allowedName)
+    }
+    foreach ($component in $fieldText.Split([char]';')) {
+        $separator = $component.IndexOf([char]'=')
+        if ($separator -le 0) {
+            throw "Executable build metadata contains a malformed field."
+        }
+        $name = $component.Substring(0, $separator)
+        $value = $component.Substring($separator + 1)
+        if ($name -cnotmatch '^[a-z0-9-]+$') {
+            throw "Executable build metadata contains an invalid field name."
+        }
+        if (-not $allowedFields.Contains($name)) {
+            throw "Executable build metadata contains an unknown field: $name"
+        }
+        if ($fields.ContainsKey($name)) {
+            throw "Executable build metadata contains a duplicate field: $name"
+        }
+        $fields.Add($name, $value)
+    }
+    return (, $fields)
+}
+
 function Require-MetadataField {
     param(
-        [Parameter(Mandatory = $true)][string]$Metadata,
+        [Parameter(Mandatory = $true)][Collections.Generic.Dictionary[string,string]]$Metadata,
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$Expected
     )
-    if (-not $Metadata.Contains(";$Name=$Expected;")) {
+    if (-not $Metadata.ContainsKey($Name) -or
+        -not [StringComparer]::Ordinal.Equals($Metadata[$Name], $Expected)) {
         throw "Executable build metadata field $Name does not match the expected value."
     }
 }
 
+function Assert-ExecutableBuildMetadataValidationSelfTest {
+    $valid = "WAAL_BUILD_METADATA_V1;artifact-kind=development;publishable=false;" +
+        "attestation=none-local-shared-security-context;" +
+        "producer-attribution=unavailable-local-shared-security-context;"
+    $parsed = ConvertFrom-ExecutableBuildMetadata $valid
+    Require-MetadataField $parsed "publishable" "false"
+    Require-MetadataField $parsed "attestation" "none-local-shared-security-context"
+    Require-MetadataField $parsed "producer-attribution" "unavailable-local-shared-security-context"
+
+    $adversarial = @(
+        "WAAL_BUILD_METADATA_V1;artifact-kind=development;" +
+            "attestation=none-local-shared-security-context;" +
+            "producer-attribution=unavailable-local-shared-security-context;",
+        "WAAL_BUILD_METADATA_V1;artifact-kind=development;publishable=true;" +
+            "attestation=none-local-shared-security-context;" +
+            "producer-attribution=unavailable-local-shared-security-context;",
+        "WAAL_BUILD_METADATA_V1;artifact-kind=development;publishable=false;publishable=true;" +
+            "attestation=none-local-shared-security-context;" +
+            "producer-attribution=unavailable-local-shared-security-context;",
+        "WAAL_BUILD_METADATA_V1;artifact-kind=development;publishable=false;" +
+            "attestation=none-local-shared-security-context;" +
+            "attestation=authenticated-builder;" +
+            "producer-attribution=unavailable-local-shared-security-context;",
+        "WAAL_BUILD_METADATA_V1;artifact-kind=development;publishable=false;" +
+            "attestation=none-local-shared-security-context;" +
+            "producer-attribution=unavailable-local-shared-security-context;" +
+            "producer-attribution=authenticated-builder;",
+        "WAAL_BUILD_METADATA_V1;artifact-kind=development;publishable=false;" +
+            "attestation=none-local-shared-security-context;" +
+            "producer-attribution=unavailable-local-shared-security-context;" +
+            "authenticated-producer=true;"
+    )
+    foreach ($candidate in $adversarial) {
+        $rejected = $false
+        try {
+            $candidateFields = ConvertFrom-ExecutableBuildMetadata $candidate
+            Require-MetadataField $candidateFields "publishable" "false"
+            Require-MetadataField `
+                $candidateFields `
+                "attestation" `
+                "none-local-shared-security-context"
+            Require-MetadataField `
+                $candidateFields `
+                "producer-attribution" `
+                "unavailable-local-shared-security-context"
+        }
+        catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw "Executable build metadata validation accepted an adversarial disclaimer marker."
+        }
+    }
+}
+
+Assert-ExecutableBuildMetadataValidationSelfTest
+
 function Verify-ExecutableMetadata {
     param([Parameter(Mandatory = $true)][string]$ExecutablePath)
 
-    $ascii = [Text.Encoding]::ASCII.GetString(
-        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::ReadRegularSingleLinkBytes($ExecutablePath)
+    $bytes = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::ReadRegularSingleLinkBytes(
+        $ExecutablePath
     )
+    try {
+        Verify-ExecutableMetadataBytes $bytes
+    }
+    finally {
+        $bytes = $null
+    }
+}
+
+function Verify-ExecutableMetadataBytes {
+    param([Parameter(Mandatory = $true)][byte[]]$ExecutableBytes)
+
+    if ($ExecutableBytes.Length -eq 0) {
+        throw "Executable metadata input must not be empty."
+    }
+    $ascii = [Text.Encoding]::ASCII.GetString($ExecutableBytes)
     $markers = @($ascii.Split([char]0) | Microsoft.PowerShell.Core\Where-Object { $_.StartsWith("WAAL_BUILD_METADATA_V1;") })
     if ($markers.Count -ne 1) {
         throw "Executable must contain exactly one WAAL build metadata marker; found $($markers.Count)."
     }
-    $metadata = $markers[0]
-    $expectedArtifactKind = if ($Development) { "development" } else { "release" }
-    Require-MetadataField $metadata "artifact-kind" $expectedArtifactKind
+    $metadata = ConvertFrom-ExecutableBuildMetadata $markers[0]
+    # build.rs emits a fixed 27-field V1 schema. Requiring the exact count in
+    # addition to every known value makes any unknown or contradictory claim
+    # fail closed, even when all mandatory local-only disclaimers are present.
+    if ($metadata.Count -ne 27) {
+        throw "Executable build metadata does not match the exact V1 field schema."
+    }
+    Require-MetadataField $metadata "artifact-kind" "development"
+    Require-MetadataField $metadata "publishable" "false"
+    Require-MetadataField $metadata "attestation" "none-local-shared-security-context"
+    Require-MetadataField $metadata "producer-attribution" "unavailable-local-shared-security-context"
     Require-MetadataField $metadata "profile" "release"
     Require-MetadataField $metadata "target-os" "windows"
     Require-MetadataField $metadata "target-arch" "x86_64"
@@ -4616,6 +5561,10 @@ function Verify-ExecutableMetadata {
     Require-MetadataField $metadata "dev-tools" "false"
     Require-MetadataField $metadata "diagnostics-ui" "false"
     Require-MetadataField $metadata "release-diagnostics" "false"
+    Require-MetadataField $metadata "macos-bundle-id" "obcardinal.windows-app-autologin"
+    Require-MetadataField $metadata "production-macos-bundle-id" ""
+    Require-MetadataField $metadata "non-production-macos-identity" "true"
+    Require-MetadataField $metadata "macos-team-id" ""
     Require-MetadataField $metadata "windows-authenticode-publisher" $WindowsPublisher
     Require-MetadataField $metadata "source-git-commit" $ReleaseGitCommit
     Require-MetadataField $metadata "source-git-tree" $ReleaseGitTree
@@ -4629,38 +5578,6 @@ function Verify-ExecutableMetadata {
     Require-MetadataField $metadata "windows-authenticode-cert-sha256" $WindowsSignerCertSha256
 }
 
-function Resolve-SigningCertificate {
-    $normalizedThumbprint = $SigningCertificateThumbprint.Replace(" ", "").ToUpperInvariant()
-    if ($normalizedThumbprint -notmatch '^[0-9A-F]{40}$') {
-        throw "WAAL_WINDOWS_SIGN_CERT_THUMBPRINT must be an exact 40-hex certificate thumbprint for a code-signing certificate."
-    }
-    $certificate = Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath "Cert:\CurrentUser\My\$normalizedThumbprint" -ErrorAction SilentlyContinue |
-        Microsoft.PowerShell.Utility\Select-Object -First 1
-    if (-not $certificate) {
-        throw "The requested Authenticode signing certificate is not installed in CurrentUser\\My. LocalMachine certificates are intentionally unsupported because signtool store selection must be unambiguous."
-    }
-    if (-not $certificate.HasPrivateKey) { throw "The requested Authenticode certificate has no accessible private key." }
-    if ($certificate.NotBefore -gt [DateTime]::UtcNow) { throw "The requested Authenticode certificate is not yet valid." }
-    if ($certificate.NotAfter -le [DateTime]::UtcNow) { throw "The requested Authenticode certificate is expired." }
-    if (-not ($certificate.EnhancedKeyUsageList | Microsoft.PowerShell.Core\Where-Object { $_.ObjectId.Value -eq "1.3.6.1.5.5.7.3.3" })) {
-        throw "The requested certificate is not valid for code signing."
-    }
-    return $certificate
-}
-
-function Get-CertificateSha256 {
-    param([Parameter(Mandatory = $true)]$Certificate)
-
-    $sha256 = [Security.Cryptography.SHA256]::Create()
-    try {
-        $digest = $sha256.ComputeHash($Certificate.RawData)
-    }
-    finally {
-        $sha256.Dispose()
-    }
-    return (($digest | Microsoft.PowerShell.Core\ForEach-Object { $_.ToString("x2") }) -join "")
-}
-
 function Get-ByteArraySha256 {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
 
@@ -4671,187 +5588,6 @@ function Get-ByteArraySha256 {
     }
     finally {
         $sha256.Dispose()
-    }
-}
-
-function Get-PeAuthenticodeLayout {
-    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
-
-    if ($Bytes.Length -lt 256 -or $Bytes[0] -ne 0x4d -or $Bytes[1] -ne 0x5a) {
-        throw "Authenticode input is not a complete PE image."
-    }
-    $peOffset = [BitConverter]::ToInt32($Bytes, 0x3c)
-    if ($peOffset -lt 0x40 -or $peOffset -gt $Bytes.Length - 24 -or
-        $Bytes[$peOffset] -ne 0x50 -or $Bytes[$peOffset + 1] -ne 0x45 -or
-        $Bytes[$peOffset + 2] -ne 0 -or $Bytes[$peOffset + 3] -ne 0) {
-        throw "Authenticode input contains an invalid PE header."
-    }
-    $optionalSize = [int][BitConverter]::ToUInt16($Bytes, $peOffset + 20)
-    $optionalOffset = $peOffset + 24
-    if ($optionalSize -lt 120 -or $optionalOffset -gt $Bytes.Length - $optionalSize) {
-        throw "Authenticode input contains an invalid optional header."
-    }
-    $magic = [BitConverter]::ToUInt16($Bytes, $optionalOffset)
-    if ($magic -eq 0x10b) {
-        $directoryCountOffset = $optionalOffset + 92
-        $directoryOffset = $optionalOffset + 96
-    }
-    elseif ($magic -eq 0x20b) {
-        $directoryCountOffset = $optionalOffset + 108
-        $directoryOffset = $optionalOffset + 112
-    }
-    else {
-        throw "Authenticode input uses an unsupported PE optional-header format."
-    }
-    if ($directoryCountOffset -gt $optionalOffset + $optionalSize - 4 -or
-        [BitConverter]::ToUInt32($Bytes, $directoryCountOffset) -lt 5) {
-        throw "Authenticode input does not contain the certificate-table directory."
-    }
-    $checksumOffset = $optionalOffset + 64
-    $securityEntryOffset = $directoryOffset + (4 * 8)
-    if ($checksumOffset -gt $optionalOffset + $optionalSize - 4 -or
-        $securityEntryOffset -gt $optionalOffset + $optionalSize - 8) {
-        throw "Authenticode input has truncated mutable PE fields."
-    }
-    return [PSCustomObject]@{
-        ChecksumOffset = $checksumOffset
-        SecurityEntryOffset = $securityEntryOffset
-        CertificateOffset = [uint64][BitConverter]::ToUInt32($Bytes, $securityEntryOffset)
-        CertificateSize = [uint64][BitConverter]::ToUInt32($Bytes, $securityEntryOffset + 4)
-    }
-}
-
-function Assert-SignedExecutablePreservesUnsignedPayload {
-    param(
-        [Parameter(Mandatory = $true)][byte[]]$ExpectedUnsignedBytes,
-        [Parameter(Mandatory = $true)][string]$SignedPath
-    )
-
-    $signedBytes = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::ReadRegularSingleLinkBytes(
-        $SignedPath
-    )
-    $unsignedLayout = Get-PeAuthenticodeLayout $ExpectedUnsignedBytes
-    $signedLayout = Get-PeAuthenticodeLayout $signedBytes
-    if ($unsignedLayout.CertificateOffset -ne 0 -or $unsignedLayout.CertificateSize -ne 0) {
-        throw "The exact pre-sign executable unexpectedly already contains a certificate table."
-    }
-    if ($signedLayout.ChecksumOffset -ne $unsignedLayout.ChecksumOffset -or
-        $signedLayout.SecurityEntryOffset -ne $unsignedLayout.SecurityEntryOffset) {
-        throw "Signing changed the PE header layout."
-    }
-    $certificateOffset = $signedLayout.CertificateOffset
-    $certificateSize = $signedLayout.CertificateSize
-    if ($certificateOffset -lt $ExpectedUnsignedBytes.Length -or
-        ($certificateOffset % 8) -ne 0 -or $certificateSize -lt 8 -or
-        $certificateSize -gt [uint64]$signedBytes.Length -or
-        $certificateOffset -gt ([uint64]$signedBytes.Length - $certificateSize) -or
-        $certificateOffset + $certificateSize -ne [uint64]$signedBytes.Length) {
-        throw "Signing produced an invalid or non-terminal Authenticode certificate table."
-    }
-    for ($index = $ExpectedUnsignedBytes.Length; $index -lt [int]$certificateOffset; $index++) {
-        if ($signedBytes[$index] -ne 0) {
-            throw "Signing inserted non-padding data before the certificate table."
-        }
-    }
-
-    $certificateCursor = [int]$certificateOffset
-    $certificateEnd = [int]($certificateOffset + $certificateSize)
-    while ($certificateCursor -lt $certificateEnd) {
-        if ($certificateCursor -gt $certificateEnd - 8) {
-            throw "Authenticode certificate table ends with a truncated WIN_CERTIFICATE."
-        }
-        $recordLength = [int][BitConverter]::ToUInt32($signedBytes, $certificateCursor)
-        if ($recordLength -lt 8 -or $recordLength -gt $certificateEnd - $certificateCursor) {
-            throw "Authenticode certificate table contains an invalid WIN_CERTIFICATE length."
-        }
-        $certificateCursor += (($recordLength + 7) -band (-bnot 7))
-    }
-    if ($certificateCursor -ne $certificateEnd) {
-        throw "Authenticode certificate-table alignment is invalid."
-    }
-
-    $expectedComparable = Microsoft.PowerShell.Utility\New-Object byte[] $ExpectedUnsignedBytes.Length
-    $signedComparable = Microsoft.PowerShell.Utility\New-Object byte[] $ExpectedUnsignedBytes.Length
-    [Array]::Copy($ExpectedUnsignedBytes, $expectedComparable, $ExpectedUnsignedBytes.Length)
-    [Array]::Copy($signedBytes, $signedComparable, $ExpectedUnsignedBytes.Length)
-    foreach ($mutable in @(
-        [PSCustomObject]@{ Offset = $unsignedLayout.ChecksumOffset; Length = 4 },
-        [PSCustomObject]@{ Offset = $unsignedLayout.SecurityEntryOffset; Length = 8 }
-    )) {
-        [Array]::Clear($expectedComparable, $mutable.Offset, $mutable.Length)
-        [Array]::Clear($signedComparable, $mutable.Offset, $mutable.Length)
-    }
-    if ((Get-ByteArraySha256 $expectedComparable) -cne
-        (Get-ByteArraySha256 $signedComparable)) {
-        throw "Authenticode signing changed executable bytes outside the checksum and certificate-table fields."
-    }
-}
-
-function Sign-AndVerify-Executable {
-    param(
-        [Parameter(Mandatory = $true)][string]$ExecutablePath,
-        [Parameter(Mandatory = $true)]$Certificate,
-        [Parameter(Mandatory = $true)][byte[]]$ExpectedUnsignedBytes
-    )
-
-    if (-not $SignTool) { throw "Pinned signtool.exe was not initialized." }
-    $timestampUri = $null
-    if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
-        $timestampUri.Scheme -notin @("http", "https")) {
-        throw "WAAL_WINDOWS_TIMESTAMP_URL must be an absolute HTTP(S) RFC 3161 timestamp URL."
-    }
-    Assert-ReleaseToolchainIntegrity
-    $currentUnsignedBytes = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::ReadRegularSingleLinkBytes(
-        $ExecutablePath
-    )
-    if ((Get-ByteArraySha256 $currentUnsignedBytes) -cne
-        (Get-ByteArraySha256 $ExpectedUnsignedBytes)) {
-        throw "The staged executable changed after its exact copy and before signing."
-    }
-    $currentUnsignedBytes = $null
-    Invoke-Checked $SignTool @(
-        "sign", "/s", "My", "/sha1", $Certificate.Thumbprint, "/fd", "SHA256",
-        "/tr", $timestampUri.AbsoluteUri, "/td", "SHA256", $ExecutablePath
-    )
-    Assert-SignedExecutablePreservesUnsignedPayload $ExpectedUnsignedBytes $ExecutablePath
-    Invoke-Checked $SignTool @("verify", "/pa", "/all", "/v", $ExecutablePath)
-    Assert-ReleaseToolchainIntegrity
-    Assert-AuthenticodeExecutable $ExecutablePath $Certificate
-}
-
-function Assert-AuthenticodeExecutable {
-    param(
-        [Parameter(Mandatory = $true)][string]$ExecutablePath,
-        [Parameter(Mandatory = $true)]$Certificate
-    )
-
-    $executableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink($ExecutablePath)
-    try {
-        $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $ExecutablePath
-        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertRegularSingleLink($executableHandle)
-    }
-    finally {
-        $executableHandle.Dispose()
-    }
-    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-        throw "Authenticode signature validation failed: $($signature.Status) $($signature.StatusMessage)"
-    }
-    if (-not $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne $Certificate.Thumbprint) {
-        throw "Authenticode signer certificate does not match the requested thumbprint."
-    }
-    $verifiedPublisher = $signature.SignerCertificate.GetNameInfo(
-        [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
-        $false
-    ).Trim()
-    if ($verifiedPublisher -cne $WindowsPublisher) {
-        throw "Authenticode signer publisher does not match the publisher embedded at compile time."
-    }
-    if ((Get-CertificateSha256 $signature.SignerCertificate) -cne $WindowsSignerCertSha256) {
-        throw "Authenticode signer certificate does not match the SHA-256 fingerprint embedded at compile time."
-    }
-    if (-not $signature.TimeStamperCertificate) {
-        throw "Publishable Windows executable is missing a trusted RFC 3161 timestamp."
     }
 }
 
@@ -4882,12 +5618,12 @@ function Get-DistributionPayloadHashes {
     param([Parameter(Mandatory = $true)][string]$Directory)
 
     $hashes = Get-CoreDistributionPayloadHashes $Directory
-    $provenancePath = Microsoft.PowerShell.Management\Join-Path $Directory "BUILD-PROVENANCE.txt"
-    if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $provenancePath -PathType Leaf) -or
-        (((Microsoft.PowerShell.Management\Get-Item -LiteralPath $provenancePath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-        throw "Distribution payload is missing a regular file: BUILD-PROVENANCE.txt"
+    $metadataPath = Microsoft.PowerShell.Management\Join-Path $Directory "BUILD-METADATA.txt"
+    if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $metadataPath -PathType Leaf) -or
+        (((Microsoft.PowerShell.Management\Get-Item -LiteralPath $metadataPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Distribution payload is missing a regular file: BUILD-METADATA.txt"
     }
-    $hashes["BUILD-PROVENANCE.txt"] = Get-SingleLinkSha256 $provenancePath
+    $hashes["BUILD-METADATA.txt"] = Get-SingleLinkSha256 $metadataPath
     return $hashes
 }
 
@@ -4908,7 +5644,7 @@ function Get-Sha256ManifestContent {
     param([Parameter(Mandatory = $true)]$PayloadHashes)
 
     $lines = foreach ($fileName in @(
-        $ExeName, "README.md", "LICENSE", "config.example.json", "BUILD-PROVENANCE.txt"
+        $ExeName, "README.md", "LICENSE", "config.example.json", "BUILD-METADATA.txt"
     )) {
         "$($PayloadHashes[$fileName])  $fileName"
     }
@@ -4919,13 +5655,13 @@ function Assert-WindowsDistribution {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
         [Parameter(Mandatory = $true)]$ExpectedPayloadHashes,
-        [Parameter(Mandatory = $true)][string]$ExpectedProvenance
+        [Parameter(Mandatory = $true)][string]$ExpectedMetadata
     )
 
     Assert-RealDirectory $Directory
     $expectedNames = @(
         $ExeName, "README.md", "LICENSE", "config.example.json",
-        "SHA256SUMS.txt", "BUILD-PROVENANCE.txt"
+        "SHA256SUMS.txt", "BUILD-METADATA.txt"
     )
     $actualNames = @()
     foreach ($item in Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $Directory -Force) {
@@ -4945,7 +5681,7 @@ function Assert-WindowsDistribution {
     Verify-ExecutableMetadata $executable
     $actualPayloadHashes = Get-DistributionPayloadHashes $Directory
     foreach ($fileName in @(
-        $ExeName, "README.md", "LICENSE", "config.example.json", "BUILD-PROVENANCE.txt"
+        $ExeName, "README.md", "LICENSE", "config.example.json", "BUILD-METADATA.txt"
     )) {
         if ($actualPayloadHashes[$fileName] -cne $ExpectedPayloadHashes[$fileName]) {
             throw "Distribution payload hash changed during publication: $fileName"
@@ -4955,11 +5691,8 @@ function Assert-WindowsDistribution {
     if ((Read-SingleLinkText (Microsoft.PowerShell.Management\Join-Path $Directory "SHA256SUMS.txt")) -cne $expectedManifest) {
         throw "Distribution SHA256SUMS.txt does not match the complete payload."
     }
-    if ((Read-SingleLinkText (Microsoft.PowerShell.Management\Join-Path $Directory "BUILD-PROVENANCE.txt")) -cne $ExpectedProvenance) {
-        throw "Distribution BUILD-PROVENANCE.txt does not match the pinned build inputs."
-    }
-    if (-not $Development) {
-        Assert-AuthenticodeExecutable $executable $SigningCertificate
+    if ((Read-SingleLinkText (Microsoft.PowerShell.Management\Join-Path $Directory "BUILD-METADATA.txt")) -cne $ExpectedMetadata) {
+        throw "Distribution BUILD-METADATA.txt does not match the captured informational build metadata."
     }
 }
 
@@ -4970,7 +5703,7 @@ function Open-DistributionPayloadHandles {
     try {
         foreach ($fileName in @(
             $ExeName, "README.md", "LICENSE", "config.example.json",
-            "SHA256SUMS.txt", "BUILD-PROVENANCE.txt"
+            "SHA256SUMS.txt", "BUILD-METADATA.txt"
         )) {
             $null = $handles.Add([PSCustomObject]@{
                 Name = $fileName
@@ -5034,7 +5767,7 @@ function Assert-DistributionPayloadHandles {
 
     $expectedNames = @(
         $ExeName, "README.md", "LICENSE", "config.example.json",
-        "SHA256SUMS.txt", "BUILD-PROVENANCE.txt"
+        "SHA256SUMS.txt", "BUILD-METADATA.txt"
     )
     if ($Handles.Count -ne $expectedNames.Count -or
         $ExpectedFileHashes.Count -ne $expectedNames.Count) {
@@ -5077,6 +5810,63 @@ function Close-DistributionPayloadHandles {
         }
     }
     $script:PublicationPayloadHandles = @()
+    if ($failure) { throw $failure }
+}
+
+function Close-BuiltExecutableHandles {
+    $failure = $null
+    foreach ($handle in @(
+        $BuiltExecutableHandle,
+        $BuiltExecutableDirectoryHandle
+    )) {
+        try {
+            if ($handle -and -not $handle.IsClosed) { $handle.Dispose() }
+        }
+        catch {
+            if (-not $failure) { $failure = $_ }
+        }
+    }
+    $script:BuiltExecutableHandle = $null
+    $script:BuiltExecutableDirectoryHandle = $null
+    if ($failure) { throw $failure }
+}
+
+function Assert-StagedExecutableHandle {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not $StagedExecutableHandle -or $StagedExecutableHandle.IsInvalid -or
+        $StagedExecutableHandle.IsClosed -or -not (Test-LowerHex $StagedExecutableSha256 64)) {
+        throw "Authenticated staged executable handle is unavailable."
+    }
+    try {
+        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+            $Path,
+            $StagedExecutableHandle
+        )
+    }
+    catch {
+        throw "Staged executable path changed identity while its exact object was retained."
+    }
+    $actualHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+        $StagedExecutableHandle
+    )
+    if ($actualHash -cne $StagedExecutableSha256) {
+        throw "Exact staged executable bytes changed while retained."
+    }
+}
+
+function Close-StagedExecutableHandle {
+    $failure = $null
+    try {
+        if ($StagedExecutableHandle -and -not $StagedExecutableHandle.IsClosed) {
+            $StagedExecutableHandle.Dispose()
+        }
+    }
+    catch {
+        $failure = $_
+    }
+    $script:StagedExecutableHandle = $null
+    $script:StagedExecutableSha256 = $null
     if ($failure) { throw $failure }
 }
 
@@ -5128,23 +5918,6 @@ try {
     Assert-ReleaseToolchainIntegrity
     Prepare-IsolatedBuildEnvironment
     Assert-ToolchainMatchesManifest
-    if (-not $Development) {
-        if (-not $SigningCertificateThumbprint) {
-            throw "Publishable Windows distribution requires WAAL_WINDOWS_SIGN_CERT_THUMBPRINT or -SigningCertificateThumbprint. Use -Development only for an explicitly unsigned local VM artifact."
-        }
-        $SigningCertificate = Resolve-SigningCertificate
-        $WindowsPublisher = $SigningCertificate.GetNameInfo(
-            [Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
-            $false
-        ).Trim()
-        $WindowsSignerCertSha256 = Get-CertificateSha256 $SigningCertificate
-        if (-not $WindowsPublisher -or $WindowsPublisher.Length -gt 512 -or $WindowsPublisher -match '[;\r\n]') {
-            throw "Authenticode certificate subject cannot be represented safely in build metadata."
-        }
-        if (-not (Test-LowerHex $WindowsSignerCertSha256 64)) {
-            throw "Unable to capture the signing certificate SHA-256 fingerprint."
-        }
-    }
     Verify-ReleaseDependencyGraph
     Assert-ReleaseSourceUnchanged $Git
 
@@ -5157,52 +5930,125 @@ try {
         )
     }
 
-    Microsoft.PowerShell.Utility\Write-Host "Building release executable from the verified source snapshot..."
-    Invoke-SanitizedCargo @(
+    Microsoft.PowerShell.Utility\Write-Host "Building an optimized unsigned development executable from the captured source snapshot..."
+    $targetExeDirectory = Microsoft.PowerShell.Management\Join-Path `
+        $BuildTargetDir `
+        "$TargetTriple\release"
+    if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $targetExeDirectory) {
+        throw "Fresh release output directory unexpectedly exists before Cargo build: $targetExeDirectory"
+    }
+    Microsoft.PowerShell.Management\New-Item `
+        -ItemType Directory `
+        -Path $targetExeDirectory | Microsoft.PowerShell.Core\Out-Null
+    Assert-RealDirectory $targetExeDirectory
+    $BuiltExecutableDirectoryHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(
+        $targetExeDirectory
+    )
+    $targetExe = Microsoft.PowerShell.Management\Join-Path `
+        $targetExeDirectory `
+        "$BinaryName.exe"
+    $builtExecutableState = Invoke-SanitizedCargo @(
         "build", "--locked", "--release", "--target", $TargetTriple,
         "--bin", $BinaryName, "--manifest-path", $manifestPath
-    )
-    $targetExe = Microsoft.PowerShell.Management\Join-Path $BuildTargetDir "$TargetTriple\release\$BinaryName.exe"
-    if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $targetExe -PathType Leaf)) {
-        throw "Release build did not produce expected executable: $targetExe"
+    ) `
+        -RetainBuiltExecutablePath $targetExe `
+        -RetainBuiltExecutableDirectoryHandle $BuiltExecutableDirectoryHandle
+    if (-not $builtExecutableState -or -not $builtExecutableState.Handle) {
+        throw "Cargo did not return a complete retained build-output state."
     }
-    Assert-RegularSingleLinkFile $targetExe
-    Verify-ExecutableMetadata $targetExe
+    $BuiltExecutableHandle = $builtExecutableState.Handle
+    $builtExecutableState = $null
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+        $BuiltExecutableDirectoryHandle,
+        "$BinaryName.exe",
+        $BuiltExecutableHandle
+    )
     Assert-ReleaseSourceUnchanged $Git
 
     $stagedDist = Microsoft.PowerShell.Management\Join-Path $ReleaseRoot $DistName
     Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $stagedDist | Microsoft.PowerShell.Core\Out-Null
     Assert-RealDirectory $stagedDist
     $stagedExe = Microsoft.PowerShell.Management\Join-Path $stagedDist $ExeName
-    $UnsignedExecutableBytes = Copy-SingleLinkExecutableAndCaptureBytes $targetExe $stagedExe
-    Assert-MaterializedReleaseSource
-    foreach ($fileName in @("README.md", "LICENSE", "config.example.json")) {
-        Copy-SingleLinkFile `
-            (Microsoft.PowerShell.Management\Join-Path $ReleaseSourceDir $fileName) `
-            (Microsoft.PowerShell.Management\Join-Path $stagedDist $fileName)
+    $UnsignedExecutableBytes = Copy-SingleLinkExecutableFromHandleAndCaptureBytes `
+        $BuiltExecutableHandle `
+        $stagedExe
+    Verify-ExecutableMetadataBytes $UnsignedExecutableBytes
+    if ((Get-ByteArraySha256 $UnsignedExecutableBytes) -cne
+        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+            $BuiltExecutableHandle
+        )) {
+        throw "Staged executable bytes do not match the exact retained Cargo output."
     }
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+        $BuiltExecutableDirectoryHandle,
+        "$BinaryName.exe",
+        $BuiltExecutableHandle
+    )
+    $committedPayloadState = Copy-CommittedReleasePayloadFiles $stagedDist
+    $CommittedPayloadHashes = $committedPayloadState.ExpectedHashes
+    $StagedPayloadHandles = @($committedPayloadState.Handles)
+    $committedPayloadState = $null
+    Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
     Assert-MaterializedReleaseSource
 
-    $signerDescription = "none-development-only"
-    if ($Development) {
-        Microsoft.PowerShell.Utility\Write-Warning "Creating an unsigned DEVELOPMENT distribution. It is not a publishable release."
+    Microsoft.PowerShell.Utility\Write-Warning "Creating an unsigned DEVELOPMENT distribution. It is not a publishable release, and its local build metadata is informational rather than an attestation."
+    if ((Get-SingleLinkSha256 $stagedExe) -cne
+        (Get-ByteArraySha256 $UnsignedExecutableBytes)) {
+        throw "Unsigned development executable changed after its exact Cargo-output copy."
     }
-    else {
-        Sign-AndVerify-Executable $stagedExe $SigningCertificate $UnsignedExecutableBytes
-        $signerDescription = $SigningCertificate.Thumbprint
+    # Authenticate and retain the exact staged executable object before the
+    # Cargo-output handle is released. Once opened, this handle denies writers
+    # and replacement until candidate transfer is complete. This preserves the
+    # selected local test bytes but deliberately does not claim who authored
+    # the build output within the shared Windows security context.
+    $StagedExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(
+        $stagedExe
+    )
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+        $stagedExe,
+        $StagedExecutableHandle
+    )
+    $stagedHandleHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+        $StagedExecutableHandle
+    )
+    if ($stagedHandleHash -cne (Get-ByteArraySha256 $UnsignedExecutableBytes)) {
+        throw "Retained development executable is not the exact Cargo-output copy."
     }
+    $StagedExecutableSha256 = $stagedHandleHash
+    Assert-StagedExecutableHandle $stagedExe
+    if ((Get-ByteArraySha256 $UnsignedExecutableBytes) -cne
+        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+            $BuiltExecutableHandle
+        )) {
+        throw "Exact retained Cargo output changed before development validation completed."
+    }
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+        $BuiltExecutableDirectoryHandle,
+        "$BinaryName.exe",
+        $BuiltExecutableHandle
+    )
+    Close-BuiltExecutableHandles
     $UnsignedExecutableBytes = $null
+    Assert-StagedExecutableHandle $stagedExe
     Verify-ExecutableMetadata $stagedExe
 
     $corePayloadHashes = Get-CoreDistributionPayloadHashes $stagedDist
+    Assert-StagedExecutableHandle $stagedExe
+    if ($corePayloadHashes[$ExeName] -cne $StagedExecutableSha256) {
+        throw "Core payload hash does not match the exact retained staged executable."
+    }
+    Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
+    Assert-CommittedReleasePayloadHashes $corePayloadHashes $CommittedPayloadHashes
     $exeSha256 = $corePayloadHashes[$ExeName]
-    $artifactKind = if ($Development) { "development-unsigned" } else { "release-authenticode" }
-    $provenance = @(
-        "WAAL_WINDOWS_BUILD_PROVENANCE_V1",
-        "artifact-kind=$artifactKind",
+    $metadataDocument = @(
+        "WAAL_WINDOWS_LOCAL_BUILD_METADATA_V1",
+        "artifact-kind=development-unsigned",
+        "publishable=false",
+        "attestation=none-local-shared-security-context",
+        "producer-attribution=unavailable-local-shared-security-context",
         "target=$TargetTriple",
-        "source-git-commit=$ReleaseGitCommit",
-        "source-git-tree=$ReleaseGitTree",
+        "captured-source-git-commit=$ReleaseGitCommit",
+        "captured-source-git-tree=$ReleaseGitTree",
         "packager-source-sha256=$PackagerSourceSha256",
         "git-sha256=$GitSha256",
         "git-runtime-content-sha256=$GitRootSha256",
@@ -5220,48 +6066,51 @@ try {
         "msvc-bin-content-sha256=$CompilerBinSha256",
         "rc-sha256=$ResourceCompilerSha256",
         "windows-sdk-bin-content-sha256=$SdkBinSha256",
-        "signtool-sha256=$SignToolSha256",
         "native-toolchain-sha256=$NativeToolchainSha256",
-        "release-materials-sha256=$ReleaseMaterialsSha256",
+        "observed-materials-sha256=$ReleaseMaterialsSha256",
         "msvc-lib-content-sha256=$TrustedLibSha256",
         "msvc-include-content-sha256=$TrustedIncludeSha256",
         "msvc-libpath-content-sha256=$TrustedLibPathSha256",
-        "authenticode-publisher=$WindowsPublisher",
-        "authenticode-certificate-sha256=$WindowsSignerCertSha256",
-        "authenticode-signer-thumbprint=$signerDescription",
         "executable-sha256=$exeSha256",
         "readme-sha256=$($corePayloadHashes['README.md'])",
         "license-sha256=$($corePayloadHashes['LICENSE'])",
         "config-example-sha256=$($corePayloadHashes['config.example.json'])"
     ) -join "`r`n"
-    $expectedProvenance = $provenance + "`r`n"
-    Write-Utf8NoBom (Microsoft.PowerShell.Management\Join-Path $stagedDist "BUILD-PROVENANCE.txt") $expectedProvenance
+    $expectedMetadata = $metadataDocument + "`r`n"
+    Write-Utf8NoBom (Microsoft.PowerShell.Management\Join-Path $stagedDist "BUILD-METADATA.txt") $expectedMetadata
     $payloadHashes = Get-DistributionPayloadHashes $stagedDist
     Write-Utf8NoBom (Microsoft.PowerShell.Management\Join-Path $stagedDist "SHA256SUMS.txt") (Get-Sha256ManifestContent $payloadHashes)
     $completeDistributionHashes = Get-CompleteDistributionFileHashes $stagedDist
 
     Assert-ReleaseSourceUnchanged $Git
-    Assert-WindowsDistribution $stagedDist $payloadHashes $expectedProvenance
+    Assert-StagedExecutableHandle $stagedExe
+    Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
+    Assert-WindowsDistribution $stagedDist $payloadHashes $expectedMetadata
     Assert-ReleaseToolchainIntegrity
     if ($StopRunning) { Stop-DistProcesses }
     $candidateDir = New-PublicationCandidate
     foreach ($fileName in @(
-        $ExeName, "README.md", "LICENSE", "config.example.json", "SHA256SUMS.txt", "BUILD-PROVENANCE.txt"
+        $ExeName, "README.md", "LICENSE", "config.example.json", "SHA256SUMS.txt", "BUILD-METADATA.txt"
     )) {
         Copy-SingleLinkFile `
             (Microsoft.PowerShell.Management\Join-Path $stagedDist $fileName) `
             (Microsoft.PowerShell.Management\Join-Path $candidateDir $fileName)
     }
-    Assert-WindowsDistribution $candidateDir $payloadHashes $expectedProvenance
+    Assert-StagedExecutableHandle $stagedExe
+    Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
+    Close-StagedExecutableHandle
+    Close-StagedPayloadHandles
+    Assert-WindowsDistribution $candidateDir $payloadHashes $expectedMetadata
     Lock-PublicationCandidateDirectory
     $PublicationPayloadHandles = Open-DistributionPayloadHandles $PublicationCandidateHandle
     Assert-DistributionPayloadHandles `
         $PublicationCandidateHandle `
         $PublicationPayloadHandles `
         $completeDistributionHashes
-    # This validation is authoritative: the directory denies entry mutations,
-    # and every expected payload is held without write sharing.
-    Assert-WindowsDistribution $candidateDir $payloadHashes $expectedProvenance
+    # Retain and validate every selected payload identity. The directory itself
+    # is intentionally not described as immutable: this is a local, unsigned,
+    # non-attested development output.
+    Assert-WindowsDistribution $candidateDir $payloadHashes $expectedMetadata
     Assert-DistributionPayloadHandles `
         $PublicationCandidateHandle `
         $PublicationPayloadHandles `
@@ -5277,7 +6126,7 @@ try {
         $PublicationFinalHandle `
         $PublicationPayloadHandles `
         $completeDistributionHashes
-    Assert-WindowsDistribution $DistDir $payloadHashes $expectedProvenance
+    Assert-WindowsDistribution $DistDir $payloadHashes $expectedMetadata
     Assert-ReleaseSourceUnchanged $Git
     Assert-ReleaseToolchainIntegrity
     $finalExeHandles = @($PublicationPayloadHandles | Microsoft.PowerShell.Core\Where-Object {
@@ -5298,7 +6147,7 @@ try {
         $PublicationFinalHandle `
         $PublicationPayloadHandles `
         $completeDistributionHashes
-    Complete-Publication
+    Complete-DevelopmentPublication $DistDir $payloadHashes $expectedMetadata
     Close-DistributionPayloadHandles
     Close-PublicationDirectoryHandles
 
@@ -5306,7 +6155,7 @@ try {
     Microsoft.PowerShell.Utility\Write-Host "  $DistDir"
     Microsoft.PowerShell.Utility\Write-Host "  $finalExe"
     Microsoft.PowerShell.Utility\Write-Host "  SHA-256: $finalHash"
-    if ($Development) { Microsoft.PowerShell.Utility\Write-Warning "This output is unsigned and development-only." }
+    Microsoft.PowerShell.Utility\Write-Warning "This output is unsigned and development-only."
 }
 catch {
     $primaryFailure = $_
@@ -5317,6 +6166,42 @@ finally {
     }
     catch {
         $cleanupFailure = $_
+    }
+    try {
+        Close-BuiltExecutableHandles
+    }
+    catch {
+        if ($cleanupFailure) {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Build-output handle cleanup also failed: $($_.Exception.Message)"
+        }
+        else {
+            $cleanupFailure = $_
+        }
+    }
+    try {
+        Close-StagedExecutableHandle
+    }
+    catch {
+        if ($cleanupFailure) {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Staged executable handle cleanup also failed: $($_.Exception.Message)"
+        }
+        else {
+            $cleanupFailure = $_
+        }
+    }
+    try {
+        Close-StagedPayloadHandles
+    }
+    catch {
+        if ($cleanupFailure) {
+            Microsoft.PowerShell.Utility\Write-Warning `
+                "Staged payload handle cleanup also failed: $($_.Exception.Message)"
+        }
+        else {
+            $cleanupFailure = $_
+        }
     }
     try {
         if (-not $PublicationComplete) {

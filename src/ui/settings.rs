@@ -12,6 +12,7 @@ use tracing::warn;
 
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let mut settings_changed = false;
+    let storage_mutations_ready = app.account_mutations_ready();
     theme::page_header_plain(
         ui,
         "Settings",
@@ -37,14 +38,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
 
             section(ui, "Security", |ui| {
                 settings_changed |= ui
-                    .checkbox(
+                    .add_enabled(
+                        storage_mutations_ready,
+                        egui::Checkbox::new(
                         &mut app.settings_draft.use_keyring,
                         "Use system secure storage",
+                        ),
                     )
                     .on_hover_text(
                         "Recommended. If disabled, password ciphertext is stored locally and its encryption key is still kept in the system credential store.",
                     )
                     .changed();
+                if !storage_mutations_ready {
+                    ui.label(theme::muted(
+                        "Password storage changes are locked until recovery completes after restart.",
+                    ));
+                }
             });
         });
 
@@ -54,6 +63,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
 }
 
 fn save_settings(app: &mut AutoLoginApp) {
+    let storage_mutations_ready = app.account_mutations_ready();
+    if restore_storage_mode_when_recovery_blocked(
+        &mut app.settings_draft,
+        &app.config.settings,
+        storage_mutations_ready,
+    ) {
+        app.set_status(pending_storage_recovery_user_status(
+            "Password storage mode was left unchanged.",
+        ));
+        app.stop_monitor_for_pending_storage_recovery();
+        if app.settings_draft == app.config.settings {
+            return;
+        }
+    }
     let result = save_settings_transaction(
         &app.config,
         app.settings_draft.clone(),
@@ -64,19 +87,48 @@ fn save_settings(app: &mut AutoLoginApp) {
         crate::storage::rollback_storage_mode_migration,
         crate::storage::commit_storage_mode_migration,
         crate::storage::clear_pending_storage_operation,
+        crate::storage::mark_storage_recovery_blocked,
     );
 
     let applied = result.applied;
     let storage_mode_changed = result.storage_mode_changed;
+    let recovery_pending = result.recovery_pending
+        || !matches!(
+            crate::storage::pending_storage_recovery_is_clear(),
+            Ok(true)
+        )
+        || !matches!(crate::storage::storage_recovery_block_is_clear(), Ok(true));
     app.config = result.config;
     app.settings_draft = result.settings_draft;
     app.set_status(result.status);
-    if !applied {
+    if recovery_pending {
+        if let Err(error) = crate::storage::mark_storage_recovery_blocked() {
+            warn!(
+                error = %error,
+                "Failed to persist the password storage recovery block before stopping the monitor"
+            );
+        }
+        app.stop_monitor_for_pending_storage_recovery();
+    }
+    if !settings_worker_sync_allowed(applied, recovery_pending) {
         return;
     }
 
     app.settings_draft = app.config.settings.clone();
     app.sync_saved_config_to_worker(storage_mode_changed);
+}
+
+fn restore_storage_mode_when_recovery_blocked(
+    settings_draft: &mut AppSettings,
+    current_settings: &AppSettings,
+    storage_mutations_ready: bool,
+) -> bool {
+    if storage_mutations_ready || settings_draft.use_keyring == current_settings.use_keyring {
+        return false;
+    }
+
+    settings_draft.use_keyring = current_settings.use_keyring;
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -86,10 +138,15 @@ struct SettingsSaveTransactionResult {
     status: String,
     applied: bool,
     storage_mode_changed: bool,
+    recovery_pending: bool,
+}
+
+fn settings_worker_sync_allowed(applied: bool, recovery_pending: bool) -> bool {
+    applied && !recovery_pending
 }
 
 #[allow(clippy::too_many_arguments)]
-fn save_settings_transaction<A, J, M, S, R, C, X>(
+fn save_settings_transaction<A, J, M, S, R, C, X, B>(
     current_config: &AppConfig,
     settings_draft: AppSettings,
     mut set_autostart_op: A,
@@ -99,6 +156,7 @@ fn save_settings_transaction<A, J, M, S, R, C, X>(
     mut rollback_storage_op: R,
     mut commit_storage_op: C,
     mut clear_storage_journal_op: X,
+    mut mark_recovery_blocked_op: B,
 ) -> SettingsSaveTransactionResult
 where
     A: FnMut(bool) -> anyhow::Result<()>,
@@ -108,6 +166,7 @@ where
     R: FnMut(&StorageModeMigration) -> anyhow::Result<usize>,
     C: FnMut(&StorageModeMigration) -> anyhow::Result<usize>,
     X: FnMut() -> anyhow::Result<()>,
+    B: FnMut() -> anyhow::Result<()>,
 {
     let previous_settings = current_config.settings.clone();
     let mut next_config = current_config.clone();
@@ -122,7 +181,12 @@ where
             previous_settings.use_keyring,
             next_config.settings.use_keyring,
         ) {
-            return rejected(
+            let recovery_pending = is_pending_storage_operation_in_progress(&e);
+            persist_settings_recovery_block_if_needed(
+                recovery_pending,
+                &mut mark_recovery_blocked_op,
+            );
+            return rejected_with_recovery_pending(
                 current_config,
                 previous_settings,
                 storage_prepare_failure_status(
@@ -130,6 +194,7 @@ where
                     "Storage mode was left unchanged.",
                     "Failed to prepare password storage migration. Storage mode was left unchanged.",
                 ),
+                recovery_pending,
             );
         }
         true
@@ -153,18 +218,28 @@ where
                     new_storage = storage_mode_label(next_config.settings.use_keyring),
                     "Password storage migration failed"
                 );
-                let status = if recovery_required {
+                let journal_cleared = !recovery_required
+                    && clear_storage_journal_after_terminal_result(
+                        storage_journal_started,
+                        &mut clear_storage_journal_op,
+                    );
+                let recovery_pending = recovery_required || !journal_cleared;
+                let status = if recovery_pending {
                     pending_storage_recovery_user_status("Storage mode was left unchanged.")
-                } else if clear_storage_journal_after_terminal_result(
-                    storage_journal_started,
-                    &mut clear_storage_journal_op,
-                ) {
+                } else {
                     "Failed to change password storage. Storage mode was left unchanged."
                         .to_string()
-                } else {
-                    pending_storage_recovery_user_status("Storage mode was left unchanged.")
                 };
-                return rejected(current_config, previous_settings, status);
+                persist_settings_recovery_block_if_needed(
+                    recovery_pending,
+                    &mut mark_recovery_blocked_op,
+                );
+                return rejected_with_recovery_pending(
+                    current_config,
+                    previous_settings,
+                    status,
+                    recovery_pending,
+                );
             }
         }
     } else {
@@ -181,26 +256,38 @@ where
             if let Some(migration) = &storage_migration {
                 if let Err(rollback_error) = rollback_storage_op(migration) {
                     let _ = rollback_error;
-                    return rejected(
-                    current_config,
-                    previous_settings,
-                    "Failed to save settings, and storage rollback could not be confirmed. Passwords may need manual cleanup.".to_string(),
-                );
+                    persist_settings_recovery_block_if_needed(true, &mut mark_recovery_blocked_op);
+                    return rejected_with_recovery_pending(
+                        current_config,
+                        previous_settings,
+                        "Failed to save settings, and storage rollback could not be confirmed. Passwords may need manual cleanup.".to_string(),
+                        true,
+                    );
                 }
             }
-            clear_storage_journal_after_terminal_result(
+            let journal_cleared = clear_storage_journal_after_terminal_result(
                 storage_journal_started,
                 &mut clear_storage_journal_op,
             );
-            return rejected(
+            persist_settings_recovery_block_if_needed(
+                !journal_cleared,
+                &mut mark_recovery_blocked_op,
+            );
+            return rejected_with_recovery_pending(
                 current_config,
                 previous_settings,
-                "Failed to save settings. Storage mode was left unchanged.".to_string(),
+                if journal_cleared {
+                    "Failed to save settings. Storage mode was left unchanged.".to_string()
+                } else {
+                    pending_storage_recovery_user_status("Storage mode was left unchanged.")
+                },
+                !journal_cleared,
             );
         }
     };
 
     let mut status_parts = Vec::new();
+    let mut recovery_pending = false;
     if auto_start_changed {
         if let Err(e) = set_autostart_op(next_config.settings.auto_start) {
             warn!(
@@ -235,6 +322,7 @@ where
 
     if let Some(migration) = &storage_migration {
         if config_durability_warning {
+            recovery_pending = true;
             // Deleting the old backend would be unsafe if a crash re-exposed
             // the previous config. The journal is deliberately retained.
             status_parts.push(
@@ -242,6 +330,7 @@ where
                     .to_string(),
             );
         } else if let Err(e) = commit_storage_op(migration) {
+            recovery_pending = true;
             warn!(
                 error = %e,
                 old_storage = storage_mode_label(previous_settings.use_keyring),
@@ -252,10 +341,14 @@ where
                 previous_settings.use_keyring,
                 next_config.settings.use_keyring,
             ));
-        } else {
-            clear_storage_journal_after_terminal_result(
-                storage_journal_started,
-                &mut clear_storage_journal_op,
+        } else if !clear_storage_journal_after_terminal_result(
+            storage_journal_started,
+            &mut clear_storage_journal_op,
+        ) {
+            recovery_pending = true;
+            status_parts.push(
+                "Password storage recovery journal removal could not be durably confirmed; auto-login remains blocked until a fresh startup verifies recovery."
+                    .to_string(),
             );
         }
     } else if config_durability_warning {
@@ -270,6 +363,7 @@ where
     } else {
         status_parts.join(" ")
     };
+    persist_settings_recovery_block_if_needed(recovery_pending, &mut mark_recovery_blocked_op);
 
     SettingsSaveTransactionResult {
         settings_draft: next_config.settings.clone(),
@@ -277,21 +371,43 @@ where
         status,
         applied: true,
         storage_mode_changed,
+        recovery_pending,
     }
 }
 
-fn rejected(
+fn persist_settings_recovery_block_if_needed<B>(recovery_pending: bool, mark: &mut B)
+where
+    B: FnMut() -> anyhow::Result<()>,
+{
+    if recovery_pending {
+        if let Err(error) = mark() {
+            warn!(
+                error = %error,
+                "Failed to persist password storage recovery block before returning a recovery-pending result"
+            );
+        }
+    }
+}
+
+fn rejected_with_recovery_pending(
     current_config: &AppConfig,
     settings_draft: AppSettings,
     status: String,
+    recovery_pending: bool,
 ) -> SettingsSaveTransactionResult {
-    rejected_with_config(current_config.clone(), settings_draft, status)
+    rejected_with_config(
+        current_config.clone(),
+        settings_draft,
+        status,
+        recovery_pending,
+    )
 }
 
 fn rejected_with_config(
     config: AppConfig,
     settings_draft: AppSettings,
     status: String,
+    recovery_pending: bool,
 ) -> SettingsSaveTransactionResult {
     SettingsSaveTransactionResult {
         config,
@@ -299,6 +415,7 @@ fn rejected_with_config(
         status,
         applied: false,
         storage_mode_changed: false,
+        recovery_pending,
     }
 }
 
@@ -364,10 +481,46 @@ fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::
 
 #[cfg(test)]
 mod tests {
-    use super::save_settings_transaction;
+    use super::{
+        restore_storage_mode_when_recovery_blocked, save_settings_transaction,
+        settings_worker_sync_allowed,
+    };
     use crate::models::{Account, AppConfig, AppSettings, FIXED_POLL_INTERVAL_SECS};
     use crate::storage::{storage_mode_migration_recovery_required_error, StorageModeMigration};
     use std::cell::RefCell;
+
+    #[test]
+    fn blocked_recovery_restores_storage_mode_without_discarding_other_settings() {
+        let current = AppSettings {
+            use_keyring: true,
+            auto_start: false,
+            ..AppSettings::default()
+        };
+        let mut draft = current.clone();
+        draft.use_keyring = false;
+        draft.auto_start = true;
+
+        assert!(restore_storage_mode_when_recovery_blocked(
+            &mut draft, &current, false
+        ));
+        assert!(draft.use_keyring);
+        assert!(draft.auto_start);
+    }
+
+    #[test]
+    fn ready_storage_allows_storage_mode_change() {
+        let current = AppSettings {
+            use_keyring: true,
+            ..AppSettings::default()
+        };
+        let mut draft = current.clone();
+        draft.use_keyring = false;
+
+        assert!(!restore_storage_mode_when_recovery_blocked(
+            &mut draft, &current, true
+        ));
+        assert!(!draft.use_keyring);
+    }
 
     #[test]
     fn storage_mode_commit_cleanup_failure_keeps_new_mode_and_target_passwords() {
@@ -414,10 +567,12 @@ mod tests {
                 anyhow::bail!("source cleanup failed after account-1")
             },
             || panic!("journal must remain pending until old storage cleanup succeeds"),
+            || Ok(()),
         );
 
         assert!(result.applied);
         assert!(result.storage_mode_changed);
+        assert!(result.recovery_pending);
         assert!(!result.config.settings.use_keyring);
         assert!(!result.settings_draft.use_keyring);
         assert_eq!(
@@ -481,6 +636,7 @@ mod tests {
                 Ok(1)
             },
             || Ok(()),
+            || Ok(()),
         );
 
         assert!(!result.applied);
@@ -529,10 +685,12 @@ mod tests {
             |_| panic!("committed config must not roll back target credentials"),
             |_| panic!("old credentials must remain until config durability is confirmed"),
             || panic!("journal must remain for recovery"),
+            || Ok(()),
         );
 
         assert!(result.applied);
         assert!(result.storage_mode_changed);
+        assert!(result.recovery_pending);
         assert!(!result.config.settings.use_keyring);
         assert!(result.status.contains("durability could not be confirmed"));
         assert!(result.status.contains("cleanup remains pending"));
@@ -594,9 +752,11 @@ mod tests {
                 events.borrow_mut().push("journal_clear".to_string());
                 Ok(())
             },
+            || Ok(()),
         );
 
         assert!(result.applied);
+        assert!(!result.recovery_pending);
         assert_eq!(
             events.into_inner(),
             vec![
@@ -606,6 +766,69 @@ mod tests {
                 "autostart:true",
                 "commit_source_cleanup",
                 "journal_clear"
+            ]
+        );
+    }
+
+    #[test]
+    fn journal_clear_ambiguity_propagates_recovery_pending_and_blocks_worker_sync() {
+        let config = config_with_two_saved_accounts(true);
+        let mut draft = config.settings.clone();
+        draft.use_keyring = false;
+        let events = RefCell::new(Vec::new());
+
+        let result = save_settings_transaction(
+            &config,
+            draft,
+            |_| Ok(()),
+            |_, _, _| {
+                events.borrow_mut().push("journal");
+                Ok(())
+            },
+            |_, from_use_keyring, to_use_keyring| {
+                events.borrow_mut().push("migrate");
+                Ok(StorageModeMigration::for_test(
+                    vec!["account-1".to_string(), "account-2".to_string()],
+                    from_use_keyring,
+                    to_use_keyring,
+                ))
+            },
+            |_| {
+                events.borrow_mut().push("save-config");
+                Ok(())
+            },
+            |_| panic!("a committed migration must not roll back"),
+            |_| {
+                events.borrow_mut().push("cleanup-source");
+                Ok(2)
+            },
+            || {
+                events.borrow_mut().push("unlink-committed-fsync-failed");
+                anyhow::bail!("journal unlink parent fsync failed")
+            },
+            || {
+                events.borrow_mut().push("mark-recovery-blocked");
+                Ok(())
+            },
+        );
+
+        assert!(result.applied);
+        assert!(result.storage_mode_changed);
+        assert!(result.recovery_pending);
+        assert!(!settings_worker_sync_allowed(
+            result.applied,
+            result.recovery_pending
+        ));
+        assert!(result.status.contains("auto-login remains blocked"));
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "journal",
+                "migrate",
+                "save-config",
+                "cleanup-source",
+                "unlink-committed-fsync-failed",
+                "mark-recovery-blocked"
             ]
         );
     }
@@ -655,6 +878,7 @@ mod tests {
                 events.borrow_mut().push("journal_clear".to_string());
                 Ok(())
             },
+            || Ok(()),
         );
 
         assert!(!result.applied);
@@ -722,6 +946,7 @@ mod tests {
                 Ok(1)
             },
             || panic!("journal must remain pending when migration recovery is required"),
+            || Ok(()),
         );
 
         assert!(!result.applied);
@@ -784,6 +1009,7 @@ mod tests {
                     .push("commit_source_cleanup".to_string());
                 Ok(1)
             },
+            || Ok(()),
             || Ok(()),
         );
 
@@ -853,6 +1079,7 @@ mod tests {
                 events.borrow_mut().push("journal_clear".to_string());
                 Ok(())
             },
+            || Ok(()),
         );
 
         assert!(result.applied);

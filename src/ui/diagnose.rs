@@ -358,6 +358,7 @@ pub(crate) fn start_runtime_status(app: &mut AutoLoginApp) {
 mod tests {
     use super::poll_runtime_status;
     use crate::app::AutoLoginApp;
+    use crate::background::WorkerInvalidator;
     use crate::models::{AppConfig, Tab};
     use std::sync::mpsc::channel as std_channel;
     use tokio::sync::mpsc::channel as tokio_channel;
@@ -369,6 +370,7 @@ mod tests {
         let (_tray_tx, tray_rx) = std_channel();
         let mut app = AutoLoginApp::new(
             worker_tx,
+            WorkerInvalidator::new().pause_latch(),
             tray_rx,
             worker_event_rx,
             AppConfig::default(),

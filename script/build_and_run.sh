@@ -13,7 +13,6 @@ BUNDLE_DIR="$ROOT_DIR/dist/$APP_NAME.app"
 CONTENTS_DIR="$BUNDLE_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 APP_EXECUTABLE="$MACOS_DIR/$BINARY_NAME"
-TARGET_EXECUTABLE="$ROOT_DIR/target/release/$BINARY_NAME"
 DEFAULT_RUNTIME_ROOT="${HOME:-/tmp}/Library/Application Support/WindowsAppAutoLogin/Runtime"
 LOCK_ROOT="${WAAL_RUNTIME_ROOT:-$DEFAULT_RUNTIME_ROOT}"
 LOCK_DIR="$LOCK_ROOT/WindowsAppAutoLogin.lock"
@@ -33,6 +32,12 @@ for arg in "$@"; do
     *) echo "Unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+
+if [ "$DEV_UI" = true ]; then
+  TARGET_EXECUTABLE="$ROOT_DIR/target/debug/$BINARY_NAME"
+else
+  TARGET_EXECUTABLE="$ROOT_DIR/target/release/$BINARY_NAME"
+fi
 
 app_pids() {
   ps -axo pid=,command= | awk \
@@ -130,7 +135,7 @@ if [ "$DEV_UI" = true ]; then
     WAAL_DEVELOPMENT_RELEASE=1 \
     WAAL_EMBED_DEVELOPMENT_MACOS_BUNDLE_PATH=1 \
     WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH="$BUNDLE_DIR" \
-    cargo build --release --features dev-tools --bin "$BINARY_NAME"
+    cargo build --features dev-tools --bin "$BINARY_NAME"
 else
   env \
     -u WAAL_RELEASE_BUNDLE_ID \
@@ -169,9 +174,13 @@ if [ -x "$LSREGISTER" ]; then
   "$LSREGISTER" -f "$BUNDLE_DIR" >/dev/null 2>&1 || true
 fi
 
+/usr/bin/open -n "$BUNDLE_DIR"
 if [ "$FULL_UI" = true ]; then
-  /usr/bin/open -n "$BUNDLE_DIR" --args --full-ui
-else
+  # A full-UI process is authorized only when the running supervisor quiesces
+  # the worker, establishes a settings lease, spawns the child, and confirms
+  # that exact child PID over authenticated local IPC. Start the supervisor
+  # first, then use a second normal launch as the activation request.
+  wait_for_monitor_status
   /usr/bin/open -n "$BUNDLE_DIR"
 fi
 

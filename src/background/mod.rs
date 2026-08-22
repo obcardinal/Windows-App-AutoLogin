@@ -4,6 +4,7 @@ use crate::models::{Account, AppSettings, LogEntry, LogLevel, WorkerStatus};
 use crate::monitor::{AppMonitor, MonitorObservation, MonitorStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender as StdSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -14,11 +15,28 @@ use tracing::{debug, info, trace, warn};
 pub(crate) enum WorkerCommand {
     Start,
     Stop,
+    Quiesce {
+        request_id: u64,
+        acknowledgement: StdSender<WorkerQuiescenceAck>,
+    },
+    #[cfg(test)]
     ApplyConfig {
         settings: AppSettings,
         accounts: Vec<Account>,
         refresh_passwords: bool,
     },
+    ApplyConfigAndReleasePause {
+        settings: AppSettings,
+        accounts: Vec<Account>,
+        refresh_passwords: bool,
+        start_monitor: bool,
+        pause_epoch: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerQuiescenceAck {
+    pub(crate) request_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +61,120 @@ impl WorkerInvalidator {
     pub(crate) fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
+
+    pub(crate) fn pause_latch(&self) -> WorkerPauseLatch {
+        WorkerPauseLatch {
+            paused: Arc::new(AtomicBool::new(false)),
+            generation: self.generation.clone(),
+            pause_epoch: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkerPauseLatch {
+    paused: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    pause_epoch: Arc<Mutex<u64>>,
+}
+
+impl WorkerPauseLatch {
+    pub(crate) fn pause(&self) {
+        self.pause_with_epoch();
+    }
+
+    pub(crate) fn pause_with_epoch(&self) -> u64 {
+        let mut pause_epoch = self
+            .pause_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pause_epoch = pause_epoch.saturating_add(1);
+        // Close the start gate before publishing the cancellation generation.
+        // Stable admission snapshots and every automation guard check both
+        // values, so a post-pause generation can never be mistaken for a fresh
+        // unpaused attempt generation.
+        self.paused.store(true, Ordering::SeqCst);
+        // Every pause creates a new epoch and immediately cancels any password
+        // load or UI automation. A queued release from an older epoch cannot
+        // reopen the latch after a newer safety event.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *pause_epoch
+    }
+
+    pub(crate) fn current_epoch(&self) -> u64 {
+        *self
+            .pause_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn resume_if_epoch(&self, expected_epoch: u64) -> bool {
+        let pause_epoch = self
+            .pause_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *pause_epoch != expected_epoch {
+            return false;
+        }
+        self.paused.store(false, Ordering::SeqCst);
+        true
+    }
+
+    pub(crate) fn apply_config_command(
+        &self,
+        pause_epoch: u64,
+        settings: AppSettings,
+        accounts: Vec<Account>,
+        refresh_passwords: bool,
+        start_monitor: bool,
+    ) -> WorkerCommand {
+        WorkerCommand::ApplyConfigAndReleasePause {
+            settings,
+            accounts,
+            refresh_passwords,
+            start_monitor,
+            pause_epoch,
+        }
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    fn stable_unpaused_generation(&self) -> Option<u64> {
+        if self.is_paused() {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::SeqCst);
+        if self.is_paused() {
+            return None;
+        }
+        let confirmed_generation = self.generation.load(Ordering::SeqCst);
+        // pause_with_epoch publishes `paused = true` before advancing the
+        // generation. Rechecking the latch after the snapshot rejects both a
+        // completed pause and one racing this admission read. Requiring two
+        // equal generation reads also rejects an independent invalidation.
+        (!self.is_paused() && generation == confirmed_generation).then_some(generation)
+    }
+
+    fn ensure_attempt_current(
+        &self,
+        expected_generation: u64,
+        reason: &'static str,
+    ) -> anyhow::Result<()> {
+        if self.is_paused() {
+            anyhow::bail!(reason);
+        }
+        ensure_generation_current(&self.generation, expected_generation, reason)?;
+        if self.is_paused() {
+            anyhow::bail!(reason);
+        }
+        ensure_generation_current(&self.generation, expected_generation, reason)?;
+        if self.is_paused() {
+            anyhow::bail!(reason);
+        }
+        Ok(())
+    }
 }
 
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
@@ -56,6 +188,119 @@ const PRE_PASSWORD_REPORT_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 6
 
 struct FlagGuard {
     flag: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct WorkerActivityTracker {
+    state: Arc<Mutex<WorkerActivityState>>,
+}
+
+struct WorkerActivityState {
+    accepting_attempts: bool,
+    active_attempts: usize,
+    quiescence_waiters: Vec<WorkerQuiescenceWaiter>,
+}
+
+struct WorkerQuiescenceWaiter {
+    request_id: u64,
+    acknowledgement: StdSender<WorkerQuiescenceAck>,
+}
+
+struct WorkerActivityGuard {
+    tracker: WorkerActivityTracker,
+}
+
+impl Default for WorkerActivityTracker {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WorkerActivityState {
+                accepting_attempts: true,
+                active_attempts: 0,
+                quiescence_waiters: Vec::new(),
+            })),
+        }
+    }
+}
+
+impl WorkerActivityTracker {
+    fn begin_attempt(&self) -> Option<WorkerActivityGuard> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if !state.accepting_attempts {
+            return None;
+        }
+        state.active_attempts = state.active_attempts.checked_add(1)?;
+        Some(WorkerActivityGuard {
+            tracker: self.clone(),
+        })
+    }
+
+    fn acknowledge_when_quiescent(
+        &self,
+        request_id: u64,
+        acknowledgement: StdSender<WorkerQuiescenceAck>,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            warn!(
+                request_id,
+                "Worker activity state is unavailable; quiescence will not be acknowledged"
+            );
+            return;
+        };
+        // Closing the gate and observing the activity count under one mutex is
+        // the linearization point: no attempt can register after this request
+        // and escape the acknowledgement barrier.
+        state.accepting_attempts = false;
+        if state.active_attempts == 0 {
+            drop(state);
+            let _ = acknowledgement.send(WorkerQuiescenceAck { request_id });
+            return;
+        }
+        state.quiescence_waiters.push(WorkerQuiescenceWaiter {
+            request_id,
+            acknowledgement,
+        });
+    }
+
+    fn reopen_after_fresh_release(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.active_attempts != 0 || !state.quiescence_waiters.is_empty() {
+            return false;
+        }
+        state.accepting_attempts = true;
+        true
+    }
+}
+
+impl Drop for WorkerActivityGuard {
+    fn drop(&mut self) {
+        let waiters = {
+            let Ok(mut state) = self.tracker.state.lock() else {
+                warn!("Worker activity state is unavailable; quiescence will not be acknowledged");
+                return;
+            };
+            let Some(remaining) = state.active_attempts.checked_sub(1) else {
+                warn!(
+                    "Worker activity accounting underflowed; quiescence will not be acknowledged"
+                );
+                return;
+            };
+            state.active_attempts = remaining;
+            if remaining == 0 {
+                std::mem::take(&mut state.quiescence_waiters)
+            } else {
+                Vec::new()
+            }
+        };
+        for waiter in waiters {
+            let _ = waiter.acknowledgement.send(WorkerQuiescenceAck {
+                request_id: waiter.request_id,
+            });
+        }
+    }
 }
 
 impl FlagGuard {
@@ -118,10 +363,11 @@ struct CurrentPromptAttempt {
     accounts: Vec<Account>,
     event_tx: Sender<WorkerEvent>,
     automation_in_progress: Arc<AtomicBool>,
-    generation: Arc<AtomicU64>,
+    pause_latch: WorkerPauseLatch,
     expected_generation: u64,
     prompt_context: Option<debug_fill::VerifiedPromptContext>,
     prompt_retry_suppression: Option<PromptRetrySuppression>,
+    activity_tracker: WorkerActivityTracker,
 }
 
 struct PromptRetrySuppression {
@@ -456,6 +702,7 @@ fn monitor_prompt_fields(
     fields
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd: WorkerCommand,
     event_tx: &Sender<WorkerEvent>,
@@ -463,9 +710,16 @@ async fn handle_command(
     settings: &mut AppSettings,
     accounts: &mut Vec<Account>,
     generation: &Arc<AtomicU64>,
+    pause_latch: &WorkerPauseLatch,
+    activity_tracker: &WorkerActivityTracker,
 ) {
     match cmd {
         WorkerCommand::Start => {
+            if pause_latch.is_paused() {
+                enforce_pause(event_tx, running, generation).await;
+                warn!("Background worker start ignored while automation pause latch is active");
+                return;
+            }
             if *running {
                 return;
             }
@@ -487,33 +741,121 @@ async fn handle_command(
                 .await;
             info!("Background worker stopped");
         }
+        WorkerCommand::Quiesce {
+            request_id,
+            acknowledgement,
+        } => {
+            activity_tracker.acknowledge_when_quiescent(request_id, acknowledgement);
+        }
+        #[cfg(test)]
         WorkerCommand::ApplyConfig {
             settings: next_settings,
             accounts: next_accounts,
             refresh_passwords,
         } => {
-            let settings_changed = *settings != next_settings;
-            let accounts_changed = *accounts != next_accounts;
-            if settings_changed {
-                *settings = next_settings;
+            apply_config(
+                settings,
+                accounts,
+                generation,
+                next_settings,
+                next_accounts,
+                refresh_passwords,
+            );
+        }
+        WorkerCommand::ApplyConfigAndReleasePause {
+            settings: next_settings,
+            accounts: next_accounts,
+            refresh_passwords,
+            start_monitor,
+            pause_epoch,
+        } => {
+            if pause_latch.current_epoch() != pause_epoch {
+                warn!("Stale worker config and pause release ignored after a newer safety event");
+                return;
             }
-            if accounts_changed {
-                *accounts = next_accounts;
-            }
-            if settings_changed || accounts_changed || refresh_passwords {
+            apply_config(
+                settings,
+                accounts,
+                generation,
+                next_settings,
+                next_accounts,
+                refresh_passwords,
+            );
+            if !start_monitor && *running {
+                *running = false;
                 generation.fetch_add(1, Ordering::SeqCst);
-                info!(
-                    "Worker config applied: settings_changed={} accounts_changed={} account(s)={} refresh_passwords={}",
-                    settings_changed,
-                    accounts_changed,
-                    accounts.len(),
-                    refresh_passwords
-                );
+                let _ = event_tx
+                    .send(WorkerEvent::StatusChanged(WorkerStatus::Idle))
+                    .await;
+                info!("Background worker stopped by atomic config apply");
+            }
+            if !pause_latch.resume_if_epoch(pause_epoch) {
+                warn!("Stale worker pause release ignored after a newer safety event");
+                return;
+            }
+            if !activity_tracker.reopen_after_fresh_release() {
+                pause_latch.pause();
+                warn!("Worker activity gate could not be reopened safely; pause remains active");
+                return;
+            }
+            info!("Background worker pause released after fresh config was applied");
+            if start_monitor && !*running {
+                *running = true;
+                generation.fetch_add(1, Ordering::SeqCst);
+                let _ = event_tx
+                    .send(WorkerEvent::StatusChanged(WorkerStatus::Running))
+                    .await;
+                info!("Background worker resumed after fresh config was applied");
             }
         }
     }
 }
 
+fn apply_config(
+    settings: &mut AppSettings,
+    accounts: &mut Vec<Account>,
+    generation: &Arc<AtomicU64>,
+    next_settings: AppSettings,
+    next_accounts: Vec<Account>,
+    refresh_passwords: bool,
+) {
+    let settings_changed = *settings != next_settings;
+    let accounts_changed = *accounts != next_accounts;
+    if settings_changed {
+        *settings = next_settings;
+    }
+    if accounts_changed {
+        *accounts = next_accounts;
+    }
+    if settings_changed || accounts_changed || refresh_passwords {
+        generation.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "Worker config applied: settings_changed={} accounts_changed={} account(s)={} refresh_passwords={}",
+            settings_changed,
+            accounts_changed,
+            accounts.len(),
+            refresh_passwords
+        );
+    }
+}
+
+async fn enforce_pause(
+    event_tx: &Sender<WorkerEvent>,
+    running: &mut bool,
+    generation: &Arc<AtomicU64>,
+) {
+    if !*running {
+        return;
+    }
+    *running = false;
+    generation.fetch_add(1, Ordering::SeqCst);
+    let _ = event_tx
+        .send(WorkerEvent::StatusChanged(WorkerStatus::Idle))
+        .await;
+    info!("Background worker paused by supervisor latch");
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drain_commands(
     cmd_rx: &mut Receiver<WorkerCommand>,
     event_tx: &Sender<WorkerEvent>,
@@ -521,9 +863,21 @@ async fn drain_commands(
     settings: &mut AppSettings,
     accounts: &mut Vec<Account>,
     generation: &Arc<AtomicU64>,
+    pause_latch: &WorkerPauseLatch,
+    activity_tracker: &WorkerActivityTracker,
 ) {
     while let Ok(cmd) = cmd_rx.try_recv() {
-        handle_command(cmd, event_tx, running, settings, accounts, generation).await;
+        handle_command(
+            cmd,
+            event_tx,
+            running,
+            settings,
+            accounts,
+            generation,
+            pause_latch,
+            activity_tracker,
+        )
+        .await;
     }
 }
 
@@ -536,6 +890,8 @@ async fn wait_or_handle_command(
     settings: &mut AppSettings,
     accounts: &mut Vec<Account>,
     generation: &Arc<AtomicU64>,
+    pause_latch: &WorkerPauseLatch,
+    activity_tracker: &WorkerActivityTracker,
 ) -> bool {
     tokio::select! {
         _ = sleep(duration) => true,
@@ -543,7 +899,17 @@ async fn wait_or_handle_command(
             let Some(cmd) = maybe_cmd else {
                 return false;
             };
-            handle_command(cmd, event_tx, running, settings, accounts, generation).await;
+            handle_command(
+                cmd,
+                event_tx,
+                running,
+                settings,
+                accounts,
+                generation,
+                pause_latch,
+                activity_tracker,
+            )
+            .await;
             drain_commands(
                 cmd_rx,
                 event_tx,
@@ -551,6 +917,8 @@ async fn wait_or_handle_command(
                 settings,
                 accounts,
                 generation,
+                pause_latch,
+                activity_tracker,
             )
             .await;
             true
@@ -559,6 +927,14 @@ async fn wait_or_handle_command(
 }
 
 fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
+    if job
+        .pause_latch
+        .ensure_attempt_current(job.expected_generation, "worker paused or config changed")
+        .is_err()
+    {
+        debug!("Fill current prompt skipped; worker is paused or config changed");
+        return false;
+    }
     let Some(automation_guard) = FlagGuard::acquire(&job.automation_in_progress) else {
         debug!("Fill current prompt skipped; UI automation is busy");
         let _ = job.event_tx.try_send(log_event(
@@ -567,6 +943,29 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
         ));
         return false;
     };
+    let Some(activity_guard) = job.activity_tracker.begin_attempt() else {
+        warn!("Fill current prompt skipped; worker activity gate is closed or unavailable");
+        let _ = job.event_tx.try_send(log_event(
+            LogLevel::Warn,
+            format!(
+                "{} skipped: worker activity gate is closed or unavailable",
+                job.trigger.label()
+            ),
+        ));
+        return false;
+    };
+
+    // Recheck after both admission locks and immediately before reserving the
+    // prompt identity. A pause already published while admission was waiting
+    // must neither start automation nor consume this prompt's retry episode.
+    if job
+        .pause_latch
+        .ensure_attempt_current(job.expected_generation, "worker paused or config changed")
+        .is_err()
+    {
+        debug!("Fill current prompt skipped; worker paused during attempt admission");
+        return false;
+    }
 
     // Reserve the stable prompt identity before the worker thread starts. A
     // crash, cancellation, rejected credential, or storage failure must not
@@ -584,50 +983,52 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
     }
 
     std::thread::spawn(move || {
-        let CurrentPromptAttempt {
-            trigger,
-            settings,
-            accounts,
-            event_tx,
-            generation,
-            expected_generation,
-            prompt_context,
-            prompt_retry_suppression: _,
-            ..
-        } = job;
-        let _automation_guard = automation_guard;
-        let guard_generation = generation.clone();
-        let report = debug_fill::fill_current_prompt_once_guarded_with_context(
-            &settings,
-            &accounts,
-            FillMethod::Keyboard,
-            prompt_context,
-            || {
-                ensure_generation_current(
-                    &guard_generation,
-                    expected_generation,
-                    "accounts/settings changed",
-                )
-            },
-        );
-        if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
-            warn!("Could not persist fill attempt report: {e}");
+        // This outer guard drops only after every password, storage, UI, report,
+        // and event-send local in the inner scope has been destroyed.
+        let _activity_guard = activity_guard;
+        {
+            let CurrentPromptAttempt {
+                trigger,
+                settings,
+                accounts,
+                event_tx,
+                pause_latch,
+                expected_generation,
+                prompt_context,
+                prompt_retry_suppression: _,
+                activity_tracker: _,
+                ..
+            } = job;
+            let _automation_guard = automation_guard;
+            let report = debug_fill::fill_current_prompt_once_guarded_with_context(
+                &settings,
+                &accounts,
+                FillMethod::Keyboard,
+                prompt_context,
+                || {
+                    pause_latch
+                        .ensure_attempt_current(expected_generation, "accounts/settings changed")
+                },
+            );
+            if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
+                warn!("Could not persist fill attempt report: {e}");
+            }
+            let level = if report.success {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            };
+            let should_log = report.success
+                || report.field("prompt_detected") == Some("true")
+                || report.field("prompt_context_present") == Some("true");
+            if should_log {
+                let _ = event_tx.try_send(log_event(
+                    level,
+                    format!("{}: {}", trigger.label(), report.summary_line()),
+                ));
+            }
+            let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
         }
-        let level = if report.success {
-            LogLevel::Info
-        } else {
-            LogLevel::Warn
-        };
-        let should_log = report.success
-            || report.field("prompt_detected") == Some("true")
-            || report.field("prompt_context_present") == Some("true");
-        if should_log {
-            let _ = event_tx.try_send(log_event(
-                level,
-                format!("{}: {}", trigger.label(), report.summary_line()),
-            ));
-        }
-        let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
     });
     true
 }
@@ -638,6 +1039,7 @@ pub(crate) fn spawn(
     initial_settings: AppSettings,
     initial_accounts: Vec<Account>,
     invalidator: WorkerInvalidator,
+    pause_latch: WorkerPauseLatch,
 ) {
     tokio::spawn(async move {
         let mut settings = initial_settings;
@@ -646,6 +1048,7 @@ pub(crate) fn spawn(
         let recent_prompt_attempts =
             Arc::new(Mutex::new(HashMap::<LoginPromptKey, Instant>::new()));
         let automation_in_progress = Arc::new(AtomicBool::new(false));
+        let activity_tracker = WorkerActivityTracker::default();
         let generation = invalidator.generation;
         #[cfg(target_os = "macos")]
         let mut last_macos_prompt_probe: Option<Instant> = None;
@@ -662,8 +1065,14 @@ pub(crate) fn spawn(
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch,
+                &activity_tracker,
             )
             .await;
+
+            if pause_latch.is_paused() {
+                enforce_pause(&event_tx, &mut running, &generation).await;
+            }
 
             if !running {
                 no_prompt_tracker.consecutive_polls = 0;
@@ -676,6 +1085,8 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
+                    &pause_latch,
+                    &activity_tracker,
                 )
                 .await
                 {
@@ -684,7 +1095,10 @@ pub(crate) fn spawn(
                 continue;
             }
 
-            let current_generation = generation.load(Ordering::SeqCst);
+            let Some(current_generation) = pause_latch.stable_unpaused_generation() else {
+                enforce_pause(&event_tx, &mut running, &generation).await;
+                continue;
+            };
             if current_generation != pre_password_generation {
                 no_prompt_tracker.consecutive_polls = 0;
                 pre_password_report_persistence.reset_observed_state();
@@ -701,6 +1115,8 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
+                    &pause_latch,
+                    &activity_tracker,
                 )
                 .await
                 {
@@ -723,6 +1139,8 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
+                    &pause_latch,
+                    &activity_tracker,
                 )
                 .await
                 {
@@ -852,13 +1270,14 @@ pub(crate) fn spawn(
                                     accounts: accounts.clone(),
                                     event_tx: event_tx.clone(),
                                     automation_in_progress: automation_in_progress.clone(),
-                                    generation: generation.clone(),
+                                    pause_latch: pause_latch.clone(),
                                     expected_generation: current_generation,
                                     prompt_context: Some(prompt_context),
                                     prompt_retry_suppression: Some(PromptRetrySuppression {
                                         recent_prompt_attempts: recent_prompt_attempts.clone(),
                                         prompt_key,
                                     }),
+                                    activity_tracker: activity_tracker.clone(),
                                 });
                                 if started {
                                     #[cfg(target_os = "macos")]
@@ -932,13 +1351,9 @@ pub(crate) fn spawn(
                 {
                     let now = Instant::now();
                     last_macos_prompt_probe = Some(now);
-                    let detect_generation = generation.clone();
                     match debug_fill::detect_current_prompt_context(&accounts, || {
-                        ensure_generation_current(
-                            &detect_generation,
-                            current_generation,
-                            "accounts/settings changed",
-                        )
+                        pause_latch
+                            .ensure_attempt_current(current_generation, "accounts/settings changed")
                     }) {
                         Ok(Some(prompt_context)) => {
                             prompt_observed_this_tick = true;
@@ -979,13 +1394,14 @@ pub(crate) fn spawn(
                                     accounts: accounts.clone(),
                                     event_tx: event_tx.clone(),
                                     automation_in_progress: automation_in_progress.clone(),
-                                    generation: generation.clone(),
+                                    pause_latch: pause_latch.clone(),
                                     expected_generation: current_generation,
                                     prompt_context: Some(prompt_context),
                                     prompt_retry_suppression: Some(PromptRetrySuppression {
                                         recent_prompt_attempts: recent_prompt_attempts.clone(),
                                         prompt_key,
                                     }),
+                                    activity_tracker: activity_tracker.clone(),
                                 });
                                 if started {
                                     if !wait_or_handle_command(
@@ -996,6 +1412,8 @@ pub(crate) fn spawn(
                                         &mut settings,
                                         &mut accounts,
                                         &generation,
+                                        &pause_latch,
+                                        &activity_tracker,
                                     )
                                     .await
                                     {
@@ -1046,6 +1464,8 @@ pub(crate) fn spawn(
                     &mut settings,
                     &mut accounts,
                     &generation,
+                    &pause_latch,
+                    &activity_tracker,
                 )
                 .await
                 {
@@ -1062,6 +1482,8 @@ pub(crate) fn spawn(
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch,
+                &activity_tracker,
             )
             .await
             {
@@ -1078,17 +1500,25 @@ mod tests {
         prompt_account_decision_allows_macos_probe, prompt_retry_is_suppressed,
         reserve_prompt_retry_suppression, wait_or_handle_command, DefinitiveNoPromptTracker,
         LoginPromptKey, MonitorStatus, PollCadence, PrePasswordReportPersistence,
-        PromptAccountDecision, PromptRetrySuppression, WorkerCommand, WorkerEvent,
+        PromptAccountDecision, PromptRetrySuppression, WorkerActivityTracker, WorkerCommand,
+        WorkerEvent, WorkerInvalidator, WorkerPauseLatch, WorkerQuiescenceAck,
         MACOS_FALLBACK_PROMPT_PROBE_INTERVAL, PRE_PASSWORD_REPORT_PERSIST_INTERVAL,
         PROMPT_STATUS_POLL_INTERVAL,
     };
     use crate::debug_fill;
     use crate::models::{Account, AppSettings, WorkerStatus};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    fn pause_latch_for_generation(generation: &Arc<AtomicU64>) -> WorkerPauseLatch {
+        WorkerInvalidator {
+            generation: generation.clone(),
+        }
+        .pause_latch()
+    }
 
     #[test]
     fn poll_cadence_backs_off_for_stable_statuses_but_keeps_prompts_fast() {
@@ -1496,6 +1926,209 @@ mod tests {
         assert_eq!(error.to_string(), "cancelled");
     }
 
+    #[test]
+    fn post_pause_generation_is_never_an_unpaused_attempt_generation() {
+        let generation = Arc::new(AtomicU64::new(7));
+        let pause_latch = pause_latch_for_generation(&generation);
+
+        assert_eq!(pause_latch.stable_unpaused_generation(), Some(7));
+        // Reproduce the original interleaving deterministically: the worker
+        // observed an unpaused latch, pause then published a new generation,
+        // and the worker captured that post-pause value.
+        assert!(!pause_latch.is_paused());
+        pause_latch.pause();
+        let post_pause_generation = generation.load(Ordering::SeqCst);
+        assert!(ensure_generation_current(&generation, post_pause_generation, "cancelled").is_ok());
+
+        assert_eq!(pause_latch.stable_unpaused_generation(), None);
+        assert!(pause_latch
+            .ensure_attempt_current(post_pause_generation, "cancelled")
+            .is_err());
+    }
+
+    #[test]
+    fn post_pause_generation_cannot_admit_or_reserve_a_prompt_attempt() {
+        let generation = Arc::new(AtomicU64::new(11));
+        let pause_latch = pause_latch_for_generation(&generation);
+        pause_latch.pause();
+        let post_pause_generation = generation.load(Ordering::SeqCst);
+        let prompt_key = LoginPromptKey::new(
+            "account-1".to_string(),
+            42,
+            0,
+            "Sign in".to_string(),
+            "user@example.com".to_string(),
+            "sheet".to_string(),
+        );
+        let recent_prompt_attempts = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::channel(1);
+
+        let started = super::spawn_current_prompt_attempt(super::CurrentPromptAttempt {
+            trigger: super::FillTrigger::Automatic,
+            settings: AppSettings::default(),
+            accounts: Vec::new(),
+            event_tx,
+            automation_in_progress: Arc::new(AtomicBool::new(false)),
+            pause_latch,
+            expected_generation: post_pause_generation,
+            prompt_context: None,
+            prompt_retry_suppression: Some(PromptRetrySuppression {
+                recent_prompt_attempts: recent_prompt_attempts.clone(),
+                prompt_key,
+            }),
+            activity_tracker: WorkerActivityTracker::default(),
+        });
+
+        assert!(!started);
+        assert!(recent_prompt_attempts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quiesce_command_withholds_ack_until_active_attempt_finishes() {
+        let tracker = WorkerActivityTracker::default();
+        let activity = tracker.begin_attempt().unwrap();
+        let (acknowledgement, receiver) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = Arc::new(AtomicU64::new(1));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let mut running = false;
+        let mut settings = AppSettings::default();
+        let mut accounts = Vec::new();
+
+        handle_command(
+            WorkerCommand::Quiesce {
+                request_id: 41,
+                acknowledgement,
+            },
+            &event_tx,
+            &mut running,
+            &mut settings,
+            &mut accounts,
+            &generation,
+            &pause_latch,
+            &tracker,
+        )
+        .await;
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(tracker.begin_attempt().is_none());
+        drop(activity);
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerQuiescenceAck { request_id: 41 }
+        );
+    }
+
+    #[test]
+    fn quiescence_ack_waits_for_final_activity_guard() {
+        let tracker = WorkerActivityTracker::default();
+        let first = tracker.begin_attempt().unwrap();
+        let second = tracker.begin_attempt().unwrap();
+        let (acknowledgement, receiver) = std::sync::mpsc::channel();
+
+        tracker.acknowledge_when_quiescent(73, acknowledgement);
+        drop(first);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(second);
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerQuiescenceAck { request_id: 73 }
+        );
+    }
+
+    #[test]
+    fn immediate_quiescence_ack_closes_registration_gate() {
+        let tracker = WorkerActivityTracker::default();
+        let (acknowledgement, receiver) = std::sync::mpsc::channel();
+
+        tracker.acknowledge_when_quiescent(91, acknowledgement);
+
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerQuiescenceAck { request_id: 91 }
+        );
+        assert!(tracker.begin_attempt().is_none());
+    }
+
+    #[tokio::test]
+    async fn only_fresh_pause_release_reopens_quiesced_registration_gate() {
+        let tracker = WorkerActivityTracker::default();
+        let (acknowledgement, receiver) = std::sync::mpsc::channel();
+        tracker.acknowledge_when_quiescent(101, acknowledgement);
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerQuiescenceAck { request_id: 101 }
+        );
+        assert!(tracker.begin_attempt().is_none());
+
+        let (event_tx, _event_rx) = mpsc::channel::<WorkerEvent>(2);
+        let generation = Arc::new(AtomicU64::new(5));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let fresh_epoch = pause_latch.pause_with_epoch();
+        let mut running = false;
+        let mut settings = AppSettings::default();
+        let mut accounts = Vec::new();
+        handle_command(
+            WorkerCommand::ApplyConfigAndReleasePause {
+                settings: settings.clone(),
+                accounts: accounts.clone(),
+                refresh_passwords: false,
+                start_monitor: false,
+                pause_epoch: fresh_epoch,
+            },
+            &event_tx,
+            &mut running,
+            &mut settings,
+            &mut accounts,
+            &generation,
+            &pause_latch,
+            &tracker,
+        )
+        .await;
+        drop(
+            tracker
+                .begin_attempt()
+                .expect("fresh release must reopen gate"),
+        );
+
+        let (acknowledgement, receiver) = std::sync::mpsc::channel();
+        tracker.acknowledge_when_quiescent(102, acknowledgement);
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerQuiescenceAck { request_id: 102 }
+        );
+        let stale_epoch = pause_latch.pause_with_epoch();
+        let newer_epoch = pause_latch.pause_with_epoch();
+        assert!(newer_epoch > stale_epoch);
+        handle_command(
+            WorkerCommand::ApplyConfigAndReleasePause {
+                settings: settings.clone(),
+                accounts: accounts.clone(),
+                refresh_passwords: false,
+                start_monitor: true,
+                pause_epoch: stale_epoch,
+            },
+            &event_tx,
+            &mut running,
+            &mut settings,
+            &mut accounts,
+            &generation,
+            &pause_latch,
+            &tracker,
+        )
+        .await;
+
+        assert!(pause_latch.is_paused());
+        assert!(tracker.begin_attempt().is_none());
+        assert!(!running);
+    }
+
     #[tokio::test]
     async fn apply_config_change_advances_generation_so_in_flight_attempts_cancel() {
         let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
@@ -1518,6 +2151,8 @@ mod tests {
             &mut settings,
             &mut accounts,
             &generation,
+            &pause_latch_for_generation(&generation),
+            &WorkerActivityTracker::default(),
         )
         .await;
 
@@ -1550,6 +2185,8 @@ mod tests {
             &mut settings,
             &mut accounts,
             &generation,
+            &pause_latch_for_generation(&generation),
+            &WorkerActivityTracker::default(),
         )
         .await;
 
@@ -1560,6 +2197,180 @@ mod tests {
             "Login attempt cancelled because credentials changed",
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn pause_latch_neutralizes_start_from_a_full_command_queue() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(2);
+        let generation = Arc::new(AtomicU64::new(17));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let mut running = false;
+        let mut settings = AppSettings::default();
+        let mut accounts = vec![account("account-1", "user@example.com", true)];
+
+        cmd_tx.try_send(WorkerCommand::Start).unwrap();
+        assert_eq!(cmd_tx.capacity(), 0);
+        pause_latch.pause();
+
+        assert!(
+            wait_or_handle_command(
+                Duration::from_secs(60),
+                &mut cmd_rx,
+                &event_tx,
+                &mut running,
+                &mut settings,
+                &mut accounts,
+                &generation,
+                &pause_latch,
+                &WorkerActivityTracker::default(),
+            )
+            .await
+        );
+
+        assert!(!running);
+        assert_eq!(generation.load(Ordering::SeqCst), 18);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pause_latch_forces_stale_running_worker_idle_without_stop_command() {
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = Arc::new(AtomicU64::new(23));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let mut running = true;
+
+        pause_latch.pause();
+        if pause_latch.is_paused() {
+            super::enforce_pause(&event_tx, &mut running, &generation).await;
+        }
+
+        assert!(!running);
+        assert_eq!(generation.load(Ordering::SeqCst), 25);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(WorkerEvent::StatusChanged(WorkerStatus::Idle))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_config_release_and_monitor_resume_are_one_atomic_command() {
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = Arc::new(AtomicU64::new(29));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let pause_epoch = pause_latch.pause_with_epoch();
+        let mut running = false;
+        let mut settings = AppSettings::default();
+        let mut accounts = Vec::new();
+        let mut next_settings = settings.clone();
+        next_settings.use_keyring = false;
+        let next_accounts = vec![account("account-1", "user@example.com", true)];
+
+        handle_command(
+            WorkerCommand::ApplyConfigAndReleasePause {
+                settings: next_settings.clone(),
+                accounts: next_accounts.clone(),
+                refresh_passwords: true,
+                start_monitor: true,
+                pause_epoch,
+            },
+            &event_tx,
+            &mut running,
+            &mut settings,
+            &mut accounts,
+            &generation,
+            &pause_latch,
+            &WorkerActivityTracker::default(),
+        )
+        .await;
+
+        assert_eq!(settings, next_settings);
+        assert_eq!(accounts, next_accounts);
+        assert!(!pause_latch.is_paused());
+        assert!(running);
+        assert_eq!(generation.load(Ordering::SeqCst), 32);
+        assert_eq!(pause_latch.stable_unpaused_generation(), Some(32));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(WorkerEvent::StatusChanged(WorkerStatus::Running))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_config_release_with_stop_intent_forces_stale_running_worker_idle() {
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = Arc::new(AtomicU64::new(31));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let pause_epoch = pause_latch.pause_with_epoch();
+        let mut running = true;
+        let mut settings = AppSettings::default();
+        let mut accounts = Vec::new();
+
+        handle_command(
+            WorkerCommand::ApplyConfigAndReleasePause {
+                settings: settings.clone(),
+                accounts: accounts.clone(),
+                refresh_passwords: false,
+                start_monitor: false,
+                pause_epoch,
+            },
+            &event_tx,
+            &mut running,
+            &mut settings,
+            &mut accounts,
+            &generation,
+            &pause_latch,
+            &WorkerActivityTracker::default(),
+        )
+        .await;
+
+        assert!(!running);
+        assert!(!pause_latch.is_paused());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(WorkerEvent::StatusChanged(WorkerStatus::Idle))
+        ));
+    }
+
+    #[tokio::test]
+    async fn newer_pause_epoch_rejects_stale_config_release_and_start() {
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1);
+        let generation = Arc::new(AtomicU64::new(37));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let stale_epoch = pause_latch.pause_with_epoch();
+        let fresh_epoch = pause_latch.pause_with_epoch();
+        assert!(fresh_epoch > stale_epoch);
+        let mut running = false;
+        let mut settings = AppSettings::default();
+        let original_settings = settings.clone();
+        let mut accounts = Vec::new();
+        let mut stale_settings = settings.clone();
+        stale_settings.use_keyring = false;
+
+        handle_command(
+            WorkerCommand::ApplyConfigAndReleasePause {
+                settings: stale_settings,
+                accounts: vec![account("account-1", "user@example.com", true)],
+                refresh_passwords: true,
+                start_monitor: true,
+                pause_epoch: stale_epoch,
+            },
+            &event_tx,
+            &mut running,
+            &mut settings,
+            &mut accounts,
+            &generation,
+            &pause_latch,
+            &WorkerActivityTracker::default(),
+        )
+        .await;
+
+        assert_eq!(settings, original_settings);
+        assert!(accounts.is_empty());
+        assert!(pause_latch.is_paused());
+        assert!(!running);
+        assert_eq!(generation.load(Ordering::SeqCst), 39);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1587,6 +2398,8 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch_for_generation(&generation),
+                &WorkerActivityTracker::default(),
             )
             .await
         );
@@ -1625,6 +2438,8 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch_for_generation(&generation),
+                &WorkerActivityTracker::default(),
             )
             .await
         );
@@ -1675,6 +2490,8 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch_for_generation(&generation),
+                &WorkerActivityTracker::default(),
             )
             .await
         );
@@ -1724,6 +2541,8 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch_for_generation(&generation),
+                &WorkerActivityTracker::default(),
             )
             .await
         );
@@ -1777,6 +2596,8 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch_for_generation(&generation),
+                &WorkerActivityTracker::default(),
             )
             .await
         );
@@ -1838,6 +2659,8 @@ mod tests {
                 &mut settings,
                 &mut accounts,
                 &generation,
+                &pause_latch_for_generation(&generation),
+                &WorkerActivityTracker::default(),
             )
             .await
         );

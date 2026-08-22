@@ -15,6 +15,8 @@ const CONFIG_FILE_NAME: &str = "config.json";
 const PASSWORD_FILE_NAME: &str = "passwords.json";
 const PASSWORD_FILE_LOCK_NAME: &str = "passwords.lock";
 const STAGED_FALLBACK_KEYS_FILE_NAME: &str = "staged-fallback-keys.json";
+const STORAGE_RECOVERY_BLOCK_FILE_NAME: &str = "storage-recovery-blocked";
+const STORAGE_RECOVERY_BLOCK_CONTENT: &[u8] = b"windows-app-autologin-storage-recovery-block-v1\n";
 const FALLBACK_KEY_FILE_NAME: &str = "fallback.key";
 const PENDING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.json";
 const RECOVERING_STORAGE_OPERATION_FILE_NAME: &str = "pending-storage-operation.recovering.json";
@@ -68,6 +70,25 @@ impl fmt::Display for PendingStorageOperationInProgress {
 impl std::error::Error for PendingStorageOperationInProgress {}
 
 #[derive(Debug)]
+struct PendingStorageRecoveryBlocked {
+    source: anyhow::Error,
+}
+
+impl fmt::Display for PendingStorageRecoveryBlocked {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "pending password storage recovery is blocked by invalid or conflicting journals; the journals were retained for safe manual recovery",
+        )
+    }
+}
+
+impl std::error::Error for PendingStorageRecoveryBlocked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
 struct StorageModeMigrationRecoveryRequired {
     message: String,
 }
@@ -79,6 +100,55 @@ impl fmt::Display for StorageModeMigrationRecoveryRequired {
 }
 
 impl std::error::Error for StorageModeMigrationRecoveryRequired {}
+
+#[derive(Debug)]
+struct StagedFallbackKeyConflict {
+    source: Option<anyhow::Error>,
+}
+
+impl StagedFallbackKeyConflict {
+    fn new() -> Self {
+        Self { source: None }
+    }
+
+    fn with_journal_save_error(source: anyhow::Error) -> Self {
+        Self {
+            source: Some(source),
+        }
+    }
+}
+
+impl fmt::Display for StagedFallbackKeyConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "staged fallback key metadata conflicts with an active credential; restart after recovery",
+        )
+    }
+}
+
+impl std::error::Error for StagedFallbackKeyConflict {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
+}
+
+#[derive(Debug)]
+struct InvalidStagedFallbackKeyState {
+    source: anyhow::Error,
+}
+
+impl fmt::Display for InvalidStagedFallbackKeyState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("staged fallback key recovery state is invalid; restart after safe recovery")
+    }
+}
+
+impl std::error::Error for InvalidStagedFallbackKeyState {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 #[derive(Debug)]
 struct PrivateFileWriteCommitted {
@@ -139,6 +209,100 @@ pub(crate) fn is_pending_storage_operation_in_progress(error: &anyhow::Error) ->
     error
         .chain()
         .any(|cause| cause.is::<PendingStorageOperationInProgress>())
+}
+
+pub(crate) fn pending_storage_recovery_is_clear() -> anyhow::Result<bool> {
+    let pending_path = pending_storage_operation_file_path()?;
+    let recovering_path = recovering_storage_operation_file_path()?;
+    Ok(!storage_operation_file_exists(&pending_path)?
+        && !storage_operation_file_exists(&recovering_path)?)
+}
+
+/// Durably latches recovery blocking before a child process requests any IPC
+/// or other process-local stop action. Re-marking an existing valid latch is
+/// idempotent and re-syncs its parent directory.
+pub(crate) fn mark_storage_recovery_blocked() -> anyhow::Result<()> {
+    ensure_config_dir()?;
+    let path = storage_recovery_block_file_path()?;
+    mark_storage_recovery_blocked_at(&path)
+}
+
+fn mark_storage_recovery_blocked_at(path: &Path) -> anyhow::Result<()> {
+    if storage_operation_file_exists(path)? {
+        validate_private_file_for_read(path)?;
+        secure_path_permissions(path, 0o600)?;
+        return sync_parent_dir(path);
+    }
+    write_private_file_create_new_atomic(path, "block.tmp", STORAGE_RECOVERY_BLOCK_CONTENT)
+}
+
+/// Returns false for any on-disk entry, including malformed files and links;
+/// callers must fail closed on errors.
+pub(crate) fn storage_recovery_block_is_clear() -> anyhow::Result<bool> {
+    Ok(!storage_operation_file_exists(
+        &storage_recovery_block_file_path()?,
+    )?)
+}
+
+/// Fresh-supervisor startup hook. Call only after journal reconciliation has
+/// completed successfully. A running process must never use this to reopen its
+/// own sticky recovery gate.
+pub(crate) fn clear_storage_recovery_block_after_startup_recovery() -> anyhow::Result<()> {
+    let recovery_is_clear = pending_storage_recovery_is_clear()?;
+    let path = storage_recovery_block_file_path()?;
+    clear_storage_recovery_block_after_startup_recovery_with_state(
+        recovery_is_clear,
+        &path,
+        |target| std::fs::remove_file(target).map_err(anyhow::Error::from),
+        sync_parent_dir,
+    )
+}
+
+#[cfg(test)]
+fn clear_storage_recovery_block_after_startup_recovery_at(path: &Path) -> anyhow::Result<()> {
+    clear_storage_recovery_block_after_startup_recovery_with_state(
+        true,
+        path,
+        |target| std::fs::remove_file(target).map_err(anyhow::Error::from),
+        sync_parent_dir,
+    )
+}
+
+fn clear_storage_recovery_block_after_startup_recovery_with_state<R, S>(
+    recovery_is_clear: bool,
+    path: &Path,
+    remove: R,
+    sync_parent: S,
+) -> anyhow::Result<()>
+where
+    R: FnMut(&Path) -> anyhow::Result<()>,
+    S: FnMut(&Path) -> anyhow::Result<()>,
+{
+    if !recovery_is_clear {
+        anyhow::bail!(
+            "storage recovery block cannot be cleared while a recovery journal is active"
+        );
+    }
+    clear_storage_recovery_block_after_startup_recovery_with_ops(path, remove, sync_parent)
+}
+
+fn clear_storage_recovery_block_after_startup_recovery_with_ops<R, S>(
+    path: &Path,
+    mut remove: R,
+    mut sync_parent: S,
+) -> anyhow::Result<()>
+where
+    R: FnMut(&Path) -> anyhow::Result<()>,
+    S: FnMut(&Path) -> anyhow::Result<()>,
+{
+    if !storage_operation_file_exists(path)? {
+        return Ok(());
+    }
+    validate_private_file_for_read(path)?;
+    remove(path)?;
+    // Failure here means the unlink happened in this process but is not known
+    // durable. The caller must remain blocked for this process lifetime.
+    sync_parent(path)
 }
 
 pub(crate) fn storage_mode_migration_error_requires_recovery(error: &anyhow::Error) -> bool {
@@ -541,27 +705,23 @@ fn migrate_legacy_passwords(
             }
         };
 
-        let save_result = save_password_to_backend(
-            account,
-            password.as_str(),
-            config.settings.use_keyring,
-            false,
-        );
-        // The source plaintext is no longer needed after the target write.
-        // Wipe it before target verification or any recovery I/O can block on
-        // Keychain/Credential Manager UI.
-        drop(password);
-        if let Err(e) = save_result {
-            warn!(
-                account_id = %redacted_account_id(&account.id),
-                error = %e,
-                "legacy password loaded, but could not be saved under migrated account"
-            );
-            return LegacyPasswordMigration {
-                source_ids,
-                ..LegacyPasswordMigration::default()
+        // Ownership crosses the write boundary so the source plaintext is
+        // wiped immediately after its final backend-specific use.
+        let receipt =
+            match write_account_password_owned(account, password, config.settings.use_keyring) {
+                Ok(receipt) => receipt,
+                Err(e) => {
+                    warn!(
+                        account_id = %redacted_account_id(&account.id),
+                        error = %e,
+                        "legacy password loaded, but could not be saved under migrated account"
+                    );
+                    return LegacyPasswordMigration {
+                        source_ids,
+                        ..LegacyPasswordMigration::default()
+                    };
+                }
             };
-        }
         if let Err(e) = load_password(account, config.settings.use_keyring) {
             warn!(
                 account_id = %redacted_account_id(&account.id),
@@ -578,7 +738,12 @@ fn migrate_legacy_passwords(
 
         account.has_saved_password = true;
         return LegacyPasswordMigration {
-            cleanup_ids_after_save: obsolete_legacy_credential_ids(&source_ids, &account.id),
+            cleanup_ids_after_save: if receipt.target_durability_warning {
+                warn!(account_id = %redacted_account_id(&account.id), "Legacy password target durability is unconfirmed; retaining every source credential for recovery");
+                Vec::new()
+            } else {
+                obsolete_legacy_credential_ids(&source_ids, &account.id)
+            },
             target_id: Some(account.id.clone()),
             source_ids,
         };
@@ -1004,15 +1169,79 @@ fn with_password_file_transaction<T>(
 fn prepare_password_file_transaction() -> anyhow::Result<()> {
     let dir = config_dir()?;
     cleanup_storage_temp_files_in_dir(&dir, PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES)?;
-    if let Err(error) = reconcile_staged_fallback_keys() {
-        // An orphan contains key material but has no ciphertext reference, so
-        // failed retirement should remain retryable without denying access to
-        // active password records. A later staged save still must update the
-        // journal successfully before it can create new key material.
-        warn!(
-            error_kind = storage_error_kind(&error),
-            "Staged fallback key recovery remains pending"
-        );
+    reconcile_staged_fallback_keys_if_safe(
+        pending_storage_recovery_is_clear,
+        reconcile_staged_fallback_keys,
+        mark_storage_recovery_blocked,
+    )?;
+    Ok(())
+}
+
+/// Startup must reconcile staged fallback-key metadata after account-journal
+/// recovery and before it clears the durable recovery latch. This uses the
+/// same lock and preflight as every credential mutation, so another process
+/// cannot insert a password-file revision between validation and cleanup.
+pub(crate) fn reconcile_staged_fallback_keys_after_pending_recovery() -> anyhow::Result<()> {
+    let _lock = acquire_password_file_transaction_lock()?;
+    prepare_password_file_transaction()
+}
+
+fn staged_fallback_recovery_requires_block(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<StagedFallbackKeyConflict>() || cause.is::<InvalidStagedFallbackKeyState>()
+    })
+}
+
+fn reconcile_staged_fallback_keys_if_safe<P, R, B>(
+    mut pending_recovery_is_clear: P,
+    mut reconcile_staged_keys: R,
+    mut mark_recovery_blocked: B,
+) -> anyhow::Result<()>
+where
+    P: FnMut() -> anyhow::Result<bool>,
+    R: FnMut() -> anyhow::Result<()>,
+    B: FnMut() -> anyhow::Result<()>,
+{
+    match pending_recovery_is_clear() {
+        Ok(true) => {
+            if let Err(error) = reconcile_staged_keys() {
+                if staged_fallback_recovery_requires_block(&error) {
+                    // A collision with an active credential is corrupt metadata,
+                    // as is an unreadable staged-key journal. Neither is
+                    // ordinary best-effort orphan cleanup. Latch recovery
+                    // durably before rejecting every further credential
+                    // mutation.
+                    mark_recovery_blocked()?;
+                    return Err(error);
+                }
+                // An orphan contains key material but has no ciphertext
+                // reference, so failed retirement should remain retryable
+                // without denying access to active password records.
+                warn!(
+                    error_kind = storage_error_kind(&error),
+                    "Staged fallback key recovery remains pending"
+                );
+            }
+        }
+        Ok(false) => {
+            // A pending account transaction may refer to a newly staged key in
+            // a password-file revision whose directory durability was
+            // ambiguous. Keep every staged key until that transaction has
+            // authenticated the winning revision and cleared its journal.
+            debug!(
+                "Deferring staged fallback key recovery while account storage recovery is pending"
+            );
+        }
+        Err(error) => {
+            // Failure to prove journal absence is equivalent to a pending
+            // journal. Returning success here would let a keyring mutation
+            // begin without knowing whether a forward fallback-key revision
+            // is still protected by an account journal.
+            mark_recovery_blocked()?;
+            return Err(error.context(
+                "pending password storage journal state could not be verified during credential preflight",
+            ));
+        }
     }
     Ok(())
 }
@@ -1031,6 +1260,10 @@ fn pending_storage_operation_file_path() -> anyhow::Result<PathBuf> {
 
 fn recovering_storage_operation_file_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join(RECOVERING_STORAGE_OPERATION_FILE_NAME))
+}
+
+fn storage_recovery_block_file_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join(STORAGE_RECOVERY_BLOCK_FILE_NAME))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -1112,8 +1345,11 @@ struct PendingStorageOperation {
     before_account: Option<Account>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     after_account: Option<Account>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollback_marker: Option<String>,
 }
 
+#[derive(Debug)]
 struct PendingStorageOperationRecord {
     operation: PendingStorageOperation,
     path: PathBuf,
@@ -1125,6 +1361,8 @@ struct StoredPasswordEnvelopeV1<'a> {
     service: String,
     account_id: AccountId,
     username_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollback_marker: Option<&'a str>,
     password: &'a str,
 }
 
@@ -1134,6 +1372,8 @@ struct StoredPasswordEnvelopeV1Owned {
     service: String,
     account_id: AccountId,
     username_sha256: String,
+    #[serde(default)]
+    rollback_marker: Option<String>,
     password: Zeroizing<String>,
 }
 
@@ -1145,6 +1385,8 @@ struct StoredPasswordEnvelopeV2Owned {
     username_sha256: String,
     #[serde(rename = "target_window_title_sha256")]
     _target_window_title_sha256: String,
+    #[serde(default)]
+    rollback_marker: Option<String>,
     password: Zeroizing<String>,
 }
 
@@ -1168,6 +1410,11 @@ fn username_binding_hash(username: &str) -> String {
     sha256_hex(canonical_username(username).as_bytes())
 }
 
+fn password_binding_matches(left: &Account, right: &Account) -> bool {
+    left.id == right.id
+        && username_binding_hash(&left.username) == username_binding_hash(&right.username)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1186,12 +1433,33 @@ fn redacted_account_id(account_id: &str) -> &'static str {
     }
 }
 
+fn validate_rollback_marker(marker: &str) -> anyhow::Result<()> {
+    let parsed = uuid::Uuid::parse_str(marker)
+        .map_err(|_| anyhow::anyhow!("stored password has an invalid rollback marker"))?;
+    if parsed.hyphenated().to_string() != marker {
+        anyhow::bail!("stored password has a non-canonical rollback marker");
+    }
+    Ok(())
+}
+
 fn encode_bound_password(account: &Account, password: &str) -> anyhow::Result<Zeroizing<String>> {
+    encode_bound_password_with_rollback_marker(account, password, None)
+}
+
+fn encode_bound_password_with_rollback_marker(
+    account: &Account,
+    password: &str,
+    rollback_marker: Option<&str>,
+) -> anyhow::Result<Zeroizing<String>> {
+    if let Some(marker) = rollback_marker {
+        validate_rollback_marker(marker)?;
+    }
     let envelope = StoredPasswordEnvelopeV1 {
         version: PASSWORD_ENVELOPE_VERSION,
         service: SERVICE_NAME.to_string(),
         account_id: account.id.clone(),
         username_sha256: username_binding_hash(&account.username),
+        rollback_marker,
         password,
     };
     let json = Zeroizing::new(serde_json::to_string(&envelope)?);
@@ -1203,18 +1471,33 @@ fn encode_bound_password(account: &Account, password: &str) -> anyhow::Result<Ze
     Ok(payload)
 }
 
+#[cfg(all(test, target_os = "windows"))]
 fn encode_keyring_password(account: &Account, password: &str) -> anyhow::Result<Zeroizing<String>> {
-    let payload = encode_bound_password(account, password)?;
+    encode_keyring_password_with_rollback_marker(account, password, None)
+}
+
+fn encode_keyring_password_with_rollback_marker(
+    account: &Account,
+    password: &str,
+    rollback_marker: Option<&str>,
+) -> anyhow::Result<Zeroizing<String>> {
+    let payload = encode_bound_password_with_rollback_marker(account, password, rollback_marker)?;
     encode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, payload.as_str())
 }
 
 fn decode_keyring_password(
     account: &Account,
     stored: &str,
-) -> anyhow::Result<(Zeroizing<String>, StoredPasswordFormat, bool)> {
+) -> anyhow::Result<(
+    Zeroizing<String>,
+    StoredPasswordFormat,
+    bool,
+    Option<String>,
+)> {
     let secret = decode_secure_storage_secret(SECURE_STORAGE_PASSWORD_PURPOSE, stored)?;
-    let (password, format) = decode_bound_password(account, secret.plaintext.as_str())?;
-    Ok((password, format, secret.needs_migration))
+    let (password, format, rollback_marker) =
+        decode_bound_password_with_rollback_marker(account, secret.plaintext.as_str())?;
+    Ok((password, format, secret.needs_migration, rollback_marker))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1483,6 +1766,14 @@ fn decode_bound_password(
     account: &Account,
     stored: &str,
 ) -> anyhow::Result<(Zeroizing<String>, StoredPasswordFormat)> {
+    let (password, format, _) = decode_bound_password_with_rollback_marker(account, stored)?;
+    Ok((password, format))
+}
+
+fn decode_bound_password_with_rollback_marker(
+    account: &Account,
+    stored: &str,
+) -> anyhow::Result<(Zeroizing<String>, StoredPasswordFormat, Option<String>)> {
     if let Some(json) = stored.strip_prefix(PASSWORD_ENVELOPE_V2_PREFIX) {
         let envelope: StoredPasswordEnvelopeV2Owned = serde_json::from_str(json)?;
         if envelope.version != PASSWORD_ENVELOPE_V2_VERSION
@@ -1492,8 +1783,15 @@ fn decode_bound_password(
         {
             anyhow::bail!("stored password binding does not match account metadata");
         }
+        if let Some(marker) = envelope.rollback_marker.as_deref() {
+            validate_rollback_marker(marker)?;
+        }
 
-        return Ok((envelope.password, StoredPasswordFormat::BoundV2));
+        return Ok((
+            envelope.password,
+            StoredPasswordFormat::BoundV2,
+            envelope.rollback_marker,
+        ));
     }
 
     let Some(json) = stored.strip_prefix(PASSWORD_ENVELOPE_PREFIX) else {
@@ -1503,6 +1801,7 @@ fn decode_bound_password(
         return Ok((
             Zeroizing::new(stored.to_string()),
             StoredPasswordFormat::LegacyRaw,
+            None,
         ));
     };
 
@@ -1514,13 +1813,20 @@ fn decode_bound_password(
     {
         anyhow::bail!("stored password binding does not match account metadata");
     }
+    if let Some(marker) = envelope.rollback_marker.as_deref() {
+        validate_rollback_marker(marker)?;
+    }
 
-    Ok((envelope.password, StoredPasswordFormat::BoundV1))
+    Ok((
+        envelope.password,
+        StoredPasswordFormat::BoundV1,
+        envelope.rollback_marker,
+    ))
 }
 
 fn load_password_file() -> anyhow::Result<PasswordFile> {
     let path = password_file_path()?;
-    if !path.exists() {
+    if !storage_operation_file_exists(&path)? {
         return Ok(PasswordFile::default());
     }
     let content = match read_private_text_file(&path, MAX_PASSWORD_FILE_BYTES) {
@@ -1633,7 +1939,7 @@ fn validate_staged_fallback_keys_journal(
 
 fn load_staged_fallback_keys_journal() -> anyhow::Result<StagedFallbackKeysJournal> {
     let path = staged_fallback_keys_file_path()?;
-    if !path.exists() {
+    if !storage_operation_file_exists(&path)? {
         return Ok(StagedFallbackKeysJournal::default());
     }
     let content = read_private_text_file(&path, MAX_STAGED_FALLBACK_KEYS_FILE_BYTES)?;
@@ -1677,24 +1983,27 @@ fn untrack_staged_fallback_keys(keys: &[ScopedFallbackKeyRef]) -> anyhow::Result
     save_staged_fallback_keys_journal(&journal)
 }
 
-fn active_scoped_fallback_keys(file: &PasswordFile) -> HashSet<ScopedFallbackKeyRef> {
+fn active_scoped_fallback_keys_by_id(file: &PasswordFile) -> HashMap<String, AccountId> {
     file.key_ids
         .iter()
-        .map(|(account_id, key_id)| ScopedFallbackKeyRef {
-            account_id: account_id.clone(),
-            key_id: key_id.clone(),
-        })
+        .map(|(account_id, key_id)| (key_id.clone(), account_id.clone()))
         .collect()
 }
 
 fn reconcile_staged_fallback_keys() -> anyhow::Result<()> {
-    let file = load_password_file()?;
-    let journal = load_staged_fallback_keys_journal()?;
+    let journal = load_staged_fallback_keys_journal()
+        .map_err(|source| anyhow::Error::new(InvalidStagedFallbackKeyState { source }))?;
     if journal.keys.is_empty() {
         return Ok(());
     }
 
-    let active = active_scoped_fallback_keys(&file);
+    // Active key addresses must be known before any staged credential can be
+    // classified as an orphan. A malformed password file therefore blocks
+    // recovery instead of degrading to best-effort deletion.
+    let file = load_password_file()
+        .map_err(|source| anyhow::Error::new(InvalidStagedFallbackKeyState { source }))?;
+
+    let active = active_scoped_fallback_keys_by_id(&file);
     reconcile_staged_fallback_keys_with_ops(journal, &active, delete_scoped_fallback_key, |next| {
         save_staged_fallback_keys_journal(next)
     })
@@ -1702,7 +2011,7 @@ fn reconcile_staged_fallback_keys() -> anyhow::Result<()> {
 
 fn reconcile_staged_fallback_keys_with_ops<D, S>(
     mut journal: StagedFallbackKeysJournal,
-    active: &HashSet<ScopedFallbackKeyRef>,
+    active_keys_by_id: &HashMap<String, AccountId>,
     mut delete_key: D,
     mut save_journal: S,
 ) -> anyhow::Result<()>
@@ -1712,8 +2021,25 @@ where
 {
     let mut remaining = Vec::new();
     let mut failures = 0usize;
+    let mut conflicts = 0usize;
     for key_ref in std::mem::take(&mut journal.keys) {
-        if active.contains(&key_ref) {
+        // The system credential-store address is derived from key_id alone.
+        // A corrupt/stale journal may pair an active key_id with a different
+        // account_id; comparing the whole pair would then delete the live
+        // credential. Protect every active credential by its actual address.
+        if let Some(active_account_id) = active_keys_by_id.get(&key_ref.key_id) {
+            if active_account_id == &key_ref.account_id {
+                continue;
+            }
+            // A key-id collision with a different account is corrupt metadata,
+            // not a proven orphan. Keep it retryable and fail closed rather
+            // than silently erasing the evidence or deleting the live key.
+            conflicts += 1;
+            warn!(
+                account_id = %redacted_account_id(&key_ref.account_id),
+                "Staged fallback key journal conflicts with an active credential"
+            );
+            remaining.push(key_ref);
             continue;
         }
         if let Err(error) = delete_key(&key_ref) {
@@ -1727,6 +2053,14 @@ where
         }
     }
     journal.keys = remaining;
+    if conflicts > 0 {
+        if let Err(error) = save_journal(&journal) {
+            return Err(anyhow::Error::new(
+                StagedFallbackKeyConflict::with_journal_save_error(error),
+            ));
+        }
+        return Err(anyhow::Error::new(StagedFallbackKeyConflict::new()));
+    }
     save_journal(&journal)?;
     if failures > 0 {
         anyhow::bail!("{failures} staged fallback key cleanup attempts failed");
@@ -1746,6 +2080,9 @@ fn validate_pending_storage_operation(operation: &PendingStorageOperation) -> an
             if operation.before_account.is_some() || operation.after_account.is_some() {
                 anyhow::bail!("storage migration journal must not contain account snapshots");
             }
+            if operation.rollback_marker.is_some() {
+                anyhow::bail!("storage migration journal must not contain a rollback marker");
+            }
         }
         "account_config_save" => {
             let Some(after_account) = &operation.after_account else {
@@ -1756,13 +2093,47 @@ fn validate_pending_storage_operation(operation: &PendingStorageOperation) -> an
             {
                 anyhow::bail!("account config journal account id does not match target account");
             }
+            if operation
+                .before_account
+                .as_ref()
+                .is_some_and(|before_account| before_account.id != after_account.id)
+            {
+                anyhow::bail!(
+                    "account config journal source account id does not match target account"
+                );
+            }
+            if let Some(marker) = operation.rollback_marker.as_deref() {
+                validate_rollback_marker(marker)?;
+            }
         }
-        "account_delete" => {
+        "account_config_rollback" => {
+            let Some(before_account) = &operation.before_account else {
+                anyhow::bail!("account rollback journal is missing source account");
+            };
+            if operation.after_account.is_some() {
+                anyhow::bail!("account rollback journal must not contain a target account");
+            }
+            if operation.account_ids.len() != 1
+                || operation.account_ids[0] != before_account.id.as_str()
+            {
+                anyhow::bail!("account rollback journal account id does not match source account");
+            }
+            // Pre-marker rollback journals may already exist after an older
+            // process crash. Keep them valid enough to remain blocking; the
+            // recovery path below deliberately refuses to complete them.
+            if let Some(marker) = operation.rollback_marker.as_deref() {
+                validate_rollback_marker(marker)?;
+            }
+        }
+        "account_delete" | "account_delete_prepared" | "account_delete_committed" => {
             if operation.after_account.is_some() {
                 anyhow::bail!("account delete journal must not contain target account");
             }
             if operation.account_ids.len() != 1 {
                 anyhow::bail!("account delete journal must contain one account id");
+            }
+            if operation.kind != "account_delete" && operation.before_account.is_none() {
+                anyhow::bail!("phased account delete journal is missing source account");
             }
             if let Some(before_account) = &operation.before_account {
                 if operation.account_ids[0] != before_account.id.as_str() {
@@ -1770,6 +2141,35 @@ fn validate_pending_storage_operation(operation: &PendingStorageOperation) -> an
                         "account delete journal account id does not match source account"
                     );
                 }
+            }
+            if operation.rollback_marker.is_some() {
+                anyhow::bail!("account delete journal must not contain a rollback marker");
+            }
+        }
+        "account_enabled_toggle_prepared" | "account_enabled_toggle_committed" => {
+            let Some(before_account) = &operation.before_account else {
+                anyhow::bail!("account enabled-toggle journal is missing source account");
+            };
+            let Some(after_account) = &operation.after_account else {
+                anyhow::bail!("account enabled-toggle journal is missing target account");
+            };
+            if operation.account_ids.len() != 1
+                || operation.account_ids[0] != before_account.id.as_str()
+                || operation.account_ids[0] != after_account.id.as_str()
+            {
+                anyhow::bail!(
+                    "account enabled-toggle journal account id does not match its snapshots"
+                );
+            }
+            let mut expected_after = before_account.clone();
+            expected_after.enabled = after_account.enabled;
+            if before_account.enabled == after_account.enabled || &expected_after != after_account {
+                anyhow::bail!("account enabled-toggle journal changes fields other than enabled");
+            }
+            if operation.rollback_marker.is_some() {
+                anyhow::bail!(
+                    "account enabled-toggle journal must not contain a password revision marker"
+                );
             }
         }
         _ => anyhow::bail!("pending storage operation has unsupported kind"),
@@ -2043,19 +2443,20 @@ fn sync_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn new_scoped_fallback_key(
-    account_id: &AccountId,
-) -> anyhow::Result<(ScopedFallbackKeyRef, Zeroizing<[u8; 32]>)> {
+fn new_scoped_fallback_key_ref(account_id: &AccountId) -> anyhow::Result<ScopedFallbackKeyRef> {
     if account_id.trim().is_empty() || account_id.len() > 256 {
         anyhow::bail!("cannot create a fallback key for an invalid account id");
     }
-    let key_ref = ScopedFallbackKeyRef {
+    Ok(ScopedFallbackKeyRef {
         account_id: account_id.clone(),
         key_id: uuid::Uuid::new_v4().hyphenated().to_string(),
-    };
+    })
+}
+
+fn new_scoped_fallback_key_material() -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::thread_rng().fill(&mut *key);
-    Ok((key_ref, key))
+    key
 }
 
 fn scoped_fallback_key_account(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<String> {
@@ -2109,7 +2510,10 @@ fn decode_scoped_fallback_key(
     decode_fallback_encryption_key(envelope.key.trim())
 }
 
-fn save_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef, key: &[u8; 32]) -> anyhow::Result<()> {
+fn save_scoped_fallback_key_payload(
+    key_ref: &ScopedFallbackKeyRef,
+    payload: &str,
+) -> anyhow::Result<()> {
     let entry = keyring::Entry::new(
         FALLBACK_KEY_SERVICE_NAME,
         &scoped_fallback_key_account(key_ref)?,
@@ -2120,8 +2524,7 @@ fn save_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef, key: &[u8; 32]) -> a
             native_secure_storage_name()
         )
     })?;
-    let payload = encode_scoped_fallback_key(key_ref, key)?;
-    entry.set_password(payload.as_str()).map_err(|e| {
+    entry.set_password(payload).map_err(|e| {
         anyhow::anyhow!(
             "{} refused to save a scoped fallback key: {e}",
             native_secure_storage_name()
@@ -2174,12 +2577,23 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
             let decoded =
                 decode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.trim())?;
             let key = decode_fallback_encryption_key(decoded.plaintext.trim())?;
-            if decoded.needs_migration {
+            let migration_result = if decoded.needs_migration {
                 let payload = encode_secure_storage_secret(
                     SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
                     decoded.plaintext.trim(),
                 )?;
-                if let Err(e) = entry.set_password(payload.as_str()) {
+                let result = entry.set_password(payload.as_str());
+                drop(payload);
+                Some(result)
+            } else {
+                None
+            };
+            // `key` is an independent zeroizing copy. Retire provider payloads
+            // before migration diagnostics or stale-file cleanup can block.
+            drop(decoded);
+            drop(encoded);
+            if let Some(result) = migration_result {
+                if let Err(e) = result {
                     warn!(error = %e, "Fallback key loaded from legacy Credential Manager format, but user-bound DPAPI migration failed");
                 } else {
                     info!("Migrated fallback key to Windows user-bound DPAPI Credential Manager storage");
@@ -2199,7 +2613,10 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
         let encoded = Zeroizing::new(STANDARD.encode(*legacy_key));
         let payload =
             encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
-        entry.set_password(payload.as_str()).map_err(|e| {
+        let set_result = entry.set_password(payload.as_str());
+        drop(payload);
+        drop(encoded);
+        set_result.map_err(|e| {
             anyhow::anyhow!(
                 "{} refused to migrate fallback key: {e}",
                 native_secure_storage_name()
@@ -2214,7 +2631,10 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
     let encoded = Zeroizing::new(STANDARD.encode(*key));
     let payload =
         encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
-    entry.set_password(payload.as_str()).map_err(|e| {
+    let set_result = entry.set_password(payload.as_str());
+    drop(payload);
+    drop(encoded);
+    set_result.map_err(|e| {
         anyhow::anyhow!(
             "{} refused to save fallback key: {e}",
             native_secure_storage_name()
@@ -2483,38 +2903,44 @@ fn remove_fallback_entry(file: &mut PasswordFile, account_id: &AccountId) -> boo
 
 fn stage_scoped_fallback_entry(
     account_id: &AccountId,
-    plaintext: &str,
+    plaintext: Zeroizing<String>,
 ) -> anyhow::Result<(ScopedFallbackKeyRef, String)> {
-    let (key_ref, key) = new_scoped_fallback_key(account_id)?;
-    let encrypted = encrypt_password_with_key(&key, plaintext)?;
-    // Persist intent before material enters Keychain/Credential Manager. A
-    // process crash after the save can then discover and retire the orphan on
-    // the next locked password-file transaction.
+    let key_ref = new_scoped_fallback_key_ref(account_id)?;
+    // Persist cleanup intent before creating either half of the recoverable
+    // secret. On macOS the Keychain accepts plaintext provider payloads, so
+    // doing this first prevents filesystem/journal I/O from retaining an AES
+    // key equivalent next to its ciphertext after encryption's final use.
     track_staged_fallback_key(&key_ref)?;
-    if let Err(error) = save_scoped_fallback_key(&key_ref, &key) {
-        // A secure-store provider may persist the value before reporting an
-        // error. Retire defensively; only remove the durable journal record
-        // once deletion is confirmed.
-        match delete_scoped_fallback_key(&key_ref) {
-            Ok(()) => {
-                if let Err(cleanup_error) =
-                    untrack_staged_fallback_keys(std::slice::from_ref(&key_ref))
-                {
-                    warn!(
-                        account_id = %redacted_account_id(&key_ref.account_id),
-                        error_kind = storage_error_kind(&cleanup_error),
-                        "Failed to clear staged fallback key journal after key save failure"
-                    );
-                }
-            }
-            Err(cleanup_error) => warn!(
-                account_id = %redacted_account_id(&key_ref.account_id),
-                error_kind = storage_error_kind(&cleanup_error),
-                "Failed key save may have committed; staged-key journal retained for cleanup"
-            ),
+
+    let stage_result = (|| {
+        let key = new_scoped_fallback_key_material();
+        let encrypted_result = encrypt_password_with_key(&key, plaintext.as_str());
+        // Encryption is the password's final use. Destroy it before provider
+        // payload construction or any later operation can block.
+        drop(plaintext);
+        let encrypted = encrypted_result?;
+        let key_payload_result = encode_scoped_fallback_key(&key_ref, &key);
+        // Provider-payload construction is the raw key's final use.
+        drop(key);
+        let key_payload = key_payload_result?;
+        // Hand the payload straight to the native provider. In particular,
+        // no lock wait, recovery scan, or journal/filesystem write may occur
+        // while macOS retains this plaintext Keychain payload and ciphertext.
+        let save_result = save_scoped_fallback_key_payload(&key_ref, key_payload.as_str());
+        drop(key_payload);
+        save_result?;
+        Ok(encrypted)
+    })();
+
+    let encrypted = match stage_result {
+        Ok(encrypted) => encrypted,
+        Err(error) => {
+            // A provider may persist the value before reporting an error. The
+            // staged journal is removed only after provider deletion is confirmed.
+            cleanup_uncommitted_scoped_keys(std::slice::from_ref(&key_ref));
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     Ok((key_ref, encrypted))
 }
 
@@ -2554,33 +2980,39 @@ fn migrate_legacy_fallback_entries(
         return Ok(Vec::new());
     }
 
-    let shared_key = fallback_encryption_key()?;
     migrate_legacy_fallback_entries_with_ops(
         file,
         &legacy_account_ids,
-        &shared_key,
+        fallback_encryption_key,
         stage_scoped_fallback_entry,
         cleanup_uncommitted_scoped_keys,
     )
 }
 
-fn migrate_legacy_fallback_entries_with_ops<SE, CK>(
+fn migrate_legacy_fallback_entries_with_ops<LK, SE, CK>(
     file: &mut PasswordFile,
     legacy_account_ids: &[AccountId],
-    shared_key: &[u8; 32],
+    mut load_shared_key: LK,
     mut stage_entry: SE,
     mut cleanup_uncommitted: CK,
 ) -> anyhow::Result<Vec<ScopedFallbackKeyRef>>
 where
-    SE: FnMut(&AccountId, &str) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
+    LK: FnMut() -> anyhow::Result<Zeroizing<[u8; 32]>>,
+    SE: FnMut(&AccountId, Zeroizing<String>) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
     CK: FnMut(&[ScopedFallbackKeyRef]),
 {
     let mut staged = Vec::<(ScopedFallbackKeyRef, String)>::new();
     for account_id in legacy_account_ids {
         let staged_entry = (|| {
             let encrypted = password_entry_for_account(file, account_id)?;
-            let plaintext = decrypt_password_with_fallback_key(shared_key, encrypted)?;
-            stage_entry(account_id, plaintext.as_str())
+            let shared_key = load_shared_key()?;
+            let plaintext_result = decrypt_password_with_fallback_key(&shared_key, encrypted);
+            // Decryption is the final shared-key use for this one legacy
+            // entry. Wipe it before per-entry secure-storage staging can
+            // block, and reload it only for the next ciphertext.
+            drop(shared_key);
+            let plaintext = plaintext_result?;
+            stage_entry(account_id, plaintext)
         })();
         match staged_entry {
             Ok(entry) => staged.push(entry),
@@ -2708,15 +3140,9 @@ where
         }
         Err(e) => {
             if password_file_write_committed(&e) {
-                if let Err(journal_error) = untrack_staged(staged_keys) {
-                    warn!(
-                        error_kind = storage_error_kind(&journal_error),
-                        "Committed staged fallback keys remain journaled for safe recovery"
-                    );
-                }
                 warn!(
                     error_kind = storage_error_kind(&e),
-                    "Password file commit completed, but durability verification failed; staged keys remain active"
+                    "Password file replacement completed, but directory durability is unconfirmed; staged keys remain journaled until startup resolves the durable password-file revision"
                 );
                 return Ok(true);
             }
@@ -2732,26 +3158,33 @@ fn password_file_write_committed(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<PasswordFileWriteCommitted>())
 }
 
-fn stage_and_commit_fallback_password_with_ops<SE, ML, SF, CK>(
+fn use_owned_secret_then_drop<S, T>(
+    secret: S,
+    use_secret: impl FnOnce(&S) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let result = use_secret(&secret);
+    drop(secret);
+    result
+}
+
+fn stage_and_commit_fallback_payload_with_ops<SE, ML, SF, CK>(
     file: &mut PasswordFile,
     account: &Account,
-    password: &str,
+    payload: Zeroizing<String>,
     mut stage_entry: SE,
     mut migrate_legacy: ML,
     save_file: SF,
     mut cleanup_uncommitted: CK,
 ) -> anyhow::Result<bool>
 where
-    SE: FnMut(&AccountId, &str) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
+    SE: FnMut(&AccountId, Zeroizing<String>) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
     ML: FnMut(&mut PasswordFile) -> anyhow::Result<Vec<ScopedFallbackKeyRef>>,
     SF: FnMut(&PasswordFile) -> anyhow::Result<()>,
     CK: FnMut(&[ScopedFallbackKeyRef]),
 {
-    let payload = encode_bound_password(account, password)?;
-    let stage_result = stage_entry(&account.id, payload.as_str());
+    let stage_result = stage_entry(&account.id, payload);
     // The bound plaintext has already been encrypted (or staging failed).
     // Wipe it before legacy-key migration and password-file commit can block.
-    drop(payload);
     let (new_key_ref, encrypted) = stage_result?;
     let mut staged_keys = vec![new_key_ref.clone()];
     install_scoped_fallback_entry(file, &account.id, &new_key_ref, encrypted);
@@ -2763,6 +3196,29 @@ where
         }
     }
     commit_password_file_with_staged_keys(file, &staged_keys, save_file, cleanup_uncommitted)
+}
+
+fn stage_and_commit_persisted_fallback_entry(
+    file: &mut PasswordFile,
+    account: &Account,
+    new_key_ref: ScopedFallbackKeyRef,
+    encrypted: String,
+) -> anyhow::Result<bool> {
+    let mut staged_keys = vec![new_key_ref.clone()];
+    install_scoped_fallback_entry(file, &account.id, &new_key_ref, encrypted);
+    match migrate_legacy_fallback_entries(file) {
+        Ok(mut migrated) => staged_keys.append(&mut migrated),
+        Err(e) => {
+            cleanup_uncommitted_scoped_keys(&staged_keys);
+            return Err(e);
+        }
+    }
+    commit_password_file_with_staged_keys(
+        file,
+        &staged_keys,
+        save_password_file,
+        cleanup_uncommitted_scoped_keys,
+    )
 }
 
 /// Returns a non-secret warning flag. Cleanup failure never invalidates a
@@ -2791,17 +3247,49 @@ fn finalize_fallback_key_retirement(file: &mut PasswordFile) -> bool {
     warning
 }
 
-fn save_to_file(account: &Account, password: &str) -> anyhow::Result<bool> {
-    with_password_file_transaction(|| save_to_file_locked(account, password))
+struct FallbackPasswordWriteOutcome {
+    target_durability_warning: bool,
+    key_cleanup_warning: bool,
 }
 
-fn save_to_file_locked(account: &Account, password: &str) -> anyhow::Result<bool> {
+fn save_to_file_with_rollback_marker(
+    account: &Account,
+    password: &str,
+    rollback_marker: Option<&str>,
+) -> anyhow::Result<FallbackPasswordWriteOutcome> {
+    with_password_file_transaction(|| save_to_file_locked(account, password, rollback_marker))
+}
+
+fn save_to_file_owned(
+    account: &Account,
+    password: Zeroizing<String>,
+    revision_marker: Option<&str>,
+) -> anyhow::Result<FallbackPasswordWriteOutcome> {
+    // Complete every potentially blocking lock/recovery operation before the
+    // password's final encryption use. This lets staging destroy the bound
+    // plaintext and send the macOS Keychain payload directly to the provider,
+    // without retaining a decrypting key alongside ciphertext across I/O.
+    let _lock = acquire_password_file_transaction_lock()?;
+    prepare_password_file_transaction()?;
+    let payload = use_owned_secret_then_drop(password, |password| {
+        encode_bound_password_with_rollback_marker(account, password.as_str(), revision_marker)
+    })?;
+    let (new_key_ref, encrypted) = stage_scoped_fallback_entry(&account.id, payload)?;
+    save_to_file_locked_persisted(account, new_key_ref, encrypted)
+}
+
+fn save_to_file_locked(
+    account: &Account,
+    password: &str,
+    rollback_marker: Option<&str>,
+) -> anyhow::Result<FallbackPasswordWriteOutcome> {
     let mut file = load_password_file()?;
-    let mut cleanup_warning = finalize_fallback_key_retirement(&mut file);
-    let password_file_durability_warning = match stage_and_commit_fallback_password_with_ops(
+    let mut key_cleanup_warning = finalize_fallback_key_retirement(&mut file);
+    let payload = encode_bound_password_with_rollback_marker(account, password, rollback_marker)?;
+    let password_file_durability_warning = match stage_and_commit_fallback_payload_with_ops(
         &mut file,
         account,
-        password,
+        payload,
         stage_scoped_fallback_entry,
         migrate_legacy_fallback_entries,
         save_password_file,
@@ -2813,11 +3301,47 @@ fn save_to_file_locked(account: &Account, password: &str) -> anyhow::Result<bool
             return Err(e);
         }
     };
-    cleanup_warning |= password_file_durability_warning;
     if !password_file_durability_warning {
-        cleanup_warning |= finalize_fallback_key_retirement(&mut file);
+        key_cleanup_warning |= finalize_fallback_key_retirement(&mut file);
     }
-    Ok(cleanup_warning)
+    Ok(FallbackPasswordWriteOutcome {
+        target_durability_warning: password_file_durability_warning,
+        key_cleanup_warning,
+    })
+}
+
+fn save_to_file_locked_persisted(
+    account: &Account,
+    new_key_ref: ScopedFallbackKeyRef,
+    encrypted: String,
+) -> anyhow::Result<FallbackPasswordWriteOutcome> {
+    let mut file = match load_password_file() {
+        Ok(file) => file,
+        Err(error) => {
+            cleanup_uncommitted_scoped_keys(std::slice::from_ref(&new_key_ref));
+            return Err(error);
+        }
+    };
+    let mut key_cleanup_warning = finalize_fallback_key_retirement(&mut file);
+    let password_file_durability_warning = match stage_and_commit_persisted_fallback_entry(
+        &mut file,
+        account,
+        new_key_ref,
+        encrypted,
+    ) {
+        Ok(warning) => warning,
+        Err(e) => {
+            warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_password_file failed");
+            return Err(e);
+        }
+    };
+    if !password_file_durability_warning {
+        key_cleanup_warning |= finalize_fallback_key_retirement(&mut file);
+    }
+    Ok(FallbackPasswordWriteOutcome {
+        target_durability_warning: password_file_durability_warning,
+        key_cleanup_warning,
+    })
 }
 
 fn load_from_file(account: &Account) -> anyhow::Result<LoadedStoredPassword> {
@@ -2841,27 +3365,38 @@ fn load_from_file_locked(account: &Account) -> anyhow::Result<LoadedStoredPasswo
     };
     let used_legacy_key = active_key_ref.is_none();
     let (password, format) = decode_bound_password(account, stored.as_str())?;
-    // `password` owns the only plaintext needed by the caller. Wipe the
-    // decrypted envelope before any migration or password-file I/O.
+    let legacy_active_payload = if format == StoredPasswordFormat::LegacyRaw {
+        Some(encode_bound_password(account, password.as_str())?)
+    } else {
+        None
+    };
+    // The first decode exists only to prepare migration. Re-read and decrypt
+    // the committed file after migration so no reversible in-memory handoff
+    // survives the intervening secure-storage/filesystem I/O.
+    drop(password);
     drop(stored);
+    drop(encrypted);
+
+    let staged_active_entry = match legacy_active_payload {
+        Some(payload) => Some(stage_scoped_fallback_entry(&account.id, payload)?),
+        None => None,
+    };
 
     let mut staged_keys = Vec::new();
+    let mut staged_active_entry = staged_active_entry;
     let migration_result = (|| -> anyhow::Result<bool> {
         let has_legacy_entries = file
             .passwords
             .keys()
             .any(|account_id| !file.key_ids.contains_key(account_id));
-        if has_legacy_entries {
-            staged_keys.extend(migrate_legacy_fallback_entries(&mut file)?);
-        }
 
-        if format == StoredPasswordFormat::LegacyRaw {
-            let payload = encode_bound_password(account, password.as_str())?;
-            let stage_result = stage_scoped_fallback_entry(&account.id, payload.as_str());
-            drop(payload);
-            let (new_key_ref, reencrypted) = stage_result?;
+        if let Some((new_key_ref, reencrypted)) = staged_active_entry.take() {
             staged_keys.push(new_key_ref.clone());
             install_scoped_fallback_entry(&mut file, &account.id, &new_key_ref, reencrypted);
+        }
+
+        if has_legacy_entries {
+            staged_keys.extend(migrate_legacy_fallback_entries(&mut file)?);
         }
 
         Ok(has_legacy_entries || used_legacy_key || format == StoredPasswordFormat::LegacyRaw)
@@ -2893,10 +3428,34 @@ fn load_from_file_locked(account: &Account) -> anyhow::Result<LoadedStoredPasswo
         }
     }
 
+    let refreshed_file = load_password_file()?;
+    let (password, rollback_marker) = load_password_from_file_snapshot(account, &refreshed_file)?;
     Ok(LoadedStoredPassword {
         password,
+        rollback_marker,
         zeroizing_wrap_ms: 0,
     })
+}
+
+fn load_password_from_file_snapshot(
+    account: &Account,
+    file: &PasswordFile,
+) -> anyhow::Result<(Zeroizing<String>, Option<String>)> {
+    let encrypted = Zeroizing::new(password_entry_for_account(file, &account.id)?.to_string());
+    if encrypted.len() > MAX_ENCRYPTED_PASSWORD_ENTRY_CHARS {
+        anyhow::bail!("encrypted password entry is too large");
+    }
+    let stored = if let Some(key_ref) = scoped_fallback_key_ref(file, &account.id) {
+        let key = load_scoped_fallback_key(&key_ref)?;
+        decrypt_password_with_fallback_key(&key, encrypted.as_str())?
+    } else {
+        let key = fallback_encryption_key()?;
+        decrypt_password_with_fallback_key(&key, encrypted.as_str())?
+    };
+    let (password, _, rollback_marker) =
+        decode_bound_password_with_rollback_marker(account, stored.as_str())?;
+    drop(stored);
+    Ok((password, rollback_marker))
 }
 
 fn password_entry_for_account<'a>(
@@ -3022,49 +3581,42 @@ impl StaleBackendCleanupWarning {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SaveAccountOutcome {
     pub(crate) stale_cleanup_warning: Option<StaleBackendCleanupWarning>,
+    /// The selected fallback-file write committed, but directory durability
+    /// could not be confirmed. The stale backend is intentionally preserved.
+    pub(crate) target_durability_warning: bool,
     /// The new password is committed, but one or more obsolete fallback keys
     /// could not yet be retired. Retry metadata remains in passwords.json.
     pub(crate) fallback_key_cleanup_warning: bool,
 }
 
-fn save_password(
-    account: &Account,
-    password: &str,
-    use_keyring: bool,
-) -> anyhow::Result<SaveAccountOutcome> {
-    save_password_to_backend(account, password, use_keyring, true)
+pub(crate) struct PasswordWriteReceipt {
+    saved_backend: PasswordStorageBackend,
+    target_durability_warning: bool,
+    fallback_key_cleanup_warning: bool,
 }
 
-fn save_password_to_backend(
+fn write_password_to_backend_borrowed(
     account: &Account,
     password: &str,
     use_keyring: bool,
-    cleanup_stale_backend: bool,
-) -> anyhow::Result<SaveAccountOutcome> {
+    rollback_marker: Option<&str>,
+) -> anyhow::Result<PasswordWriteReceipt> {
     debug!(account_id = %redacted_account_id(&account.id), use_keyring, "save_password called");
     if use_keyring {
         let entry = keyring::Entry::new(SERVICE_NAME, &account.id)
             .map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", native_secure_storage_name()))?;
-        let payload = encode_keyring_password(account, password)?;
+        let payload =
+            encode_keyring_password_with_rollback_marker(account, password, rollback_marker)?;
         let set_result = entry.set_password(payload.as_str());
         // The provider has consumed the payload. Wipe it before stale-backend
         // cleanup performs unrelated filesystem or secure-storage I/O.
         drop(payload);
         match set_result {
             Ok(()) => {
-                let stale_cleanup_warning = cleanup_stale_backend_after_successful_save(
-                    &account.id,
-                    PasswordStorageBackend::SystemSecureStorage,
-                    cleanup_stale_backend,
-                    |account_id| {
-                        delete_from_file(account_id)?;
-                        cleanup_unused_fallback_key_material()
-                    },
-                    delete_from_keyring,
-                );
                 info!(account_id = %redacted_account_id(&account.id), "Password saved to secure storage successfully");
-                return Ok(SaveAccountOutcome {
-                    stale_cleanup_warning,
+                return Ok(PasswordWriteReceipt {
+                    saved_backend: PasswordStorageBackend::SystemSecureStorage,
+                    target_durability_warning: false,
                     fallback_key_cleanup_warning: false,
                 });
             }
@@ -3079,8 +3631,12 @@ fn save_password_to_backend(
             "Keyring disabled; using weaker local encrypted file storage by explicit setting"
         );
     }
-    let fallback_key_cleanup_warning = match save_to_file(account, password) {
-        Ok(warning) => warning,
+    let fallback_outcome = match save_to_file_with_rollback_marker(
+        account,
+        password,
+        rollback_marker,
+    ) {
+        Ok(outcome) => outcome,
         Err(e) => {
             warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_to_file failed");
             return Err(e);
@@ -3090,17 +3646,210 @@ fn save_password_to_backend(
         account_id = %redacted_account_id(&account.id),
         "Password saved to fallback encrypted file storage"
     );
-    let stale_cleanup_warning = cleanup_stale_backend_after_successful_save(
-        &account.id,
-        PasswordStorageBackend::EncryptedFallbackFile,
-        cleanup_stale_backend,
-        delete_from_file,
-        delete_from_keyring,
-    );
-    Ok(SaveAccountOutcome {
-        stale_cleanup_warning,
-        fallback_key_cleanup_warning,
+    Ok(PasswordWriteReceipt {
+        saved_backend: PasswordStorageBackend::EncryptedFallbackFile,
+        target_durability_warning: fallback_outcome.target_durability_warning,
+        fallback_key_cleanup_warning: fallback_outcome.key_cleanup_warning,
     })
+}
+
+pub(crate) fn write_account_password_owned(
+    account: &Account,
+    password: Zeroizing<String>,
+    use_keyring: bool,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    write_account_password_owned_preflighted(account, password, use_keyring)
+}
+
+/// Direct/legacy writes have no outer account journal, so they must prove the
+/// staged fallback-key state safe before any keyring/fallback provider
+/// callback. Journaled callers use the `_with_revision` entry point: their
+/// journal creation already performed the same preflight under this lock, and
+/// taking it again would deadlock the fallback transaction.
+fn write_account_password_owned_preflighted(
+    account: &Account,
+    password: Zeroizing<String>,
+    use_keyring: bool,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    direct_password_write_after_preflight_with_ops(
+        password,
+        use_keyring,
+        acquire_password_file_transaction_lock,
+        prepare_password_file_transaction,
+        |password| write_account_password_owned_impl(account, password, use_keyring, None),
+    )
+}
+
+fn direct_password_write_after_preflight_with_ops<G, R, L, P, W>(
+    password: Zeroizing<String>,
+    use_keyring: bool,
+    acquire_lock: L,
+    preflight: P,
+    write_password: W,
+) -> anyhow::Result<R>
+where
+    L: FnOnce() -> anyhow::Result<G>,
+    P: FnOnce() -> anyhow::Result<()>,
+    W: FnOnce(Zeroizing<String>) -> anyhow::Result<R>,
+{
+    if use_keyring {
+        let _lock = acquire_lock()?;
+        preflight()?;
+        write_password(password)
+    } else {
+        // The fallback implementation acquires the same lock and runs the
+        // preflight immediately before staging its provider payload.
+        write_password(password)
+    }
+}
+
+pub(crate) fn write_account_password_owned_with_revision(
+    account: &Account,
+    password: Zeroizing<String>,
+    use_keyring: bool,
+    revision_marker: &str,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    validate_rollback_marker(revision_marker)?;
+    write_account_password_owned_impl(account, password, use_keyring, Some(revision_marker))
+}
+
+fn write_account_password_owned_impl(
+    account: &Account,
+    password: Zeroizing<String>,
+    use_keyring: bool,
+    revision_marker: Option<&str>,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    debug!(account_id = %redacted_account_id(&account.id), use_keyring, "save_account called");
+    if password.is_empty() {
+        anyhow::bail!("refusing to save an empty password")
+    }
+
+    if use_keyring {
+        let entry = keyring::Entry::new(SERVICE_NAME, &account.id)
+            .map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", native_secure_storage_name()))?;
+        let payload = use_owned_secret_then_drop(password, |password| {
+            encode_keyring_password_with_rollback_marker(
+                account,
+                password.as_str(),
+                revision_marker,
+            )
+        })?;
+        let set_result = entry.set_password(payload.as_str());
+        drop(payload);
+        match set_result {
+            Ok(()) => {
+                info!(account_id = %redacted_account_id(&account.id), "Password saved to secure storage successfully");
+                return Ok(PasswordWriteReceipt {
+                    saved_backend: PasswordStorageBackend::SystemSecureStorage,
+                    target_durability_warning: false,
+                    fallback_key_cleanup_warning: false,
+                });
+            }
+            Err(e) => anyhow::bail!(
+                "{} refused to save the password: {e}",
+                native_secure_storage_name()
+            ),
+        }
+    }
+
+    warn!(
+        account_id = %redacted_account_id(&account.id),
+        "Keyring disabled; using weaker local encrypted file storage by explicit setting"
+    );
+    let fallback_outcome = match save_to_file_owned(account, password, revision_marker) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            warn!(account_id = %redacted_account_id(&account.id), error = %e, "save_to_file failed");
+            return Err(e);
+        }
+    };
+    info!(
+        account_id = %redacted_account_id(&account.id),
+        "Password saved to fallback encrypted file storage"
+    );
+    Ok(PasswordWriteReceipt {
+        saved_backend: PasswordStorageBackend::EncryptedFallbackFile,
+        target_durability_warning: fallback_outcome.target_durability_warning,
+        fallback_key_cleanup_warning: fallback_outcome.key_cleanup_warning,
+    })
+}
+
+pub(crate) fn write_account_password_borrowed_with_revision(
+    account: &Account,
+    password: &str,
+    use_keyring: bool,
+    revision_marker: &str,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    validate_rollback_marker(revision_marker)?;
+    write_account_password_borrowed_impl(account, password, use_keyring, Some(revision_marker))
+}
+
+fn write_account_password_borrowed_impl(
+    account: &Account,
+    password: &str,
+    use_keyring: bool,
+    revision_marker: Option<&str>,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    if password.is_empty() {
+        anyhow::bail!("refusing to save an empty password")
+    }
+    write_password_to_backend_borrowed(account, password, use_keyring, revision_marker)
+}
+
+pub(crate) fn write_account_password_borrowed_for_rollback(
+    account: &Account,
+    password: &str,
+    use_keyring: bool,
+    rollback_marker: Option<&str>,
+) -> anyhow::Result<PasswordWriteReceipt> {
+    if password.is_empty() {
+        anyhow::bail!("refusing to save an empty password")
+    }
+    write_password_to_backend_borrowed(account, password, use_keyring, rollback_marker)
+}
+
+pub(crate) fn finish_account_password_write(
+    account_id: &AccountId,
+    receipt: PasswordWriteReceipt,
+) -> SaveAccountOutcome {
+    finish_account_password_write_with_ops(
+        account_id,
+        receipt,
+        |account_id| {
+            delete_from_file(account_id)?;
+            cleanup_unused_fallback_key_material()
+        },
+        delete_from_keyring,
+    )
+}
+
+fn finish_account_password_write_with_ops<DF, DK>(
+    account_id: &AccountId,
+    receipt: PasswordWriteReceipt,
+    delete_from_file_op: DF,
+    delete_from_keyring_op: DK,
+) -> SaveAccountOutcome
+where
+    DF: FnMut(&AccountId) -> anyhow::Result<()>,
+    DK: FnMut(&AccountId) -> anyhow::Result<()>,
+{
+    let stale_cleanup_warning = if receipt.target_durability_warning {
+        warn!(account_id = %redacted_account_id(account_id), "Preserving stale password backend because target durability is unconfirmed");
+        None
+    } else {
+        cleanup_stale_backend_after_successful_save(
+            account_id,
+            receipt.saved_backend,
+            true,
+            delete_from_file_op,
+            delete_from_keyring_op,
+        )
+    };
+    SaveAccountOutcome {
+        stale_cleanup_warning,
+        target_durability_warning: receipt.target_durability_warning,
+        fallback_key_cleanup_warning: receipt.fallback_key_cleanup_warning,
+    }
 }
 
 fn cleanup_stale_backend_after_successful_save<DF, DK>(
@@ -3164,6 +3913,18 @@ pub(crate) fn load_password(
         .map_err(anyhow::Error::from)
 }
 
+pub(crate) fn load_password_for_rollback_verification(
+    account: &Account,
+    use_keyring: bool,
+) -> anyhow::Result<(Zeroizing<String>, Option<String>)> {
+    let loaded = if use_keyring {
+        load_from_keyring_timed(account)?
+    } else {
+        load_from_file(account)?
+    };
+    Ok((loaded.password, loaded.rollback_marker))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StorageModeMigration {
     migrated_account_ids: Vec<AccountId>,
@@ -3217,15 +3978,28 @@ pub(crate) fn migrate_storage_mode(
             }
         };
 
-        let save_result =
-            save_password_to_backend(account, password.as_str(), to_use_keyring, false);
-        // Do not retain the source plaintext while target verification or
-        // rollback performs additional secure-storage operations.
-        drop(password);
-        if let Err(e) = save_result {
-            let recovery_error = storage_mode_migration_recovery_required_error(format!(
-                "storage migration target write failed and may need recovery cleanup: {e}"
-            ));
+        let receipt = match write_account_password_owned(account, password, to_use_keyring) {
+            Ok(receipt) => receipt,
+            Err(e) => {
+                let recovery_error = storage_mode_migration_recovery_required_error(format!(
+                    "storage migration target write failed and may need recovery cleanup: {e}"
+                ));
+                rollback_partial_storage_migration(
+                    migrated_account_ids,
+                    from_use_keyring,
+                    to_use_keyring,
+                    recovery_error,
+                )?;
+                unreachable!("rollback_partial_storage_migration always returns Err");
+            }
+        };
+
+        migrated_account_ids.push(account.id.clone());
+
+        if receipt.target_durability_warning {
+            let recovery_error = storage_mode_migration_recovery_required_error(
+                "storage migration target write committed, but durability is unconfirmed",
+            );
             rollback_partial_storage_migration(
                 migrated_account_ids,
                 from_use_keyring,
@@ -3234,8 +4008,6 @@ pub(crate) fn migrate_storage_mode(
             )?;
             unreachable!("rollback_partial_storage_migration always returns Err");
         }
-
-        migrated_account_ids.push(account.id.clone());
 
         if let Err(e) = load_password(account, to_use_keyring) {
             rollback_partial_storage_migration(
@@ -3272,16 +4044,19 @@ pub(crate) fn begin_storage_mode_migration_journal(
         use_keyring: false,
         before_account: None,
         after_account: None,
+        rollback_marker: None,
     };
     validate_pending_storage_operation(&operation)?;
     save_pending_storage_operation(&operation)
 }
 
-pub(crate) fn begin_account_config_save_journal(
+pub(crate) fn begin_account_config_save_journal_with_revision(
     before_account: Option<&Account>,
     after_account: &Account,
     use_keyring: bool,
+    revision_marker: &str,
 ) -> anyhow::Result<()> {
+    validate_rollback_marker(revision_marker)?;
     let operation = PendingStorageOperation {
         version: PENDING_STORAGE_OPERATION_VERSION,
         kind: "account_config_save".to_string(),
@@ -3291,9 +4066,130 @@ pub(crate) fn begin_account_config_save_journal(
         use_keyring,
         before_account: before_account.cloned(),
         after_account: Some(after_account.clone()),
+        rollback_marker: Some(revision_marker.to_owned()),
     };
     validate_pending_storage_operation(&operation)?;
     save_pending_storage_operation(&operation)
+}
+
+pub(crate) fn new_account_config_rollback_marker() -> String {
+    new_account_config_revision_marker()
+}
+
+pub(crate) fn new_account_config_revision_marker() -> String {
+    uuid::Uuid::new_v4().hyphenated().to_string()
+}
+
+pub(crate) fn begin_account_enabled_toggle_journal(
+    before_account: &Account,
+    after_account: &Account,
+    use_keyring: bool,
+) -> anyhow::Result<()> {
+    let operation = PendingStorageOperation {
+        version: PENDING_STORAGE_OPERATION_VERSION,
+        kind: "account_enabled_toggle_prepared".to_string(),
+        account_ids: vec![before_account.id.clone()],
+        from_use_keyring: false,
+        to_use_keyring: false,
+        use_keyring,
+        before_account: Some(before_account.clone()),
+        after_account: Some(after_account.clone()),
+        rollback_marker: None,
+    };
+    validate_pending_storage_operation(&operation)?;
+    save_pending_storage_operation(&operation)
+}
+
+pub(crate) fn mark_account_enabled_toggle_committed_journal(
+    before_account: &Account,
+    after_account: &Account,
+    use_keyring: bool,
+) -> anyhow::Result<()> {
+    let operation = PendingStorageOperation {
+        version: PENDING_STORAGE_OPERATION_VERSION,
+        kind: "account_enabled_toggle_committed".to_string(),
+        account_ids: vec![before_account.id.clone()],
+        from_use_keyring: false,
+        to_use_keyring: false,
+        use_keyring,
+        before_account: Some(before_account.clone()),
+        after_account: Some(after_account.clone()),
+        rollback_marker: None,
+    };
+    validate_pending_storage_operation(&operation)?;
+    let pending_path = pending_storage_operation_file_path()?;
+    let recovering_path = recovering_storage_operation_file_path()?;
+    replace_prepared_account_enabled_toggle_journal(&operation, &pending_path, &recovering_path)
+}
+
+fn replace_prepared_account_enabled_toggle_journal(
+    committed: &PendingStorageOperation,
+    pending_path: &Path,
+    recovering_path: &Path,
+) -> anyhow::Result<()> {
+    if storage_operation_file_exists(recovering_path)? {
+        anyhow::bail!("account enabled-toggle recovery has already started")
+    }
+    let current = load_pending_storage_operation_from_path(pending_path)?;
+    if current.operation.kind != "account_enabled_toggle_prepared"
+        || current.operation.account_ids != committed.account_ids
+        || current.operation.use_keyring != committed.use_keyring
+        || current.operation.before_account != committed.before_account
+        || current.operation.after_account != committed.after_account
+    {
+        anyhow::bail!("pending account enabled-toggle journal does not match the commit request")
+    }
+
+    let content = serde_json::to_string_pretty(committed)?;
+    write_private_file_atomic(pending_path, "json.tmp", content.as_bytes())
+}
+
+pub(crate) fn mark_account_config_rollback_journal(
+    before_account: &Account,
+    use_keyring: bool,
+    rollback_marker: &str,
+) -> anyhow::Result<()> {
+    validate_rollback_marker(rollback_marker)?;
+    let operation = PendingStorageOperation {
+        version: PENDING_STORAGE_OPERATION_VERSION,
+        kind: "account_config_rollback".to_string(),
+        account_ids: vec![before_account.id.clone()],
+        from_use_keyring: false,
+        to_use_keyring: false,
+        use_keyring,
+        before_account: Some(before_account.clone()),
+        after_account: None,
+        rollback_marker: Some(rollback_marker.to_string()),
+    };
+    validate_pending_storage_operation(&operation)?;
+    let pending_path = pending_storage_operation_file_path()?;
+    let recovering_path = recovering_storage_operation_file_path()?;
+    replace_account_config_save_journal_with_rollback(&operation, &pending_path, &recovering_path)
+}
+
+fn replace_account_config_save_journal_with_rollback(
+    rollback: &PendingStorageOperation,
+    pending_path: &Path,
+    recovering_path: &Path,
+) -> anyhow::Result<()> {
+    if storage_operation_file_exists(recovering_path)? {
+        anyhow::bail!("account storage recovery has already started")
+    }
+    let current = load_pending_storage_operation_from_path(pending_path)?;
+    let expected_before = rollback
+        .before_account
+        .as_ref()
+        .expect("validated rollback journal has a source account");
+    if current.operation.kind != "account_config_save"
+        || current.operation.account_ids != rollback.account_ids
+        || current.operation.use_keyring != rollback.use_keyring
+        || current.operation.before_account.as_ref() != Some(expected_before)
+    {
+        anyhow::bail!("pending account journal does not match the rollback request")
+    }
+
+    let content = serde_json::to_string_pretty(rollback)?;
+    write_private_file_atomic(pending_path, "json.tmp", content.as_bytes())
 }
 
 pub(crate) fn begin_account_delete_journal(
@@ -3302,22 +4198,90 @@ pub(crate) fn begin_account_delete_journal(
 ) -> anyhow::Result<()> {
     let operation = PendingStorageOperation {
         version: PENDING_STORAGE_OPERATION_VERSION,
-        kind: "account_delete".to_string(),
+        kind: "account_delete_prepared".to_string(),
         account_ids: vec![before_account.id.clone()],
         from_use_keyring: false,
         to_use_keyring: false,
         use_keyring,
-        before_account: None,
+        before_account: Some(before_account.clone()),
         after_account: None,
+        rollback_marker: None,
     };
     validate_pending_storage_operation(&operation)?;
     save_pending_storage_operation(&operation)
 }
 
+pub(crate) fn mark_account_delete_committed_journal(
+    before_account: &Account,
+    use_keyring: bool,
+) -> anyhow::Result<()> {
+    let operation = PendingStorageOperation {
+        version: PENDING_STORAGE_OPERATION_VERSION,
+        kind: "account_delete_committed".to_string(),
+        account_ids: vec![before_account.id.clone()],
+        from_use_keyring: false,
+        to_use_keyring: false,
+        use_keyring,
+        before_account: Some(before_account.clone()),
+        after_account: None,
+        rollback_marker: None,
+    };
+    validate_pending_storage_operation(&operation)?;
+    let pending_path = pending_storage_operation_file_path()?;
+    let recovering_path = recovering_storage_operation_file_path()?;
+    replace_prepared_account_delete_journal(&operation, &pending_path, &recovering_path)
+}
+
+fn replace_prepared_account_delete_journal(
+    committed: &PendingStorageOperation,
+    pending_path: &Path,
+    recovering_path: &Path,
+) -> anyhow::Result<()> {
+    if storage_operation_file_exists(recovering_path)? {
+        anyhow::bail!("account deletion recovery has already started")
+    }
+    let current = load_pending_storage_operation_from_path(pending_path)?;
+    if current.operation.kind != "account_delete_prepared"
+        || current.operation.account_ids != committed.account_ids
+        || current.operation.use_keyring != committed.use_keyring
+        || current.operation.before_account != committed.before_account
+    {
+        anyhow::bail!("pending account deletion journal does not match the commit request")
+    }
+
+    let content = serde_json::to_string_pretty(committed)?;
+    write_private_file_atomic(pending_path, "json.tmp", content.as_bytes())
+}
+
 pub(crate) fn clear_pending_storage_operation() -> anyhow::Result<()> {
     let pending_path = pending_storage_operation_file_path()?;
     let recovering_path = recovering_storage_operation_file_path()?;
-    clear_pending_storage_operation_paths(&pending_path, &recovering_path)
+    clear_pending_storage_operation_with_marker(
+        &pending_path,
+        &recovering_path,
+        mark_storage_recovery_blocked,
+    )
+}
+
+fn clear_pending_storage_operation_with_marker<M>(
+    pending_path: &Path,
+    recovering_path: &Path,
+    mut mark_recovery_blocked: M,
+) -> anyhow::Result<()>
+where
+    M: FnMut() -> anyhow::Result<()>,
+{
+    match clear_pending_storage_operation_paths(pending_path, recovering_path) {
+        Ok(()) => Ok(()),
+        Err(clear_error) => {
+            if let Err(marker_error) = mark_recovery_blocked() {
+                anyhow::bail!(
+                    "{clear_error}; recovery block persistence also failed: {marker_error}"
+                );
+            }
+            Err(clear_error)
+        }
+    }
 }
 
 fn clear_pending_storage_operation_paths(
@@ -3347,7 +4311,7 @@ fn clear_pending_storage_operation_paths(
 }
 
 pub(crate) fn reconcile_pending_storage_operations(config: &mut AppConfig) -> anyhow::Result<()> {
-    let Some(record) = load_pending_storage_operation_record_or_quarantine()? else {
+    let Some(record) = load_pending_storage_operation_record_fail_closed()? else {
         return Ok(());
     };
     let record = consume_pending_storage_operation_record(record)?;
@@ -3356,7 +4320,27 @@ pub(crate) fn reconcile_pending_storage_operations(config: &mut AppConfig) -> an
         "account_config_save" => {
             reconcile_account_config_save_operation(config, &record.operation)?
         }
-        "account_delete" => reconcile_account_delete_operation(config, &record.operation)?,
+        "account_config_rollback" => {
+            reconcile_account_config_rollback_operation(config, &record.operation)?
+        }
+        "account_delete" => {
+            warn!(
+                "Legacy unphased account deletion journal remains blocked for safe manual recovery"
+            );
+            anyhow::bail!("legacy account deletion journal has no recoverable transaction phase");
+        }
+        "account_delete_prepared" => {
+            reconcile_prepared_account_delete_operation(config, &record.operation)?
+        }
+        "account_delete_committed" => {
+            reconcile_account_delete_operation(config, &record.operation)?
+        }
+        "account_enabled_toggle_prepared" => {
+            reconcile_prepared_account_enabled_toggle_operation(config, &record.operation)?
+        }
+        "account_enabled_toggle_committed" => {
+            reconcile_committed_account_enabled_toggle_operation(config, &record.operation)?
+        }
         _ => unreachable!("pending storage operation kind was validated"),
     }
     clear_pending_storage_operation()
@@ -3380,9 +4364,10 @@ fn reconcile_storage_mode_operation(
     operation: &PendingStorageOperation,
 ) -> anyhow::Result<()> {
     if !pending_storage_operation_account_ids_known(operation, &config.accounts) {
-        warn!("Pending storage migration journal referenced unknown account ids; quarantining");
-        quarantine_pending_storage_operation_files()?;
-        return Ok(());
+        warn!("Pending storage migration journal referenced unknown account ids; recovery remains blocked");
+        anyhow::bail!(
+            "pending storage migration references accounts that are absent from the current config"
+        );
     }
     let Some(backend_to_cleanup) =
         pending_storage_backend_to_cleanup(operation, config.settings.use_keyring)
@@ -3438,23 +4423,28 @@ fn reconcile_account_config_save_operation(
     reconcile_account_config_save_operation_with_ops(
         config,
         operation,
-        |account, use_keyring| load_password(account, use_keyring).map(|_| ()),
+        |account, use_keyring| {
+            load_password_for_rollback_verification(account, use_keyring).map(|(_, marker)| marker)
+        },
+        finalize_recovered_selected_backend,
         save_config,
         |account_ids, use_keyring| cleanup_storage_backend(account_ids, use_keyring).map(|_| ()),
         delete_password,
     )
 }
 
-fn reconcile_account_config_save_operation_with_ops<L, S, C, D>(
+fn reconcile_account_config_save_operation_with_ops<L, F, S, C, D>(
     config: &mut AppConfig,
     operation: &PendingStorageOperation,
     mut load_password_op: L,
+    mut finalize_selected_backend_op: F,
     mut save_config_op: S,
     mut cleanup_storage_backend_op: C,
     mut delete_password_op: D,
 ) -> anyhow::Result<()>
 where
-    L: FnMut(&Account, bool) -> anyhow::Result<()>,
+    L: FnMut(&Account, bool) -> anyhow::Result<Option<String>>,
+    F: FnMut(bool) -> anyhow::Result<()>,
     S: FnMut(&AppConfig) -> anyhow::Result<()>,
     C: FnMut(&[AccountId], bool) -> anyhow::Result<()>,
     D: FnMut(&AccountId) -> anyhow::Result<()>,
@@ -3465,20 +4455,114 @@ where
     let mut after_account = after_account.clone();
     after_account.has_saved_password = true;
 
-    if load_password_op(&after_account, operation.use_keyring).is_ok() {
+    let target_revision = load_password_op(&after_account, operation.use_keyring);
+    let mut verified_before_account = None;
+    let target_is_verified = match operation.rollback_marker.as_deref() {
+        Some(expected_marker) => match target_revision {
+            Ok(Some(loaded_marker)) if loaded_marker == expected_marker => true,
+            Ok(Some(_))
+                if operation
+                    .before_account
+                    .as_ref()
+                    .is_some_and(|before_account| {
+                        before_account.has_saved_password
+                            && password_binding_matches(before_account, &after_account)
+                    }) =>
+            {
+                // The rollback-intent journal replacement may have reached
+                // the filesystem while its directory sync remained
+                // unconfirmed. After a crash the older forward journal can
+                // therefore reappear next to the already-restored password.
+                // A different authenticated revision is safe to classify as
+                // the prior state only when both snapshots have identical
+                // password binding metadata; otherwise fail closed below.
+                verified_before_account = operation.before_account.clone();
+                false
+            }
+            Ok(_) => {
+                warn!(
+                    account_id = %redacted_account_id(&after_account.id),
+                    "Pending account save found a readable password from the wrong revision; recovery remains blocked"
+                );
+                anyhow::bail!("forward password revision marker could not be verified");
+            }
+            Err(target_error) => {
+                let Some(before_account) = operation.before_account.as_ref() else {
+                    warn!(
+                        account_id = %redacted_account_id(&after_account.id),
+                        error_kind = storage_error_kind(&target_error),
+                        "Pending new-account save could not verify the forward password; destructive recovery was refused"
+                    );
+                    anyhow::bail!(
+                        "forward password revision could not be read; recovery remains pending"
+                    );
+                };
+                if !before_account.has_saved_password {
+                    warn!(
+                        account_id = %redacted_account_id(&after_account.id),
+                        error_kind = storage_error_kind(&target_error),
+                        "Pending account save has no prior password revision that can disambiguate a target read failure"
+                    );
+                    anyhow::bail!(
+                        "forward password revision could not be read or safely rolled back"
+                    );
+                }
+
+                match load_password_op(before_account, operation.use_keyring) {
+                    Ok(Some(loaded_marker)) if loaded_marker == expected_marker => {
+                        // When password binding metadata did not change, the
+                        // same committed forward payload can be readable under
+                        // both snapshots. Its authenticated marker wins over a
+                        // transient first read failure.
+                        true
+                    }
+                    Ok(_) => {
+                        verified_before_account = Some(before_account.clone());
+                        false
+                    }
+                    Err(before_error) => {
+                        warn!(
+                            account_id = %redacted_account_id(&after_account.id),
+                            target_error_kind = storage_error_kind(&target_error),
+                            before_error_kind = storage_error_kind(&before_error),
+                            "Pending account save could not authenticate either password revision; recovery remains blocked"
+                        );
+                        anyhow::bail!(
+                            "neither forward nor prior password revision could be verified"
+                        );
+                    }
+                }
+            }
+        },
+        // Pre-revision journals retain their legacy recovery behavior. New
+        // journals always carry a marker and use the fail-closed branch above.
+        None => target_revision.is_ok(),
+    };
+
+    if target_is_verified {
+        finalize_selected_backend_op(operation.use_keyring)?;
         upsert_recovered_account(config, after_account);
         save_config_op(config)?;
         cleanup_storage_backend_op(&operation.account_ids, !operation.use_keyring)?;
         return Ok(());
     }
 
+    if let Some(before_account) = verified_before_account {
+        finalize_selected_backend_op(operation.use_keyring)?;
+        upsert_recovered_account(config, before_account);
+        save_config_op(config)?;
+        return Ok(());
+    }
+
     if let Some(before_account) = operation.before_account.as_ref() {
         let mut before_account = before_account.clone();
-        if before_account.has_saved_password
-            && load_password_op(&before_account, operation.use_keyring).is_err()
-        {
-            before_account.has_saved_password = false;
-            before_account.enabled = false;
+        if before_account.has_saved_password {
+            if load_password_op(&before_account, operation.use_keyring).is_err() {
+                before_account.has_saved_password = false;
+                before_account.enabled = false;
+            } else {
+                finalize_selected_backend_op(operation.use_keyring)?;
+            }
         }
         upsert_recovered_account(config, before_account);
         save_config_op(config)?;
@@ -3499,32 +4583,239 @@ where
     save_config_op(config)
 }
 
-fn reconcile_account_delete_operation(
-    config: &AppConfig,
+fn reconcile_prepared_account_enabled_toggle_operation(
+    config: &mut AppConfig,
     operation: &PendingStorageOperation,
 ) -> anyhow::Result<()> {
-    reconcile_account_delete_operation_with_ops(config, operation, delete_account)
+    reconcile_prepared_account_enabled_toggle_operation_with_ops(config, operation, save_config)
 }
 
-fn reconcile_account_delete_operation_with_ops<D>(
-    config: &AppConfig,
+fn reconcile_prepared_account_enabled_toggle_operation_with_ops<S>(
+    config: &mut AppConfig,
     operation: &PendingStorageOperation,
+    mut save_config_op: S,
+) -> anyhow::Result<()>
+where
+    S: FnMut(&AppConfig) -> anyhow::Result<()>,
+{
+    let before_account = operation
+        .before_account
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("prepared account enabled-toggle has no source snapshot"))?;
+    let after_account = operation
+        .after_account
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("prepared account enabled-toggle has no target snapshot"))?;
+    match config
+        .accounts
+        .iter()
+        .find(|account| account.id == before_account.id)
+    {
+        Some(existing) if existing == before_account || existing == after_account => {}
+        Some(_) => {
+            anyhow::bail!("prepared account enabled-toggle found mismatched account metadata")
+        }
+        None => anyhow::bail!("prepared account enabled-toggle cannot prove config was unchanged"),
+    }
+
+    // A prepared journal is the only durable entry that may survive when the
+    // prepared->committed atomic replacement had ambiguous directory
+    // durability. Resolve both directions to the disabled snapshot: a disable
+    // request must never roll back to enabled, while an enable request is not
+    // allowed to take effect until committed intent is durable.
+    let disabled_account = if before_account.enabled {
+        after_account
+    } else {
+        before_account
+    };
+    upsert_recovered_account(config, disabled_account.clone());
+    save_config_op(config)
+}
+
+fn reconcile_committed_account_enabled_toggle_operation(
+    config: &mut AppConfig,
+    operation: &PendingStorageOperation,
+) -> anyhow::Result<()> {
+    reconcile_committed_account_enabled_toggle_operation_with_ops(config, operation, save_config)
+}
+
+fn reconcile_committed_account_enabled_toggle_operation_with_ops<S>(
+    config: &mut AppConfig,
+    operation: &PendingStorageOperation,
+    mut save_config_op: S,
+) -> anyhow::Result<()>
+where
+    S: FnMut(&AppConfig) -> anyhow::Result<()>,
+{
+    let before_account = operation.before_account.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("committed account enabled-toggle has no source snapshot")
+    })?;
+    let after_account = operation.after_account.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("committed account enabled-toggle has no target snapshot")
+    })?;
+
+    match config
+        .accounts
+        .iter()
+        .find(|account| account.id == before_account.id)
+    {
+        Some(existing) if existing == before_account || existing == after_account => {}
+        Some(_) => {
+            anyhow::bail!("committed account enabled-toggle found mismatched account metadata")
+        }
+        None => anyhow::bail!("committed account enabled-toggle target account is absent"),
+    }
+    upsert_recovered_account(config, after_account.clone());
+    // The committed intent wins even if an earlier atomic config rename was
+    // lost after a power failure. Re-save the target snapshot durably before
+    // allowing the journal to be cleared.
+    save_config_op(config)
+}
+
+fn reconcile_account_config_rollback_operation(
+    config: &mut AppConfig,
+    operation: &PendingStorageOperation,
+) -> anyhow::Result<()> {
+    reconcile_account_config_rollback_operation_with_ops(
+        config,
+        operation,
+        |account, use_keyring| {
+            load_password_for_rollback_verification(account, use_keyring).map(|(_, marker)| marker)
+        },
+        finalize_recovered_selected_backend,
+        save_config,
+        |account_ids, use_keyring| cleanup_storage_backend(account_ids, use_keyring).map(|_| ()),
+    )
+}
+
+fn reconcile_account_config_rollback_operation_with_ops<L, F, S, C>(
+    config: &mut AppConfig,
+    operation: &PendingStorageOperation,
+    mut load_password_op: L,
+    mut finalize_selected_backend_op: F,
+    mut save_config_op: S,
+    mut cleanup_storage_backend_op: C,
+) -> anyhow::Result<()>
+where
+    L: FnMut(&Account, bool) -> anyhow::Result<Option<String>>,
+    F: FnMut(bool) -> anyhow::Result<()>,
+    S: FnMut(&AppConfig) -> anyhow::Result<()>,
+    C: FnMut(&[AccountId], bool) -> anyhow::Result<()>,
+{
+    let Some(before_account) = operation.before_account.as_ref() else {
+        return Ok(());
+    };
+    let Some(expected_marker) = operation.rollback_marker.as_deref() else {
+        warn!(
+            account_id = %redacted_account_id(&before_account.id),
+            "Pending account rollback predates verifiable rollback markers and remains blocked"
+        );
+        anyhow::bail!("pending account rollback has no verifiable rollback marker");
+    };
+    if before_account.has_saved_password {
+        let loaded_marker = load_password_op(before_account, operation.use_keyring).inspect_err(
+            |error| {
+                warn!(
+                    account_id = %redacted_account_id(&before_account.id),
+                    error_kind = storage_error_kind(error),
+                    "Pending account rollback kept recovery state because the restored password could not be verified"
+                );
+            },
+        )?;
+        if loaded_marker.as_deref() != Some(expected_marker) {
+            warn!(
+                account_id = %redacted_account_id(&before_account.id),
+                "Pending account rollback kept recovery state because the stored password lacks the matching rollback marker"
+            );
+            anyhow::bail!("restored password rollback marker could not be verified");
+        }
+        finalize_selected_backend_op(operation.use_keyring)?;
+    }
+
+    upsert_recovered_account(config, before_account.clone());
+    save_config_op(config)?;
+    cleanup_storage_backend_op(&operation.account_ids, !operation.use_keyring)
+}
+
+fn finalize_recovered_selected_backend(use_keyring: bool) -> anyhow::Result<()> {
+    if use_keyring {
+        Ok(())
+    } else {
+        // A fallback password load can succeed while retired-key cleanup is
+        // still pending. Recovery must surface that state and retain its
+        // journal instead of treating the backend as fully finalized.
+        cleanup_unused_fallback_key_material()
+    }
+}
+
+fn reconcile_account_delete_operation(
+    config: &mut AppConfig,
+    operation: &PendingStorageOperation,
+) -> anyhow::Result<()> {
+    reconcile_account_delete_operation_with_ops(config, operation, save_config, delete_account)
+}
+
+fn reconcile_account_delete_operation_with_ops<S, D>(
+    config: &mut AppConfig,
+    operation: &PendingStorageOperation,
+    mut save_config_op: S,
     mut delete_account_op: D,
 ) -> anyhow::Result<()>
 where
+    S: FnMut(&AppConfig) -> anyhow::Result<()>,
     D: FnMut(&AccountId) -> anyhow::Result<()>,
 {
     let Some(account_id) = operation.account_ids.first() else {
         return Ok(());
     };
-    if config
+    let Some(before_account) = operation.before_account.as_ref() else {
+        anyhow::bail!("committed account deletion has no source snapshot");
+    };
+    if let Some(existing) = config
         .accounts
         .iter()
-        .any(|account| account.id == *account_id)
+        .find(|account| account.id == *account_id)
     {
-        return Ok(());
+        if existing != before_account {
+            anyhow::bail!("account deletion recovery found mismatched account metadata");
+        }
+        config.accounts.retain(|account| account.id != *account_id);
     }
+    // Recovery can run in the same boot immediately after an atomic config
+    // replacement whose directory sync failed. Re-save and confirm durability
+    // before independently destroying the credential.
+    save_config_op(config)?;
     delete_account_op(account_id)
+}
+
+fn reconcile_prepared_account_delete_operation(
+    config: &AppConfig,
+    operation: &PendingStorageOperation,
+) -> anyhow::Result<()> {
+    reconcile_prepared_account_delete_operation_with_ops(config, operation)
+}
+
+fn reconcile_prepared_account_delete_operation_with_ops(
+    config: &AppConfig,
+    operation: &PendingStorageOperation,
+) -> anyhow::Result<()> {
+    let Some(account_id) = operation.account_ids.first() else {
+        return Ok(());
+    };
+    let Some(before_account) = operation.before_account.as_ref() else {
+        anyhow::bail!("prepared account deletion has no source snapshot");
+    };
+    match config
+        .accounts
+        .iter()
+        .find(|account| account.id == *account_id)
+    {
+        Some(existing) if existing == before_account => Ok(()),
+        Some(_) => anyhow::bail!("prepared account deletion found mismatched account metadata"),
+        None => anyhow::bail!(
+            "prepared account deletion cannot prove that config storage was left unchanged"
+        ),
+    }
 }
 
 fn upsert_recovered_account(config: &mut AppConfig, account: Account) {
@@ -3564,9 +4855,35 @@ fn storage_mode_migration_account_ids(accounts: &[Account]) -> Vec<AccountId> {
 
 fn save_pending_storage_operation(operation: &PendingStorageOperation) -> anyhow::Result<()> {
     ensure_config_dir()?;
+    // The staged-key scan must happen before the pending journal is created:
+    // once that journal exists, fallback cleanup is deliberately deferred to
+    // protect an ambiguous forward revision. Holding the password lock across
+    // both steps also prevents a concurrent local transaction from changing
+    // the active key map between validation and intent creation.
     let path = pending_storage_operation_file_path()?;
     let recovering_path = recovering_storage_operation_file_path()?;
-    save_pending_storage_operation_to_paths(operation, &path, &recovering_path)
+    save_pending_storage_operation_with_preflight_ops(
+        operation,
+        acquire_password_file_transaction_lock,
+        prepare_password_file_transaction,
+        |operation| save_pending_storage_operation_to_paths(operation, &path, &recovering_path),
+    )
+}
+
+fn save_pending_storage_operation_with_preflight_ops<G, L, P, S>(
+    operation: &PendingStorageOperation,
+    acquire_lock: L,
+    mut preflight: P,
+    mut save_operation: S,
+) -> anyhow::Result<()>
+where
+    L: FnOnce() -> anyhow::Result<G>,
+    P: FnMut() -> anyhow::Result<()>,
+    S: FnMut(&PendingStorageOperation) -> anyhow::Result<()>,
+{
+    let _lock = acquire_lock()?;
+    preflight()?;
+    save_operation(operation)
 }
 
 fn save_pending_storage_operation_to_paths(
@@ -3605,14 +4922,42 @@ fn storage_operation_file_exists(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-fn load_pending_storage_operation_record_or_quarantine(
+fn load_pending_storage_operation_record_fail_closed(
 ) -> anyhow::Result<Option<PendingStorageOperationRecord>> {
     let recovering_path = recovering_storage_operation_file_path()?;
     let pending_path = pending_storage_operation_file_path()?;
-    load_pending_storage_operation_record_or_quarantine_from_paths(&recovering_path, &pending_path)
+    load_pending_storage_operation_record_fail_closed_with_marker(
+        &recovering_path,
+        &pending_path,
+        mark_storage_recovery_blocked,
+    )
 }
 
-fn load_pending_storage_operation_record_or_quarantine_from_paths(
+fn load_pending_storage_operation_record_fail_closed_with_marker<M>(
+    recovering_path: &Path,
+    pending_path: &Path,
+    mut mark_recovery_blocked: M,
+) -> anyhow::Result<Option<PendingStorageOperationRecord>>
+where
+    M: FnMut() -> anyhow::Result<()>,
+{
+    match load_pending_storage_operation_record_fail_closed_from_paths(
+        recovering_path,
+        pending_path,
+    ) {
+        Ok(record) => Ok(record),
+        Err(load_error) => {
+            if let Err(marker_error) = mark_recovery_blocked() {
+                return Err(load_error.context(format!(
+                    "storage recovery block persistence also failed: {marker_error}"
+                )));
+            }
+            Err(load_error)
+        }
+    }
+}
+
+fn load_pending_storage_operation_record_fail_closed_from_paths(
     recovering_path: &Path,
     pending_path: &Path,
 ) -> anyhow::Result<Option<PendingStorageOperationRecord>> {
@@ -3624,16 +4969,43 @@ fn load_pending_storage_operation_record_or_quarantine_from_paths(
             "Failed to clean stale pending storage operation temp files before recovery"
         );
     }
-    if let Some(record) = load_pending_storage_operation_record_from_path_or_quarantine(
-        recovering_path,
-        "recovering",
-    )? {
-        return Ok(Some(record));
+    // Always inspect both active slots. A crash can leave the original
+    // pending name alongside the recovering name; preferring recovering
+    // without authenticating pending would let one operation run and then
+    // erase evidence of a different operation during journal cleanup.
+    let recovering =
+        load_pending_storage_operation_record_from_path_fail_closed(recovering_path, "recovering");
+    let pending =
+        load_pending_storage_operation_record_from_path_fail_closed(pending_path, "pending");
+
+    match (recovering, pending) {
+        (Ok(Some(recovering)), Ok(Some(pending))) => {
+            if recovering.operation != pending.operation {
+                warn!(
+                    "recovering and pending storage operation journals conflict; retaining both active paths"
+                );
+                return Err(anyhow::Error::new(PendingStorageRecoveryBlocked {
+                    source: anyhow::anyhow!(
+                        "recovering and pending storage operation journals describe different operations"
+                    ),
+                }));
+            }
+            // The recovering slot is authoritative only after both validated
+            // records proved structurally identical. Keeping its path avoids
+            // a redundant rename while recovery durably re-syncs it.
+            Ok(Some(recovering))
+        }
+        (Ok(Some(record)), Ok(None)) | (Ok(None), Ok(Some(record))) => Ok(Some(record)),
+        (Ok(None), Ok(None)) => Ok(None),
+        (Err(recovering_error), Ok(_)) => Err(recovering_error),
+        (Ok(_), Err(pending_error)) => Err(pending_error),
+        (Err(recovering_error), Err(pending_error)) => Err(recovering_error.context(format!(
+            "pending journal validation also failed: {pending_error}"
+        ))),
     }
-    load_pending_storage_operation_record_from_path_or_quarantine(pending_path, "pending")
 }
 
-fn load_pending_storage_operation_record_from_path_or_quarantine(
+fn load_pending_storage_operation_record_from_path_fail_closed(
     path: &Path,
     slot_name: &'static str,
 ) -> anyhow::Result<Option<PendingStorageOperationRecord>> {
@@ -3646,11 +5018,12 @@ fn load_pending_storage_operation_record_from_path_or_quarantine(
         Err(e) => {
             warn!(
                 slot = slot_name,
-                error = %e,
-                "pending storage operation journal is invalid; quarantining"
+                error_kind = storage_error_kind(&e),
+                "pending storage operation journal is invalid; retaining it at the active path so credential changes remain blocked"
             );
-            quarantine_pending_storage_operation_file(path)?;
-            Ok(None)
+            Err(anyhow::Error::new(PendingStorageRecoveryBlocked {
+                source: e,
+            }))
         }
     }
 }
@@ -3672,23 +5045,43 @@ fn consume_pending_storage_operation_record(
     record: PendingStorageOperationRecord,
 ) -> anyhow::Result<PendingStorageOperationRecord> {
     let recovering_path = recovering_storage_operation_file_path()?;
-    if record.path == recovering_path {
-        return Ok(record);
+    consume_pending_storage_operation_record_with_ops(
+        record,
+        &recovering_path,
+        |from, to| std::fs::rename(from, to).map_err(anyhow::Error::from),
+        |path| secure_path_permissions(path, 0o600),
+        sync_parent_dir,
+    )
+}
+
+fn consume_pending_storage_operation_record_with_ops<R, P, S>(
+    record: PendingStorageOperationRecord,
+    recovering_path: &Path,
+    mut rename: R,
+    mut secure_permissions: P,
+    mut sync_parent: S,
+) -> anyhow::Result<PendingStorageOperationRecord>
+where
+    R: FnMut(&Path, &Path) -> anyhow::Result<()>,
+    P: FnMut(&Path) -> anyhow::Result<()>,
+    S: FnMut(&Path) -> anyhow::Result<()>,
+{
+    if record.path != recovering_path {
+        rename(&record.path, recovering_path)?;
     }
-    std::fs::rename(&record.path, &recovering_path)?;
-    secure_path_permissions(&recovering_path, 0o600)?;
-    sync_parent_dir(&recovering_path)?;
+    // Recovery side effects can retire fallback keys. Sync even when a prior
+    // process already renamed the journal, because that process may have died
+    // before the directory sync that also pins an earlier passwords.json
+    // replacement in the same directory.
+    secure_permissions(recovering_path)?;
+    sync_parent(recovering_path)?;
     Ok(PendingStorageOperationRecord {
         operation: record.operation,
-        path: recovering_path,
+        path: recovering_path.to_path_buf(),
     })
 }
 
-fn quarantine_pending_storage_operation_files() -> anyhow::Result<()> {
-    quarantine_pending_storage_operation_file(&pending_storage_operation_file_path()?)?;
-    quarantine_pending_storage_operation_file(&recovering_storage_operation_file_path()?)
-}
-
+#[cfg(test)]
 fn quarantine_pending_storage_operation_file(path: &Path) -> anyhow::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -3937,6 +5330,7 @@ pub(crate) struct PasswordLoadResult {
 
 struct LoadedStoredPassword {
     password: Zeroizing<String>,
+    rollback_marker: Option<String>,
     zeroizing_wrap_ms: u128,
 }
 
@@ -4033,28 +5427,52 @@ fn redact_password_load_error(
 }
 
 fn load_from_keyring_timed(account: &Account) -> anyhow::Result<LoadedStoredPassword> {
+    // Finish every potentially blocking lock/recovery operation before the
+    // provider can materialize a legacy plaintext password. Keep the lock
+    // through a possible migration write so another credential transaction
+    // cannot change staged fallback-key state between preflight and commit.
+    let _lock = acquire_password_file_transaction_lock()?;
+    prepare_password_file_transaction()?;
     let entry = keyring::Entry::new(SERVICE_NAME, &account.id)?;
     let stored = Zeroizing::new(entry.get_password()?);
     let zeroizing_start = std::time::Instant::now();
-    let (password, format, secure_storage_needs_migration) =
+    let (password, format, secure_storage_needs_migration, rollback_marker) =
         decode_keyring_password(account, stored.as_str())?;
-    // The decoded password is independently zeroizing. Wipe the provider's
-    // stored payload before a migration write can block or report an error.
-    drop(stored);
     let zeroizing_wrap_ms = zeroizing_start.elapsed().as_millis();
-    if secure_storage_needs_migration || format == StoredPasswordFormat::LegacyRaw {
-        let payload = encode_keyring_password(account, password.as_str())?;
+    let migration_payload =
+        if secure_storage_needs_migration || format == StoredPasswordFormat::LegacyRaw {
+            Some(encode_keyring_password_with_rollback_marker(
+                account,
+                password.as_str(),
+                rollback_marker.as_deref(),
+            )?)
+        } else {
+            None
+        };
+    if let Some(payload) = migration_payload {
+        // The initial decode was needed only to construct the replacement.
+        // Recreate the return allocation from that replacement after the
+        // provider call instead of retaining any separately reversible copy.
+        drop(password);
+        drop(stored);
         let set_result = entry.set_password(payload.as_str());
-        drop(payload);
         if let Err(e) = set_result {
             warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy keychain format, but migration to user-bound DPAPI storage failed");
         } else {
             info!(account_id = %redacted_account_id(&account.id), "Migrated legacy keychain password to user-bound DPAPI storage");
         }
+        let (password, _, _, rollback_marker) = decode_keyring_password(account, payload.as_str())?;
+        drop(payload);
+        return Ok(LoadedStoredPassword {
+            password,
+            rollback_marker,
+            zeroizing_wrap_ms,
+        });
     }
-    debug!(account_id = %redacted_account_id(&account.id), "Password loaded from secure storage");
+    drop(stored);
     Ok(LoadedStoredPassword {
         password,
+        rollback_marker,
         zeroizing_wrap_ms,
     })
 }
@@ -4135,28 +5553,6 @@ fn delete_password(account_id: &AccountId) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn save_account(
-    account: &Account,
-    password: &str,
-    use_keyring: bool,
-) -> anyhow::Result<()> {
-    save_account_with_outcome(account, password, use_keyring).map(|_| ())
-}
-
-pub(crate) fn save_account_with_outcome(
-    account: &Account,
-    password: &str,
-    use_keyring: bool,
-) -> anyhow::Result<SaveAccountOutcome> {
-    debug!(account_id = %redacted_account_id(&account.id), use_keyring, "save_account called");
-    if password.is_empty() {
-        warn!(account_id = %redacted_account_id(&account.id), "save_account received empty password, skipping keyring storage");
-        Ok(SaveAccountOutcome::default())
-    } else {
-        save_password(account, password, use_keyring)
-    }
-}
-
 pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
     debug!(account_id = %redacted_account_id(account_id), "delete_account called");
     if let Err(e) = delete_password(account_id) {
@@ -4184,33 +5580,52 @@ pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_scoped_fallback_keys, backup_invalid_config_file,
+        active_scoped_fallback_keys_by_id, backup_invalid_config_file,
         cleanup_fallback_key_if_password_file_empty,
         cleanup_legacy_fallback_key_residue_files_in_dir, cleanup_retired_fallback_keys_with_ops,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
         cleanup_storage_temp_files_in_dir, clear_pending_storage_operation_paths,
-        commit_password_file_with_staged_keys_with_ops, decode_bound_password,
+        clear_pending_storage_operation_with_marker,
+        clear_storage_recovery_block_after_startup_recovery_at,
+        clear_storage_recovery_block_after_startup_recovery_with_ops,
+        clear_storage_recovery_block_after_startup_recovery_with_state,
+        commit_password_file_with_staged_keys_with_ops, committed_config_write_test_error,
+        config_write_committed, consume_pending_storage_operation_record_with_ops,
+        decode_bound_password, decode_bound_password_with_rollback_marker,
         decrypt_password_with_fallback_key, decrypt_password_with_key,
         delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
-        encode_bound_password, encrypt_password_with_key, ensure_no_pending_storage_operation,
+        direct_password_write_after_preflight_with_ops, encode_bound_password,
+        encode_bound_password_with_rollback_marker, encrypt_password_with_key,
+        ensure_no_pending_storage_operation, finish_account_password_write_with_ops,
         install_scoped_fallback_entry, is_pending_storage_operation_in_progress,
         legacy_account_id_for_migrated_config, legacy_migration_target_cleanup_id,
         legacy_password_migration_ready_to_persist, load_config_file,
-        load_pending_storage_operation_record_or_quarantine_from_paths, migrate_legacy_config,
+        load_pending_storage_operation_record_fail_closed_from_paths,
+        load_pending_storage_operation_record_fail_closed_with_marker,
+        mark_storage_recovery_blocked_at, migrate_legacy_config,
         migrate_legacy_fallback_entries_with_ops, normalize_config, password_entry_for_account,
         pending_storage_backend_to_cleanup, pending_storage_operation_account_ids_known,
         quarantine_pending_storage_operation_file, read_private_text_file,
+        reconcile_account_config_rollback_operation_with_ops,
         reconcile_account_config_save_operation_with_ops,
-        reconcile_account_delete_operation_with_ops, reconcile_staged_fallback_keys_with_ops,
-        redact_password_load_error, redacted_account_id, remove_fallback_entry,
-        save_pending_storage_operation_to_paths, sha256_hex,
-        stage_and_commit_fallback_password_with_ops, storage_error_kind,
-        validate_password_file_shape, validate_pending_storage_operation,
-        verify_pending_storage_surviving_backend, write_private_file_atomic,
-        write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
-        LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted, PasswordStorageBackend,
-        PendingStorageOperation, ScopedFallbackKeyRef, StagedFallbackKeysJournal,
-        StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
+        reconcile_account_delete_operation_with_ops,
+        reconcile_committed_account_enabled_toggle_operation_with_ops,
+        reconcile_prepared_account_delete_operation_with_ops,
+        reconcile_prepared_account_enabled_toggle_operation_with_ops,
+        reconcile_staged_fallback_keys_if_safe, reconcile_staged_fallback_keys_with_ops,
+        reconcile_storage_mode_operation, redact_password_load_error, redacted_account_id,
+        remove_fallback_entry, replace_account_config_save_journal_with_rollback,
+        replace_prepared_account_delete_journal, replace_prepared_account_enabled_toggle_journal,
+        save_pending_storage_operation_to_paths, save_pending_storage_operation_with_preflight_ops,
+        sha256_hex, stage_and_commit_fallback_payload_with_ops, storage_error_kind,
+        use_owned_secret_then_drop, validate_password_file_shape,
+        validate_pending_storage_operation, verify_pending_storage_surviving_backend,
+        write_private_file_atomic, write_private_file_create_new_atomic, LegacyConfig,
+        LegacyCredentialsConfig, LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted,
+        PasswordStorageBackend, PasswordWriteReceipt, PendingStorageOperation,
+        PendingStorageOperationRecord, PendingStorageRecoveryBlocked, ScopedFallbackKeyRef,
+        StagedFallbackKeyConflict, StagedFallbackKeysJournal, StoredPasswordFormat,
+        AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
         PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES, PENDING_STORAGE_OPERATION_VERSION,
         SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE,
         STAGED_FALLBACK_KEYS_VERSION, WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
@@ -4228,6 +5643,7 @@ mod tests {
     use base64::Engine as _;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use zeroize::Zeroizing;
 
     #[test]
     fn legacy_migration_uses_fixed_poll_interval() {
@@ -4418,6 +5834,7 @@ mod tests {
             use_keyring: false,
             before_account: None,
             after_account: None,
+            rollback_marker: None,
         };
 
         for (config_not_saved, expected_backend) in [(true, false), (false, true)] {
@@ -4445,6 +5862,7 @@ mod tests {
             use_keyring: false,
             before_account: None,
             after_account: None,
+            rollback_marker: None,
         };
         let mut attempts = Vec::new();
 
@@ -4470,6 +5888,12 @@ mod tests {
                 events
                     .borrow_mut()
                     .push(format!("load:{}:{use_keyring}", account.id));
+                Ok(None)
+            },
+            |use_keyring| {
+                events
+                    .borrow_mut()
+                    .push(format!("finalize-target:{use_keyring}"));
                 Ok(())
             },
             |next_config| {
@@ -4495,6 +5919,7 @@ mod tests {
             events.into_inner(),
             vec![
                 "load:account-1:true",
+                "finalize-target:true",
                 "save_config",
                 "cleanup:account-1:false"
             ]
@@ -4518,6 +5943,12 @@ mod tests {
                 if account.username == "user@example.com" {
                     anyhow::bail!("target missing")
                 }
+                Ok(None)
+            },
+            |use_keyring| {
+                events
+                    .borrow_mut()
+                    .push(format!("finalize-before:{use_keyring}"));
                 Ok(())
             },
             |next_config| {
@@ -4538,37 +5969,715 @@ mod tests {
             vec![
                 "load:user@example.com:true",
                 "load:old@example.com:true",
+                "finalize-before:true",
                 "save_config"
             ]
         );
     }
 
     #[test]
-    fn pending_account_delete_recovery_cleans_up_only_after_config_removed_account() {
-        let config = AppConfig::default();
+    fn pending_account_config_save_rejects_readable_password_from_an_old_revision() {
+        let expected_marker = "11111111-1111-4111-8111-111111111111";
+        let old_marker = "22222222-2222-4222-8222-222222222222";
+        let mut operation = account_config_save_pending_operation(false);
+        operation.rollback_marker = Some(expected_marker.to_string());
+        validate_pending_storage_operation(&operation).unwrap();
+
+        let before_account = operation.before_account.clone().unwrap();
+        let mut config = AppConfig {
+            accounts: vec![before_account.clone()],
+            ..AppConfig::default()
+        };
+        let error = reconcile_account_config_save_operation_with_ops(
+            &mut config,
+            &operation,
+            |account, _| {
+                assert_eq!(account.username, "user@example.com");
+                Ok(Some(old_marker.to_string()))
+            },
+            |_| panic!("the wrong password revision must not be finalized"),
+            |_| panic!("the wrong password revision must not change config"),
+            |_, _| panic!("the wrong password revision must not trigger stale cleanup"),
+            |_| panic!("the wrong password revision must not be deleted or rolled back"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("forward password revision marker could not be verified"));
+        assert_eq!(config.accounts, vec![before_account]);
+    }
+
+    #[test]
+    fn pending_password_only_save_recovers_prior_authenticated_revision() {
+        let forward_marker = "11111111-1111-4111-8111-111111111111";
+        let rollback_marker = "22222222-2222-4222-8222-222222222222";
+        let mut operation = account_config_save_pending_operation(true);
+        operation.after_account = operation.before_account.clone();
+        operation.rollback_marker = Some(forward_marker.to_string());
+        validate_pending_storage_operation(&operation).unwrap();
+        let before_account = operation.before_account.clone().unwrap();
+        let mut config = AppConfig {
+            accounts: vec![before_account.clone()],
+            ..AppConfig::default()
+        };
+        let events = RefCell::new(Vec::new());
+
+        reconcile_account_config_save_operation_with_ops(
+            &mut config,
+            &operation,
+            |account, _| {
+                assert_eq!(account.id, before_account.id);
+                Ok(Some(rollback_marker.to_string()))
+            },
+            |_| {
+                events.borrow_mut().push("finalize-prior");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("save-prior-config");
+                Ok(())
+            },
+            |_, _| panic!("prior-state recovery must preserve the stale backend"),
+            |_| panic!("prior-state recovery must preserve the restored password"),
+        )
+        .unwrap();
+
+        assert_eq!(config.accounts, vec![before_account]);
+        assert_eq!(
+            events.into_inner(),
+            vec!["finalize-prior", "save-prior-config"]
+        );
+    }
+
+    #[test]
+    fn pending_username_change_rejects_wrong_authenticated_revision() {
+        let forward_marker = "11111111-1111-4111-8111-111111111111";
+        let rollback_marker = "22222222-2222-4222-8222-222222222222";
+        let mut operation = account_config_save_pending_operation(false);
+        operation.rollback_marker = Some(forward_marker.to_string());
+        validate_pending_storage_operation(&operation).unwrap();
+        let before_account = operation.before_account.clone().unwrap();
+        let mut config = AppConfig {
+            accounts: vec![before_account.clone()],
+            ..AppConfig::default()
+        };
+
+        let error = reconcile_account_config_save_operation_with_ops(
+            &mut config,
+            &operation,
+            |account, _| {
+                assert_eq!(account.username, "user@example.com");
+                Ok(Some(rollback_marker.to_string()))
+            },
+            |_| panic!("mismatched binding must not be finalized"),
+            |_| panic!("mismatched binding must not change config"),
+            |_, _| panic!("mismatched binding must not clean stale storage"),
+            |_| panic!("mismatched binding must not delete a credential"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("forward password revision marker could not be verified"));
+        assert_eq!(config.accounts, vec![before_account]);
+    }
+
+    #[test]
+    fn pending_account_config_save_accepts_only_the_matching_forward_revision() {
+        let expected_marker = "11111111-1111-4111-8111-111111111111";
+        let mut operation = account_config_save_pending_operation(true);
+        operation.rollback_marker = Some(expected_marker.to_string());
+        validate_pending_storage_operation(&operation).unwrap();
+        let after_account = operation.after_account.clone().unwrap();
+        let mut config = AppConfig::default();
+
+        reconcile_account_config_save_operation_with_ops(
+            &mut config,
+            &operation,
+            |_, _| Ok(Some(expected_marker.to_string())),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_, _| Ok(()),
+            |_| panic!("a matching target revision must not be deleted"),
+        )
+        .unwrap();
+
+        assert_eq!(config.accounts, vec![after_account]);
+    }
+
+    #[test]
+    fn pending_new_account_save_retains_journal_on_transient_target_read_error() {
+        let expected_marker = "11111111-1111-4111-8111-111111111111";
+        let mut operation = account_config_save_pending_operation(true);
+        operation.before_account = None;
+        operation.rollback_marker = Some(expected_marker.to_string());
+        validate_pending_storage_operation(&operation).unwrap();
+        let mut config = AppConfig::default();
+        let delete_called = Cell::new(false);
+
+        let error = reconcile_account_config_save_operation_with_ops(
+            &mut config,
+            &operation,
+            |_, _| anyhow::bail!("transient credential provider failure"),
+            |_| panic!("an unreadable target must not be finalized"),
+            |_| panic!("an unreadable target must not mutate config"),
+            |_, _| panic!("an unreadable target must not clean stale storage"),
+            |_| {
+                delete_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("recovery remains pending"));
+        assert!(config.accounts.is_empty());
+        assert!(!delete_called.get());
+    }
+
+    #[test]
+    fn pending_password_only_save_retry_recognizes_matching_forward_revision() {
+        let expected_marker = "11111111-1111-4111-8111-111111111111";
+        let mut operation = account_config_save_pending_operation(true);
+        operation.after_account = operation.before_account.clone();
+        operation.rollback_marker = Some(expected_marker.to_string());
+        validate_pending_storage_operation(&operation).unwrap();
+        let after_account = operation.after_account.clone().unwrap();
+        let mut config = AppConfig {
+            accounts: vec![after_account.clone()],
+            ..AppConfig::default()
+        };
+        let load_attempts = Cell::new(0usize);
+        let events = RefCell::new(Vec::new());
+
+        reconcile_account_config_save_operation_with_ops(
+            &mut config,
+            &operation,
+            |_, _| {
+                let attempt = load_attempts.get();
+                load_attempts.set(attempt + 1);
+                if attempt == 0 {
+                    anyhow::bail!("transient first read failure")
+                }
+                Ok(Some(expected_marker.to_string()))
+            },
+            |_| {
+                events.borrow_mut().push("finalize-forward");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("save-forward-config");
+                Ok(())
+            },
+            |_, _| {
+                events.borrow_mut().push("cleanup-stale-backend");
+                Ok(())
+            },
+            |_| panic!("a matching forward revision must never be deleted"),
+        )
+        .unwrap();
+
+        assert_eq!(load_attempts.get(), 2);
+        assert_eq!(config.accounts, vec![after_account]);
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "finalize-forward",
+                "save-forward-config",
+                "cleanup-stale-backend"
+            ]
+        );
+    }
+
+    #[test]
+    fn account_rollback_journal_restores_before_state_before_stale_cleanup() {
+        let save_operation = account_config_save_pending_operation(true);
+        let before_account = save_operation.before_account.clone().unwrap();
+        let rollback_operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "account_config_rollback".to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: true,
+            before_account: Some(before_account.clone()),
+            after_account: None,
+            rollback_marker: Some("11111111-1111-4111-8111-111111111111".to_string()),
+        };
+        validate_pending_storage_operation(&rollback_operation).unwrap();
+
+        let mut config = AppConfig::default();
+        config
+            .accounts
+            .push(save_operation.after_account.clone().unwrap());
+        let events = RefCell::new(Vec::new());
+        reconcile_account_config_rollback_operation_with_ops(
+            &mut config,
+            &rollback_operation,
+            |account, use_keyring| {
+                events
+                    .borrow_mut()
+                    .push(format!("verify:{}:{use_keyring}", account.username));
+                Ok(Some("11111111-1111-4111-8111-111111111111".to_string()))
+            },
+            |use_keyring| {
+                events
+                    .borrow_mut()
+                    .push(format!("finalize-restored:{use_keyring}"));
+                Ok(())
+            },
+            |next_config| {
+                events.borrow_mut().push("save-before-config".to_string());
+                assert_eq!(next_config.accounts, vec![before_account.clone()]);
+                Ok(())
+            },
+            |account_ids, use_keyring| {
+                events.borrow_mut().push(format!(
+                    "cleanup-stale:{}:{use_keyring}",
+                    account_ids.join(",")
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config.accounts, vec![before_account]);
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "verify:old@example.com:true",
+                "finalize-restored:true",
+                "save-before-config",
+                "cleanup-stale:account-1:false"
+            ]
+        );
+    }
+
+    #[test]
+    fn account_rollback_journal_stays_pending_when_before_password_is_unverified() {
+        let save_operation = account_config_save_pending_operation(false);
+        let before_account = save_operation.before_account.clone().unwrap();
+        let rollback_operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "account_config_rollback".to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: false,
+            before_account: Some(before_account),
+            after_account: None,
+            rollback_marker: Some("11111111-1111-4111-8111-111111111111".to_string()),
+        };
+        let mut config = AppConfig::default();
+        config
+            .accounts
+            .push(save_operation.after_account.clone().unwrap());
+        let original = config.clone();
+
+        let error = reconcile_account_config_rollback_operation_with_ops(
+            &mut config,
+            &rollback_operation,
+            |_, _| anyhow::bail!("restored password unavailable"),
+            |_| panic!("unverified rollback must not finalize backend cleanup"),
+            |_| panic!("unverified rollback must not change config"),
+            |_, _| panic!("unverified rollback must not clean stale storage"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("restored password unavailable"));
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn account_rollback_journal_rejects_readable_password_without_matching_marker() {
+        let save_operation = account_config_save_pending_operation(true);
+        let before_account = save_operation.before_account.clone().unwrap();
+        let rollback_operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "account_config_rollback".to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: true,
+            before_account: Some(before_account),
+            after_account: None,
+            rollback_marker: Some("11111111-1111-4111-8111-111111111111".to_string()),
+        };
+        let mut config = AppConfig::default();
+        config
+            .accounts
+            .push(save_operation.after_account.clone().unwrap());
+        let original = config.clone();
+
+        let error = reconcile_account_config_rollback_operation_with_ops(
+            &mut config,
+            &rollback_operation,
+            |_, _| Ok(None),
+            |_| panic!("unmarked password must not finalize backend cleanup"),
+            |_| panic!("unmarked password must not change config"),
+            |_, _| panic!("unmarked password must not clean stale storage"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rollback marker"));
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn legacy_unmarked_account_rollback_journal_remains_blocked() {
+        let save_operation = account_config_save_pending_operation(true);
+        let before_account = save_operation.before_account.clone().unwrap();
+        let rollback_operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "account_config_rollback".to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: true,
+            before_account: Some(before_account),
+            after_account: None,
+            rollback_marker: None,
+        };
+        validate_pending_storage_operation(&rollback_operation).unwrap();
+        let mut config = AppConfig::default();
+        config
+            .accounts
+            .push(save_operation.after_account.clone().unwrap());
+        let original = config.clone();
+
+        let error = reconcile_account_config_rollback_operation_with_ops(
+            &mut config,
+            &rollback_operation,
+            |_, _| panic!("unmarked rollback must not inspect or accept a password"),
+            |_| panic!("unmarked rollback must not finalize backend cleanup"),
+            |_| panic!("unmarked rollback must not change config"),
+            |_, _| panic!("unmarked rollback must not clean stale storage"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no verifiable rollback marker"));
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn account_rollback_journal_stays_pending_when_selected_backend_cleanup_is_unfinished() {
+        let save_operation = account_config_save_pending_operation(false);
+        let before_account = save_operation.before_account.clone().unwrap();
+        let rollback_operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "account_config_rollback".to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: false,
+            before_account: Some(before_account),
+            after_account: None,
+            rollback_marker: Some("11111111-1111-4111-8111-111111111111".to_string()),
+        };
+        let mut config = AppConfig::default();
+        config
+            .accounts
+            .push(save_operation.after_account.clone().unwrap());
+        let original = config.clone();
+
+        let error = reconcile_account_config_rollback_operation_with_ops(
+            &mut config,
+            &rollback_operation,
+            |_, _| Ok(Some("11111111-1111-4111-8111-111111111111".to_string())),
+            |_| anyhow::bail!("retired fallback key cleanup pending"),
+            |_| panic!("unfinished selected backend must not change config"),
+            |_, _| panic!("unfinished selected backend must not clean stale storage"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("retired fallback key cleanup pending"));
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn rollback_phase_atomically_replaces_only_matching_account_save_journal() {
+        let root = temp_storage_test_dir("account-rollback-journal-replace");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let save_operation = account_config_save_pending_operation(true);
+        save_pending_storage_operation_to_paths(&save_operation, &pending_path, &recovering_path)
+            .unwrap();
+        let before_account = save_operation.before_account.clone().unwrap();
+        let rollback_operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "account_config_rollback".to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: true,
+            before_account: Some(before_account),
+            after_account: None,
+            rollback_marker: Some("11111111-1111-4111-8111-111111111111".to_string()),
+        };
+
+        replace_account_config_save_journal_with_rollback(
+            &rollback_operation,
+            &pending_path,
+            &recovering_path,
+        )
+        .unwrap();
+        let replaced = super::load_pending_storage_operation_from_path(&pending_path).unwrap();
+        assert_eq!(replaced.operation, rollback_operation);
+
+        let second_error = replace_account_config_save_journal_with_rollback(
+            &rollback_operation,
+            &pending_path,
+            &recovering_path,
+        )
+        .unwrap_err();
+        assert!(second_error
+            .to_string()
+            .contains("does not match the rollback request"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_delete_commit_phase_atomically_replaces_only_matching_prepared_journal() {
+        let root = temp_storage_test_dir("account-delete-journal-phase");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let prepared = account_delete_prepared_operation();
+        save_pending_storage_operation_to_paths(&prepared, &pending_path, &recovering_path)
+            .unwrap();
+        let committed = account_delete_pending_operation();
+
+        replace_prepared_account_delete_journal(&committed, &pending_path, &recovering_path)
+            .unwrap();
+        let replaced = super::load_pending_storage_operation_from_path(&pending_path).unwrap();
+        assert_eq!(replaced.operation, committed);
+
+        let second_error =
+            replace_prepared_account_delete_journal(&committed, &pending_path, &recovering_path)
+                .unwrap_err();
+        assert!(second_error
+            .to_string()
+            .contains("does not match the commit request"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_enabled_toggle_commit_phase_atomically_replaces_prepared_intent() {
+        let root = temp_storage_test_dir("account-enabled-toggle-journal-phase");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let prepared = account_enabled_toggle_operation(true, "account_enabled_toggle_prepared");
+        save_pending_storage_operation_to_paths(&prepared, &pending_path, &recovering_path)
+            .unwrap();
+        let committed = account_enabled_toggle_operation(true, "account_enabled_toggle_committed");
+
+        replace_prepared_account_enabled_toggle_journal(
+            &committed,
+            &pending_path,
+            &recovering_path,
+        )
+        .unwrap();
+        let replaced = super::load_pending_storage_operation_from_path(&pending_path).unwrap();
+        assert_eq!(replaced.operation, committed);
+
+        let second_error = replace_prepared_account_enabled_toggle_journal(
+            &committed,
+            &pending_path,
+            &recovering_path,
+        )
+        .unwrap_err();
+        assert!(second_error
+            .to_string()
+            .contains("does not match the commit request"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_enabled_toggle_recovery_always_resolves_to_disabled() {
+        for before_enabled in [true, false] {
+            let operation =
+                account_enabled_toggle_operation(before_enabled, "account_enabled_toggle_prepared");
+            validate_pending_storage_operation(&operation).unwrap();
+            let before_account = operation.before_account.clone().unwrap();
+            let after_account = operation.after_account.clone().unwrap();
+
+            // Exercise both a config that still contains the pre-toggle state
+            // and one whose atomic rename became visible before journal-phase
+            // durability was lost.
+            for existing in [before_account.clone(), after_account] {
+                let mut config = AppConfig {
+                    accounts: vec![existing],
+                    ..AppConfig::default()
+                };
+                let saves = Cell::new(0usize);
+                reconcile_prepared_account_enabled_toggle_operation_with_ops(
+                    &mut config,
+                    &operation,
+                    |saved| {
+                        saves.set(saves.get() + 1);
+                        assert!(!saved.accounts[0].enabled);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!(!config.accounts[0].enabled);
+                assert_eq!(saves.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn committed_disable_recovery_reapplies_target_after_ambiguous_config_commit() {
+        let operation = account_enabled_toggle_operation(true, "account_enabled_toggle_committed");
+        validate_pending_storage_operation(&operation).unwrap();
+        let before_account = operation.before_account.clone().unwrap();
+        let mut config = AppConfig {
+            accounts: vec![before_account],
+            ..AppConfig::default()
+        };
+
+        let first_error = reconcile_committed_account_enabled_toggle_operation_with_ops(
+            &mut config,
+            &operation,
+            |saved| {
+                assert!(!saved.accounts[0].enabled);
+                Err(committed_config_write_test_error())
+            },
+        )
+        .unwrap_err();
+        assert!(config_write_committed(&first_error));
+        assert!(!config.accounts[0].enabled);
+
+        // A retained journal makes the next recovery idempotently persist the
+        // same disabled target rather than resurrecting the old enabled state.
+        reconcile_committed_account_enabled_toggle_operation_with_ops(
+            &mut config,
+            &operation,
+            |saved| {
+                assert!(!saved.accounts[0].enabled);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!config.accounts[0].enabled);
+    }
+
+    #[test]
+    fn enabled_toggle_journal_rejects_changes_beyond_the_enabled_flag() {
+        for kind in [
+            "account_enabled_toggle_prepared",
+            "account_enabled_toggle_committed",
+        ] {
+            let mut operation = account_enabled_toggle_operation(true, kind);
+            operation.after_account.as_mut().unwrap().username = "attacker@example.com".to_string();
+            assert!(validate_pending_storage_operation(&operation)
+                .unwrap_err()
+                .to_string()
+                .contains("fields other than enabled"));
+        }
+    }
+
+    #[test]
+    fn committed_account_delete_recovery_durably_reapplies_removal_before_password_cleanup() {
+        let mut config = AppConfig::default();
         let operation = account_delete_pending_operation();
         let attempts = RefCell::new(Vec::new());
 
-        let error =
-            reconcile_account_delete_operation_with_ops(&config, &operation, |account_id| {
+        let error = reconcile_account_delete_operation_with_ops(
+            &mut config,
+            &operation,
+            |_| {
+                attempts.borrow_mut().push("save_config".to_string());
+                Ok(())
+            },
+            |account_id| {
                 attempts.borrow_mut().push(account_id.clone());
                 anyhow::bail!("delete failed")
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("delete failed"));
-        assert_eq!(attempts.into_inner(), vec!["account-1".to_string()]);
+        assert_eq!(
+            attempts.into_inner(),
+            vec!["save_config".to_string(), "account-1".to_string()]
+        );
 
         let mut config = AppConfig::default();
-        let mut account = Account::new("user@example.com");
-        account.id = operation.account_ids[0].clone();
-        account.has_saved_password = true;
-        config.accounts.push(account);
+        config
+            .accounts
+            .push(operation.before_account.clone().unwrap());
+        let events = RefCell::new(Vec::new());
 
-        reconcile_account_delete_operation_with_ops(&config, &operation, |_| {
-            panic!("delete cleanup must wait until account removal is committed")
-        })
+        reconcile_account_delete_operation_with_ops(
+            &mut config,
+            &operation,
+            |saved| {
+                events.borrow_mut().push("save_config");
+                assert!(saved.accounts.is_empty());
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+        )
         .unwrap();
+        assert!(config.accounts.is_empty());
+        assert_eq!(events.into_inner(), vec!["save_config", "delete"]);
+    }
+
+    #[test]
+    fn pending_account_delete_recovery_requires_durable_config_before_password_cleanup() {
+        let mut config = AppConfig::default();
+        let operation = account_delete_pending_operation();
+        let events = RefCell::new(Vec::new());
+
+        let error = reconcile_account_delete_operation_with_ops(
+            &mut config,
+            &operation,
+            |_| {
+                events.borrow_mut().push("save_config");
+                Err(committed_config_write_test_error())
+            },
+            |_| {
+                events.borrow_mut().push("delete");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(config_write_committed(&error));
+        assert_eq!(events.into_inner(), vec!["save_config"]);
+    }
+
+    #[test]
+    fn prepared_account_delete_recovery_cancels_only_when_source_account_is_unchanged() {
+        let operation = account_delete_prepared_operation();
+        let mut config = AppConfig::default();
+        config
+            .accounts
+            .push(operation.before_account.clone().unwrap());
+
+        reconcile_prepared_account_delete_operation_with_ops(&config, &operation).unwrap();
+
+        config.accounts.clear();
+        let absent_error =
+            reconcile_prepared_account_delete_operation_with_ops(&config, &operation).unwrap_err();
+        assert!(absent_error
+            .to_string()
+            .contains("cannot prove that config storage was left unchanged"));
+
+        config
+            .accounts
+            .push(operation.before_account.clone().unwrap());
+        config.accounts[0].username = "different@example.com".to_string();
+        let mismatch_error =
+            reconcile_prepared_account_delete_operation_with_ops(&config, &operation).unwrap_err();
+        assert!(mismatch_error
+            .to_string()
+            .contains("mismatched account metadata"));
     }
 
     #[test]
@@ -4588,6 +6697,7 @@ mod tests {
             use_keyring: false,
             before_account: None,
             after_account: None,
+            rollback_marker: None,
         };
 
         let error = verify_pending_storage_surviving_backend(&config, &operation, |_, _| {
@@ -4617,6 +6727,7 @@ mod tests {
             use_keyring: false,
             before_account: None,
             after_account: None,
+            rollback_marker: None,
         };
 
         verify_pending_storage_surviving_backend(&config, &operation, |_, _| {
@@ -4639,6 +6750,7 @@ mod tests {
             use_keyring: false,
             before_account: None,
             after_account: None,
+            rollback_marker: None,
         };
 
         assert!(pending_storage_operation_account_ids_known(
@@ -4657,6 +6769,10 @@ mod tests {
             &operation,
             &[account]
         ));
+
+        let error = reconcile_storage_mode_operation(&AppConfig::default(), &operation)
+            .expect_err("unknown migration accounts must keep recovery blocked");
+        assert!(error.to_string().contains("absent from the current config"));
     }
 
     #[test]
@@ -4673,6 +6789,7 @@ mod tests {
             use_keyring: true,
             before_account: None,
             after_account: Some(after_account),
+            rollback_marker: None,
         };
 
         validate_pending_storage_operation(&account_config_operation).unwrap();
@@ -4680,14 +6797,22 @@ mod tests {
         assert!(!serialized.contains("super-secret-password"));
         assert!(!serialized.contains("encrypted_password"));
 
+        let mut mismatched_config_operation = account_config_operation.clone();
+        let mut mismatched_before = Account::new("other@example.com");
+        mismatched_before.id = "different-account".to_string();
+        mismatched_config_operation.before_account = Some(mismatched_before);
+        let mismatch_error = validate_pending_storage_operation(&mismatched_config_operation)
+            .expect_err("source and target snapshots must name the same account");
+        assert!(mismatch_error
+            .to_string()
+            .contains("source account id does not match target account"));
+
         let account_delete_operation = account_delete_pending_operation();
         validate_pending_storage_operation(&account_delete_operation).unwrap();
         let serialized = serde_json::to_string(&account_delete_operation).unwrap();
         assert!(!serialized.contains("super-secret-password"));
         assert!(!serialized.contains("encrypted_password"));
-        assert!(!serialized.contains("user@example.com"));
-        assert!(!serialized.contains("\"username\""));
-        assert!(!serialized.contains("before_account"));
+        assert!(serialized.contains("before_account"));
 
         let mut before_account = Account::new("user@example.com");
         before_account.id = "account-1".to_string();
@@ -4701,6 +6826,7 @@ mod tests {
             use_keyring: true,
             before_account: Some(before_account),
             after_account: None,
+            rollback_marker: None,
         };
 
         validate_pending_storage_operation(&legacy_delete_operation).unwrap();
@@ -4723,6 +6849,7 @@ mod tests {
             use_keyring: true,
             before_account: None,
             after_account: None,
+            rollback_marker: None,
         };
 
         ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap();
@@ -4765,6 +6892,170 @@ mod tests {
         assert!(
             invalid_storage_operation_entries(&root, "pending-storage-operation.json.tmp.")
                 .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_recovering_journal_is_synced_before_recovery_side_effects() {
+        let root = temp_storage_test_dir("recovering-journal-sync-order");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let operation = account_delete_pending_operation();
+        let record = PendingStorageOperationRecord {
+            operation,
+            path: recovering_path.clone(),
+        };
+        let events = RefCell::new(Vec::new());
+
+        let durable_record = consume_pending_storage_operation_record_with_ops(
+            record,
+            &recovering_path,
+            |_, _| -> anyhow::Result<()> {
+                panic!("an existing recovering journal must not be renamed")
+            },
+            |_| {
+                events.borrow_mut().push("secure-journal");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("sync-parent");
+                Ok(())
+            },
+        )
+        .unwrap();
+        events.borrow_mut().push("retire-old-key");
+
+        assert_eq!(durable_record.path, recovering_path);
+        assert_eq!(
+            events.into_inner(),
+            vec!["secure-journal", "sync-parent", "retire-old-key"]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovering_journal_sync_failure_prevents_retired_key_deletion() {
+        let root = temp_storage_test_dir("recovering-journal-sync-failure");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let record = PendingStorageOperationRecord {
+            operation: account_delete_pending_operation(),
+            path: recovering_path.clone(),
+        };
+        let retired_key_deleted = Cell::new(false);
+
+        let result = consume_pending_storage_operation_record_with_ops(
+            record,
+            &recovering_path,
+            |_, _| -> anyhow::Result<()> { panic!("journal is already recovering") },
+            |_| Ok(()),
+            |_| anyhow::bail!("parent fsync failed"),
+        )
+        .map(|_| {
+            retired_key_deleted.set(true);
+        });
+
+        assert!(result.is_err());
+        assert!(!retired_key_deleted.get());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_storage_recovery_block_persists_until_fresh_start_clear() {
+        let root = temp_storage_test_dir("durable-recovery-block");
+        let block_path = root.join("storage-recovery-blocked");
+
+        mark_storage_recovery_blocked_at(&block_path).unwrap();
+        assert!(block_path.exists());
+        assert_eq!(
+            std::fs::read(&block_path).unwrap(),
+            super::STORAGE_RECOVERY_BLOCK_CONTENT
+        );
+
+        // Re-marking is idempotent and does not clear the cross-process latch.
+        mark_storage_recovery_blocked_at(&block_path).unwrap();
+        assert!(block_path.exists());
+
+        clear_storage_recovery_block_after_startup_recovery_at(&block_path).unwrap();
+        assert!(!block_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_start_recovery_block_clear_refuses_while_journal_is_active() {
+        let root = temp_storage_test_dir("recovery-block-active-journal");
+        let block_path = root.join("storage-recovery-blocked");
+        let remove_called = Cell::new(false);
+        mark_storage_recovery_blocked_at(&block_path).unwrap();
+
+        let error = clear_storage_recovery_block_after_startup_recovery_with_state(
+            false,
+            &block_path,
+            |_| {
+                remove_called.set(true);
+                Ok(())
+            },
+            |_| panic!("an active journal must prevent marker removal"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("recovery journal is active"));
+        assert!(!remove_called.get());
+        assert!(block_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_block_unlink_fsync_failure_remains_ambiguous_to_caller() {
+        let root = temp_storage_test_dir("recovery-block-unlink-ambiguity");
+        let block_path = root.join("storage-recovery-blocked");
+        mark_storage_recovery_blocked_at(&block_path).unwrap();
+        let events = RefCell::new(Vec::new());
+
+        let error = clear_storage_recovery_block_after_startup_recovery_with_ops(
+            &block_path,
+            |path| {
+                events.borrow_mut().push("unlink-committed");
+                std::fs::remove_file(path).map_err(anyhow::Error::from)
+            },
+            |_| {
+                events.borrow_mut().push("parent-fsync-failed");
+                anyhow::bail!("injected parent fsync failure")
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("parent fsync failure"));
+        assert_eq!(
+            events.into_inner(),
+            vec!["unlink-committed", "parent-fsync-failed"]
+        );
+        assert!(!block_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_journal_clear_failure_marks_recovery_block_before_returning_error() {
+        let root = temp_storage_test_dir("pending-clear-marks-recovery-block");
+        let non_directory_parent = root.join("not-a-directory");
+        let pending_path = non_directory_parent.join("pending-storage-operation.json");
+        let recovering_path =
+            non_directory_parent.join("pending-storage-operation.recovering.json");
+        let block_path = root.join("storage-recovery-blocked");
+        let marker_calls = Cell::new(0);
+        std::fs::write(&non_directory_parent, "force journal clear failure").unwrap();
+
+        let error =
+            clear_pending_storage_operation_with_marker(&pending_path, &recovering_path, || {
+                marker_calls.set(marker_calls.get() + 1);
+                mark_storage_recovery_blocked_at(&block_path)
+            })
+            .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(marker_calls.get(), 1);
+        assert_eq!(
+            std::fs::read(&block_path).unwrap(),
+            super::STORAGE_RECOVERY_BLOCK_CONTENT
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4924,7 +7215,7 @@ mod tests {
         let pending_temp_path = root.join("pending-storage-operation.json.tmp.123.456");
         std::fs::write(&pending_temp_path, "pending-user@example.com").unwrap();
 
-        let record = load_pending_storage_operation_record_or_quarantine_from_paths(
+        let record = load_pending_storage_operation_record_fail_closed_from_paths(
             &recovering_path,
             &pending_path,
         )
@@ -4936,7 +7227,120 @@ mod tests {
     }
 
     #[test]
-    fn recovering_directory_does_not_mask_valid_pending_journal() {
+    fn dual_identical_storage_operation_journals_select_recovering_after_both_validate() {
+        let root = temp_storage_test_dir("dual-identical-journals");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let operation = account_delete_pending_operation();
+        let recovering_content = serde_json::to_vec_pretty(&operation).unwrap();
+        let pending_content = serde_json::to_vec(&operation).unwrap();
+        assert_ne!(recovering_content, pending_content);
+        write_private_file_atomic(&recovering_path, "json.tmp", &recovering_content).unwrap();
+        write_private_file_atomic(&pending_path, "json.tmp", &pending_content).unwrap();
+        let marker_called = Cell::new(false);
+
+        let record = load_pending_storage_operation_record_fail_closed_with_marker(
+            &recovering_path,
+            &pending_path,
+            || {
+                marker_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(record.operation, operation);
+        assert_eq!(record.path, recovering_path);
+        assert!(!marker_called.get());
+        assert_eq!(std::fs::read(&recovering_path).unwrap(), recovering_content);
+        assert_eq!(std::fs::read(&pending_path).unwrap(), pending_content);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dual_conflicting_storage_operation_journals_are_retained_and_durably_blocked() {
+        let root = temp_storage_test_dir("dual-conflicting-journals");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let block_path = root.join("storage-recovery-blocked");
+        let recovering_content =
+            serde_json::to_vec_pretty(&account_config_save_pending_operation(true)).unwrap();
+        let pending_content =
+            serde_json::to_vec_pretty(&account_config_save_pending_operation(false)).unwrap();
+        write_private_file_atomic(&recovering_path, "json.tmp", &recovering_content).unwrap();
+        write_private_file_atomic(&pending_path, "json.tmp", &pending_content).unwrap();
+
+        let error = load_pending_storage_operation_record_fail_closed_with_marker(
+            &recovering_path,
+            &pending_path,
+            || mark_storage_recovery_blocked_at(&block_path),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<PendingStorageRecoveryBlocked>()
+            .is_some());
+        assert_eq!(std::fs::read(&recovering_path).unwrap(), recovering_content);
+        assert_eq!(std::fs::read(&pending_path).unwrap(), pending_content);
+        assert_eq!(
+            std::fs::read(&block_path).unwrap(),
+            super::STORAGE_RECOVERY_BLOCK_CONTENT
+        );
+        assert!(is_pending_storage_operation_in_progress(
+            &ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err()
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dual_storage_operation_journals_with_either_invalid_slot_are_retained_and_blocked() {
+        for invalid_slot in ["recovering", "pending"] {
+            let root = temp_storage_test_dir(&format!("dual-invalid-{invalid_slot}"));
+            let pending_path = root.join("pending-storage-operation.json");
+            let recovering_path = root.join("pending-storage-operation.recovering.json");
+            let block_path = root.join("storage-recovery-blocked");
+            let valid_content =
+                serde_json::to_vec_pretty(&account_delete_pending_operation()).unwrap();
+            let invalid_content = b"{\"version\":1,\"kind\":\"account_delete_committed\"";
+            let recovering_content = if invalid_slot == "recovering" {
+                invalid_content.as_slice()
+            } else {
+                valid_content.as_slice()
+            };
+            let pending_content = if invalid_slot == "pending" {
+                invalid_content.as_slice()
+            } else {
+                valid_content.as_slice()
+            };
+            write_private_file_atomic(&recovering_path, "json.tmp", recovering_content).unwrap();
+            write_private_file_atomic(&pending_path, "json.tmp", pending_content).unwrap();
+
+            let error = load_pending_storage_operation_record_fail_closed_with_marker(
+                &recovering_path,
+                &pending_path,
+                || mark_storage_recovery_blocked_at(&block_path),
+            )
+            .unwrap_err();
+
+            assert!(error
+                .downcast_ref::<PendingStorageRecoveryBlocked>()
+                .is_some());
+            assert_eq!(std::fs::read(&recovering_path).unwrap(), recovering_content);
+            assert_eq!(std::fs::read(&pending_path).unwrap(), pending_content);
+            assert_eq!(
+                std::fs::read(&block_path).unwrap(),
+                super::STORAGE_RECOVERY_BLOCK_CONTENT
+            );
+            assert!(is_pending_storage_operation_in_progress(
+                &ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err()
+            ));
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn invalid_recovering_journal_blocks_older_valid_pending_journal() {
         let root = temp_storage_test_dir("recovering-dir-with-valid-pending");
         let pending_path = root.join("pending-storage-operation.json");
         let recovering_path = root.join("pending-storage-operation.recovering.json");
@@ -4945,25 +7349,105 @@ mod tests {
         write_private_file_atomic(&pending_path, "json.tmp", content.as_bytes()).unwrap();
         std::fs::create_dir(&recovering_path).unwrap();
 
-        let record = load_pending_storage_operation_record_or_quarantine_from_paths(
+        let error = load_pending_storage_operation_record_fail_closed_from_paths(
             &recovering_path,
             &pending_path,
         )
-        .unwrap()
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(record.path, pending_path);
-        assert_eq!(record.operation, operation);
+        assert!(error
+            .downcast_ref::<PendingStorageRecoveryBlocked>()
+            .is_some());
         assert!(pending_path.exists());
-        assert!(!recovering_path.exists());
-        assert_eq!(
-            invalid_storage_operation_entries(
-                &root,
-                "pending-storage-operation.recovering.invalid."
+        assert!(recovering_path.is_dir());
+        assert!(invalid_storage_operation_entries(
+            &root,
+            "pending-storage-operation.recovering.invalid."
+        )
+        .is_empty());
+        assert!(is_pending_storage_operation_in_progress(
+            &ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err()
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_rollback_markers_remain_canonical_and_block_credential_mutations() {
+        for (case, marker) in [
+            ("invalid", "not-a-uuid"),
+            ("noncanonical", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"),
+        ] {
+            let root = temp_storage_test_dir(&format!("rollback-marker-{case}"));
+            let pending_path = root.join("pending-storage-operation.json");
+            let recovering_path = root.join("pending-storage-operation.recovering.json");
+            let save_operation = account_config_save_pending_operation(true);
+            let before_account = save_operation.before_account.unwrap();
+            let rollback_operation = PendingStorageOperation {
+                version: PENDING_STORAGE_OPERATION_VERSION,
+                kind: "account_config_rollback".to_string(),
+                account_ids: vec![before_account.id.clone()],
+                from_use_keyring: false,
+                to_use_keyring: false,
+                use_keyring: true,
+                before_account: Some(before_account),
+                after_account: None,
+                rollback_marker: Some(marker.to_string()),
+            };
+            let content = serde_json::to_vec_pretty(&rollback_operation).unwrap();
+            write_private_file_atomic(&pending_path, "json.tmp", &content).unwrap();
+
+            let error = load_pending_storage_operation_record_fail_closed_from_paths(
+                &recovering_path,
+                &pending_path,
             )
-            .len(),
-            1
-        );
+            .unwrap_err();
+
+            assert!(error
+                .downcast_ref::<PendingStorageRecoveryBlocked>()
+                .is_some());
+            assert_eq!(std::fs::read(&pending_path).unwrap(), content);
+            assert!(
+                invalid_storage_operation_entries(&root, "pending-storage-operation.invalid.")
+                    .is_empty()
+            );
+            assert!(is_pending_storage_operation_in_progress(
+                &ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err()
+            ));
+
+            let second_error = load_pending_storage_operation_record_fail_closed_from_paths(
+                &recovering_path,
+                &pending_path,
+            )
+            .unwrap_err();
+            assert!(second_error
+                .downcast_ref::<PendingStorageRecoveryBlocked>()
+                .is_some());
+            assert_eq!(std::fs::read(&pending_path).unwrap(), content);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn truncated_active_journal_remains_byte_exact_and_blocking() {
+        let root = temp_storage_test_dir("truncated-active-journal");
+        let pending_path = root.join("pending-storage-operation.json");
+        let recovering_path = root.join("pending-storage-operation.recovering.json");
+        let content = b"{\"version\":1,\"kind\":\"account_config_save\"";
+        write_private_file_atomic(&pending_path, "json.tmp", content).unwrap();
+
+        let error = load_pending_storage_operation_record_fail_closed_from_paths(
+            &recovering_path,
+            &pending_path,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<PendingStorageRecoveryBlocked>()
+            .is_some());
+        assert_eq!(std::fs::read(&pending_path).unwrap(), content);
+        assert!(is_pending_storage_operation_in_progress(
+            &ensure_no_pending_storage_operation(&pending_path, &recovering_path).unwrap_err()
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5007,7 +7491,10 @@ mod tests {
 
         reconcile_staged_fallback_keys_with_ops(
             journal,
-            &std::collections::HashSet::from([active_key]),
+            &std::collections::HashMap::from([(
+                active_key.key_id.clone(),
+                active_key.account_id.clone(),
+            )]),
             |key_ref| {
                 deleted.borrow_mut().push(key_ref.clone());
                 Ok(())
@@ -5024,6 +7511,39 @@ mod tests {
     }
 
     #[test]
+    fn staged_fallback_recovery_never_deletes_an_active_key_id_with_mismatched_account() {
+        let active_key_id = "00000000-0000-4000-8000-000000000004".to_string();
+        let corrupt_staged_ref = ScopedFallbackKeyRef {
+            account_id: "wrong-account".to_string(),
+            key_id: active_key_id.clone(),
+        };
+        let journal = StagedFallbackKeysJournal {
+            version: STAGED_FALLBACK_KEYS_VERSION,
+            keys: vec![corrupt_staged_ref.clone()],
+        };
+        let delete_called = Cell::new(false);
+        let saved = RefCell::new(None);
+
+        let error = reconcile_staged_fallback_keys_with_ops(
+            journal,
+            &std::collections::HashMap::from([(active_key_id, "active-account".to_string())]),
+            |_| {
+                delete_called.set(true);
+                Ok(())
+            },
+            |next| {
+                *saved.borrow_mut() = Some(next.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<StagedFallbackKeyConflict>().is_some());
+        assert!(!delete_called.get());
+        assert_eq!(saved.into_inner().unwrap().keys, vec![corrupt_staged_ref]);
+    }
+
+    #[test]
     fn staged_fallback_recovery_keeps_failed_deletion_retryable() {
         let orphan_key = ScopedFallbackKeyRef {
             account_id: "orphan-account".to_string(),
@@ -5037,7 +7557,7 @@ mod tests {
 
         let error = reconcile_staged_fallback_keys_with_ops(
             journal,
-            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
             |_| anyhow::bail!("credential store unavailable"),
             |next| {
                 *saved.borrow_mut() = Some(next.clone());
@@ -5048,6 +7568,185 @@ mod tests {
 
         assert!(error.to_string().contains("cleanup attempts failed"));
         assert_eq!(saved.into_inner().unwrap().keys, vec![orphan_key]);
+    }
+
+    #[test]
+    fn staged_fallback_recovery_waits_until_pending_journal_absence_is_proven() {
+        let reconcile_calls = Cell::new(0usize);
+        reconcile_staged_fallback_keys_if_safe(
+            || Ok(false),
+            || {
+                reconcile_calls.set(reconcile_calls.get() + 1);
+                Ok(())
+            },
+            || panic!("a known pending journal must only defer staged-key recovery"),
+        )
+        .unwrap();
+        assert_eq!(reconcile_calls.get(), 0);
+
+        let reconcile_calls = Cell::new(0usize);
+        reconcile_staged_fallback_keys_if_safe(
+            || Ok(true),
+            || {
+                reconcile_calls.set(reconcile_calls.get() + 1);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(reconcile_calls.get(), 1);
+    }
+
+    #[test]
+    fn staged_fallback_preflight_fails_closed_when_journal_state_cannot_be_read() {
+        let reconcile_calls = Cell::new(0usize);
+        let latch_calls = Cell::new(0usize);
+
+        let error = reconcile_staged_fallback_keys_if_safe(
+            || anyhow::bail!("journal metadata unavailable"),
+            || {
+                reconcile_calls.set(reconcile_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                latch_calls.set(latch_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("journal state could not be verified"));
+        assert_eq!(reconcile_calls.get(), 0);
+        assert_eq!(latch_calls.get(), 1);
+    }
+
+    #[test]
+    fn staged_fallback_conflict_latches_recovery_and_blocks_the_mutation() {
+        let events = RefCell::new(Vec::new());
+
+        let error = reconcile_staged_fallback_keys_if_safe(
+            || Ok(true),
+            || {
+                events.borrow_mut().push("conflict");
+                Err(anyhow::Error::new(StagedFallbackKeyConflict::new()))
+            },
+            || {
+                events.borrow_mut().push("latch");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<StagedFallbackKeyConflict>().is_some());
+        assert_eq!(events.into_inner(), vec!["conflict", "latch"]);
+    }
+
+    #[test]
+    fn ordinary_staged_orphan_cleanup_failure_remains_retryable_without_blocking_mutations() {
+        let latch_called = Cell::new(false);
+
+        reconcile_staged_fallback_keys_if_safe(
+            || Ok(true),
+            || anyhow::bail!("credential store temporarily unavailable"),
+            || {
+                latch_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!latch_called.get());
+    }
+
+    #[test]
+    fn staged_fallback_conflict_still_latches_when_journal_save_fails() {
+        let active_key_id = "00000000-0000-4000-8000-000000000005".to_string();
+        let journal = StagedFallbackKeysJournal {
+            version: STAGED_FALLBACK_KEYS_VERSION,
+            keys: vec![ScopedFallbackKeyRef {
+                account_id: "wrong-account".to_string(),
+                key_id: active_key_id.clone(),
+            }],
+        };
+        let reconcile_error = reconcile_staged_fallback_keys_with_ops(
+            journal,
+            &std::collections::HashMap::from([(active_key_id, "active-account".to_string())]),
+            |_| panic!("an active fallback key must never be deleted"),
+            |_| anyhow::bail!("journal storage unavailable"),
+        )
+        .unwrap_err();
+        assert!(reconcile_error
+            .chain()
+            .any(|cause| cause.is::<StagedFallbackKeyConflict>()));
+
+        let latch_called = Cell::new(false);
+        let mut reconcile_error = Some(reconcile_error);
+        let error = reconcile_staged_fallback_keys_if_safe(
+            || Ok(true),
+            || Err(reconcile_error.take().unwrap()),
+            || {
+                latch_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .chain()
+            .any(|cause| cause.is::<StagedFallbackKeyConflict>()));
+        assert!(latch_called.get());
+    }
+
+    #[test]
+    fn pending_journal_is_not_created_when_staged_key_preflight_fails() {
+        let operation = PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: "storage_mode_migration".to_string(),
+            account_ids: Vec::new(),
+            from_use_keyring: true,
+            to_use_keyring: false,
+            use_keyring: false,
+            before_account: None,
+            after_account: None,
+            rollback_marker: None,
+        };
+        let save_called = Cell::new(false);
+
+        let error = save_pending_storage_operation_with_preflight_ops(
+            &operation,
+            || Ok(()),
+            || Err(anyhow::Error::new(StagedFallbackKeyConflict::new())),
+            |_| {
+                save_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<StagedFallbackKeyConflict>().is_some());
+        assert!(!save_called.get());
+    }
+
+    #[test]
+    fn direct_keyring_provider_is_not_called_when_staged_key_preflight_fails() {
+        let provider_called = Cell::new(false);
+
+        let error = direct_password_write_after_preflight_with_ops(
+            zeroize::Zeroizing::new("secret".to_string()),
+            true,
+            || Ok(()),
+            || Err(anyhow::Error::new(StagedFallbackKeyConflict::new())),
+            |_| {
+                provider_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<StagedFallbackKeyConflict>().is_some());
+        assert!(!provider_called.get());
     }
 
     #[test]
@@ -5101,6 +7800,7 @@ mod tests {
             use_keyring,
             before_account: Some(before_account),
             after_account: Some(after_account),
+            rollback_marker: None,
         }
     }
 
@@ -5110,13 +7810,43 @@ mod tests {
         account.has_saved_password = true;
         PendingStorageOperation {
             version: PENDING_STORAGE_OPERATION_VERSION,
-            kind: "account_delete".to_string(),
+            kind: "account_delete_committed".to_string(),
             account_ids: vec![account.id.clone()],
             from_use_keyring: false,
             to_use_keyring: false,
             use_keyring: true,
-            before_account: None,
+            before_account: Some(account),
             after_account: None,
+            rollback_marker: None,
+        }
+    }
+
+    fn account_delete_prepared_operation() -> PendingStorageOperation {
+        let mut operation = account_delete_pending_operation();
+        operation.kind = "account_delete_prepared".to_string();
+        operation
+    }
+
+    fn account_enabled_toggle_operation(
+        before_enabled: bool,
+        kind: &str,
+    ) -> PendingStorageOperation {
+        let mut before_account = Account::new("user@example.com");
+        before_account.id = "account-1".to_string();
+        before_account.enabled = before_enabled;
+        before_account.has_saved_password = true;
+        let mut after_account = before_account.clone();
+        after_account.enabled = !before_enabled;
+        PendingStorageOperation {
+            version: PENDING_STORAGE_OPERATION_VERSION,
+            kind: kind.to_string(),
+            account_ids: vec![before_account.id.clone()],
+            from_use_keyring: false,
+            to_use_keyring: false,
+            use_keyring: true,
+            before_account: Some(before_account),
+            after_account: Some(after_account),
+            rollback_marker: None,
         }
     }
 
@@ -5285,6 +8015,29 @@ mod tests {
     }
 
     #[test]
+    fn rollback_marker_is_authenticated_inside_the_password_envelope() {
+        let mut account = Account::new("user@example.com");
+        account.id = "account-1".to_string();
+        let marker = "11111111-1111-4111-8111-111111111111";
+
+        let encoded =
+            encode_bound_password_with_rollback_marker(&account, "previous-secret", Some(marker))
+                .unwrap();
+        let (password, format, decoded_marker) =
+            decode_bound_password_with_rollback_marker(&account, encoded.as_str()).unwrap();
+
+        assert_eq!(password.as_str(), "previous-secret");
+        assert_eq!(format, StoredPasswordFormat::BoundV1);
+        assert_eq!(decoded_marker.as_deref(), Some(marker));
+        assert!(encode_bound_password_with_rollback_marker(
+            &account,
+            "previous-secret",
+            Some("not-a-marker")
+        )
+        .is_err());
+    }
+
+    #[test]
     fn windows_user_bound_entropy_is_stable_and_purpose_bound() {
         assert_eq!(WINDOWS_USER_BOUND_SECRET_PREFIX, "waub:");
         assert_eq!(WINDOWS_LEGACY_WAAB_SECRET_PREFIX, "waab:");
@@ -5367,17 +8120,19 @@ mod tests {
         assert!(!encoded.contains("super-secret-password"));
         assert!(!encoded.contains(PASSWORD_ENVELOPE_PREFIX));
 
-        let (decoded, format, needs_migration) =
+        let (decoded, format, needs_migration, rollback_marker) =
             decode_keyring_password(&account, encoded.as_str()).unwrap();
         assert_eq!(decoded.as_str(), "super-secret-password");
         assert_eq!(format, StoredPasswordFormat::BoundV1);
         assert!(!needs_migration);
+        assert!(rollback_marker.is_none());
 
-        let (legacy_decoded, legacy_format, legacy_needs_migration) =
+        let (legacy_decoded, legacy_format, legacy_needs_migration, rollback_marker) =
             decode_keyring_password(&account, "legacy-secret").unwrap();
         assert_eq!(legacy_decoded.as_str(), "legacy-secret");
         assert_eq!(legacy_format, StoredPasswordFormat::LegacyRaw);
         assert!(legacy_needs_migration);
+        assert!(rollback_marker.is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -5585,15 +8340,18 @@ mod tests {
         let staged = migrate_legacy_fallback_entries_with_ops(
             &mut file,
             &account_ids,
-            &shared_key,
+            || Ok(Zeroizing::new(shared_key)),
             |account_id, plaintext| {
-                assert_eq!(plaintext, plaintexts[account_id]);
+                assert_eq!(plaintext.as_str(), plaintexts[account_id]);
                 let key = scoped_keys[account_id];
                 let key_ref = ScopedFallbackKeyRef {
                     account_id: account_id.clone(),
                     key_id: scoped_key_ids[account_id].clone(),
                 };
-                Ok((key_ref, encrypt_password_with_key(&key, plaintext).unwrap()))
+                Ok((
+                    key_ref,
+                    encrypt_password_with_key(&key, plaintext.as_str()).unwrap(),
+                ))
             },
             |_| panic!("successful migration must not clean staged keys"),
         )
@@ -5644,7 +8402,7 @@ mod tests {
         let result = migrate_legacy_fallback_entries_with_ops(
             &mut file,
             &account_ids,
-            &shared_key,
+            || Ok(Zeroizing::new(shared_key)),
             |account_id, plaintext| {
                 let count = stage_count.get();
                 stage_count.set(count + 1);
@@ -5654,7 +8412,7 @@ mod tests {
                 assert_eq!(account_id, &account_ids[0]);
                 Ok((
                     first_key.clone(),
-                    encrypt_password_with_key(&[7u8; 32], plaintext).unwrap(),
+                    encrypt_password_with_key(&[7u8; 32], plaintext.as_str()).unwrap(),
                 ))
             },
             |keys| cleaned.borrow_mut().extend_from_slice(keys),
@@ -5703,10 +8461,11 @@ mod tests {
         let mut account = Account::new("user@example.com");
         account.id = account_id.clone();
 
-        let result = stage_and_commit_fallback_password_with_ops(
+        let payload = encode_bound_password(&account, "new-password").unwrap();
+        let result = stage_and_commit_fallback_payload_with_ops(
             &mut file,
             &account,
-            "new-password",
+            payload,
             |received_account_id, plaintext| {
                 events.borrow_mut().push("stage-active-key");
                 assert_eq!(received_account_id, &account_id);
@@ -5768,6 +8527,7 @@ mod tests {
             ..PasswordFile::default()
         };
         let cleanup_calls = Cell::new(0usize);
+        let untrack_calls = Cell::new(0usize);
 
         let durability_warning = commit_password_file_with_staged_keys_with_ops(
             &file,
@@ -5778,12 +8538,16 @@ mod tests {
                 }))
             },
             |_| cleanup_calls.set(cleanup_calls.get() + 1),
-            |_| Ok(()),
+            |_| {
+                untrack_calls.set(untrack_calls.get() + 1);
+                Ok(())
+            },
         )
         .unwrap();
 
         assert!(durability_warning);
         assert_eq!(cleanup_calls.get(), 0);
+        assert_eq!(untrack_calls.get(), 0);
     }
 
     #[test]
@@ -5816,8 +8580,8 @@ mod tests {
         assert_eq!(cleanup_calls.get(), 0);
         assert_eq!(untrack_calls.get(), 1);
         assert_eq!(
-            active_scoped_fallback_keys(&file),
-            std::collections::HashSet::from([key_ref])
+            active_scoped_fallback_keys_by_id(&file),
+            std::collections::HashMap::from([(key_ref.key_id, key_ref.account_id)])
         );
     }
 
@@ -5932,6 +8696,26 @@ mod tests {
         );
 
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn unconfirmed_target_durability_preserves_stale_backend() {
+        let receipt = PasswordWriteReceipt {
+            saved_backend: PasswordStorageBackend::EncryptedFallbackFile,
+            target_durability_warning: true,
+            fallback_key_cleanup_warning: false,
+        };
+
+        let outcome = finish_account_password_write_with_ops(
+            &"account-1".to_string(),
+            receipt,
+            |_| panic!("fallback target must not delete itself"),
+            |_| panic!("stale keyring must survive until target durability is confirmed"),
+        );
+
+        assert!(outcome.stale_cleanup_warning.is_none());
+        assert!(outcome.target_durability_warning);
+        assert!(!outcome.fallback_key_cleanup_warning);
     }
 
     #[test]
@@ -6545,18 +9329,38 @@ mod tests {
                 .0
         };
 
-        let fallback_save = between(
-            "fn stage_and_commit_fallback_password_with_ops<",
-            "fn finalize_fallback_key_retirement(",
+        let fallback_stage = between(
+            "fn stage_scoped_fallback_entry(",
+            "fn cleanup_uncommitted_scoped_keys(",
         );
         assert_ordered(
-            fallback_save,
+            fallback_stage,
             &[
-                "let stage_result = stage_entry(",
-                "drop(payload);",
-                "let (new_key_ref, encrypted) = stage_result?;",
-                "match migrate_legacy(file)",
-                "commit_password_file_with_staged_keys(",
+                "new_scoped_fallback_key_ref(account_id)?;",
+                "track_staged_fallback_key(&key_ref)?;",
+                "new_scoped_fallback_key_material();",
+                "encrypt_password_with_key(&key, plaintext.as_str());",
+                "drop(plaintext);",
+                "let encrypted = encrypted_result?;",
+                "encode_scoped_fallback_key(&key_ref, &key);",
+                "drop(key);",
+                "save_scoped_fallback_key_payload(&key_ref, key_payload.as_str());",
+                "drop(key_payload);",
+                "let encrypted = match stage_result",
+                "cleanup_uncommitted_scoped_keys(",
+            ],
+        );
+        assert!(!fallback_stage.contains("PreparedScopedFallbackEntry"));
+
+        let owned_fallback_save = between("fn save_to_file_owned(", "fn save_to_file_locked(");
+        assert_ordered(
+            owned_fallback_save,
+            &[
+                "acquire_password_file_transaction_lock()?;",
+                "prepare_password_file_transaction()?;",
+                "use_owned_secret_then_drop(password,",
+                "stage_scoped_fallback_entry(&account.id, payload)?;",
+                "save_to_file_locked_persisted(",
             ],
         );
 
@@ -6568,26 +9372,46 @@ mod tests {
             fallback_load,
             &[
                 "decode_bound_password(account, stored.as_str())?;",
+                "Some(encode_bound_password(account, password.as_str())?)",
+                "drop(password);",
                 "drop(stored);",
+                "drop(encrypted);",
+                "stage_scoped_fallback_entry(&account.id, payload)?",
                 "let migration_result =",
-                "let stage_result = stage_scoped_fallback_entry(",
-                "drop(payload);",
-                "let (new_key_ref, reencrypted) = stage_result?;",
+                "install_scoped_fallback_entry(&mut file,",
                 "commit_password_file_with_staged_keys(",
+                "let refreshed_file = load_password_file()?;",
+                "load_password_from_file_snapshot(account, &refreshed_file)?;",
+            ],
+        );
+
+        let legacy_fallback_migration = between(
+            "fn migrate_legacy_fallback_entries_with_ops<",
+            "fn cleanup_retired_fallback_keys(",
+        );
+        assert_ordered(
+            legacy_fallback_migration,
+            &[
+                "password_entry_for_account(file, account_id)?;",
+                "let shared_key = load_shared_key()?;",
+                "decrypt_password_with_fallback_key(&shared_key, encrypted);",
+                "drop(shared_key);",
+                "let plaintext = plaintext_result?;",
+                "stage_entry(account_id, plaintext)",
             ],
         );
 
         let keyring_save = between(
-            "fn save_password_to_backend(",
-            "fn cleanup_stale_backend_after_successful_save<",
+            "pub(crate) fn write_account_password_owned(",
+            "pub(crate) fn write_account_password_borrowed_with_revision(",
         );
         assert_ordered(
             keyring_save,
             &[
+                "use_owned_secret_then_drop(password,",
                 "let set_result = entry.set_password(payload.as_str());",
                 "drop(payload);",
                 "match set_result",
-                "cleanup_stale_backend_after_successful_save(",
             ],
         );
 
@@ -6598,13 +9422,54 @@ mod tests {
         assert_ordered(
             keyring_load,
             &[
+                "acquire_password_file_transaction_lock()?;",
+                "prepare_password_file_transaction()?;",
+                "entry.get_password()?",
                 "decode_keyring_password(account, stored.as_str())?;",
+                "let migration_payload =",
+                "if let Some(payload) = migration_payload",
+                "drop(password);",
                 "drop(stored);",
-                "if secure_storage_needs_migration",
                 "let set_result = entry.set_password(payload.as_str());",
+                "decode_keyring_password(account, payload.as_str())?;",
                 "drop(payload);",
-                "if let Err(e) = set_result",
+                "return Ok(LoadedStoredPassword",
             ],
+        );
+        assert_eq!(
+            keyring_load
+                .matches("acquire_password_file_transaction_lock()?;")
+                .count(),
+            1
+        );
+        assert_eq!(
+            keyring_load
+                .matches("prepare_password_file_transaction()?;")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn owned_secret_helper_drops_before_followup_work() {
+        struct DropProbe<'a>(&'a RefCell<Vec<&'static str>>);
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("drop-secret");
+            }
+        }
+
+        let events = RefCell::new(Vec::new());
+        use_owned_secret_then_drop(DropProbe(&events), |_| {
+            events.borrow_mut().push("use-secret");
+            Ok(())
+        })
+        .unwrap();
+        events.borrow_mut().push("followup-io");
+
+        assert_eq!(
+            events.into_inner(),
+            vec!["use-secret", "drop-secret", "followup-io"]
         );
     }
 

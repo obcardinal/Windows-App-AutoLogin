@@ -356,6 +356,105 @@ cleanup_test_root() {
 }
 trap cleanup_test_root EXIT
 
+EARLY_GUARD_TOOL="$TEST_ROOT/publishable-entry-point-tool"
+EARLY_GUARD_MARKER="$TEST_ROOT/publishable-entry-point-tool.ran"
+EARLY_GUARD_HOSTILE_PATH="$TEST_ROOT/publishable-entry-point-hostile-path"
+EARLY_GUARD_HOSTILE_BASH_MARKER="$TEST_ROOT/hostile-path-bash.ran"
+EARLY_GUARD_BASH_ENV="$TEST_ROOT/publishable-entry-point-bash-env"
+EARLY_GUARD_BASH_ENV_MARKER="$TEST_ROOT/publishable-entry-point-bash-env.ran"
+EARLY_GUARD_FUNCTION_MARKER="$TEST_ROOT/publishable-entry-point-function.ran"
+/bin/mkdir "$EARLY_GUARD_HOSTILE_PATH"
+/usr/bin/printf '%s\n' \
+  '#!/bin/sh' \
+  '/usr/bin/touch "$0.ran"' \
+  'exit 99' \
+  >"$EARLY_GUARD_TOOL"
+/bin/chmod 700 "$EARLY_GUARD_TOOL"
+/usr/bin/printf '%s\n' \
+  '#!/bin/sh' \
+  '/usr/bin/touch "$WAAL_TEST_HOSTILE_BASH_MARKER"' \
+  'exit 98' \
+  >"$EARLY_GUARD_HOSTILE_PATH/bash"
+/bin/chmod 700 "$EARLY_GUARD_HOSTILE_PATH/bash"
+/usr/bin/printf '%s\n' \
+  '/usr/bin/touch "$WAAL_TEST_BASH_ENV_MARKER"' \
+  >"$EARLY_GUARD_BASH_ENV"
+for publishable_argument in --release --release-diagnostics-artifact; do
+  publishable_label="${publishable_argument#--}"
+  publishable_diagnostics="$TEST_ROOT/$publishable_label.stderr"
+  publishable_status=0
+  if (
+    echo() {
+      /usr/bin/touch "$WAAL_TEST_EXPORTED_FUNCTION_MARKER"
+      builtin echo "$@"
+    }
+    export -f echo
+    export PATH="$EARLY_GUARD_HOSTILE_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+    export BASH_ENV="$EARLY_GUARD_BASH_ENV"
+    export HOME="$TEST_ROOT"
+    export WAAL_TEST_HOSTILE_BASH_MARKER="$EARLY_GUARD_HOSTILE_BASH_MARKER"
+    export WAAL_TEST_BASH_ENV_MARKER="$EARLY_GUARD_BASH_ENV_MARKER"
+    export WAAL_TEST_EXPORTED_FUNCTION_MARKER="$EARLY_GUARD_FUNCTION_MARKER"
+    export WAAL_RELEASE_CARGO_PATH="$EARLY_GUARD_TOOL"
+    export WAAL_RELEASE_RUSTC_PATH="$EARLY_GUARD_TOOL"
+    "$ROOT_DIR/script/package_macos.sh" "$publishable_argument"
+  ) >"$TEST_ROOT/$publishable_label.stdout" 2>"$publishable_diagnostics"; then
+    fail "$publishable_argument unexpectedly entered local macOS packaging"
+  else
+    publishable_status=$?
+  fi
+  [ "$publishable_status" -eq 1 ] \
+    || fail "$publishable_argument did not use the fail-closed publishable-mode status"
+  /usr/bin/grep -Fq \
+    'Publishable macOS packaging is disabled in the local packager.' \
+    "$publishable_diagnostics" \
+    || fail "$publishable_argument did not report the local publishable-build boundary"
+  [ ! -e "$EARLY_GUARD_MARKER" ] \
+    || fail "$publishable_argument resolved a caller-supplied build tool before rejection"
+  [ ! -e "$EARLY_GUARD_HOSTILE_BASH_MARKER" ] \
+    || fail "$publishable_argument resolved bash through caller-controlled PATH"
+  [ ! -e "$EARLY_GUARD_BASH_ENV_MARKER" ] \
+    || fail "$publishable_argument executed caller-controlled BASH_ENV before rejection"
+  [ ! -e "$EARLY_GUARD_FUNCTION_MARKER" ] \
+    || fail "$publishable_argument imported a caller-controlled shell function before rejection"
+done
+
+NO_ARGUMENT_DIAGNOSTICS="$TEST_ROOT/no-argument.stderr"
+no_argument_status=0
+if (
+  echo() {
+    /usr/bin/touch "$WAAL_TEST_EXPORTED_FUNCTION_MARKER"
+    builtin echo "$@"
+  }
+  export -f echo
+  export PATH="$EARLY_GUARD_HOSTILE_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+  export BASH_ENV="$EARLY_GUARD_BASH_ENV"
+  export HOME="$TEST_ROOT"
+  export WAAL_TEST_HOSTILE_BASH_MARKER="$EARLY_GUARD_HOSTILE_BASH_MARKER"
+  export WAAL_TEST_BASH_ENV_MARKER="$EARLY_GUARD_BASH_ENV_MARKER"
+  export WAAL_TEST_EXPORTED_FUNCTION_MARKER="$EARLY_GUARD_FUNCTION_MARKER"
+  export WAAL_RELEASE_CARGO_PATH="$EARLY_GUARD_TOOL"
+  export WAAL_RELEASE_RUSTC_PATH="$EARLY_GUARD_TOOL"
+  "$ROOT_DIR/script/package_macos.sh"
+) >"$TEST_ROOT/no-argument.stdout" 2>"$NO_ARGUMENT_DIAGNOSTICS"; then
+  fail "macOS packager entered local signed packaging without explicit opt-in"
+else
+  no_argument_status=$?
+fi
+[ "$no_argument_status" -eq 2 ] \
+  || fail "macOS packager did not reject the missing local-signed argument with usage status"
+/usr/bin/grep -Fq 'Usage: script/package_macos.sh --local-signed-release' \
+  "$NO_ARGUMENT_DIAGNOSTICS" \
+  || fail "macOS packager did not report the required local-signed entry point"
+for forbidden_early_marker in \
+  "$EARLY_GUARD_MARKER" \
+  "$EARLY_GUARD_HOSTILE_BASH_MARKER" \
+  "$EARLY_GUARD_BASH_ENV_MARKER" \
+  "$EARLY_GUARD_FUNCTION_MARKER"; do
+  [ ! -e "$forbidden_early_marker" ] \
+    || fail "missing-argument rejection executed caller-controlled code"
+done
+
 PRIVATE_TEMP_OWNER="$TEST_ROOT/private-temp-owner"
 /bin/mkdir -m 700 "$PRIVATE_TEMP_OWNER"
 create_private_release_root_for_root "$PRIVATE_TEMP_OWNER"
@@ -704,7 +803,13 @@ run_committed_bootstrap_fixture() {
     1111111111111111111111111111111111111111 \
     2222222222222222222222222222222222222222 \
     /private/tmp/waal-bootstrap-source \
-    /private/tmp/waal-bootstrap-checkout || status=$?
+    /private/tmp/waal-bootstrap-checkout \
+    /private/tmp/waal-bootstrap-private-root \
+    /private/tmp/waal-bootstrap-private-parent \
+    private-root-id private-parent-id \
+    3333333333333333333333333333333333333333 \
+    4444444444444444444444444444444444444444 \
+    --local-signed-release || status=$?
   exec 6<&- 7<&- 8<&- 9<&-
   return "$status"
 }
@@ -713,6 +818,7 @@ write_bootstrap_package_fixture() {
   local path="$1"
   /usr/bin/printf '%s\n' \
     '[ "${1:-}" = --internal-committed-snapshot ] || exit 91' \
+    '[ "${!#}" = --local-signed-release ] || exit 92' \
     'package_macos_main() { /usr/bin/touch "$BOOTSTRAP_MARKER"; }' \
     >"$path"
 }
@@ -844,7 +950,6 @@ STAGE_DIR="$TEST_ROOT/stage"
 BUILD_TARGET_DIR="$TEST_ROOT/target"
 RELEASE_SOURCE_ROOT="$TEST_ROOT/release-environment"
 PRODUCTION_BUNDLE_ID="com.example.WindowsAppAutoLogin"
-DIAGNOSTICS_BUNDLE_ID=""
 EXPECTED_TEAM_ID="ABCDE12345"
 /bin/mkdir -p "$STAGE_DIR" "$RELEASE_SOURCE_ROOT"
 prepare_isolated_release_cargo_home
@@ -865,6 +970,10 @@ verify_release_toolchain_integrity() { return 0; }
 EXPECTED_ARCHIVE_NAME="Fixture-macos-$EXPECTED_COMMIT.zip"
 [ "$(release_archive_filename Fixture-macos "$EXPECTED_COMMIT")" = "$EXPECTED_ARCHIVE_NAME" ] \
   || fail "macOS release archive is not commit-addressed"
+EXPECTED_LOCAL_SIGNED_ARCHIVE_NAME="WindowsAppAutoLogin-macos-local-signed-$EXPECTED_COMMIT.zip"
+[ "$(release_archive_filename "$RELEASE_ARCHIVE_BASE" "$EXPECTED_COMMIT")" \
+  = "$EXPECTED_LOCAL_SIGNED_ARCHIVE_NAME" ] \
+  || fail "local signed macOS archive is not explicitly named and commit-addressed"
 if release_archive_filename '../escape' "$EXPECTED_COMMIT" >/dev/null 2>&1; then
   fail "unsafe release archive base was accepted"
 fi
@@ -1536,7 +1645,8 @@ case "$CAPTURED_RUSTFLAGS" in
   *$'\x1f-C\x1f'"link-arg=-fuse-ld=$REAL_LD_BIN") ;;
   *) fail "sanitized release rustflags do not force the pinned physical ld" ;;
 esac
-assert_env_value "$ENV_CAPTURE" WAAL_PUBLISHABLE_RELEASE "1"
+assert_env_value "$ENV_CAPTURE" WAAL_PUBLISHABLE_RELEASE "0"
+assert_env_value "$ENV_CAPTURE" WAAL_LOCAL_SIGNED_RELEASE "1"
 assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_GIT_COMMIT "$EXPECTED_COMMIT"
 assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_GIT_TREE "$EXPECTED_TREE"
 assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_CARGO_VERSION "$RELEASE_CARGO_VERSION"
@@ -1546,6 +1656,89 @@ assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_RUSTC_SHA256 "$RELEASE_RUSTC_SHA256
 assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_RUST_SYSROOT_SHA256 "$RELEASE_RUST_SYSROOT_SHA256"
 assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_NATIVE_TOOLCHAIN_SHA256 "$RELEASE_NATIVE_TOOLCHAIN_SHA256"
 assert_env_value "$ENV_CAPTURE" WAAL_RELEASE_MATERIALS_SHA256 "$RELEASE_MATERIALS_SHA256"
+
+LOCAL_SIGNED_INFO_BUNDLE="$STAGE_DIR/local-signed-info.app"
+LOCAL_SIGNED_INFO_FILE="$LOCAL_SIGNED_INFO_BUNDLE/Contents/Resources/BUILD-INFO.txt"
+/bin/mkdir -p "$LOCAL_SIGNED_INFO_BUNDLE/Contents/Resources"
+write_macos_release_provenance "$LOCAL_SIGNED_INFO_BUNDLE"
+[ -f "$LOCAL_SIGNED_INFO_FILE" ] && [ ! -L "$LOCAL_SIGNED_INFO_FILE" ] \
+  || fail "local signed bundle information is not a regular BUILD-INFO.txt file"
+[ ! -e "$LOCAL_SIGNED_INFO_BUNDLE/Contents/Resources/BUILD-PROVENANCE.txt" ] \
+  || fail "local signed bundle still emits a producer-attested BUILD-PROVENANCE.txt file"
+for expected_local_info_line in \
+  WAAL_MACOS_LOCAL_SIGNED_BUILD_INFO_V1 \
+  publishable=false \
+  attestation=none-local-shared-security-context \
+  producer-attribution=unavailable-local-shared-security-context; do
+  /usr/bin/grep -Fxq "$expected_local_info_line" "$LOCAL_SIGNED_INFO_FILE" \
+    || fail "BUILD-INFO.txt is missing local-only disclaimer: $expected_local_info_line"
+done
+if /usr/bin/grep -Eq \
+  '^(publishable=true|attestation=.*authenticated|producer-attribution=(available|authenticated).*)$' \
+  "$LOCAL_SIGNED_INFO_FILE"; then
+  fail "BUILD-INFO.txt makes a false publishability or producer-attestation claim"
+fi
+verify_macos_release_provenance "$LOCAL_SIGNED_INFO_BUNDLE"
+/usr/bin/sed \
+  's/^producer-attribution=unavailable-local-shared-security-context$/producer-attribution=authenticated-builder/' \
+  "$LOCAL_SIGNED_INFO_FILE" >"$STAGE_DIR/tampered-local-signed-build-info.txt"
+/bin/mv "$STAGE_DIR/tampered-local-signed-build-info.txt" "$LOCAL_SIGNED_INFO_FILE"
+if (verify_macos_release_provenance "$LOCAL_SIGNED_INFO_BUNDLE" >/dev/null 2>&1); then
+  fail "local signed BUILD-INFO verification accepted false producer attribution"
+fi
+write_macos_release_provenance "$LOCAL_SIGNED_INFO_BUNDLE"
+
+SAVED_EXPECTED_BUNDLE_ID="$EXPECTED_BUNDLE_ID"
+SAVED_EXPECTED_BUNDLE_ID_ENV="$EXPECTED_BUNDLE_ID_ENV"
+EXPECTED_BUNDLE_ID="$PRODUCTION_BUNDLE_ID"
+EXPECTED_BUNDLE_ID_ENV="WAAL_RELEASE_BUNDLE_ID"
+LOCAL_SIGNED_METADATA_BUNDLE="$STAGE_DIR/local-signed-metadata.app"
+LOCAL_SIGNED_METADATA_EXECUTABLE="$LOCAL_SIGNED_METADATA_BUNDLE/Contents/MacOS/metadata-fixture"
+/bin/mkdir -p "$LOCAL_SIGNED_METADATA_BUNDLE/Contents/MacOS"
+/usr/bin/printf '%s\n' \
+  '<?xml version="1.0" encoding="UTF-8"?>' \
+  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+  '<plist version="1.0"><dict>' \
+  '<key>CFBundleExecutable</key><string>metadata-fixture</string>' \
+  '</dict></plist>' \
+  >"$LOCAL_SIGNED_METADATA_BUNDLE/Contents/Info.plist"
+LOCAL_SIGNED_METADATA="WAAL_BUILD_METADATA_V1;artifact-kind=local-signed-release;publishable=false;attestation=none-local-shared-security-context;producer-attribution=unavailable-local-shared-security-context;"
+LOCAL_SIGNED_METADATA+="profile=release;target-os=macos;target-arch=aarch64;debug-assertions=false;debug-fill=false;dev-tools=false;diagnostics-ui=false;release-diagnostics=false;"
+LOCAL_SIGNED_METADATA+="macos-bundle-id=$EXPECTED_BUNDLE_ID;production-macos-bundle-id=$EXPECTED_BUNDLE_ID;non-production-macos-identity=false;macos-team-id=$EXPECTED_TEAM_ID;"
+LOCAL_SIGNED_METADATA+="windows-authenticode-publisher=;windows-authenticode-cert-sha256=;"
+LOCAL_SIGNED_METADATA+="source-git-commit=$RELEASE_GIT_COMMIT;source-git-tree=$RELEASE_GIT_TREE;release-cargo-version=$RELEASE_CARGO_VERSION;release-rustc-version=$RELEASE_RUSTC_VERSION;"
+LOCAL_SIGNED_METADATA+="release-cargo-sha256=$RELEASE_CARGO_SHA256;release-rustc-sha256=$RELEASE_RUSTC_SHA256;release-rust-sysroot-sha256=$RELEASE_RUST_SYSROOT_SHA256;release-native-toolchain-sha256=$RELEASE_NATIVE_TOOLCHAIN_SHA256;release-materials-sha256=$RELEASE_MATERIALS_SHA256;"
+/usr/bin/printf '%s\n' "$LOCAL_SIGNED_METADATA" >"$LOCAL_SIGNED_METADATA_EXECUTABLE"
+/bin/chmod 700 "$LOCAL_SIGNED_METADATA_EXECUTABLE"
+verify_release_build_metadata "$LOCAL_SIGNED_METADATA_BUNDLE"
+for false_claim in \
+  'publishable=false|publishable=true' \
+  'attestation=none-local-shared-security-context|attestation=external-authenticated-builder' \
+  'producer-attribution=unavailable-local-shared-security-context|producer-attribution=authenticated-builder'; do
+  false_claim_from="${false_claim%%|*}"
+  false_claim_to="${false_claim#*|}"
+  /usr/bin/printf '%s\n' "${LOCAL_SIGNED_METADATA/$false_claim_from/$false_claim_to}" \
+    >"$LOCAL_SIGNED_METADATA_EXECUTABLE"
+  if (verify_release_build_metadata "$LOCAL_SIGNED_METADATA_BUNDLE" >/dev/null 2>&1); then
+    fail "local signed executable metadata accepted false claim: $false_claim_to"
+  fi
+done
+for duplicate_claim in \
+  'publishable=false;|publishable=false;publishable=true;' \
+  'attestation=none-local-shared-security-context;|attestation=none-local-shared-security-context;attestation=external-authenticated-builder;' \
+  'producer-attribution=unavailable-local-shared-security-context;|producer-attribution=unavailable-local-shared-security-context;producer-attribution=authenticated-builder;' \
+  'profile=release;|profile=release;unknown-release-claim=true;'; do
+  duplicate_claim_from="${duplicate_claim%%|*}"
+  duplicate_claim_to="${duplicate_claim#*|}"
+  /usr/bin/printf '%s\n' "${LOCAL_SIGNED_METADATA/$duplicate_claim_from/$duplicate_claim_to}" \
+    >"$LOCAL_SIGNED_METADATA_EXECUTABLE"
+  if (verify_release_build_metadata "$LOCAL_SIGNED_METADATA_BUNDLE" >/dev/null 2>&1); then
+    fail "local signed executable metadata accepted duplicate or unknown claim: $duplicate_claim_to"
+  fi
+done
+/usr/bin/printf '%s\n' "$LOCAL_SIGNED_METADATA" >"$LOCAL_SIGNED_METADATA_EXECUTABLE"
+EXPECTED_BUNDLE_ID="$SAVED_EXPECTED_BUNDLE_ID"
+EXPECTED_BUNDLE_ID_ENV="$SAVED_EXPECTED_BUNDLE_ID_ENV"
 
 eval "$VERIFY_TOOLCHAIN_FUNCTION"
 
@@ -1666,8 +1859,50 @@ verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE"
   || fail "codesign changed executable bytes outside normalized signature metadata"
 RELEASE_BUNDLE_PAYLOAD_SHA256=""
 
+[ "$(/usr/bin/head -n 1 "$ROOT_DIR/script/package_macos.sh")" = '#!/bin/bash -p' ] \
+  || fail "macOS local packager does not enter privileged Bash through an absolute shebang"
+[ -x "$ROOT_DIR/script/package_macos.sh" ] \
+  || fail "macOS local packager is not directly executable through its protected shebang"
+if ! /usr/bin/perl -0777 -e '
+  my $text = <>;
+  my $guard_start = index($text, q{if [ "${BASH_SOURCE[0]}" = "$0" ]; then});
+  my $guard_end = index($text, "RELEASE_SNAPSHOT_REEXECUTED=false", $guard_start);
+  exit 1 if $guard_start < 0 || $guard_end <= $guard_start;
+  my $guard = substr($text, $guard_start, $guard_end - $guard_start);
+  exit 1 if index($guard, q{--release|--release-diagnostics-artifact)}) < 0;
+  exit 1 if index(
+    $guard,
+    q{Publishable macOS packaging is disabled in the local packager.}) < 0;
+  exit 1 if index($guard, q{exit 1}) < 0;
+  for my $post_guard_input (
+    q{LOADED_PACKAGE_MACOS_SHA256="$(},
+    q{LOADED_MACOS_BUNDLE_SHA256="$(},
+    q{RELEASE_GIT_BIN="/Applications/Xcode.app/Contents/Developer/usr/bin/git"},
+    q{CODESIGN_IDENTITY="${WAAL_CODESIGN_IDENTITY:-}"},
+    q{NOTARY_PROFILE="${WAAL_NOTARY_PROFILE:-}"}) {
+    my $position = index($text, $post_guard_input);
+    exit 1 if $position < $guard_end;
+  }
+' "$ROOT_DIR/script/package_macos.sh"; then
+  fail "publishable macOS entry points are not rejected before release-input resolution"
+fi
+/usr/bin/grep -Fq 'BUILD-INFO.txt' "$ROOT_DIR/script/package_macos.sh" \
+  || fail "local signed macOS packaging does not include BUILD-INFO.txt"
+if /usr/bin/grep -Fq 'BUILD-PROVENANCE.txt' "$ROOT_DIR/script/package_macos.sh"; then
+  fail "local signed macOS packaging still claims a producer-attested provenance file"
+fi
 /usr/bin/grep -Fq 'source-git-commit={};source-git-tree={};' "$ROOT_DIR/build.rs" \
   || fail "build metadata does not embed both provenance fields"
+/usr/bin/grep -Fq 'artifact-kind={};publishable={};attestation={};producer-attribution={};' \
+  "$ROOT_DIR/build.rs" \
+  || fail "build metadata does not encode publishability and producer-attestation status"
+/usr/bin/grep -Fq 'require_canonical_release_metadata "$metadata"' \
+  "$ROOT_DIR/script/package_macos.sh" \
+  || fail "macOS packager does not require the exact unique build-metadata schema"
+/usr/bin/grep -Fq '"none-local-shared-security-context"' "$ROOT_DIR/build.rs" \
+  || fail "local build metadata does not disclaim attestation"
+/usr/bin/grep -Fq '"unavailable-local-shared-security-context"' "$ROOT_DIR/build.rs" \
+  || fail "local build metadata does not disclaim producer attribution"
 /usr/bin/grep -Fq 'release-cargo-sha256={};release-rustc-sha256={};' "$ROOT_DIR/build.rs" \
   || fail "build metadata does not embed release toolchain hashes"
 /usr/bin/grep -Fq 'release-rust-sysroot-sha256={};release-native-toolchain-sha256={};' "$ROOT_DIR/build.rs" \
@@ -1786,6 +2021,12 @@ if ! /usr/bin/perl -0777 -e '
   my $end = index($text, "restore_and_verify_snapshot_execution() {", $start);
   exit 1 if $start < 0 || $end <= $start;
   my $reexec = substr($text, $start, $end - $start);
+  exit 1 if index($reexec, q{local reexec_argument="--local-signed-release"}) < 0;
+  exit 1 if $reexec =~ /reexec_argument="--release(?:-diagnostics-artifact)?"/;
+  exit 1 if index($reexec, q{RELEASE_DIAGNOSTICS_ARTIFACT}) >= 0;
+  exit 1 if index(
+    $reexec,
+    q{"$RELEASE_GIT_COMMIT" "$RELEASE_GIT_TREE" "$reexec_argument"}) < 0;
   my @ordered = (
     q{package_execution_identity="$(descriptor_identity /dev/fd/8)"},
     q{bundle_execution_identity="$(descriptor_identity /dev/fd/7)"},
@@ -1838,7 +2079,7 @@ if ! /usr/bin/perl -0777 -e '
     $cursor = $next;
   }
 ' "$ROOT_DIR/script/package_macos.sh"; then
-  fail "macOS packager does not authenticate package then helper descriptors before closing them"
+  fail "macOS packager does not preserve local-only mode while authenticating package and helper descriptors"
 fi
 /usr/bin/grep -Fq -- '--internal-committed-snapshot' "$ROOT_DIR/script/package_macos.sh" \
   || fail "macOS packager does not enter an explicit committed-snapshot child mode"
@@ -1896,25 +2137,97 @@ fi
 if /usr/bin/grep -E '/bin/(rm|mv)[[:space:]].*\$ZIP_PATH' "$ROOT_DIR/script/package_macos.sh" >/dev/null; then
   fail "macOS packager can delete or replace an immutable published ZIP"
 fi
-/usr/bin/grep -Fq 'WAAL_PUBLISHABLE_RELEASE = "1"' "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows packager does not mark publishable builds at compile time"
-/usr/bin/grep -Fq 'Get-AuthenticodeSignature' "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows packager does not verify Authenticode after signing"
+/usr/bin/grep -Fq 'Publishable Windows packaging is disabled in the local packager.' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows local packager does not fail closed for publishable builds"
+/usr/bin/grep -Fq 'The development-only Windows packager rejects certificate and timestamp inputs.' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows development packager does not reject signing inputs"
+if /usr/bin/grep -Fq 'Invoke-Checked $SignTool @(' "$ROOT_DIR/script/build_windows_dist.ps1"; then
+  fail "Windows local packager still contains an executable signtool signing path"
+fi
+if /usr/bin/grep -Fq 'Get-AuthenticodeSignature' "$ROOT_DIR/script/build_windows_dist.ps1"; then
+  fail "Windows local packager still accesses Authenticode certificate state"
+fi
+if /usr/bin/grep -Fq 'WAAL_PUBLISHABLE_RELEASE' "$ROOT_DIR/script/build_windows_dist.ps1"; then
+  fail "Windows local packager still marks any locally built executable as publishable"
+fi
 /usr/bin/grep -Fq 'SHA256SUMS.txt' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not publish a SHA-256 manifest"
-/usr/bin/grep -Fq '$hashes["BUILD-PROVENANCE.txt"]' "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows SHA-256 manifest does not cover BUILD-PROVENANCE.txt"
+/usr/bin/grep -Fq '$hashes["BUILD-METADATA.txt"]' "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows SHA-256 manifest does not cover BUILD-METADATA.txt"
+/usr/bin/grep -Fq '"attestation=none-local-shared-security-context"' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows local build metadata does not disclaim attestation"
+/usr/bin/grep -Fq '"producer-attribution=unavailable-local-shared-security-context"' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows local build metadata does not disclaim producer attribution"
+if ! /usr/bin/perl -0777 -e '
+  my $text = <>;
+  my $parser_start = index($text, "function ConvertFrom-ExecutableBuildMetadata {");
+  my $require_start = index($text, "function Require-MetadataField {", $parser_start);
+  my $self_test_start = index(
+    $text,
+    "function Assert-ExecutableBuildMetadataValidationSelfTest {",
+    $require_start);
+  my $verify_start = index($text, "function Verify-ExecutableMetadataBytes {", $self_test_start);
+  my $verify_end = index($text, "function Get-ByteArraySha256 {", $verify_start);
+  exit 1 if $parser_start < 0 || $require_start <= $parser_start ||
+    $self_test_start <= $require_start || $verify_start <= $self_test_start ||
+    $verify_end <= $verify_start;
+
+  my $parser = substr($text, $parser_start, $require_start - $parser_start);
+  for my $needle (
+    q{[Collections.Generic.Dictionary[string,string]]::new(},
+    q{[Collections.Generic.HashSet[string]]::new(},
+    q{[StringComparer]::Ordinal},
+    q{$allowedFields.Contains($name)},
+    q{Executable build metadata contains an unknown field},
+    q{$fields.ContainsKey($name)},
+    q{Executable build metadata contains a duplicate field}) {
+    exit 1 if index($parser, $needle) < 0;
+  }
+
+  my $require = substr($text, $require_start, $self_test_start - $require_start);
+  exit 1 if index($require, q{$Metadata.ContainsKey($Name)}) < 0;
+  exit 1 if index(
+    $require,
+    q{[StringComparer]::Ordinal.Equals($Metadata[$Name], $Expected)}) < 0;
+  exit 1 if $require =~ /\.Contains\(\s*";\$Name=/;
+
+  my $self_test = substr($text, $self_test_start, $verify_start - $self_test_start);
+  for my $needle (
+    q{Assert-ExecutableBuildMetadataValidationSelfTest},
+    q{publishable=true;},
+    q{publishable=false;publishable=true;},
+    q{attestation=authenticated-builder;},
+    q{producer-attribution=authenticated-builder;},
+    q{authenticated-producer=true;},
+    q{Executable build metadata validation accepted an adversarial disclaimer marker.}) {
+    exit 1 if index($self_test, $needle) < 0;
+  }
+  my $self_test_calls = () = $text =~ /^Assert-ExecutableBuildMetadataValidationSelfTest\s*$/mg;
+  exit 1 if $self_test_calls != 1;
+
+  my $verify = substr($text, $verify_start, $verify_end - $verify_start);
+  for my $required (
+    q{$metadata = ConvertFrom-ExecutableBuildMetadata $markers[0]},
+    q{if ($metadata.Count -ne 27)},
+    q{Require-MetadataField $metadata "publishable" "false"},
+    q{Require-MetadataField $metadata "attestation" "none-local-shared-security-context"},
+    q{Require-MetadataField $metadata "producer-attribution" "unavailable-local-shared-security-context"}) {
+    exit 1 if index($verify, $required) < 0;
+  }
+  exit 0;
+' "$ROOT_DIR/script/build_windows_dist.ps1"; then
+  fail "Windows executable metadata validation does not reject missing, contradictory, or duplicate disclaimer fields"
+fi
 /usr/bin/grep -Fq '[IO.FileAttributes]::ReparsePoint' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not reject reparse-point dist paths"
 /usr/bin/grep -Fq 'Assert-CommitContainsOnlyRegularFiles' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not reject committed links and gitlinks"
-/usr/bin/grep -Fq 'WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256' "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows packager does not embed the signing certificate SHA-256 fingerprint"
 /usr/bin/grep -Fq '[switch]$Development' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not expose an explicit non-production mode"
-/usr/bin/grep -Fq '$PSVersionTable.PSVersion.Minor -ne 1' \
-  "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows publishable packaging is not pinned to PowerShell 5.1 Desktop"
 /usr/bin/grep -Fq '$executingPackagerSource = $MyInvocation.MyCommand.ScriptBlock.Ast.Extent.Text' \
   "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not capture the source already parsed into the clean child"
@@ -1943,7 +2256,7 @@ if /usr/bin/grep -Fq '"-File", "-"' "$ROOT_DIR/script/build_windows_dist.ps1"; t
 fi
 /usr/bin/grep -Fq '"packager-source-sha256=$PackagerSourceSha256"' \
   "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows provenance does not record the attested packager-source digest"
+  || fail "Windows informational metadata does not record the loaded packager-source digest"
 if ! /usr/bin/perl -0777 -e '
   my $text = <>;
   my $source_start = index($text, "function Resolve-AndVerify-SourceTools {");
@@ -2080,19 +2393,22 @@ for windows_handle_contract in \
   '$script:ReleaseRootParentHandle = $handles[0]' \
   '$script:ReleaseRootHandle = $handles[1]' \
   '$script:ReleaseSourceHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(' \
-  'Assert-RegularSingleLinkFile $targetExe' \
-  'Copy-SingleLinkExecutableAndCaptureBytes $targetExe $stagedExe' \
+  'LockTrackedBuildOutputAfterBuild(' \
+  'Copy-SingleLinkExecutableFromHandleAndCaptureBytes `' \
+  'Copy-CommittedReleasePayloadFiles $stagedDist' \
+  'Assert-StagedExecutableHandle $stagedExe' \
   'Lock-PublicationCandidateDirectory' \
   '$PublicationPayloadHandles = Open-DistributionPayloadHandles $PublicationCandidateHandle' \
   'Lock-DistributionPayloadHandlesAfterRename `' \
   'AssertTrackedRegularPath(' \
   'HashTrackedRegularSingleLinkSha256(' \
+  'CopyTrackedRegularSingleLink(' \
   'CopyRegularSingleLinkAndCaptureBytes(' \
+  'CopyTrackedRegularSingleLinkAndCaptureBytes(' \
   'Lock-SourceToolInputs' \
   'Resolve-AndLock-CodeDomCompiler' \
   'Assert-CodeDomCompilerIntegrity' \
   'Lock-ToolchainDirectories' \
-  'Assert-SignedExecutablePreservesUnsignedPayload' \
   '$completeDistributionHashes = Get-CompleteDistributionFileHashes $stagedDist'; do
   /usr/bin/grep -Fq "$windows_handle_contract" \
     "$ROOT_DIR/script/build_windows_dist.ps1" \
@@ -2106,7 +2422,7 @@ if ! /usr/bin/perl -0777 -e '
   my $open = substr($text, $open_start, $open_end - $open_start);
   exit 1 unless $open =~ /foreach\s*\(\$fileName\s+in\s+\@\(\s*
     \$ExeName\s*,\s*"README\.md"\s*,\s*"LICENSE"\s*,\s*"config\.example\.json"\s*,\s*
-    "SHA256SUMS\.txt"\s*,\s*"BUILD-PROVENANCE\.txt"\s*\)\s*\)/xms;
+    "SHA256SUMS\.txt"\s*,\s*"BUILD-METADATA\.txt"\s*\)\s*\)/xms;
   my $open_count = () = $open =~ /OpenTrackedRegularSingleLinkForRename\s*\(/g;
   exit 1 if $open_count != 1;
 
@@ -2131,8 +2447,14 @@ if ! /usr/bin/perl -0777 -e '
   my $cleanup_end = index($text, "function Assert-CommitContainsOnlyRegularFiles {", $cleanup_start);
   exit 1 if $cleanup_start < 0 || $cleanup_end <= $cleanup_start;
   my $cleanup = substr($text, $cleanup_start, $cleanup_end - $cleanup_start);
-  exit 1 if index($cleanup, q{DeleteTrackedTree($ReleaseRootHandle)}) < 0;
+  exit 1 unless $cleanup =~ /DeleteTrackedTree\s*\(\s*\$ReleaseRootHandle\s*\)/ms;
   exit 1 if index($cleanup, q{$ReleaseRootParentHandle.Dispose()}) < 0;
+  my $source_assert = index($cleanup, q{AssertPhysicalDirectory(});
+  my $source_dispose = index($cleanup, q{$ReleaseSourceHandle.Dispose()}, $source_assert);
+  my $root_delete = index($cleanup, q{DeleteTrackedTree(}, $source_dispose);
+  exit 1 if $source_assert < 0 || $source_dispose <= $source_assert ||
+    $root_delete <= $source_dispose;
+  exit 1 if index($cleanup, "finally {", $source_assert) < 0;
 
   my $cargo_start = index($text, "function Invoke-SanitizedCargo {");
   my $cargo_end = index($text, "function Write-Utf8NoBom {", $cargo_start);
@@ -2140,13 +2462,307 @@ if ! /usr/bin/perl -0777 -e '
   my $cargo = substr($text, $cargo_start, $cargo_end - $cargo_start);
   exit 1 if index($cargo, q{Open-MaterializedReleaseSourceHandles}) < 0;
   exit 1 if index($cargo, q{Assert-AndCloseMaterializedReleaseSourceHandles}) < 0;
+  my $cargo_invoke = index($cargo, q{Invoke-Checked $Cargo $Arguments});
+  my $cargo_output_lock = index($cargo, q{LockTrackedBuildOutputAfterBuild(}, $cargo_invoke);
+  exit 1 if $cargo_invoke < 0 || $cargo_output_lock <= $cargo_invoke;
+
+  my $source_open_start = index($text, "function Open-MaterializedReleaseSourceHandles {");
+  my $source_assert_start = index(
+    $text,
+    "function Assert-MaterializedReleaseSourceHandleState {",
+    $source_open_start);
+  my $source_close_start = index(
+    $text,
+    "function Assert-AndCloseMaterializedReleaseSourceHandles {",
+    $source_assert_start);
+  my $materialize_start = index($text, "function Materialize-ReleaseSource {", $source_close_start);
+  exit 1 if $source_open_start < 0 || $source_assert_start <= $source_open_start ||
+    $source_close_start <= $source_assert_start || $materialize_start <= $source_close_start;
+  my $source_open = substr(
+    $text,
+    $source_open_start,
+    $source_assert_start - $source_open_start);
+  my $source_assert = substr(
+    $text,
+    $source_assert_start,
+    $source_close_start - $source_assert_start);
+  my $source_close = substr(
+    $text,
+    $source_close_start,
+    $materialize_start - $source_close_start);
+  for my $needle (
+    q{RelativePath = $entry.Path},
+    q{ExpectedBlob = $entry.Blob},
+    q{Assert-MaterializedReleaseSourceHandleState $result}) {
+    exit 1 if index($source_open, $needle) < 0;
+  }
+  for my $needle (
+    q{$expectedFiles.Add($entry.Path, $entry.Blob)},
+    q{AssertTrackedDirectoryPath(},
+    q{AssertTrackedRegularPath(},
+    q{HashTrackedRegularSingleLinkGitBlobSha1(},
+    q{if ($handleBlob -cne $expectedFiles[$relativePath])},
+    q{Assert-MaterializedReleaseSource}) {
+    exit 1 if index($source_assert, $needle) < 0;
+  }
+  my $post_cargo_assert = index(
+    $source_close,
+    q{Assert-MaterializedReleaseSourceHandleState $Handles});
+  my $first_source_dispose = index($source_close, q{$state.Handle.Dispose()});
+  exit 1 if $post_cargo_assert < 0 || $first_source_dispose <= $post_cargo_assert;
+
+  my $tracked_blob_start = index(
+    $text,
+    "public static string HashTrackedRegularSingleLinkGitBlobSha1(");
+  my $tracked_blob_end = index(
+    $text,
+    "public static void AssertPhysicalDirectory(",
+    $tracked_blob_start);
+  exit 1 if $tracked_blob_start < 0 || $tracked_blob_end <= $tracked_blob_start;
+  my $tracked_blob = substr(
+    $text,
+    $tracked_blob_start,
+    $tracked_blob_end - $tracked_blob_start);
+  for my $needle (
+    q{DuplicateHandle(},
+    q{"blob " + before.FileSize + "\0"},
+    q{EnsureStableSingleLinkFile(before, after, "tracked Git-blob input")}) {
+    exit 1 if index($tracked_blob, $needle) < 0;
+  }
+
+  my $lock_build_start = index(
+    $text,
+    "public static SafeFileHandle LockTrackedBuildOutputAfterBuild(");
+  my $regular_assert_start = index(
+    $text,
+    "public static void AssertRegularSingleLink(",
+    $lock_build_start);
+  exit 1 if $lock_build_start < 0 || $regular_assert_start <= $lock_build_start;
+  my $lock_build = substr(
+    $text,
+    $lock_build_start,
+    $regular_assert_start - $lock_build_start);
+  exit 1 if $text =~ /
+    CreateTrackedBuildOutput|
+    BuiltExecutableConstructionHandle|
+    RetainBuiltExecutableConstructionHandle|
+    ConstructionHandleTransferred
+  /x;
+  for my $needle (
+    q{Identity directoryBefore = GetIdentity(},
+    q{OpenChildNoFollow(},
+    q{GenericRead | FileReadAttributes | Synchronize},
+    q{FileShareRead},
+    q{output.FileSize == 0},
+    q{directoryBefore.SameObjectAndKind(directoryAfter)},
+    q{Build-output directory changed while locking the completed child.}) {
+    exit 1 if index($lock_build, $needle) < 0;
+  }
+  exit 1 if index($lock_build, q{FileShareWrite}) >= 0 ||
+    index($lock_build, q{FileShareDelete}) >= 0;
+
+  my $tracked_copy_start = index(
+    $text,
+    "private static byte[] CopyTrackedRegularSingleLinkCore(");
+  my $tracked_copy_end = index(
+    $text,
+    "public static void DeleteTrackedTree(",
+    $tracked_copy_start);
+  exit 1 if $tracked_copy_start < 0 || $tracked_copy_end <= $tracked_copy_start;
+  my $tracked_copy = substr(
+    $text,
+    $tracked_copy_start,
+    $tracked_copy_end - $tracked_copy_start);
+  for my $needle (
+    q{DuplicateHandle(},
+    q{sourceStream.CopyTo(destinationStream)},
+    q{destinationStream.Flush(true)},
+    q{Identity destinationWritten = GetIdentity(},
+    q{EnsureSameSingleLinkFileIdentity(},
+    q{destinationWritten.FileSize != sourceBefore.FileSize},
+    q{EnsureStableSingleLinkFile(sourceBefore, sourceAfter, "tracked copy source")},
+    q{EnsureStableSingleLinkFile(destinationWritten, destinationAfter, "copy destination")},
+    q{destinationWritten,},
+    q{ConstantTimeEquals(sourceDigest, destinationDigest)},
+    q{sourceStream.Position = 0}) {
+    exit 1 if index($tracked_copy, $needle) < 0;
+  }
+  my $destination_flush = index($tracked_copy, q{destinationStream.Flush(true)});
+  my $destination_snapshot = index(
+    $tracked_copy,
+    q{Identity destinationWritten = GetIdentity(},
+    $destination_flush);
+  my $destination_hash = index(
+    $tracked_copy,
+    q{byte[] destinationDigest = destinationSha256.ComputeHash(destinationStream)},
+    $destination_snapshot);
+  exit 1 if $destination_flush < 0 || $destination_snapshot <= $destination_flush ||
+    $destination_hash <= $destination_snapshot;
+  exit 1 if $tracked_copy =~ /EnsureStableSingleLinkFile\s*\(\s*
+    destinationCreated\s*,/xms;
+  my $same_identity_start = index(
+    $text,
+    "private static void EnsureSameSingleLinkFileIdentity(");
+  my $constant_time_start = index(
+    $text,
+    "private static bool ConstantTimeEquals(",
+    $same_identity_start);
+  exit 1 if $same_identity_start < 0 || $constant_time_start <= $same_identity_start;
+  my $same_identity = substr(
+    $text,
+    $same_identity_start,
+    $constant_time_start - $same_identity_start);
+  for my $needle (
+    q{before.SameObjectAndKind(after)},
+    q{before.NumberOfLinks != 1},
+    q{after.NumberOfLinks != 1}) {
+    exit 1 if index($same_identity, $needle) < 0;
+  }
+  exit 1 if index($same_identity, q{FileSize}) >= 0;
+
+  # Deterministic share-mode adversary contract: Cargo owns destination
+  # creation/replacement while it runs. The exact post-build child is then
+  # opened relative to the retained directory without write/delete sharing;
+  # staged committed payload handles use the same no-mutation boundary.
+  exit 1 if $lock_build =~ /FileShareWrite|FileShareDelete/;
+
+  my $committed_copy_start = index(
+    $text,
+    "function Copy-CommittedReleasePayloadFiles {");
+  my $committed_assert_start = index(
+    $text,
+    "function Assert-CommittedReleasePayloadHashes {",
+    $committed_copy_start);
+  my $committed_copy_end = index(
+    $text,
+    "function Materialize-ReleaseSource {",
+    $committed_assert_start);
+  exit 1 if $committed_copy_start < 0 ||
+    $committed_assert_start <= $committed_copy_start ||
+    $committed_copy_end <= $committed_assert_start;
+  my $committed_copy = substr(
+    $text,
+    $committed_copy_start,
+    $committed_assert_start - $committed_copy_start);
+  my $committed_assert = substr(
+    $text,
+    $committed_assert_start,
+    $committed_copy_end - $committed_assert_start);
+  exit 1 unless $committed_copy =~ /\$fileNames\s*=\s*\@\(
+    "README\.md"\s*,\s*"LICENSE"\s*,\s*"config\.example\.json"\s*\)/xms;
+  for my $needle (
+    q{"cat-file", "blob", ([string]$matches[0].Blob)},
+    q{Get-GitBlobSha1FromBytes $committedBytes},
+    q{OpenRegularSingleLink(},
+    q{HashTrackedRegularSingleLinkGitBlobSha1(},
+    q{HashTrackedRegularSingleLinkSha256(},
+    q{Copy-SingleLinkFileFromHandle $state.Handle $destinationPath},
+    q{Handle = $destinationHandle},
+    q{$expectedHashes[$fileName] = $state.ExpectedSha256}) {
+    exit 1 if index($committed_copy, $needle) < 0;
+  }
+  my $staged_assert_start = index(
+    $text,
+    "function Assert-StagedPayloadHandles {",
+    $committed_assert_start);
+  my $staged_close_start = index(
+    $text,
+    "function Close-StagedPayloadHandles {",
+    $staged_assert_start);
+  exit 1 if $staged_assert_start < 0 || $staged_close_start <= $staged_assert_start;
+  my $staged_assert = substr(
+    $text,
+    $staged_assert_start,
+    $staged_close_start - $staged_assert_start);
+  for my $needle (
+    q{AssertTrackedRegularPath(},
+    q{HashTrackedRegularSingleLinkSha256(},
+    q{$handleHash -cne $ExpectedHashes[$state.Name]}) {
+    exit 1 if index($staged_assert, $needle) < 0;
+  }
+  for my $needle (
+    q{$ActualHashes[$fileName] -cne $ExpectedHashes[$fileName]},
+    q{captured commit ${ReleaseGitCommit}}) {
+    exit 1 if index($committed_assert, $needle) < 0;
+  }
+
+  my $main_start = index($text, q{$primaryFailure = $null});
+  exit 1 if $main_start < 0;
+  my $main = substr($text, $main_start);
+  my @build_flow = (
+    q{$BuiltExecutableDirectoryHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(},
+    q{$targetExe = Microsoft.PowerShell.Management\Join-Path `},
+    q{$builtExecutableState = Invoke-SanitizedCargo @(},
+    q{-RetainBuiltExecutableDirectoryHandle $BuiltExecutableDirectoryHandle},
+    q{$BuiltExecutableHandle = $builtExecutableState.Handle},
+    q{Copy-SingleLinkExecutableFromHandleAndCaptureBytes `},
+    q{Verify-ExecutableMetadataBytes $UnsignedExecutableBytes},
+    q{HashTrackedRegularSingleLinkSha256(},
+    q{$committedPayloadState = Copy-CommittedReleasePayloadFiles $stagedDist},
+    q{$StagedPayloadHandles = @($committedPayloadState.Handles)},
+    q{$StagedExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(},
+    q{Assert-StagedExecutableHandle $stagedExe},
+    q{Close-BuiltExecutableHandles},
+    q{Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes},
+    q{Assert-CommittedReleasePayloadHashes $corePayloadHashes $CommittedPayloadHashes}
+  );
+  my $build_cursor = -1;
+  for my $needle (@build_flow) {
+    my $next = index($main, $needle, $build_cursor + 1);
+    exit 1 if $next < 0;
+    $build_cursor = $next;
+  }
+  exit 1 if index(
+    $main,
+    q{Copy-SingleLinkExecutableAndCaptureBytes $targetExe $stagedExe}) >= 0;
+  my $copy_exe = index(
+    $main,
+    q{Copy-SingleLinkExecutableFromHandleAndCaptureBytes `});
+  my $retain_staged_exe = index(
+    $main,
+    q{$StagedExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(},
+    $copy_exe);
+  my $assert_staged_exe = index(
+    $main,
+    q{Assert-StagedExecutableHandle $stagedExe},
+    $retain_staged_exe);
+  my $close_exe = index($main, q{Close-BuiltExecutableHandles}, $assert_staged_exe);
+  exit 1 if $copy_exe < 0 ||
+    $retain_staged_exe <= $copy_exe || $assert_staged_exe <= $retain_staged_exe ||
+    $close_exe <= $assert_staged_exe;
+  exit 1 if index($main, q{Sign-AndVerify-Executable}) >= 0 ||
+    index($main, q{Assert-AuthenticodeExecutable}) >= 0;
+  my $copy_docs = index($main, q{$committedPayloadState = Copy-CommittedReleasePayloadFiles $stagedDist});
+  my $candidate_docs = index($main, q{Copy-SingleLinkFile `}, $copy_docs);
+  my $assert_staged_docs = index(
+    $main,
+    q{Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes},
+    $candidate_docs);
+  my $close_staged_docs = index($main, q{Close-StagedPayloadHandles}, $assert_staged_docs);
+  my $assert_candidate_exe = index(
+    $main,
+    q{Assert-StagedExecutableHandle $stagedExe},
+    $candidate_docs);
+  my $close_staged_exe = index(
+    $main,
+    q{Close-StagedExecutableHandle},
+    $assert_candidate_exe);
+  exit 1 if $copy_docs < 0 || $candidate_docs <= $copy_docs ||
+    $assert_candidate_exe <= $candidate_docs || $close_staged_exe <= $assert_candidate_exe ||
+    $assert_staged_docs <= $candidate_docs || $close_staged_docs <= $assert_staged_docs;
+  exit 1 if $main =~ /foreach\s*\(\$fileName\s+in\s+\@\(
+    "README\.md"\s*,\s*"LICENSE"\s*,\s*"config\.example\.json"\s*\)\s*\)\s*\{
+    \s*Copy-SingleLinkFile/xms;
 
   my $child_start = index($text, "public static void AssertTrackedChild(");
   my $child_end = index($text, "public static byte[] ReadRegularSingleLinkBytes(", $child_start);
   exit 1 if $child_start < 0 || $child_end <= $child_start;
   my $child = substr($text, $child_start, $child_end - $child_start);
-  exit 1 if index($child, q{FileReadAttributes | Synchronize}) < 0;
-  exit 1 if index($child, q{FileShareRead | FileShareWrite}) < 0;
+  exit 1 unless $child =~ /OpenChildNoFollow\s*\(\s*
+    directory\s*,\s*leafName\s*,\s*
+    FileReadAttributes\s*\|\s*Synchronize\s*,\s*
+    FileShareRead\s*\|\s*FileShareWrite\s*\|\s*FileShareDelete\s*
+  \)/xms;
 
   my $root_start = index($text, "function New-ReleaseRoot {");
   my $root_end = index($text, "function Remove-ReleaseRootSafely {", $root_start);
@@ -2155,6 +2771,27 @@ if ! /usr/bin/perl -0777 -e '
   exit 1 unless $root =~ /\.compiler-anchor.*?\[IO\.FileAccess\]::ReadWrite\s*,\s*
     \s*\[IO\.FileShare\]::Read/xms;
   exit 1 if $root =~ /\.compiler-anchor.*?\[IO\.FileShare\]::None/xms;
+  for my $needle (
+    q![IO.FileOptions]::DeleteOnClose!,
+    q!if ($compilerSentinel) {!,
+    q!"Unable to close cleanup compiler sentinel:!,
+    q!("Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner" -as [type])!,
+    q!$compilerDirectoryHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(!,
+    q![IO.Directory]::Delete($compilerTemp, $false)!,
+    q!"Leaving non-empty unverified cleanup compiler directory in place:!) {
+    exit 1 if index($root, $needle) < 0;
+  }
+
+  my $complete_start = index($text, "function Complete-DevelopmentPublication {");
+  my $complete_end = index($text, "function Stop-DistProcesses {", $complete_start);
+  exit 1 if $complete_start < 0 || $complete_end <= $complete_start;
+  my $complete = substr($text, $complete_start, $complete_end - $complete_start);
+  my $final_enumeration = index(
+    $complete,
+    q{Assert-WindowsDistribution $Directory $ExpectedPayloadHashes $ExpectedMetadata});
+  my $complete_flag = index($complete, q{$script:PublicationComplete = $true});
+  exit 1 if $final_enumeration < 0 || $complete_flag <= $final_enumeration;
+  exit 1 if index($complete, q{mutable, non-attested development output}) < 0;
 ' "$ROOT_DIR/script/build_windows_dist.ps1"; then
   fail "Windows packager no longer holds exact single-link source and six-file publication handles"
 fi
@@ -2200,24 +2837,20 @@ if ! /usr/bin/perl -0777 -e '
     $codedom_lock <= $source_assert || $codedom_assert <= $codedom_lock ||
     $tool_lock <= $codedom_assert || $close_lock <= $tool_lock;
 
-  my $sign_start = index($text, "function Sign-AndVerify-Executable {");
-  my $sign_end = index($text, "function Assert-AuthenticodeExecutable {", $sign_start);
-  exit 1 if $sign_start < 0 || $sign_end <= $sign_start;
-  my $sign = substr($text, $sign_start, $sign_end - $sign_start);
-  my @sign_order = (
-    q{ReadRegularSingleLinkBytes(},
-    q{Get-ByteArraySha256 $ExpectedUnsignedBytes},
-    q{Invoke-Checked $SignTool @(},
-    q{Assert-SignedExecutablePreservesUnsignedPayload},
-    q{Invoke-Checked $SignTool @("verify"},
-    q{Assert-AuthenticodeExecutable}
-  );
-  my $cursor = -1;
-  for my $needle (@sign_order) {
-    my $next = index($sign, $needle, $cursor + 1);
-    exit 1 if $next < 0;
-    $cursor = $next;
-  }
+  exit 1 if $text =~ /function\s+(?:Sign-AndVerify-Executable|Assert-AuthenticodeExecutable)\b/;
+  exit 1 if $text =~ /Invoke-Checked\s+\$SignTool\s+\@\(/;
+  my $guard = index(
+    $text,
+    q{Publishable Windows packaging is disabled in the local packager.});
+  my $source_capture = index(
+    $text,
+    q{$executingPackagerSource = $MyInvocation.MyCommand.ScriptBlock.Ast.Extent.Text});
+  my $engine_resolution = index(
+    $text,
+    q{$enginePath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName});
+  my $child_start = index($text, q{if (-not $childProcess.Start())});
+  exit 1 if $guard < 0 || $source_capture <= $guard ||
+    $engine_resolution <= $guard || $child_start <= $guard;
 
   my $publish_start = index($text, "function Assert-DistributionPayloadHandles {");
   my $publish_end = index($text, "function Close-DistributionPayloadHandles {", $publish_start);
@@ -2234,7 +2867,7 @@ if ! /usr/bin/perl -0777 -e '
   my $rewinds = () = $hash =~ /stream\.Position\s*=\s*0\s*;/g;
   exit 1 if $rewinds < 2;
 ' "$ROOT_DIR/script/build_windows_dist.ps1"; then
-  fail "Windows non-write-sharing tree, exact signing, or publication identity contract changed"
+  fail "Windows local-only guard, non-write-sharing tree, or publication identity contract changed"
 fi
 if /usr/bin/grep -Fq 'WAAL_WINDOWS_SIGNTOOL' "$ROOT_DIR/script/build_windows_dist.ps1"; then
   fail "Windows packager still accepts an arbitrary late signtool override"
@@ -2254,7 +2887,6 @@ for pin_name in \
   WAAL_WINDOWS_RELEASE_EXPECTED_MSVC_BIN_SHA256 \
   WAAL_WINDOWS_RELEASE_EXPECTED_RC_SHA256 \
   WAAL_WINDOWS_RELEASE_EXPECTED_SDK_BIN_SHA256 \
-  WAAL_WINDOWS_RELEASE_EXPECTED_SIGNTOOL_SHA256 \
   WAAL_WINDOWS_RELEASE_EXPECTED_LIB_SHA256 \
   WAAL_WINDOWS_RELEASE_EXPECTED_INCLUDE_SHA256 \
   WAAL_WINDOWS_RELEASE_EXPECTED_LIBPATH_SHA256 \
@@ -2270,10 +2902,6 @@ done
   || fail "Windows packager does not bind Git exec-path to its pinned runtime tree"
 /usr/bin/grep -Fq 'Assert-PathWithinPinnedDirectory $ResourceCompiler $SdkBin "rc.exe"' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not bind rc.exe to the pinned SDK executable tree"
-/usr/bin/grep -Fq 'Assert-PathWithinPinnedDirectory $SignTool $SdkBin "signtool.exe"' "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows packager does not bind signtool.exe to the pinned SDK executable tree"
-/usr/bin/grep -Fq '@($CompilerSha256, $LibrarianSha256, $LinkerSha256, $CompilerBinSha256, $ResourceCompilerSha256, $SdkBinSha256, $SignToolSha256)' "$ROOT_DIR/script/build_windows_dist.ps1" \
-  || fail "Windows native aggregate does not include the ordered SDK runtime inputs"
 if ! /usr/bin/perl -0777 -e '
   my $text = <>;
   exit($text =~ /\$script:ReleaseMaterialsSha256\s*=\s*Get-OrderedHashAggregate\s*\@\(\s*
@@ -2307,5 +2935,14 @@ if /usr/bin/grep -E 'Remove-Item.*(Publication|DistDir|DistName)' "$ROOT_DIR/scr
 fi
 /usr/bin/grep -Fq '#[cfg(any(target_os = "macos", target_os = "windows"))]' "$ROOT_DIR/src/main.rs" \
   || fail "Windows executable does not include generated release metadata"
+/usr/bin/grep -Fq \
+  'WAAL_PUBLISHABLE_RELEASE is disabled: source-controlled build metadata cannot authenticate its own producer' \
+  "$ROOT_DIR/build.rs" \
+  || fail "build metadata still permits caller-selected publishability"
+if /usr/bin/grep -Eq \
+  'attestation=(external|authenticated)|producer-attribution=(available|authenticated)' \
+  "$ROOT_DIR/build.rs"; then
+  fail "build.rs still embeds a self-asserted producer attestation"
+fi
 
 echo "release provenance tests passed"
