@@ -466,6 +466,17 @@ TEST_FUNCTION_PRIVATE_ROOT_PARENT_ID="$RELEASE_PRIVATE_ROOT_PARENT_ID"
 TEST_FUNCTION_TEMP_DIR="$RELEASE_TEMP_DIR"
 TEST_FUNCTION_STAGE_DIR="$STAGE_DIR"
 TEST_FUNCTION_SOURCE_ROOT="$RELEASE_SOURCE_ROOT"
+for preallocated_release_directory in \
+  "$RELEASE_PRIVATE_ROOT/build-toolchain" \
+  "$RELEASE_SOURCE_ROOT/build-home" \
+  "$RELEASE_SOURCE_ROOT/cargo-home" \
+  "$RELEASE_SOURCE_ROOT/cargo-work" \
+  "$RELEASE_SOURCE_ROOT/tmp"; do
+  [ -d "$preallocated_release_directory" ] \
+    && [ ! -L "$preallocated_release_directory" ] \
+    && [ "$(/usr/bin/stat -f '%Lp' "$preallocated_release_directory")" = 700 ] \
+    || fail "release identity-anchor child was not securely preallocated: $preallocated_release_directory"
+done
 
 UNSAFE_PARENT_OWNER="$TEST_ROOT/unsafe-parent-owner"
 /bin/mkdir -m 700 "$UNSAFE_PARENT_OWNER"
@@ -659,6 +670,22 @@ materialize_release_source_for_root \
 RELEASE_SOURCE_DIR="$SOURCE_IDENTITY_SNAPSHOT"
 RELEASE_GIT_SOURCE_ROOT="$REPO_DIR"
 capture_release_source_identity_baseline
+# Reproduce the live release order: Cargo directories are prepared and the
+# toolchain snapshot is populated only after the committed source baseline is
+# captured. Because their anchor children were preallocated, these legitimate
+# nested writes must not mutate the guarded private-root/source-parent records.
+prepare_isolated_release_cargo_home
+/usr/bin/printf 'anchor regression\n' \
+  >"$RELEASE_PRIVATE_ROOT/build-toolchain/anchor-regression"
+/usr/bin/printf 'source-parent regression\n' \
+  >"$RELEASE_CARGO_HOME/anchor-regression"
+verify_release_source_identity_baseline \
+  || fail "post-freeze Cargo/toolchain setup changed a release identity anchor"
+/bin/rm -f -- \
+  "$RELEASE_PRIVATE_ROOT/build-toolchain/anchor-regression" \
+  "$RELEASE_CARGO_HOME/anchor-regression"
+verify_release_source_identity_baseline \
+  || fail "toolchain snapshot cleanup changed a release identity anchor"
 SOURCE_IDENTITY_ORIGINAL="$TEST_ROOT/source-identity-tracked-original"
 if /bin/mv \
   "$SOURCE_IDENTITY_SNAPSHOT/tracked.txt" "$SOURCE_IDENTITY_ORIGINAL" \

@@ -1564,15 +1564,33 @@ materialize_immutable_release_toolchain_snapshot() {
   local source_path
   local relative_path
   local destination_path
+  local preallocated_entry
 
   if [ -z "$RELEASE_PRIVATE_ROOT" ] || ! verify_private_release_root; then
     echo "Private release root is required before snapshotting the build toolchain." >&2
     return 1
   fi
   RELEASE_TOOLCHAIN_SNAPSHOT_ROOT="$RELEASE_PRIVATE_ROOT/build-toolchain"
-  if [ -e "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" ] \
-    || [ -L "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" ]; then
-    echo "Release toolchain snapshot destination already exists." >&2
+  if [ -L "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" ] \
+    || [ ! -d "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" ] \
+    || [ "$(cd "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" 2>/dev/null && /bin/pwd -P)" \
+      != "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" ] \
+    || [ "$(/usr/bin/stat -f '%u:%Lp' "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT")" \
+      != "$(/usr/bin/id -u):700" ]; then
+    echo "Preallocated release toolchain snapshot directory is unsafe." >&2
+    return 1
+  fi
+  require_no_acl "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" \
+    "Preallocated release toolchain snapshot directory" || return 1
+  if ! preallocated_entry="$(
+    /usr/bin/find -x "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" \
+      -mindepth 1 -maxdepth 1 -print -quit
+  )"; then
+    echo "Unable to inspect the preallocated release toolchain snapshot directory." >&2
+    return 1
+  fi
+  if [ -n "$preallocated_entry" ]; then
+    echo "Preallocated release toolchain snapshot directory is not empty." >&2
     return 1
   fi
   case "$original_cargo:$original_rustc" in
@@ -1580,7 +1598,6 @@ materialize_immutable_release_toolchain_snapshot() {
     *) echo "Cargo and rustc must be inside the pinned Rust sysroot." >&2; return 1 ;;
   esac
 
-  /bin/mkdir -m 700 "$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT" || return 1
   rust_snapshot="$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT/rust-sysroot"
   native_snapshot="$RELEASE_TOOLCHAIN_SNAPSHOT_ROOT/xcode-developer"
   /bin/cp -cR -P "$original_rust_sysroot" "$rust_snapshot" || return 1
@@ -2215,7 +2232,20 @@ create_private_release_root_for_root() {
   STAGE_DIR="$RELEASE_PRIVATE_ROOT/stage"
   RELEASE_TEMP_DIR="$RELEASE_PRIVATE_ROOT/tmp"
   RELEASE_SOURCE_ROOT="$RELEASE_PRIVATE_ROOT/source-environment"
-  /bin/mkdir -m 700 "$STAGE_DIR" "$RELEASE_TEMP_DIR" "$RELEASE_SOURCE_ROOT"
+  # Allocate every direct child of the filesystem-identity anchors before the
+  # committed source is frozen. Later writes stay below these preallocated
+  # directories, so legitimate Cargo/toolchain setup cannot change the exact
+  # private-root or source-parent metadata guarded for the whole build.
+  /bin/mkdir -m 700 \
+    "$STAGE_DIR" \
+    "$RELEASE_TEMP_DIR" \
+    "$RELEASE_SOURCE_ROOT" \
+    "$RELEASE_PRIVATE_ROOT/build-toolchain" || return 1
+  /bin/mkdir -m 700 \
+    "$RELEASE_SOURCE_ROOT/build-home" \
+    "$RELEASE_SOURCE_ROOT/cargo-home" \
+    "$RELEASE_SOURCE_ROOT/cargo-work" \
+    "$RELEASE_SOURCE_ROOT/tmp" || return 1
 }
 
 create_private_release_root() {
