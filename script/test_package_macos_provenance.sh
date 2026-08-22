@@ -833,6 +833,43 @@ write_bootstrap_bundle_fixture() {
     >"$path"
 }
 
+write_bootstrap_shared_offset_package_fixture() {
+  local path="$1"
+  local expected_bundle_oid="$2"
+
+  {
+    /usr/bin/printf '%s\n' \
+      '[ "${1:-}" = --internal-committed-snapshot ] || exit 91' \
+      '[ "${!#}" = --local-signed-release ] || exit 92' \
+      'LOADED_MACOS_BUNDLE_SHA256="$5"' \
+      "LOADED_MACOS_BUNDLE_OID=$expected_bundle_oid" \
+      'RELEASE_GIT_SOURCE_ROOT=/' \
+      'sanitized_git() {' \
+      '  shift 2' \
+      "  \"$REAL_GIT_BIN\" \"\$@\"" \
+      '}'
+    /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+      /usr/bin/perl -0777 -e '
+        use strict;
+        use warnings;
+        my $text = <>;
+        my $start = index($text, "load_authenticated_bundle_helper() {");
+        my $end = index($text, "canonical_executable_path() {", $start);
+        die "authenticated bundle-helper loader not found\n"
+          if $start < 0 || $end <= $start;
+        print substr($text, $start, $end - $start);
+      ' "$ROOT_DIR/script/package_macos.sh"
+    /usr/bin/printf '%s\n' \
+      'package_macos_main() {' \
+      '  load_authenticated_bundle_helper' \
+      '  declare -F waal_require_tool >/dev/null' \
+      '  declare -F waal_cargo_version >/dev/null' \
+      '  declare -F waal_assemble_app_bundle >/dev/null' \
+      '  /usr/bin/touch "$BOOTSTRAP_MARKER"' \
+      '}'
+  } >"$path"
+}
+
 BOOTSTRAP_POSITIVE_PACKAGE="$TEST_ROOT/bootstrap-positive-package.sh"
 BOOTSTRAP_POSITIVE_BUNDLE="$TEST_ROOT/bootstrap-positive-bundle.sh"
 BOOTSTRAP_POSITIVE_MARKER="$TEST_ROOT/bootstrap-positive.ran"
@@ -848,6 +885,27 @@ run_committed_bootstrap_fixture \
   || fail "descriptor-bound committed bootstrap rejected its positive control"
 [ -f "$BOOTSTRAP_POSITIVE_MARKER" ] \
   || fail "descriptor-bound committed bootstrap did not invoke the verified package"
+
+# The real bootstrap hashes descriptor 6 before sourcing the committed
+# packager. On macOS that /dev/fd/6 read advances the descriptor's shared
+# offset to EOF. Exercise the real helper-loader function in that state so a
+# missing pre-hash rewind cannot be hidden by the lightweight positive fixture.
+BOOTSTRAP_SHARED_OFFSET_PACKAGE="$TEST_ROOT/bootstrap-shared-offset-package.sh"
+BOOTSTRAP_SHARED_OFFSET_BUNDLE="$TEST_ROOT/bootstrap-shared-offset-bundle.sh"
+BOOTSTRAP_SHARED_OFFSET_MARKER="$TEST_ROOT/bootstrap-shared-offset.ran"
+write_bootstrap_bundle_fixture "$BOOTSTRAP_SHARED_OFFSET_BUNDLE"
+BOOTSTRAP_SHARED_OFFSET_BUNDLE_OID="$($REAL_GIT_BIN hash-object -- "$BOOTSTRAP_SHARED_OFFSET_BUNDLE")"
+write_bootstrap_shared_offset_package_fixture \
+  "$BOOTSTRAP_SHARED_OFFSET_PACKAGE" "$BOOTSTRAP_SHARED_OFFSET_BUNDLE_OID"
+run_committed_bootstrap_fixture \
+  "$BOOTSTRAP_SHARED_OFFSET_PACKAGE" "$BOOTSTRAP_SHARED_OFFSET_PACKAGE" \
+  "$BOOTSTRAP_SHARED_OFFSET_BUNDLE" "$BOOTSTRAP_SHARED_OFFSET_BUNDLE" \
+  "$(release_tool_sha256 "$BOOTSTRAP_SHARED_OFFSET_PACKAGE")" \
+  "$(release_tool_sha256 "$BOOTSTRAP_SHARED_OFFSET_BUNDLE")" \
+  "$BOOTSTRAP_SHARED_OFFSET_MARKER" \
+  || fail "authenticated bundle-helper loader did not rewind bootstrap-consumed descriptor 6"
+[ -f "$BOOTSTRAP_SHARED_OFFSET_MARKER" ] \
+  || fail "shared-offset bootstrap regression did not load the authenticated helper"
 
 BOOTSTRAP_WRONG_DIGEST_PACKAGE="$TEST_ROOT/bootstrap-wrong-digest-package.sh"
 BOOTSTRAP_WRONG_DIGEST_BUNDLE="$TEST_ROOT/bootstrap-wrong-digest-bundle.sh"
@@ -2271,7 +2329,9 @@ if ! /usr/bin/perl -0777 -e '
   my @helper_ordered = (
     q{bundle_execution_identity="$(descriptor_identity /dev/fd/7)"},
     q{bundle_verification_identity="$(descriptor_identity /dev/fd/6)"},
+    q{rewind helper descriptor before hashing},
     q{actual_bundle_sha256="$(},
+    q{rewind helper descriptor:},
     q{actual_bundle_oid="$(},
     q{builtin source /dev/fd/7},
     q{exec 6<&- 7<&-}

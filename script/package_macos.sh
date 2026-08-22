@@ -1036,6 +1036,16 @@ load_authenticated_bundle_helper() {
     unset -f descriptor_identity
     return 1
   fi
+  # The bootstrap has already hashed /dev/fd/6. On macOS, reopening a
+  # /dev/fd path duplicates the underlying open file description and leaves
+  # its shared offset at EOF. Rewind the independent verification descriptor
+  # before hashing it again; descriptor 7 remains untouched for interpretation.
+  /usr/bin/perl -e '
+    use strict;
+    use warnings;
+    defined(sysseek(STDIN, 0, 0))
+      or die "rewind helper descriptor before hashing: $!\n";
+  ' <&6 || return 1
   actual_bundle_sha256="$(
     /usr/bin/shasum -a 256 /dev/fd/6 | /usr/bin/awk '{ print $1; exit }'
   )"
