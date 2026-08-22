@@ -213,7 +213,7 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
             .with_min_inner_size([560.0, 360.0])
             .with_icon(load_icon()?)
             .with_visible(true),
-        renderer: eframe::Renderer::Glow,
+        renderer: full_ui_renderer(),
         ..Default::default()
     };
 
@@ -237,6 +237,21 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     );
 
     result.map_err(|e| anyhow::anyhow!("EFrame error: {:?}", e))
+}
+
+fn full_ui_renderer() -> eframe::Renderer {
+    #[cfg(target_os = "windows")]
+    {
+        // Clean Windows VMs commonly expose DirectX through the Microsoft
+        // software adapter but no OpenGL 2.0 driver. WGPU can use that DX12
+        // path, while Glow fails before the Accounts window is created.
+        eframe::Renderer::Wgpu
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        eframe::Renderer::Glow
+    }
 }
 
 fn acquire_authorized_settings_session_with<Token, Lease>(
@@ -1844,9 +1859,9 @@ fn load_icon() -> anyhow::Result<egui::IconData> {
 mod tests {
     use super::{
         acquire_authorized_settings_session_with, fill_result_label,
-        finish_startup_storage_recovery_after_journals_with_ops, full_ui_command, initial_tab_arg,
-        publish_initial_monitor_status, std_channel, sync_startup_auto_start_with, tokio_channel,
-        LightweightSupervisor, MonitorControlState, StartupConfig,
+        finish_startup_storage_recovery_after_journals_with_ops, full_ui_command, full_ui_renderer,
+        initial_tab_arg, publish_initial_monitor_status, std_channel, sync_startup_auto_start_with,
+        tokio_channel, LightweightSupervisor, MonitorControlState, StartupConfig,
     };
     use crate::background::{WorkerCommand, WorkerInvalidator, WorkerQuiescenceAck};
     use crate::debug_fill::FillAttemptReport;
@@ -2041,6 +2056,18 @@ mod tests {
         assert!(authorization < full_ui_guard);
         assert!(full_ui_guard < config_load);
         assert!(config_load < ui_start);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_full_ui_uses_wgpu_without_an_opengl_requirement() {
+        assert_eq!(full_ui_renderer(), eframe::Renderer::Wgpu);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_full_ui_keeps_the_existing_glow_renderer() {
+        assert_eq!(full_ui_renderer(), eframe::Renderer::Glow);
     }
 
     #[cfg(target_os = "windows")]
