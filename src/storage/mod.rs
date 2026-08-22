@@ -2748,7 +2748,11 @@ where
     CK: FnMut(&[ScopedFallbackKeyRef]),
 {
     let payload = encode_bound_password(account, password)?;
-    let (new_key_ref, encrypted) = stage_entry(&account.id, payload.as_str())?;
+    let stage_result = stage_entry(&account.id, payload.as_str());
+    // The bound plaintext has already been encrypted (or staging failed).
+    // Wipe it before legacy-key migration and password-file commit can block.
+    drop(payload);
+    let (new_key_ref, encrypted) = stage_result?;
     let mut staged_keys = vec![new_key_ref.clone()];
     install_scoped_fallback_entry(file, &account.id, &new_key_ref, encrypted);
     match migrate_legacy(file) {
@@ -2837,6 +2841,9 @@ fn load_from_file_locked(account: &Account) -> anyhow::Result<LoadedStoredPasswo
     };
     let used_legacy_key = active_key_ref.is_none();
     let (password, format) = decode_bound_password(account, stored.as_str())?;
+    // `password` owns the only plaintext needed by the caller. Wipe the
+    // decrypted envelope before any migration or password-file I/O.
+    drop(stored);
 
     let mut staged_keys = Vec::new();
     let migration_result = (|| -> anyhow::Result<bool> {
@@ -2850,8 +2857,9 @@ fn load_from_file_locked(account: &Account) -> anyhow::Result<LoadedStoredPasswo
 
         if format == StoredPasswordFormat::LegacyRaw {
             let payload = encode_bound_password(account, password.as_str())?;
-            let (new_key_ref, reencrypted) =
-                stage_scoped_fallback_entry(&account.id, payload.as_str())?;
+            let stage_result = stage_scoped_fallback_entry(&account.id, payload.as_str());
+            drop(payload);
+            let (new_key_ref, reencrypted) = stage_result?;
             staged_keys.push(new_key_ref.clone());
             install_scoped_fallback_entry(&mut file, &account.id, &new_key_ref, reencrypted);
         }
@@ -3038,7 +3046,11 @@ fn save_password_to_backend(
         let entry = keyring::Entry::new(SERVICE_NAME, &account.id)
             .map_err(|e| anyhow::anyhow!("{} is unavailable: {e}", native_secure_storage_name()))?;
         let payload = encode_keyring_password(account, password)?;
-        match entry.set_password(payload.as_str()) {
+        let set_result = entry.set_password(payload.as_str());
+        // The provider has consumed the payload. Wipe it before stale-backend
+        // cleanup performs unrelated filesystem or secure-storage I/O.
+        drop(payload);
+        match set_result {
             Ok(()) => {
                 let stale_cleanup_warning = cleanup_stale_backend_after_successful_save(
                     &account.id,
@@ -4026,10 +4038,15 @@ fn load_from_keyring_timed(account: &Account) -> anyhow::Result<LoadedStoredPass
     let zeroizing_start = std::time::Instant::now();
     let (password, format, secure_storage_needs_migration) =
         decode_keyring_password(account, stored.as_str())?;
+    // The decoded password is independently zeroizing. Wipe the provider's
+    // stored payload before a migration write can block or report an error.
+    drop(stored);
     let zeroizing_wrap_ms = zeroizing_start.elapsed().as_millis();
     if secure_storage_needs_migration || format == StoredPasswordFormat::LegacyRaw {
         let payload = encode_keyring_password(account, password.as_str())?;
-        if let Err(e) = entry.set_password(payload.as_str()) {
+        let set_result = entry.set_password(payload.as_str());
+        drop(payload);
+        if let Err(e) = set_result {
             warn!(account_id = %redacted_account_id(&account.id), error = %e, "Password loaded from legacy keychain format, but migration to user-bound DPAPI storage failed");
         } else {
             info!(account_id = %redacted_account_id(&account.id), "Migrated legacy keychain password to user-bound DPAPI storage");
@@ -6515,6 +6532,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plaintext_storage_temporaries_are_dropped_before_followup_io() {
+        let implementation = include_str!("mod.rs");
+        let between = |start: &str, end: &str| {
+            let tail = implementation
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing function marker: {start}"))
+                .1;
+            tail.split_once(end)
+                .unwrap_or_else(|| panic!("missing function boundary: {end}"))
+                .0
+        };
+
+        let fallback_save = between(
+            "fn stage_and_commit_fallback_password_with_ops<",
+            "fn finalize_fallback_key_retirement(",
+        );
+        assert_ordered(
+            fallback_save,
+            &[
+                "let stage_result = stage_entry(",
+                "drop(payload);",
+                "let (new_key_ref, encrypted) = stage_result?;",
+                "match migrate_legacy(file)",
+                "commit_password_file_with_staged_keys(",
+            ],
+        );
+
+        let fallback_load = between(
+            "fn load_from_file_locked(",
+            "fn password_entry_for_account<'a>(",
+        );
+        assert_ordered(
+            fallback_load,
+            &[
+                "decode_bound_password(account, stored.as_str())?;",
+                "drop(stored);",
+                "let migration_result =",
+                "let stage_result = stage_scoped_fallback_entry(",
+                "drop(payload);",
+                "let (new_key_ref, reencrypted) = stage_result?;",
+                "commit_password_file_with_staged_keys(",
+            ],
+        );
+
+        let keyring_save = between(
+            "fn save_password_to_backend(",
+            "fn cleanup_stale_backend_after_successful_save<",
+        );
+        assert_ordered(
+            keyring_save,
+            &[
+                "let set_result = entry.set_password(payload.as_str());",
+                "drop(payload);",
+                "match set_result",
+                "cleanup_stale_backend_after_successful_save(",
+            ],
+        );
+
+        let keyring_load = between(
+            "fn load_from_keyring_timed(",
+            "fn cleanup_migrated_legacy_credentials(",
+        );
+        assert_ordered(
+            keyring_load,
+            &[
+                "decode_keyring_password(account, stored.as_str())?;",
+                "drop(stored);",
+                "if secure_storage_needs_migration",
+                "let set_result = entry.set_password(payload.as_str());",
+                "drop(payload);",
+                "if let Err(e) = set_result",
+            ],
+        );
+    }
+
     #[cfg(target_os = "macos")]
     fn add_macos_acl(path: &std::path::Path, acl: &str) -> bool {
         let output = std::process::Command::new("/bin/chmod")
@@ -6585,6 +6678,16 @@ mod tests {
             let mut permissions = std::fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o600);
             std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    fn assert_ordered(source: &str, markers: &[&str]) {
+        let mut offset = 0;
+        for marker in markers {
+            let relative = source[offset..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing ordered source marker: {marker}"));
+            offset += relative + marker.len();
         }
     }
 
