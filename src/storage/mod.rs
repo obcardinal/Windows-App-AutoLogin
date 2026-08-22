@@ -151,6 +151,46 @@ impl std::error::Error for InvalidStagedFallbackKeyState {
 }
 
 #[derive(Debug)]
+struct FallbackCiphertextAuthenticationFailed;
+
+impl fmt::Display for FallbackCiphertextAuthenticationFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("fallback ciphertext authentication failed")
+    }
+}
+
+impl std::error::Error for FallbackCiphertextAuthenticationFailed {}
+
+#[derive(Debug)]
+struct ScopedFallbackKeyVerificationFailed {
+    source: Option<anyhow::Error>,
+}
+
+impl ScopedFallbackKeyVerificationFailed {
+    fn mismatch() -> Self {
+        Self { source: None }
+    }
+
+    fn with_source(source: anyhow::Error) -> Self {
+        Self {
+            source: Some(source),
+        }
+    }
+}
+
+impl fmt::Display for ScopedFallbackKeyVerificationFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("scoped fallback key read-back verification failed")
+    }
+}
+
+impl std::error::Error for ScopedFallbackKeyVerificationFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
+}
+
+#[derive(Debug)]
 struct PrivateFileWriteCommitted {
     source: anyhow::Error,
 }
@@ -2567,7 +2607,7 @@ fn delete_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<
     }
 }
 
-fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
+fn load_legacy_fallback_key_from_native_storage() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
     ensure_config_dir()?;
 
     let entry =
@@ -2583,61 +2623,20 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
             let decoded =
                 decode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.trim())?;
             let key = decode_fallback_encryption_key(decoded.plaintext.trim())?;
-            let migration_result = if decoded.needs_migration {
-                let payload = encode_secure_storage_secret(
-                    SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
-                    decoded.plaintext.trim(),
-                )?;
-                let result = entry.set_password(payload.as_str());
-                drop(payload);
-                Some(result)
-            } else {
-                None
-            };
-            // `key` is an independent zeroizing copy. Retire provider payloads
-            // before migration diagnostics can block.
+            // A legacy file key may be different and may be the only key that
+            // authenticates a restored ciphertext. Loading either source must
+            // therefore never overwrite or migrate the other source before
+            // every legacy entry has been durably migrated to a scoped key.
             drop(decoded);
             drop(encoded);
-            if let Some(result) = migration_result {
-                if let Err(e) = result {
-                    warn!(error = %e, "Fallback key loaded from legacy Credential Manager format, but user-bound DPAPI migration failed");
-                } else {
-                    info!("Migrated fallback key to Windows user-bound DPAPI Credential Manager storage");
-                }
-            }
-            return Ok(key);
+            Ok(Some(key))
         }
-        Err(keyring::Error::NoEntry) => {}
-        Err(e) => anyhow::bail!(
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
             "{} refused to load fallback key: {e}",
             native_secure_storage_name()
-        ),
+        )),
     }
-
-    if let Some(legacy_key) = load_legacy_fallback_key_from_file()? {
-        let encoded = Zeroizing::new(STANDARD.encode(*legacy_key));
-        let payload =
-            encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
-        let set_result = entry.set_password(payload.as_str());
-        drop(payload);
-        drop(encoded);
-        set_result.map_err(|e| {
-            anyhow::anyhow!(
-                "{} refused to migrate fallback key: {e}",
-                native_secure_storage_name()
-            )
-        })?;
-        // Keep the legacy file until every ciphertext that depends on the
-        // shared key has been durably migrated. `retire_legacy_shared_key`
-        // performs the authenticated post-commit cleanup of both copies and
-        // any historical residue.
-        return Ok(legacy_key);
-    }
-
-    // Every caller is decrypting already-existing legacy ciphertext. A newly
-    // generated key could never decrypt that data and would make recovery
-    // ambiguous, so absence must fail closed.
-    anyhow::bail!("legacy fallback encryption key is unavailable")
 }
 
 fn load_legacy_fallback_key_from_file() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
@@ -2824,7 +2823,7 @@ fn decrypt_password_with_key(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Zero
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(nonce, &data[AES_GCM_NONCE_BYTES..])
-            .map_err(|e| anyhow::anyhow!("decryption failed: {:?}", e))?,
+            .map_err(|_| anyhow::Error::new(FallbackCiphertextAuthenticationFailed))?,
     );
     zeroizing_bytes_into_string(plaintext)
 }
@@ -2838,6 +2837,62 @@ fn decrypt_password_with_fallback_key(
     }
     let data = Zeroizing::new(STANDARD.decode(encoded)?);
     decrypt_password_with_key(key, &data)
+}
+
+fn fallback_ciphertext_authentication_failed(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<FallbackCiphertextAuthenticationFailed>())
+}
+
+fn decrypt_password_with_legacy_fallback_keys(encoded: &str) -> anyhow::Result<Zeroizing<String>> {
+    decrypt_password_with_legacy_fallback_keys_with_ops(
+        encoded,
+        load_legacy_fallback_key_from_native_storage,
+        load_legacy_fallback_key_from_file,
+    )
+}
+
+fn decrypt_password_with_legacy_fallback_keys_with_ops<LN, LF>(
+    encoded: &str,
+    mut load_native_key: LN,
+    mut load_file_key: LF,
+) -> anyhow::Result<Zeroizing<String>>
+where
+    LN: FnMut() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>>,
+    LF: FnMut() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>>,
+{
+    if let Some(native_key) = load_native_key()? {
+        let native_result = decrypt_password_with_fallback_key(&native_key, encoded);
+        // The native key's final use is authentication. Destroy it before a
+        // possible filesystem read can block.
+        drop(native_key);
+        match native_result {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(error) if fallback_ciphertext_authentication_failed(&error) => {
+                // Only an authenticated-ciphertext mismatch permits trying a
+                // second key source. Malformed Base64, truncated ciphertext,
+                // and authenticated non-UTF-8 plaintext all fail closed.
+                let Some(file_key) = load_file_key()? else {
+                    return Err(error);
+                };
+                let file_result = decrypt_password_with_fallback_key(&file_key, encoded);
+                drop(file_key);
+                return file_result;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let Some(file_key) = load_file_key()? else {
+        // Every caller is decrypting already-existing legacy ciphertext. A
+        // newly generated key could never decrypt that data and would make
+        // recovery ambiguous, so absence must fail closed.
+        anyhow::bail!("legacy fallback encryption key is unavailable");
+    };
+    let result = decrypt_password_with_fallback_key(&file_key, encoded);
+    drop(file_key);
+    result
 }
 
 fn scoped_fallback_key_ref(
@@ -2893,12 +2948,36 @@ fn stage_scoped_fallback_entry(
     account_id: &AccountId,
     plaintext: Zeroizing<String>,
 ) -> anyhow::Result<(ScopedFallbackKeyRef, String)> {
+    stage_scoped_fallback_entry_with_ops(
+        account_id,
+        plaintext,
+        track_staged_fallback_key,
+        save_scoped_fallback_key_payload,
+        load_scoped_fallback_key,
+        cleanup_uncommitted_scoped_keys,
+    )
+}
+
+fn stage_scoped_fallback_entry_with_ops<TS, SP, LK, CK>(
+    account_id: &AccountId,
+    plaintext: Zeroizing<String>,
+    mut track_staged: TS,
+    mut save_key_payload: SP,
+    mut load_key: LK,
+    mut cleanup_uncommitted: CK,
+) -> anyhow::Result<(ScopedFallbackKeyRef, String)>
+where
+    TS: FnMut(&ScopedFallbackKeyRef) -> anyhow::Result<()>,
+    SP: FnMut(&ScopedFallbackKeyRef, &str) -> anyhow::Result<()>,
+    LK: FnMut(&ScopedFallbackKeyRef) -> anyhow::Result<Zeroizing<[u8; 32]>>,
+    CK: FnMut(&[ScopedFallbackKeyRef]),
+{
     let key_ref = new_scoped_fallback_key_ref(account_id)?;
     // Persist cleanup intent before creating either half of the recoverable
     // secret. On macOS the Keychain accepts plaintext provider payloads, so
     // doing this first prevents filesystem/journal I/O from retaining an AES
     // key equivalent next to its ciphertext after encryption's final use.
-    track_staged_fallback_key(&key_ref)?;
+    track_staged(&key_ref)?;
 
     let stage_result = (|| {
         let key = new_scoped_fallback_key_material();
@@ -2907,6 +2986,7 @@ fn stage_scoped_fallback_entry(
         // payload construction or any later operation can block.
         drop(plaintext);
         let encrypted = encrypted_result?;
+        let expected_key_fingerprint = sha256_hex(&*key);
         let key_payload_result = encode_scoped_fallback_key(&key_ref, &key);
         // Provider-payload construction is the raw key's final use.
         drop(key);
@@ -2914,9 +2994,28 @@ fn stage_scoped_fallback_entry(
         // Hand the payload straight to the native provider. In particular,
         // no lock wait, recovery scan, or journal/filesystem write may occur
         // while macOS retains this plaintext Keychain payload and ciphertext.
-        let save_result = save_scoped_fallback_key_payload(&key_ref, key_payload.as_str());
+        let save_result = save_key_payload(&key_ref, key_payload.as_str());
         drop(key_payload);
         save_result?;
+
+        // A provider success response is not proof that the persisted value
+        // is the one just supplied. Reopen it, decode its bound envelope, and
+        // verify the reread raw key before ciphertext can be published.
+        let verified_key = match load_key(&key_ref) {
+            Ok(key) => key,
+            Err(error) => {
+                return Err(anyhow::Error::new(
+                    ScopedFallbackKeyVerificationFailed::with_source(error),
+                ));
+            }
+        };
+        let actual_key_fingerprint = sha256_hex(&*verified_key);
+        drop(verified_key);
+        if actual_key_fingerprint != expected_key_fingerprint {
+            return Err(anyhow::Error::new(
+                ScopedFallbackKeyVerificationFailed::mismatch(),
+            ));
+        }
         Ok(encrypted)
     })();
 
@@ -2925,7 +3024,7 @@ fn stage_scoped_fallback_entry(
         Err(error) => {
             // A provider may persist the value before reporting an error. The
             // staged journal is removed only after provider deletion is confirmed.
-            cleanup_uncommitted_scoped_keys(std::slice::from_ref(&key_ref));
+            cleanup_uncommitted(std::slice::from_ref(&key_ref));
             return Err(error);
         }
     };
@@ -2971,21 +3070,21 @@ fn migrate_legacy_fallback_entries(
     migrate_legacy_fallback_entries_with_ops(
         file,
         &legacy_account_ids,
-        fallback_encryption_key,
+        decrypt_password_with_legacy_fallback_keys,
         stage_scoped_fallback_entry,
         cleanup_uncommitted_scoped_keys,
     )
 }
 
-fn migrate_legacy_fallback_entries_with_ops<LK, SE, CK>(
+fn migrate_legacy_fallback_entries_with_ops<DC, SE, CK>(
     file: &mut PasswordFile,
     legacy_account_ids: &[AccountId],
-    mut load_shared_key: LK,
+    mut decrypt_ciphertext: DC,
     mut stage_entry: SE,
     mut cleanup_uncommitted: CK,
 ) -> anyhow::Result<Vec<ScopedFallbackKeyRef>>
 where
-    LK: FnMut() -> anyhow::Result<Zeroizing<[u8; 32]>>,
+    DC: FnMut(&str) -> anyhow::Result<Zeroizing<String>>,
     SE: FnMut(&AccountId, Zeroizing<String>) -> anyhow::Result<(ScopedFallbackKeyRef, String)>,
     CK: FnMut(&[ScopedFallbackKeyRef]),
 {
@@ -2993,13 +3092,7 @@ where
     for account_id in legacy_account_ids {
         let staged_entry = (|| {
             let encrypted = password_entry_for_account(file, account_id)?;
-            let shared_key = load_shared_key()?;
-            let plaintext_result = decrypt_password_with_fallback_key(&shared_key, encrypted);
-            // Decryption is the final shared-key use for this one legacy
-            // entry. Wipe it before per-entry secure-storage staging can
-            // block, and reload it only for the next ciphertext.
-            drop(shared_key);
-            let plaintext = plaintext_result?;
+            let plaintext = decrypt_ciphertext(encrypted)?;
             stage_entry(account_id, plaintext)
         })();
         match staged_entry {
@@ -3348,8 +3441,7 @@ fn load_from_file_locked(account: &Account) -> anyhow::Result<LoadedStoredPasswo
         let key = load_scoped_fallback_key(key_ref)?;
         decrypt_password_with_fallback_key(&key, encrypted.as_str())?
     } else {
-        let key = fallback_encryption_key()?;
-        decrypt_password_with_fallback_key(&key, encrypted.as_str())?
+        decrypt_password_with_legacy_fallback_keys(encrypted.as_str())?
     };
     let used_legacy_key = active_key_ref.is_none();
     let (password, format) = decode_bound_password(account, stored.as_str())?;
@@ -3437,8 +3529,7 @@ fn load_password_from_file_snapshot(
         let key = load_scoped_fallback_key(&key_ref)?;
         decrypt_password_with_fallback_key(&key, encrypted.as_str())?
     } else {
-        let key = fallback_encryption_key()?;
-        decrypt_password_with_fallback_key(&key, encrypted.as_str())?
+        decrypt_password_with_legacy_fallback_keys(encrypted.as_str())?
     };
     let (password, _, rollback_marker) =
         decode_bound_password_with_rollback_marker(account, stored.as_str())?;
@@ -5580,14 +5671,14 @@ mod tests {
         config_write_committed, consume_pending_storage_operation_record_with_ops,
         decode_bound_password, decode_bound_password_with_rollback_marker,
         decrypt_password_with_fallback_key, decrypt_password_with_key,
-        delete_fallback_key_material_with_ops, delete_sensitive_private_file_if_present,
-        direct_password_write_after_preflight_with_ops, encode_bound_password,
-        encode_bound_password_with_rollback_marker, encrypt_password_with_key,
-        ensure_no_pending_storage_operation, finish_account_password_write_with_ops,
-        install_scoped_fallback_entry, is_pending_storage_operation_in_progress,
-        legacy_account_id_for_migrated_config, legacy_migration_target_cleanup_id,
-        legacy_password_migration_ready_to_persist, load_config_file,
-        load_config_file_with_legacy_ops, load_config_from_path,
+        decrypt_password_with_legacy_fallback_keys_with_ops, delete_fallback_key_material_with_ops,
+        delete_sensitive_private_file_if_present, direct_password_write_after_preflight_with_ops,
+        encode_bound_password, encode_bound_password_with_rollback_marker,
+        encrypt_password_with_key, ensure_no_pending_storage_operation,
+        finish_account_password_write_with_ops, install_scoped_fallback_entry,
+        is_pending_storage_operation_in_progress, legacy_account_id_for_migrated_config,
+        legacy_migration_target_cleanup_id, legacy_password_migration_ready_to_persist,
+        load_config_file, load_config_file_with_legacy_ops, load_config_from_path,
         load_legacy_fallback_key_from_path,
         load_pending_storage_operation_record_fail_closed_from_paths,
         load_pending_storage_operation_record_fail_closed_with_marker,
@@ -5607,18 +5698,20 @@ mod tests {
         replace_prepared_account_delete_journal, replace_prepared_account_enabled_toggle_journal,
         save_config_to_file, save_pending_storage_operation_to_paths,
         save_pending_storage_operation_with_preflight_ops,
-        stage_and_commit_fallback_payload_with_ops, storage_error_kind, use_owned_secret_then_drop,
-        validate_password_file_shape, validate_pending_storage_operation,
-        verify_pending_storage_surviving_backend, write_private_file_atomic,
-        write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
+        stage_and_commit_fallback_payload_with_ops, stage_scoped_fallback_entry_with_ops,
+        storage_error_kind, use_owned_secret_then_drop, validate_password_file_shape,
+        validate_pending_storage_operation, verify_pending_storage_surviving_backend,
+        write_private_file_atomic, write_private_file_create_new_atomic,
+        FallbackCiphertextAuthenticationFailed, LegacyConfig, LegacyCredentialsConfig,
         LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted, PasswordStorageBackend,
         PasswordWriteReceipt, PendingStorageOperation, PendingStorageOperationRecord,
-        PendingStorageRecoveryBlocked, ScopedFallbackKeyRef, StagedFallbackKeyConflict,
-        StagedFallbackKeysJournal, StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES,
-        MAX_PASSWORD_FILE_BYTES, PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES,
-        PENDING_STORAGE_OPERATION_VERSION, SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
-        SECURE_STORAGE_PASSWORD_PURPOSE, STAGED_FALLBACK_KEYS_VERSION,
-        WINDOWS_LEGACY_WAAB_SECRET_PREFIX, WINDOWS_USER_BOUND_SECRET_PREFIX,
+        PendingStorageRecoveryBlocked, ScopedFallbackKeyRef, ScopedFallbackKeyVerificationFailed,
+        StagedFallbackKeyConflict, StagedFallbackKeysJournal, StoredPasswordFormat,
+        AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
+        PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES, PENDING_STORAGE_OPERATION_VERSION,
+        SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE,
+        STAGED_FALLBACK_KEYS_VERSION, WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
+        WINDOWS_USER_BOUND_SECRET_PREFIX,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -8277,6 +8370,251 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_password_reports_typed_authentication_failure() {
+        let ciphertext = encrypt_password_with_key(&[7u8; 32], "bound-password").unwrap();
+        let error = decrypt_password_with_fallback_key(&[9u8; 32], &ciphertext).unwrap_err();
+
+        assert!(error
+            .chain()
+            .any(|cause| cause.is::<FallbackCiphertextAuthenticationFailed>()));
+    }
+
+    #[test]
+    fn legacy_fallback_decryption_tries_file_key_after_native_authentication_failure() {
+        let native_key = [7u8; 32];
+        let file_key = [9u8; 32];
+        let ciphertext = encrypt_password_with_key(&file_key, "recoverable-password").unwrap();
+        let native_loads = Cell::new(0usize);
+        let file_loads = Cell::new(0usize);
+
+        let plaintext = decrypt_password_with_legacy_fallback_keys_with_ops(
+            &ciphertext,
+            || {
+                native_loads.set(native_loads.get() + 1);
+                Ok(Some(Zeroizing::new(native_key)))
+            },
+            || {
+                file_loads.set(file_loads.get() + 1);
+                Ok(Some(Zeroizing::new(file_key)))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plaintext.as_str(), "recoverable-password");
+        assert_eq!(native_loads.get(), 1);
+        assert_eq!(file_loads.get(), 1);
+    }
+
+    #[test]
+    fn legacy_fallback_decryption_does_not_try_file_key_for_malformed_ciphertext() {
+        for malformed in ["%%%", "AA=="] {
+            let file_loads = Cell::new(0usize);
+            let result = decrypt_password_with_legacy_fallback_keys_with_ops(
+                malformed,
+                || Ok(Some(Zeroizing::new([7u8; 32]))),
+                || {
+                    file_loads.set(file_loads.get() + 1);
+                    Ok(Some(Zeroizing::new([9u8; 32])))
+                },
+            );
+
+            assert!(result.is_err());
+            assert_eq!(file_loads.get(), 0, "unexpected retry for {malformed}");
+        }
+    }
+
+    #[test]
+    fn legacy_fallback_decryption_obeys_source_precedence_and_fails_closed_when_absent() {
+        let native_key = [7u8; 32];
+        let file_key = [9u8; 32];
+        let native_ciphertext = encrypt_password_with_key(&native_key, "native-password").unwrap();
+        let file_ciphertext = encrypt_password_with_key(&file_key, "file-password").unwrap();
+
+        let file_loads = Cell::new(0usize);
+        let native_plaintext = decrypt_password_with_legacy_fallback_keys_with_ops(
+            &native_ciphertext,
+            || Ok(Some(Zeroizing::new(native_key))),
+            || {
+                file_loads.set(file_loads.get() + 1);
+                Ok(Some(Zeroizing::new(file_key)))
+            },
+        )
+        .unwrap();
+        assert_eq!(native_plaintext.as_str(), "native-password");
+        assert_eq!(file_loads.get(), 0);
+
+        let file_plaintext = decrypt_password_with_legacy_fallback_keys_with_ops(
+            &file_ciphertext,
+            || Ok(None),
+            || Ok(Some(Zeroizing::new(file_key))),
+        )
+        .unwrap();
+        assert_eq!(file_plaintext.as_str(), "file-password");
+
+        let absent = decrypt_password_with_legacy_fallback_keys_with_ops(
+            &file_ciphertext,
+            || Ok(None),
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert!(absent
+            .to_string()
+            .contains("legacy fallback encryption key is unavailable"));
+
+        let file_loads_after_native_error = Cell::new(0usize);
+        let native_error = decrypt_password_with_legacy_fallback_keys_with_ops(
+            &file_ciphertext,
+            || Err(anyhow::anyhow!("native provider unavailable")),
+            || {
+                file_loads_after_native_error.set(file_loads_after_native_error.get() + 1);
+                Ok(Some(Zeroizing::new(file_key)))
+            },
+        )
+        .unwrap_err();
+        assert!(native_error
+            .to_string()
+            .contains("native provider unavailable"));
+        assert_eq!(file_loads_after_native_error.get(), 0);
+    }
+
+    #[test]
+    fn legacy_fallback_decryption_does_not_retry_authenticated_non_utf8_plaintext() {
+        use aes_gcm::aead::{Aead, KeyInit};
+
+        let native_key = [7u8; 32];
+        let cipher = aes_gcm::Aes256Gcm::new_from_slice(&native_key).unwrap();
+        let nonce_bytes = [3u8; AES_GCM_NONCE_BYTES];
+        let ciphertext = cipher
+            .encrypt(aes_gcm::Nonce::from_slice(&nonce_bytes), &[0xffu8][..])
+            .unwrap();
+        let mut combined = nonce_bytes.to_vec();
+        combined.extend_from_slice(&ciphertext);
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &combined);
+        let file_loads = Cell::new(0usize);
+
+        let result = decrypt_password_with_legacy_fallback_keys_with_ops(
+            &encoded,
+            || Ok(Some(Zeroizing::new(native_key))),
+            || {
+                file_loads.set(file_loads.get() + 1);
+                Ok(Some(Zeroizing::new([9u8; 32])))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(file_loads.get(), 0);
+    }
+
+    #[test]
+    fn scoped_fallback_stage_rejects_wrong_provider_readback_and_cleans_staged_key() {
+        let account_id = "account-1".to_string();
+        let events = RefCell::new(Vec::new());
+        let tracked = RefCell::new(Vec::new());
+        let cleaned = RefCell::new(Vec::new());
+
+        let error = stage_scoped_fallback_entry_with_ops(
+            &account_id,
+            Zeroizing::new("bound-password".to_string()),
+            |key_ref| {
+                events.borrow_mut().push("track");
+                tracked.borrow_mut().push(key_ref.clone());
+                Ok(())
+            },
+            |_key_ref, _payload| {
+                events.borrow_mut().push("save");
+                Ok(())
+            },
+            |key_ref| {
+                events.borrow_mut().push("read-back");
+                let wrong_payload =
+                    super::encode_scoped_fallback_key(key_ref, &[0xffu8; 32]).unwrap();
+                super::decode_scoped_fallback_key(key_ref, wrong_payload.as_str())
+            },
+            |keys| {
+                events.borrow_mut().push("cleanup");
+                cleaned.borrow_mut().extend_from_slice(keys);
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .chain()
+            .any(|cause| cause.is::<ScopedFallbackKeyVerificationFailed>()));
+        assert_eq!(
+            &*events.borrow(),
+            &["track", "save", "read-back", "cleanup"]
+        );
+        assert_eq!(&*cleaned.borrow(), &*tracked.borrow());
+        assert_eq!(cleaned.borrow().len(), 1);
+    }
+
+    #[test]
+    fn scoped_fallback_stage_returns_only_after_matching_provider_readback() {
+        let account_id = "account-1".to_string();
+        let provider_payload = RefCell::new(None::<Zeroizing<String>>);
+        let cleanup_calls = Cell::new(0usize);
+
+        let (key_ref, ciphertext) = stage_scoped_fallback_entry_with_ops(
+            &account_id,
+            Zeroizing::new("bound-password".to_string()),
+            |_key_ref| Ok(()),
+            |_key_ref, payload| {
+                *provider_payload.borrow_mut() = Some(Zeroizing::new(payload.to_string()));
+                Ok(())
+            },
+            |key_ref| {
+                let payload = provider_payload.borrow();
+                super::decode_scoped_fallback_key(key_ref, payload.as_ref().unwrap().as_str())
+            },
+            |_keys| cleanup_calls.set(cleanup_calls.get() + 1),
+        )
+        .unwrap();
+
+        let key = super::decode_scoped_fallback_key(
+            &key_ref,
+            provider_payload.borrow().as_ref().unwrap().as_str(),
+        )
+        .unwrap();
+        let plaintext = decrypt_password_with_fallback_key(&key, &ciphertext).unwrap();
+        drop(key);
+
+        assert_eq!(plaintext.as_str(), "bound-password");
+        assert_eq!(cleanup_calls.get(), 0);
+    }
+
+    #[test]
+    fn scoped_fallback_stage_wraps_invalid_readback_and_cleans_staged_key() {
+        let account_id = "account-1".to_string();
+        let cleanup_calls = Cell::new(0usize);
+
+        let error = stage_scoped_fallback_entry_with_ops(
+            &account_id,
+            Zeroizing::new("bound-password".to_string()),
+            |_key_ref| Ok(()),
+            |_key_ref, _payload| Ok(()),
+            |key_ref| {
+                let other_ref = ScopedFallbackKeyRef {
+                    account_id: "other-account".to_string(),
+                    key_id: key_ref.key_id.clone(),
+                };
+                let mismatched_payload =
+                    super::encode_scoped_fallback_key(&other_ref, &[7u8; 32]).unwrap();
+                super::decode_scoped_fallback_key(key_ref, mismatched_payload.as_str())
+            },
+            |keys| {
+                assert_eq!(keys.len(), 1);
+                cleanup_calls.set(cleanup_calls.get() + 1);
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .chain()
+            .any(|cause| cause.is::<ScopedFallbackKeyVerificationFailed>()));
+        assert_eq!(cleanup_calls.get(), 1);
+    }
+
+    #[test]
     fn scoped_fallback_update_and_delete_retire_each_password_revision_key() {
         let account_id = "account-1".to_string();
         let first_key = ScopedFallbackKeyRef {
@@ -8453,7 +8791,7 @@ mod tests {
         let staged = migrate_legacy_fallback_entries_with_ops(
             &mut file,
             &account_ids,
-            || Ok(Zeroizing::new(shared_key)),
+            |encrypted| decrypt_password_with_fallback_key(&shared_key, encrypted),
             |account_id, plaintext| {
                 assert_eq!(plaintext.as_str(), plaintexts[account_id]);
                 let key = scoped_keys[account_id];
@@ -8488,6 +8826,76 @@ mod tests {
     }
 
     #[test]
+    fn legacy_shared_key_migration_accepts_entries_from_both_preserved_key_sources() {
+        let native_key = [3u8; 32];
+        let file_key = [5u8; 32];
+        let account_ids = vec!["account-1".to_string(), "account-2".to_string()];
+        let mut file = PasswordFile {
+            passwords: HashMap::from([
+                (
+                    account_ids[0].clone(),
+                    encrypt_password_with_key(&native_key, "native-entry").unwrap(),
+                ),
+                (
+                    account_ids[1].clone(),
+                    encrypt_password_with_key(&file_key, "file-entry").unwrap(),
+                ),
+            ]),
+            ..PasswordFile::default()
+        };
+        let native_loads = Cell::new(0usize);
+        let file_loads = Cell::new(0usize);
+        let staged_plaintexts = RefCell::new(Vec::new());
+
+        let staged = migrate_legacy_fallback_entries_with_ops(
+            &mut file,
+            &account_ids,
+            |encrypted| {
+                decrypt_password_with_legacy_fallback_keys_with_ops(
+                    encrypted,
+                    || {
+                        native_loads.set(native_loads.get() + 1);
+                        Ok(Some(Zeroizing::new(native_key)))
+                    },
+                    || {
+                        file_loads.set(file_loads.get() + 1);
+                        Ok(Some(Zeroizing::new(file_key)))
+                    },
+                )
+            },
+            |account_id, plaintext| {
+                staged_plaintexts
+                    .borrow_mut()
+                    .push(plaintext.as_str().to_string());
+                let key_id = if account_id == &account_ids[0] {
+                    "11111111-1111-4111-8111-111111111111"
+                } else {
+                    "22222222-2222-4222-8222-222222222222"
+                };
+                Ok((
+                    ScopedFallbackKeyRef {
+                        account_id: account_id.clone(),
+                        key_id: key_id.to_string(),
+                    },
+                    encrypt_password_with_key(&[9u8; 32], plaintext.as_str()).unwrap(),
+                ))
+            },
+            |_| panic!("successful migration must not clean staged keys"),
+        )
+        .unwrap();
+
+        assert_eq!(staged.len(), 2);
+        assert_eq!(native_loads.get(), 2);
+        assert_eq!(file_loads.get(), 1);
+        assert_eq!(
+            &*staged_plaintexts.borrow(),
+            &["native-entry".to_string(), "file-entry".to_string()]
+        );
+        assert!(file.retire_legacy_shared_key);
+        validate_password_file_shape(&file).unwrap();
+    }
+
+    #[test]
     fn failed_legacy_migration_cleans_staged_keys_without_mutating_password_metadata() {
         let shared_key = [3u8; 32];
         let account_ids = vec!["account-1".to_string(), "account-2".to_string()];
@@ -8515,7 +8923,7 @@ mod tests {
         let result = migrate_legacy_fallback_entries_with_ops(
             &mut file,
             &account_ids,
-            || Ok(Zeroizing::new(shared_key)),
+            |encrypted| decrypt_password_with_fallback_key(&shared_key, encrypted),
             |account_id, plaintext| {
                 let count = stage_count.get();
                 stage_count.set(count + 1);
@@ -9007,19 +9415,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fallback_key_loader_never_replaces_or_cleans_key_material() {
+    fn legacy_fallback_key_sources_are_read_only_until_scoped_migration_commits() {
         let implementation = include_str!("mod.rs");
-        let loader = implementation
-            .split("fn fallback_encryption_key()")
+        let native_loader = implementation
+            .split("fn load_legacy_fallback_key_from_native_storage(")
             .nth(1)
             .and_then(|tail| tail.split("fn load_legacy_fallback_key_from_file").next())
             .unwrap();
+        let decryptor = implementation
+            .split("fn decrypt_password_with_legacy_fallback_keys_with_ops<")
+            .nth(1)
+            .and_then(|tail| tail.split("fn scoped_fallback_key_ref(").next())
+            .unwrap();
 
-        assert!(loader.contains("load_legacy_fallback_key_from_file()?"));
-        assert!(loader.contains("legacy fallback encryption key is unavailable"));
-        assert!(!loader.contains("thread_rng"));
-        assert!(!loader.contains("cleanup_legacy_fallback_key_file"));
-        assert!(!loader.contains("cleanup_legacy_fallback_key_residue"));
+        assert!(native_loader.contains("entry.get_password()"));
+        assert!(!native_loader.contains("entry.set_password"));
+        assert!(!native_loader.contains("load_legacy_fallback_key_from_file"));
+        assert!(!native_loader.contains("cleanup_legacy_fallback_key"));
+        assert!(decryptor.contains("load_native_key()?"));
+        assert!(decryptor.contains("load_file_key()?"));
+        assert!(decryptor.contains("legacy fallback encryption key is unavailable"));
+        assert!(!decryptor.contains("set_password"));
+        assert!(!decryptor.contains("cleanup_legacy_fallback_key"));
+        assert!(!decryptor.contains("thread_rng"));
     }
 
     #[test]
@@ -9498,27 +9916,50 @@ mod tests {
         };
 
         let fallback_stage = between(
-            "fn stage_scoped_fallback_entry(",
+            "fn stage_scoped_fallback_entry_with_ops<",
             "fn cleanup_uncommitted_scoped_keys(",
         );
         assert_ordered(
             fallback_stage,
             &[
                 "new_scoped_fallback_key_ref(account_id)?;",
-                "track_staged_fallback_key(&key_ref)?;",
+                "track_staged(&key_ref)?;",
                 "new_scoped_fallback_key_material();",
                 "encrypt_password_with_key(&key, plaintext.as_str());",
                 "drop(plaintext);",
                 "let encrypted = encrypted_result?;",
+                "let expected_key_fingerprint = sha256_hex(&*key);",
                 "encode_scoped_fallback_key(&key_ref, &key);",
                 "drop(key);",
-                "save_scoped_fallback_key_payload(&key_ref, key_payload.as_str());",
+                "save_key_payload(&key_ref, key_payload.as_str());",
                 "drop(key_payload);",
+                "load_key(&key_ref)",
+                "let actual_key_fingerprint = sha256_hex(&*verified_key);",
+                "drop(verified_key);",
+                "actual_key_fingerprint != expected_key_fingerprint",
                 "let encrypted = match stage_result",
-                "cleanup_uncommitted_scoped_keys(",
+                "cleanup_uncommitted(std::slice::from_ref(&key_ref));",
             ],
         );
         assert!(!fallback_stage.contains("PreparedScopedFallbackEntry"));
+
+        let legacy_fallback_decryption = between(
+            "fn decrypt_password_with_legacy_fallback_keys_with_ops<",
+            "fn scoped_fallback_key_ref(",
+        );
+        assert_ordered(
+            legacy_fallback_decryption,
+            &[
+                "if let Some(native_key) = load_native_key()?",
+                "decrypt_password_with_fallback_key(&native_key, encoded);",
+                "drop(native_key);",
+                "fallback_ciphertext_authentication_failed(&error)",
+                "let Some(file_key) = load_file_key()? else",
+                "decrypt_password_with_fallback_key(&file_key, encoded);",
+                "drop(file_key);",
+                "return file_result;",
+            ],
+        );
 
         let owned_fallback_save = between("fn save_to_file_owned(", "fn save_to_file_locked(");
         assert_ordered(
@@ -9561,10 +10002,7 @@ mod tests {
             legacy_fallback_migration,
             &[
                 "password_entry_for_account(file, account_id)?;",
-                "let shared_key = load_shared_key()?;",
-                "decrypt_password_with_fallback_key(&shared_key, encrypted);",
-                "drop(shared_key);",
-                "let plaintext = plaintext_result?;",
+                "let plaintext = decrypt_ciphertext(encrypted)?;",
                 "stage_entry(account_id, plaintext)",
             ],
         );
