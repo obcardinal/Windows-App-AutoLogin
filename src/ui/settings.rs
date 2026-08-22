@@ -25,12 +25,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         .show(ui, |ui| {
             section(ui, "System", |ui| {
                 settings_changed |= ui
-                    .checkbox(&mut app.settings_draft.auto_start, "Open at Login")
+                    .add_enabled(
+                        storage_mutations_ready,
+                        egui::Checkbox::new(
+                            &mut app.settings_draft.auto_start,
+                            "Open at Login",
+                        ),
+                    )
                     .changed();
                 settings_changed |= ui
-                    .checkbox(
-                        &mut app.settings_draft.start_minimized,
-                        "Hide main window at launch",
+                    .add_enabled(
+                        storage_mutations_ready,
+                        egui::Checkbox::new(
+                            &mut app.settings_draft.start_minimized,
+                            "Hide main window at launch",
+                        ),
                     )
                     .on_hover_text("The app keeps running from the menu bar or system tray.")
                     .changed();
@@ -51,7 +60,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                     .changed();
                 if !storage_mutations_ready {
                     ui.label(theme::muted(
-                        "Password storage changes are locked until recovery completes after restart.",
+                        "Settings changes are locked until storage recovery completes after restart.",
                     ));
                 }
             });
@@ -64,18 +73,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
 
 fn save_settings(app: &mut AutoLoginApp) {
     let storage_mutations_ready = app.account_mutations_ready();
-    if restore_storage_mode_when_recovery_blocked(
+    if restore_settings_when_recovery_blocked(
         &mut app.settings_draft,
         &app.config.settings,
         storage_mutations_ready,
     ) {
         app.set_status(pending_storage_recovery_user_status(
-            "Password storage mode was left unchanged.",
+            "Settings were left unchanged.",
         ));
         app.stop_monitor_for_pending_storage_recovery();
-        if app.settings_draft == app.config.settings {
-            return;
-        }
+        return;
     }
     let result = save_settings_transaction(
         &app.config,
@@ -118,16 +125,16 @@ fn save_settings(app: &mut AutoLoginApp) {
     app.sync_saved_config_to_worker(storage_mode_changed);
 }
 
-fn restore_storage_mode_when_recovery_blocked(
+fn restore_settings_when_recovery_blocked(
     settings_draft: &mut AppSettings,
     current_settings: &AppSettings,
     storage_mutations_ready: bool,
 ) -> bool {
-    if storage_mutations_ready || settings_draft.use_keyring == current_settings.use_keyring {
+    if storage_mutations_ready || settings_draft == current_settings {
         return false;
     }
 
-    settings_draft.use_keyring = current_settings.use_keyring;
+    settings_draft.clone_from(current_settings);
     true
 }
 
@@ -482,7 +489,7 @@ fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::
 #[cfg(test)]
 mod tests {
     use super::{
-        restore_storage_mode_when_recovery_blocked, save_settings_transaction,
+        restore_settings_when_recovery_blocked, save_settings_transaction,
         settings_worker_sync_allowed,
     };
     use crate::models::{Account, AppConfig, AppSettings, FIXED_POLL_INTERVAL_SECS};
@@ -490,7 +497,7 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
-    fn blocked_recovery_restores_storage_mode_without_discarding_other_settings() {
+    fn blocked_recovery_restores_every_setting_without_persisting_defaults() {
         let current = AppSettings {
             use_keyring: true,
             auto_start: false,
@@ -500,11 +507,12 @@ mod tests {
         draft.use_keyring = false;
         draft.auto_start = true;
 
-        assert!(restore_storage_mode_when_recovery_blocked(
+        assert!(restore_settings_when_recovery_blocked(
             &mut draft, &current, false
         ));
         assert!(draft.use_keyring);
-        assert!(draft.auto_start);
+        assert!(!draft.auto_start);
+        assert_eq!(draft, current);
     }
 
     #[test]
@@ -516,7 +524,7 @@ mod tests {
         let mut draft = current.clone();
         draft.use_keyring = false;
 
-        assert!(!restore_storage_mode_when_recovery_blocked(
+        assert!(!restore_settings_when_recovery_blocked(
             &mut draft, &current, true
         ));
         assert!(!draft.use_keyring);

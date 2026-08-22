@@ -260,16 +260,35 @@ struct StartupConfig {
 fn load_startup_config() -> StartupConfig {
     let _ = autostart::cleanup_stale();
     let mut startup = load_config_with_storage_recovery_inner(true);
-    let auto_start_enabled = autostart::is_enabled();
-    if startup.config.settings.auto_start != auto_start_enabled {
-        startup.config.settings.auto_start = auto_start_enabled;
-        let _ = storage::save_config(&startup.config);
-    }
+    sync_startup_auto_start_with(&mut startup, autostart::is_enabled(), storage::save_config);
     startup
 }
 
+fn sync_startup_auto_start_with(
+    startup: &mut StartupConfig,
+    auto_start_enabled: bool,
+    save_config: impl FnOnce(&models::AppConfig) -> anyhow::Result<()>,
+) {
+    // A default config produced for a blocked startup is an in-memory safety
+    // value, never a replacement for config that could not be loaded. Do not
+    // let the startup auto-start reconciliation persist it over that file.
+    if !startup.storage_recovery_ready || startup.config.settings.auto_start == auto_start_enabled {
+        return;
+    }
+    startup.config.settings.auto_start = auto_start_enabled;
+    if let Err(error) = save_config(&startup.config) {
+        tracing::warn!(%error, "Could not persist the current auto-start state");
+    }
+}
+
 fn load_full_ui_config() -> StartupConfig {
-    let mut config = storage::load_config();
+    let mut config = match storage::load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "Config could not be loaded safely; settings remain blocked");
+            return blocked_startup_config();
+        }
+    };
     let auto_start_enabled = autostart::is_enabled();
     if config.settings.auto_start != auto_start_enabled {
         config.settings.auto_start = auto_start_enabled;
@@ -316,7 +335,13 @@ fn load_config_with_storage_recovery() -> StartupConfig {
 }
 
 fn load_config_with_storage_recovery_inner(clear_startup_block: bool) -> StartupConfig {
-    let mut config = storage::load_config();
+    let mut config = match storage::load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "Config could not be loaded safely; password storage recovery remains blocked");
+            return blocked_startup_config();
+        }
+    };
     let storage_recovery_ready = match storage::reconcile_pending_storage_operations(&mut config) {
         Ok(()) => {
             let journals_clear = match storage::pending_storage_recovery_is_clear() {
@@ -1820,8 +1845,8 @@ mod tests {
     use super::{
         acquire_authorized_settings_session_with, fill_result_label,
         finish_startup_storage_recovery_after_journals_with_ops, full_ui_command, initial_tab_arg,
-        publish_initial_monitor_status, std_channel, tokio_channel, LightweightSupervisor,
-        MonitorControlState, StartupConfig,
+        publish_initial_monitor_status, std_channel, sync_startup_auto_start_with, tokio_channel,
+        LightweightSupervisor, MonitorControlState, StartupConfig,
     };
     use crate::background::{WorkerCommand, WorkerInvalidator, WorkerQuiescenceAck};
     use crate::debug_fill::FillAttemptReport;
@@ -1893,6 +1918,38 @@ mod tests {
             Some("very_long_failure_reason_that_should_not_expand_the_status_menu_forever"),
         );
         assert!(fill_result_label(&long_failure).len() <= 48);
+    }
+
+    #[test]
+    fn blocked_startup_does_not_autosave_in_memory_defaults() {
+        let mut startup = super::blocked_startup_config();
+        let save_called = std::cell::Cell::new(false);
+
+        sync_startup_auto_start_with(&mut startup, true, |_| {
+            save_called.set(true);
+            Ok(())
+        });
+
+        assert!(!save_called.get());
+        assert!(!startup.config.settings.auto_start);
+        assert!(!startup.storage_recovery_ready);
+    }
+
+    #[test]
+    fn verified_startup_reconciles_and_persists_auto_start() {
+        let mut startup = StartupConfig {
+            config: AppConfig::default(),
+            storage_recovery_ready: true,
+        };
+        let saved_auto_start = std::cell::Cell::new(None);
+
+        sync_startup_auto_start_with(&mut startup, true, |config| {
+            saved_auto_start.set(Some(config.settings.auto_start));
+            Ok(())
+        });
+
+        assert_eq!(saved_auto_start.get(), Some(true));
+        assert!(startup.config.settings.auto_start);
     }
 
     #[test]

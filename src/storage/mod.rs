@@ -1,4 +1,4 @@
-use crate::models::{Account, AccountId, AppConfig, FIXED_POLL_INTERVAL_SECS};
+use crate::models::{Account, AccountId, AppConfig, AppSettings, FIXED_POLL_INTERVAL_SECS};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -345,23 +345,103 @@ fn native_secure_storage_name() -> &'static str {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(default)]
-struct LegacyConfig {
-    poll_interval_secs: u64,
-    credentials: Option<LegacyCredentialsConfig>,
+#[serde(deny_unknown_fields)]
+struct StoredAppConfigWire {
+    accounts: Vec<StoredAccountWire>,
+    settings: StoredAppSettingsWire,
 }
 
-impl Default for LegacyConfig {
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAccountWire {
+    id: AccountId,
+    username: String,
+    #[serde(default)]
+    has_saved_password: bool,
+    #[serde(default = "default_stored_account_enabled")]
+    enabled: bool,
+    #[serde(default, rename = "target_window_title")]
+    _removed_target_window_title: Option<String>,
+}
+
+fn default_stored_account_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StoredAppSettingsWire {
+    #[serde(rename = "poll_interval_secs")]
+    _removed_poll_interval_secs: u64,
+    auto_start: bool,
+    start_minimized: bool,
+    use_keyring: bool,
+    #[serde(rename = "reconnect_delay_secs")]
+    _removed_reconnect_delay_secs: u64,
+    #[serde(rename = "macos_app_name")]
+    _removed_macos_app_name: Option<String>,
+}
+
+impl Default for StoredAppSettingsWire {
     fn default() -> Self {
         Self {
-            poll_interval_secs: 1,
-            credentials: None,
+            _removed_poll_interval_secs: FIXED_POLL_INTERVAL_SECS,
+            auto_start: false,
+            start_minimized: false,
+            use_keyring: true,
+            _removed_reconnect_delay_secs: 2,
+            _removed_macos_app_name: None,
+        }
+    }
+}
+
+impl From<StoredAppConfigWire> for AppConfig {
+    fn from(stored: StoredAppConfigWire) -> Self {
+        Self {
+            accounts: stored
+                .accounts
+                .into_iter()
+                .map(|account| Account {
+                    id: account.id,
+                    username: account.username,
+                    has_saved_password: account.has_saved_password,
+                    enabled: account.enabled,
+                })
+                .collect(),
+            settings: AppSettings {
+                poll_interval_secs: FIXED_POLL_INTERVAL_SECS,
+                auto_start: stored.settings.auto_start,
+                start_minimized: stored.settings.start_minimized,
+                use_keyring: stored.settings.use_keyring,
+            },
         }
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
+struct LegacyConfig {
+    process_names: Vec<String>,
+    poll_interval_secs: u64,
+    reconnect_delay_secs: u64,
+    credentials: Option<LegacyCredentialsConfig>,
+    macos_app_name: Option<String>,
+}
+
+impl Default for LegacyConfig {
+    fn default() -> Self {
+        Self {
+            process_names: Vec::new(),
+            poll_interval_secs: 1,
+            reconnect_delay_secs: 2,
+            credentials: None,
+            macos_app_name: None,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LegacyCredentialsConfig {
     username: String,
     account_id: Option<String>,
@@ -557,29 +637,53 @@ fn no_follow_open_error(_error: &std::io::Error) -> bool {
     false
 }
 
-pub(crate) fn load_config() -> AppConfig {
-    let path = match config_file() {
-        Ok(path) => path,
+pub(crate) fn load_config() -> anyhow::Result<AppConfig> {
+    let path = config_file().map_err(|error| {
+        warn!(error = %error, "Failed to resolve config path safely");
+        error
+    })?;
+    load_config_from_path(&path)
+}
+
+fn load_config_from_path(path: &Path) -> anyhow::Result<AppConfig> {
+    match load_config_file(path) {
+        Ok(config) => Ok(normalize_config(config)),
         Err(e) => {
-            warn!(error = %e, "Failed to resolve config path; using defaults");
-            return AppConfig::default();
-        }
-    };
-    match load_config_file(&path) {
-        Ok(config) => normalize_config(config),
-        Err(e) => {
-            warn!(path = %redacted_path(&path), error = %e, "Failed to load config; using defaults");
-            if let Err(backup_error) = backup_invalid_config_file(&path, &e) {
-                warn!(path = %redacted_path(&path), error = %backup_error, "Failed to write invalid config diagnostics before using defaults");
-            }
-            normalize_config(AppConfig::default())
+            warn!(path = %redacted_path(path), error = %e, "Failed to load config safely");
+            // The first error may be a transient metadata, permission, or I/O
+            // failure. Retrying the read here and moving the file if that
+            // retry succeeds would turn a temporary failure into persistent
+            // loss of the active config. Preserve the exact path and bytes;
+            // callers keep all mutations blocked until a later load succeeds.
+            Err(e)
         }
     }
 }
 
 fn load_config_file(path: &Path) -> anyhow::Result<AppConfig> {
-    if !path.exists() {
-        return Ok(AppConfig::default());
+    load_config_file_with_legacy_ops(
+        path,
+        migrate_legacy_passwords,
+        save_config_to_file,
+        cleanup_migrated_legacy_credentials,
+    )
+}
+
+fn load_config_file_with_legacy_ops<M, S, C>(
+    path: &Path,
+    mut migrate_passwords: M,
+    mut save_migrated_config: S,
+    mut cleanup_source_credentials: C,
+) -> anyhow::Result<AppConfig>
+where
+    M: FnMut(&LegacyConfig, &mut AppConfig) -> LegacyPasswordMigration,
+    S: FnMut(&AppConfig, &Path) -> anyhow::Result<()>,
+    C: FnMut(&[AccountId]),
+{
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AppConfig::default()),
+        Err(e) => return Err(e.into()),
     }
     if let Some(dir) = path.parent() {
         validate_private_dir(dir)?;
@@ -589,23 +693,25 @@ fn load_config_file(path: &Path) -> anyhow::Result<AppConfig> {
     let content = read_private_text_file(path, MAX_CONFIG_FILE_BYTES)?;
     let value: serde_json::Value = serde_json::from_str(&content)?;
     if value.get("accounts").is_some() || value.get("settings").is_some() {
-        return Ok(normalize_config(serde_json::from_value(value)?));
+        let stored: StoredAppConfigWire = serde_json::from_value(value)?;
+        return Ok(normalize_config(stored.into()));
+    }
+    if !legacy_config_has_recognized_field(&value) {
+        anyhow::bail!("config does not match the current or recognized legacy schema");
     }
 
     let legacy: LegacyConfig = serde_json::from_value(value)?;
     let mut config = normalize_config(migrate_legacy_config(&legacy));
-    let legacy_password_migration = migrate_legacy_passwords(&legacy, &mut config);
+    let legacy_password_migration = migrate_passwords(&legacy, &mut config);
     if !legacy_password_migration_ready_to_persist(&legacy_password_migration) {
         warn!(
             path = %redacted_path(path),
             "legacy config was loaded, but password migration did not complete; legacy config was left on disk for retry"
         );
-        return Ok(config);
+        anyhow::bail!("legacy password migration did not complete safely");
     }
-    match save_config_to_file(&normalize_config(config.clone()), path) {
-        Ok(()) => {
-            cleanup_migrated_legacy_credentials(&legacy_password_migration.cleanup_ids_after_save)
-        }
+    match save_migrated_config(&normalize_config(config.clone()), path) {
+        Ok(()) => cleanup_source_credentials(&legacy_password_migration.cleanup_ids_after_save),
         Err(e) if config_write_committed(&e) => {
             // The migrated config is now the visible file, so deleting the
             // migration target would corrupt it. Also retain the legacy source
@@ -626,14 +732,35 @@ fn load_config_file(path: &Path) -> anyhow::Result<AppConfig> {
                 error = %e,
                 "legacy config was loaded, but migrated config could not be saved; legacy credentials were left intact"
             );
+            return Err(e.context("migrated config could not be saved safely"));
         }
     }
     Ok(config)
 }
 
+fn legacy_config_has_recognized_field(value: &serde_json::Value) -> bool {
+    const RECOGNIZED_LEGACY_FIELDS: &[&str] = &[
+        "process_names",
+        "poll_interval_secs",
+        "reconnect_delay_secs",
+        "credentials",
+        "macos_app_name",
+    ];
+    value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|key| RECOGNIZED_LEGACY_FIELDS.contains(&key.as_str()))
+    })
+}
+
 fn migrate_legacy_config(legacy: &LegacyConfig) -> AppConfig {
     let mut config = AppConfig::default();
-    let _ = legacy.poll_interval_secs;
+    let _ = (
+        &legacy.process_names,
+        legacy.poll_interval_secs,
+        legacy.reconnect_delay_secs,
+        &legacy.macos_app_name,
+    );
     config.settings.poll_interval_secs = FIXED_POLL_INTERVAL_SECS;
 
     if let Some(credentials) = &legacy.credentials {
@@ -676,6 +803,30 @@ fn migrate_legacy_passwords(
     legacy: &LegacyConfig,
     config: &mut AppConfig,
 ) -> LegacyPasswordMigration {
+    migrate_legacy_passwords_with_ops(
+        legacy,
+        config,
+        load_password,
+        write_account_password_owned,
+        load_password,
+        cleanup_legacy_migration_target_after_failed_save,
+    )
+}
+
+fn migrate_legacy_passwords_with_ops<L, W, V, C>(
+    legacy: &LegacyConfig,
+    config: &mut AppConfig,
+    mut load_source_password: L,
+    mut write_target_password: W,
+    mut verify_target_password: V,
+    mut cleanup_failed_target: C,
+) -> LegacyPasswordMigration
+where
+    L: FnMut(&Account, bool) -> anyhow::Result<Zeroizing<String>>,
+    W: FnMut(&Account, Zeroizing<String>, bool) -> anyhow::Result<PasswordWriteReceipt>,
+    V: FnMut(&Account, bool) -> anyhow::Result<Zeroizing<String>>,
+    C: FnMut(&LegacyPasswordMigration) -> bool,
+{
     let Some(credentials) = &legacy.credentials else {
         return LegacyPasswordMigration::default();
     };
@@ -693,47 +844,50 @@ fn migrate_legacy_passwords(
         source_account.username = credentials.username.trim().to_string();
         source_account.has_saved_password = true;
 
-        let password = match load_password(&source_account, credentials.use_credential_manager) {
-            Ok(password) => password,
-            Err(e) => {
-                debug!(
-                    account_id = %redacted_account_id(source_id),
-                    error = %e,
-                    "legacy password source did not load during config migration"
-                );
-                continue;
-            }
-        };
+        let password =
+            match load_source_password(&source_account, credentials.use_credential_manager) {
+                Ok(password) => password,
+                Err(e) => {
+                    debug!(
+                        account_id = %redacted_account_id(source_id),
+                        error = %e,
+                        "legacy password source did not load during config migration"
+                    );
+                    continue;
+                }
+            };
 
         // Ownership crosses the write boundary so the source plaintext is
         // wiped immediately after its final backend-specific use.
-        let receipt =
-            match write_account_password_owned(account, password, config.settings.use_keyring) {
-                Ok(receipt) => receipt,
-                Err(e) => {
-                    warn!(
-                        account_id = %redacted_account_id(&account.id),
-                        error = %e,
-                        "legacy password loaded, but could not be saved under migrated account"
-                    );
-                    return LegacyPasswordMigration {
-                        source_ids,
-                        ..LegacyPasswordMigration::default()
-                    };
-                }
-            };
-        if let Err(e) = load_password(account, config.settings.use_keyring) {
+        let receipt = match write_target_password(account, password, config.settings.use_keyring) {
+            Ok(receipt) => receipt,
+            Err(e) => {
+                warn!(
+                    account_id = %redacted_account_id(&account.id),
+                    error = %e,
+                    "legacy password loaded, but could not be saved under migrated account"
+                );
+                return LegacyPasswordMigration {
+                    source_ids,
+                    ..LegacyPasswordMigration::default()
+                };
+            }
+        };
+        if let Err(e) = verify_target_password(account, config.settings.use_keyring) {
             warn!(
                 account_id = %redacted_account_id(&account.id),
                 error = %e,
                 "legacy password saved under migrated account, but verification failed"
             );
-            cleanup_legacy_migration_target_after_failed_save(&LegacyPasswordMigration {
-                source_ids,
+            cleanup_failed_target(&LegacyPasswordMigration {
+                source_ids: source_ids.clone(),
                 target_id: Some(account.id.clone()),
                 cleanup_ids_after_save: Vec::new(),
             });
-            return LegacyPasswordMigration::default();
+            return LegacyPasswordMigration {
+                source_ids,
+                ..LegacyPasswordMigration::default()
+            };
         }
 
         account.has_saved_password = true;
@@ -859,148 +1013,6 @@ fn normalize_account_selection_metadata(accounts: &mut [Account]) {
             disabled_duplicate_usernames,
             "Disabled duplicate saved account metadata to keep account selection unambiguous"
         );
-    }
-}
-
-#[derive(Debug, serde::Serialize)]
-struct InvalidConfigDiagnosticBackup {
-    redaction_version: u8,
-    kind: &'static str,
-    original_file_name: String,
-    original_size_bytes: usize,
-    original_sha256: String,
-    load_error_kind: &'static str,
-    json_parse_status: &'static str,
-    json_top_level_type: &'static str,
-    has_accounts: bool,
-    account_count: Option<usize>,
-    has_settings: bool,
-    raw_content: &'static str,
-}
-
-fn backup_invalid_config_file(path: &Path, load_error: &anyhow::Error) -> anyhow::Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    if metadata.file_type().is_symlink() {
-        std::fs::remove_file(path)?;
-        return sync_parent_dir(path);
-    }
-    if !metadata.file_type().is_file() {
-        return Ok(());
-    }
-    validate_private_file_for_read(path)?;
-    let content = Zeroizing::new(read_private_file_bytes(path, MAX_CONFIG_FILE_BYTES)?);
-    let diagnostic = invalid_config_diagnostic_backup_bytes(path, &content, load_error)?;
-
-    // Preserve the exact bytes (including account ids/usernames needed to recover
-    // orphaned credentials) instead of replacing them with a redacted summary.
-    // The containing directory and both quarantine files remain private.
-    let quarantine_path = invalid_config_quarantine_path(path);
-    if std::fs::symlink_metadata(&quarantine_path).is_ok() {
-        anyhow::bail!("invalid config quarantine destination already exists");
-    }
-    std::fs::rename(path, &quarantine_path)?;
-    validate_private_file_for_read(&quarantine_path)
-        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
-    secure_path_permissions(&quarantine_path, 0o600)
-        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
-    sync_parent_dir(&quarantine_path)
-        .map_err(|source| anyhow::Error::new(PrivateFileWriteCommitted { source }))?;
-
-    let diagnostic_path = invalid_config_diagnostic_path(&quarantine_path);
-    write_private_file_create_new_atomic(&diagnostic_path, "json.tmp", &diagnostic)?;
-    Ok(())
-}
-
-fn invalid_config_quarantine_path(path: &Path) -> PathBuf {
-    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-    let nonce = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_default()
-        .unsigned_abs();
-    path.with_extension(format!(
-        "json.invalid.{timestamp}.{}.{}",
-        std::process::id(),
-        nonce
-    ))
-}
-
-fn invalid_config_diagnostic_path(quarantine_path: &Path) -> PathBuf {
-    let name = quarantine_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json.invalid");
-    quarantine_path.with_file_name(format!("{name}.diagnostic.json"))
-}
-
-fn invalid_config_diagnostic_backup_bytes(
-    path: &Path,
-    content: &[u8],
-    load_error: &anyhow::Error,
-) -> anyhow::Result<Vec<u8>> {
-    let parsed = serde_json::from_slice::<serde_json::Value>(content);
-    let (json_parse_status, json_top_level_type, has_accounts, account_count, has_settings) =
-        match parsed.as_ref() {
-            Ok(value) => (
-                "parsed",
-                json_value_kind(value),
-                value.get("accounts").is_some(),
-                value
-                    .get("accounts")
-                    .and_then(|accounts| accounts.as_array())
-                    .map(Vec::len),
-                value.get("settings").is_some(),
-            ),
-            Err(_) => ("invalid_json", "unknown", false, None, false),
-        };
-
-    let backup = InvalidConfigDiagnosticBackup {
-        redaction_version: 1,
-        kind: "invalid_config_diagnostic",
-        original_file_name: path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(CONFIG_FILE_NAME)
-            .to_string(),
-        original_size_bytes: content.len(),
-        original_sha256: sha256_hex(content),
-        load_error_kind: invalid_config_load_error_kind(load_error),
-        json_parse_status,
-        json_top_level_type,
-        has_accounts,
-        account_count,
-        has_settings,
-        raw_content: "[omitted]",
-    };
-    Ok(serde_json::to_vec_pretty(&backup)?)
-}
-
-fn json_value_kind(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-fn invalid_config_load_error_kind(error: &anyhow::Error) -> &'static str {
-    let message = error.to_string();
-    if message.contains("UTF-8") || message.contains("utf-8") {
-        "invalid_utf8"
-    } else if message.contains("line")
-        || message.contains("column")
-        || message.contains("EOF")
-        || message.contains("trailing")
-    {
-        "json_parse_failed"
-    } else {
-        "schema_invalid"
     }
 }
 
@@ -2557,12 +2569,6 @@ fn delete_scoped_fallback_key(key_ref: &ScopedFallbackKeyRef) -> anyhow::Result<
 
 fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
     ensure_config_dir()?;
-    if let Err(e) = cleanup_legacy_fallback_key_residue_files_if_present() {
-        warn!(
-            error = %e,
-            "Legacy fallback key residue cleanup failed; continuing"
-        );
-    }
 
     let entry =
         keyring::Entry::new(FALLBACK_KEY_SERVICE_NAME, FALLBACK_KEY_ACCOUNT).map_err(|e| {
@@ -2589,7 +2595,7 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
                 None
             };
             // `key` is an independent zeroizing copy. Retire provider payloads
-            // before migration diagnostics or stale-file cleanup can block.
+            // before migration diagnostics can block.
             drop(decoded);
             drop(encoded);
             if let Some(result) = migration_result {
@@ -2599,7 +2605,6 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
                     info!("Migrated fallback key to Windows user-bound DPAPI Credential Manager storage");
                 }
             }
-            cleanup_stale_fallback_key_file_if_present()?;
             return Ok(key);
         }
         Err(keyring::Error::NoEntry) => {}
@@ -2609,7 +2614,7 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
         ),
     }
 
-    if let Some((legacy_key_path, legacy_key)) = load_legacy_fallback_key_from_file()? {
+    if let Some(legacy_key) = load_legacy_fallback_key_from_file()? {
         let encoded = Zeroizing::new(STANDARD.encode(*legacy_key));
         let payload =
             encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
@@ -2622,55 +2627,38 @@ fn fallback_encryption_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
                 native_secure_storage_name()
             )
         })?;
-        cleanup_legacy_fallback_key_file(&legacy_key_path)?;
+        // Keep the legacy file until every ciphertext that depends on the
+        // shared key has been durably migrated. `retire_legacy_shared_key`
+        // performs the authenticated post-commit cleanup of both copies and
+        // any historical residue.
         return Ok(legacy_key);
     }
 
-    let mut key = Zeroizing::new([0u8; 32]);
-    rand::thread_rng().fill(&mut *key);
-    let encoded = Zeroizing::new(STANDARD.encode(*key));
-    let payload =
-        encode_secure_storage_secret(SECURE_STORAGE_FALLBACK_KEY_PURPOSE, encoded.as_str())?;
-    let set_result = entry.set_password(payload.as_str());
-    drop(payload);
-    drop(encoded);
-    set_result.map_err(|e| {
-        anyhow::anyhow!(
-            "{} refused to save fallback key: {e}",
-            native_secure_storage_name()
-        )
-    })?;
-    Ok(key)
+    // Every caller is decrypting already-existing legacy ciphertext. A newly
+    // generated key could never decrypt that data and would make recovery
+    // ambiguous, so absence must fail closed.
+    anyhow::bail!("legacy fallback encryption key is unavailable")
 }
 
-fn load_legacy_fallback_key_from_file() -> anyhow::Result<Option<(PathBuf, Zeroizing<[u8; 32]>)>> {
+fn load_legacy_fallback_key_from_file() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
     let path = fallback_key_file_path()?;
-    if !path.exists() {
+    load_legacy_fallback_key_from_path(&path)
+}
+
+fn load_legacy_fallback_key_from_path(path: &Path) -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
+    if !storage_operation_file_exists(path)? {
         return Ok(None);
     }
-
-    let key = match read_fallback_encryption_key(&path) {
-        Ok(key) => key,
-        Err(e) => {
-            warn!(path = %redacted_path(&path), error = %e, "Fallback key file is invalid; deleting it without backup");
-            if let Err(cleanup_error) = delete_sensitive_private_file_if_present(&path) {
-                warn!(
-                    path = %redacted_path(&path),
-                    error = %cleanup_error,
-                    "Invalid fallback key file cleanup failed"
-                );
-            }
-            return Ok(None);
-        }
-    };
-
-    Ok(Some((path, key)))
-}
-
-fn cleanup_stale_fallback_key_file_if_present() -> anyhow::Result<()> {
-    let path = fallback_key_file_path()?;
-    cleanup_legacy_fallback_key_file(&path)?;
-    Ok(())
+    read_fallback_encryption_key(path)
+        .map(Some)
+        .map_err(|error| {
+            // A malformed key and a transient read/permission failure are not
+            // distinguishable safely here. Preserve the only material that
+            // may decrypt legacy ciphertext and fail closed rather than
+            // deleting it or generating an unrelated replacement key.
+            warn!(path = %redacted_path(path), error_kind = storage_error_kind(&error), "Legacy fallback key file could not be loaded; preserving it for recovery");
+            error.context("legacy fallback key file could not be loaded safely")
+        })
 }
 
 fn cleanup_legacy_fallback_key_file(path: &Path) -> anyhow::Result<()> {
@@ -2761,7 +2749,7 @@ fn delete_legacy_fallback_key_file_if_present() -> anyhow::Result<()> {
 
 fn cleanup_legacy_fallback_key_residue_files_if_present() -> anyhow::Result<usize> {
     let dir = config_dir()?;
-    if !dir.exists() {
+    if !storage_operation_file_exists(&dir)? {
         return Ok(0);
     }
     cleanup_legacy_fallback_key_residue_files_in_dir(&dir)
@@ -5580,8 +5568,7 @@ pub(crate) fn delete_account(account_id: &AccountId) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_scoped_fallback_keys_by_id, backup_invalid_config_file,
-        cleanup_fallback_key_if_password_file_empty,
+        active_scoped_fallback_keys_by_id, cleanup_fallback_key_if_password_file_empty,
         cleanup_legacy_fallback_key_residue_files_in_dir, cleanup_retired_fallback_keys_with_ops,
         cleanup_stale_backend_after_successful_save, cleanup_storage_backend_with_ops,
         cleanup_storage_temp_files_in_dir, clear_pending_storage_operation_paths,
@@ -5600,13 +5587,15 @@ mod tests {
         install_scoped_fallback_entry, is_pending_storage_operation_in_progress,
         legacy_account_id_for_migrated_config, legacy_migration_target_cleanup_id,
         legacy_password_migration_ready_to_persist, load_config_file,
+        load_config_file_with_legacy_ops, load_config_from_path,
+        load_legacy_fallback_key_from_path,
         load_pending_storage_operation_record_fail_closed_from_paths,
         load_pending_storage_operation_record_fail_closed_with_marker,
         mark_storage_recovery_blocked_at, migrate_legacy_config,
-        migrate_legacy_fallback_entries_with_ops, normalize_config, password_entry_for_account,
-        pending_storage_backend_to_cleanup, pending_storage_operation_account_ids_known,
-        quarantine_pending_storage_operation_file, read_private_text_file,
-        reconcile_account_config_rollback_operation_with_ops,
+        migrate_legacy_fallback_entries_with_ops, migrate_legacy_passwords_with_ops,
+        normalize_config, password_entry_for_account, pending_storage_backend_to_cleanup,
+        pending_storage_operation_account_ids_known, quarantine_pending_storage_operation_file,
+        read_private_text_file, reconcile_account_config_rollback_operation_with_ops,
         reconcile_account_config_save_operation_with_ops,
         reconcile_account_delete_operation_with_ops,
         reconcile_committed_account_enabled_toggle_operation_with_ops,
@@ -5616,20 +5605,20 @@ mod tests {
         reconcile_storage_mode_operation, redact_password_load_error, redacted_account_id,
         remove_fallback_entry, replace_account_config_save_journal_with_rollback,
         replace_prepared_account_delete_journal, replace_prepared_account_enabled_toggle_journal,
-        save_pending_storage_operation_to_paths, save_pending_storage_operation_with_preflight_ops,
-        sha256_hex, stage_and_commit_fallback_payload_with_ops, storage_error_kind,
-        use_owned_secret_then_drop, validate_password_file_shape,
-        validate_pending_storage_operation, verify_pending_storage_surviving_backend,
-        write_private_file_atomic, write_private_file_create_new_atomic, LegacyConfig,
-        LegacyCredentialsConfig, LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted,
-        PasswordStorageBackend, PasswordWriteReceipt, PendingStorageOperation,
-        PendingStorageOperationRecord, PendingStorageRecoveryBlocked, ScopedFallbackKeyRef,
-        StagedFallbackKeyConflict, StagedFallbackKeysJournal, StoredPasswordFormat,
-        AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES, MAX_PASSWORD_FILE_BYTES,
-        PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES, PENDING_STORAGE_OPERATION_VERSION,
-        SECURE_STORAGE_FALLBACK_KEY_PURPOSE, SECURE_STORAGE_PASSWORD_PURPOSE,
-        STAGED_FALLBACK_KEYS_VERSION, WINDOWS_LEGACY_WAAB_SECRET_PREFIX,
-        WINDOWS_USER_BOUND_SECRET_PREFIX,
+        save_config_to_file, save_pending_storage_operation_to_paths,
+        save_pending_storage_operation_with_preflight_ops,
+        stage_and_commit_fallback_payload_with_ops, storage_error_kind, use_owned_secret_then_drop,
+        validate_password_file_shape, validate_pending_storage_operation,
+        verify_pending_storage_surviving_backend, write_private_file_atomic,
+        write_private_file_create_new_atomic, LegacyConfig, LegacyCredentialsConfig,
+        LegacyPasswordMigration, PasswordFile, PasswordFileWriteCommitted, PasswordStorageBackend,
+        PasswordWriteReceipt, PendingStorageOperation, PendingStorageOperationRecord,
+        PendingStorageRecoveryBlocked, ScopedFallbackKeyRef, StagedFallbackKeyConflict,
+        StagedFallbackKeysJournal, StoredPasswordFormat, AES_GCM_NONCE_BYTES, AES_GCM_TAG_BYTES,
+        MAX_PASSWORD_FILE_BYTES, PASSWORD_TRANSACTION_TEMP_FILE_PREFIXES,
+        PENDING_STORAGE_OPERATION_VERSION, SECURE_STORAGE_FALLBACK_KEY_PURPOSE,
+        SECURE_STORAGE_PASSWORD_PURPOSE, STAGED_FALLBACK_KEYS_VERSION,
+        WINDOWS_LEGACY_WAAB_SECRET_PREFIX, WINDOWS_USER_BOUND_SECRET_PREFIX,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -5821,6 +5810,241 @@ mod tests {
         let config = load_config_file(&path).unwrap();
 
         assert!(!config.settings.auto_start);
+    }
+
+    #[test]
+    fn invalid_config_load_is_not_converted_to_defaults() {
+        let root = temp_storage_test_dir("invalid-config-load-fails-closed");
+        let path = root.join("config.json");
+        let sentinel = br#"{"accounts":"not-an-array"}"#;
+        write_test_private_text(&path, sentinel);
+
+        let result = load_config_from_path(&path);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        let quarantined = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("config.json.invalid."))
+            })
+            .count();
+        assert_eq!(quarantined, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_only_config_is_preserved_and_rejected() {
+        let root = temp_storage_test_dir("unknown-only-config");
+        let path = root.join("config.json");
+        let sentinel = br#"{"future_schema":7,"opaque":"keep"}"#;
+        write_test_private_text(&path, sentinel);
+
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn misspelled_current_config_field_is_preserved_and_rejected() {
+        let root = temp_storage_test_dir("misspelled-current-config");
+        let path = root.join("config.json");
+        let sentinel =
+            br#"{"acounts":[{"id":"account-1","username":"user@example.com"}],"settings":{}}"#;
+        write_test_private_text(&path, sentinel);
+
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn misspelled_legacy_config_field_is_preserved_and_rejected() {
+        let root = temp_storage_test_dir("misspelled-legacy-config");
+        let path = root.join("config.json");
+        let sentinel = br#"{"poll_interval_secs":1,"credentails":{"username":"user@example.com"}}"#;
+        write_test_private_text(&path, sentinel);
+
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn current_config_wire_accepts_only_known_historical_fields() {
+        let root = temp_storage_test_dir("known-current-config-fields");
+        let path = root.join("config.json");
+        write_test_private_text(
+            &path,
+            br#"{
+                "accounts":[{
+                    "id":"account-1",
+                    "username":"user@example.com",
+                    "target_window_title":"Legacy Target"
+                }],
+                "settings":{
+                    "poll_interval_secs":60,
+                    "reconnect_delay_secs":2,
+                    "macos_app_name":"Windows App"
+                }
+            }"#,
+        );
+
+        let config = load_config_from_path(&path).unwrap();
+
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].username, "user@example.com");
+        assert_eq!(config.settings.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
+        assert!(config.settings.use_keyring);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_current_config_is_preserved_and_rejected() {
+        for sentinel in [
+            br#"{"accounts":[]}"#.as_slice(),
+            br#"{"settings":{}}"#.as_slice(),
+        ] {
+            let root = temp_storage_test_dir("partial-current-config");
+            let path = root.join("config.json");
+            write_test_private_text(&path, sentinel);
+
+            assert!(load_config_from_path(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn saved_config_round_trips_through_strict_wire_schema() {
+        let root = temp_storage_test_dir("strict-config-round-trip");
+        let path = root.join("config.json");
+        let mut account = Account::new("user@example.com");
+        account.id = "account-1".to_string();
+        account.has_saved_password = true;
+        let mut config = AppConfig {
+            accounts: vec![account],
+            ..AppConfig::default()
+        };
+        config.settings.auto_start = true;
+        config.settings.start_minimized = true;
+        config.settings.use_keyring = false;
+
+        save_config_to_file(&config, &path).unwrap();
+        let loaded = load_config_from_path(&path).unwrap();
+
+        assert_eq!(loaded, config);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_legacy_password_migration_is_not_returned_as_authoritative_config() {
+        let root = temp_storage_test_dir("incomplete-legacy-config-migration");
+        let path = root.join("config.json");
+        let sentinel = br#"{"credentials":{"username":"legacy@example.com"}}"#;
+        write_test_private_text(&path, sentinel);
+
+        let result = load_config_file_with_legacy_ops(
+            &path,
+            |_, _| LegacyPasswordMigration {
+                source_ids: vec!["legacy@example.com".to_string()],
+                target_id: None,
+                cleanup_ids_after_save: Vec::new(),
+            },
+            |_, _| panic!("incomplete migration must not save config"),
+            |_| panic!("incomplete migration must not clean source credentials"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_legacy_config_commit_is_not_returned_as_authoritative_config() {
+        let root = temp_storage_test_dir("failed-legacy-config-commit");
+        let path = root.join("config.json");
+        let sentinel = br#"{"poll_interval_secs":3}"#;
+        write_test_private_text(&path, sentinel);
+
+        let result = load_config_file_with_legacy_ops(
+            &path,
+            |_, _| LegacyPasswordMigration::default(),
+            |_, _| anyhow::bail!("injected config write failure"),
+            |_| panic!("failed config commit must not clean source credentials"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_target_verification_failure_keeps_source_migration_incomplete() {
+        let legacy = LegacyConfig {
+            credentials: Some(LegacyCredentialsConfig {
+                username: "legacy@example.com".to_string(),
+                account_id: None,
+                use_credential_manager: true,
+            }),
+            ..LegacyConfig::default()
+        };
+        let mut config = migrate_legacy_config(&legacy);
+        let cleanup_called = Cell::new(false);
+
+        let migration = migrate_legacy_passwords_with_ops(
+            &legacy,
+            &mut config,
+            |_, _| Ok(Zeroizing::new("legacy-secret".to_string())),
+            |_, password, _| {
+                drop(password);
+                Ok(PasswordWriteReceipt {
+                    saved_backend: PasswordStorageBackend::SystemSecureStorage,
+                    target_durability_warning: false,
+                    fallback_key_cleanup_warning: false,
+                })
+            },
+            |_, _| anyhow::bail!("injected verification failure"),
+            |failed| {
+                cleanup_called.set(true);
+                assert_eq!(failed.source_ids, vec!["legacy@example.com".to_string()]);
+                assert!(failed.target_id.is_some());
+                true
+            },
+        );
+
+        assert!(cleanup_called.get());
+        assert_eq!(migration.source_ids, vec!["legacy@example.com".to_string()]);
+        assert!(migration.target_id.is_none());
+        assert!(!legacy_password_migration_ready_to_persist(&migration));
+        assert!(!config.accounts[0].has_saved_password);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_config_symlink_is_not_treated_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_storage_test_dir("dangling-config-symlink");
+        let path = root.join("config.json");
+        symlink(root.join("missing-target.json"), &path).unwrap();
+
+        let result = load_config_from_path(&path);
+
+        assert!(result.is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7867,117 +8091,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_config_quarantine_preserves_exact_metadata_privately() {
-        let root = temp_storage_test_dir("invalid-config-backup-redacted");
-        let config_path = root.join("config.json");
-        let original = r#"{
-  "accounts": [
-    {
-      "id": "account-secret-id",
-      "username": "user@example.com",
-      "has_saved_password": "invalid-bool",
-      "enabled": true
-    }
-  ],
-  "settings": {
-    "auto_start": true
-  }
-}"#;
-        write_test_private_text(&config_path, original);
-
-        backup_invalid_config_file(
-            &config_path,
-            &anyhow::anyhow!("schema failed for user@example.com account-secret-id"),
-        )
-        .unwrap();
-
-        assert!(!config_path.exists());
-        let backups = invalid_storage_operation_entries(&root, "config.json.invalid.");
-        assert_eq!(backups.len(), 2);
-        let quarantine = backups
-            .iter()
-            .find(|path| !path.to_string_lossy().ends_with(".diagnostic.json"))
-            .unwrap();
-        let diagnostic_path = backups
-            .iter()
-            .find(|path| path.to_string_lossy().ends_with(".diagnostic.json"))
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(quarantine).unwrap(), original);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(quarantine).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-
-        let backup = std::fs::read_to_string(diagnostic_path).unwrap();
-        assert!(!backup.contains("user@example.com"));
-        assert!(!backup.contains("account-secret-id"));
-        assert!(!backup.contains("has_saved_password"));
-        assert!(!backup.contains("invalid-bool"));
-
-        let diagnostic: serde_json::Value = serde_json::from_str(&backup).unwrap();
-        assert_eq!(diagnostic["kind"], "invalid_config_diagnostic");
-        assert_eq!(diagnostic["raw_content"], "[omitted]");
-        assert_eq!(diagnostic["json_parse_status"], "parsed");
-        assert_eq!(diagnostic["has_accounts"], true);
-        assert_eq!(diagnostic["account_count"], 1);
-        assert_eq!(diagnostic["has_settings"], true);
-        assert_eq!(
-            diagnostic["original_sha256"],
-            sha256_hex(original.as_bytes())
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn malformed_invalid_config_quarantine_preserves_raw_content_but_redacts_diagnostic() {
-        let root = temp_storage_test_dir("malformed-config-backup-redacted");
-        let config_path = root.join("config.json");
-        let original = r#"{"accounts":[{"id":"account-secret-id","username":"user@example.com"}],"#;
-        write_test_private_text(&config_path, original);
-
-        backup_invalid_config_file(
-            &config_path,
-            &anyhow::anyhow!("parse failed for user@example.com account-secret-id"),
-        )
-        .unwrap();
-
-        assert!(!config_path.exists());
-        let backups = invalid_storage_operation_entries(&root, "config.json.invalid.");
-        assert_eq!(backups.len(), 2);
-        let quarantine = backups
-            .iter()
-            .find(|path| !path.to_string_lossy().ends_with(".diagnostic.json"))
-            .unwrap();
-        let diagnostic_path = backups
-            .iter()
-            .find(|path| path.to_string_lossy().ends_with(".diagnostic.json"))
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(quarantine).unwrap(), original);
-        let backup = std::fs::read_to_string(diagnostic_path).unwrap();
-        assert!(!backup.contains("user@example.com"));
-        assert!(!backup.contains("account-secret-id"));
-        assert!(!backup.contains(original));
-
-        let diagnostic: serde_json::Value = serde_json::from_str(&backup).unwrap();
-        assert_eq!(diagnostic["kind"], "invalid_config_diagnostic");
-        assert_eq!(diagnostic["raw_content"], "[omitted]");
-        assert_eq!(diagnostic["json_parse_status"], "invalid_json");
-        assert_eq!(diagnostic["has_accounts"], false);
-        assert_eq!(diagnostic["has_settings"], false);
-        assert_eq!(
-            diagnostic["original_sha256"],
-            sha256_hex(original.as_bytes())
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn app_config_serialization_does_not_contain_plaintext_password() {
         let mut account = Account::new(" user@example.com ");
         account.id = "account-1".to_string();
@@ -8844,7 +8957,73 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fallback_key_residue_cleanup_removes_only_fallback_backups() {
+    fn malformed_legacy_fallback_key_is_preserved_and_fails_closed() {
+        let root = temp_storage_test_dir("malformed-legacy-fallback-key");
+        let key_path = root.join("fallback.key");
+        let sentinel = b"malformed fallback key for token=keep-this-exactly";
+        write_test_private_text(&key_path, sentinel);
+
+        let error = load_legacy_fallback_key_from_path(&key_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("legacy fallback key file could not be loaded safely"));
+        assert_eq!(std::fs::read(&key_path).unwrap(), sentinel);
+        assert!(invalid_storage_operation_entries(&root, "fallback.json.invalid.").is_empty());
+        assert!(invalid_storage_operation_entries(&root, "fallback.key.invalid.").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_legacy_fallback_key_is_the_only_none_case() {
+        let root = temp_storage_test_dir("absent-legacy-fallback-key");
+        let key_path = root.join("fallback.key");
+
+        assert!(load_legacy_fallback_key_from_path(&key_path)
+            .unwrap()
+            .is_none());
+
+        std::fs::create_dir(&key_path).unwrap();
+        assert!(load_legacy_fallback_key_from_path(&key_path).is_err());
+        assert!(key_path.is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_legacy_fallback_key_symlink_is_preserved_as_an_error() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_storage_test_dir("dangling-legacy-fallback-key");
+        let key_path = root.join("fallback.key");
+        symlink(root.join("missing-key"), &key_path).unwrap();
+
+        assert!(load_legacy_fallback_key_from_path(&key_path).is_err());
+        assert!(std::fs::symlink_metadata(&key_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_fallback_key_loader_never_replaces_or_cleans_key_material() {
+        let implementation = include_str!("mod.rs");
+        let loader = implementation
+            .split("fn fallback_encryption_key()")
+            .nth(1)
+            .and_then(|tail| tail.split("fn load_legacy_fallback_key_from_file").next())
+            .unwrap();
+
+        assert!(loader.contains("load_legacy_fallback_key_from_file()?"));
+        assert!(loader.contains("legacy fallback encryption key is unavailable"));
+        assert!(!loader.contains("thread_rng"));
+        assert!(!loader.contains("cleanup_legacy_fallback_key_file"));
+        assert!(!loader.contains("cleanup_legacy_fallback_key_residue"));
+    }
+
+    #[test]
+    fn explicit_legacy_fallback_key_residue_cleanup_is_prefix_bounded() {
         let root = temp_storage_test_dir("fallback-key-residue");
         let fallback_json_backup = root.join("fallback.json.invalid.20260514120000");
         let fallback_key_backup = root.join("fallback.key.invalid.20260514120000");
@@ -9188,16 +9367,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn private_backup_and_quarantine_strip_macos_acl() {
+    fn private_pending_quarantine_strips_macos_acl() {
         let root = temp_test_root("private-backup-quarantine-acl");
-        let config_path = root.join("config.json");
-        write_test_private_text(&config_path, "not-json");
         let pending_path = root.join("pending-storage-operation.json");
         write_test_private_text(&pending_path, "not-json");
         if !add_macos_acl(
-            &config_path,
-            "everyone allow read,readattr,readextattr,readsecurity",
-        ) || !add_macos_acl(
             &pending_path,
             "everyone allow read,readattr,readextattr,readsecurity",
         ) {
@@ -9205,7 +9379,6 @@ mod tests {
             return;
         }
 
-        backup_invalid_config_file(&config_path, &anyhow::anyhow!("invalid config")).unwrap();
         quarantine_pending_storage_operation_file(&pending_path).unwrap();
 
         let backed_up = std::fs::read_dir(&root)
@@ -9213,11 +9386,6 @@ mod tests {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
-        assert!(backed_up.iter().any(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("config.json.invalid."))
-        }));
         assert!(backed_up.iter().any(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())

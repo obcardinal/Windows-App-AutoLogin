@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 if [ "$#" -ne 0 ]; then
   echo "This test does not accept arguments." >&2
@@ -1116,10 +1117,122 @@ if verify_bundle_tree_entry_safety "$HARDLINK_BUNDLE" 2>/dev/null; then
   fail "multiply linked bundle files were accepted"
 fi
 
+MODE_BUNDLE="$STAGE_DIR/mode-safety.app"
+MODE_EXECUTABLE="$MODE_BUNDLE/Contents/MacOS/$BINARY_NAME"
+MODE_RESOURCE="$MODE_BUNDLE/Contents/Resources/payload.txt"
+/bin/mkdir -p \
+  "$MODE_BUNDLE/Contents/MacOS" "$MODE_BUNDLE/Contents/Resources"
+/usr/bin/printf 'executable fixture\n' >"$MODE_EXECUTABLE"
+/usr/bin/printf 'resource fixture\n' >"$MODE_RESOURCE"
+/usr/bin/printf 'plist fixture\n' >"$MODE_BUNDLE/Contents/Info.plist"
+/usr/bin/chgrp "$(/usr/bin/id -gn)" "$MODE_EXECUTABLE"
+/usr/bin/find "$MODE_BUNDLE" -type d -exec /bin/chmod 755 {} +
+/usr/bin/find "$MODE_BUNDLE" -type f -exec /bin/chmod 644 {} +
+/bin/chmod 755 "$MODE_EXECUTABLE"
+verify_bundle_tree_entry_safety "$MODE_BUNDLE"
+
+assert_bundle_mode_rejected() {
+  local label="$1"
+  local path="$2"
+  local rejected_mode="$3"
+  local restored_mode="$4"
+
+  /bin/chmod "$rejected_mode" "$path"
+  if verify_bundle_tree_entry_safety "$MODE_BUNDLE" >/dev/null 2>&1; then
+    fail "non-canonical $label bundle mode $rejected_mode was accepted"
+  fi
+  /bin/chmod "$restored_mode" "$path"
+  verify_bundle_tree_entry_safety "$MODE_BUNDLE"
+}
+
+assert_bundle_mode_rejected directory-world-writable "$MODE_BUNDLE/Contents" 0777 0755
+assert_bundle_mode_rejected directory-group-writable "$MODE_BUNDLE/Contents" 0775 0755
+assert_bundle_mode_rejected resource-world-writable "$MODE_RESOURCE" 0666 0644
+assert_bundle_mode_rejected resource-group-writable "$MODE_RESOURCE" 0664 0644
+assert_bundle_mode_rejected resource-executable "$MODE_RESOURCE" 0755 0644
+assert_bundle_mode_rejected main-setuid "$MODE_EXECUTABLE" 04755 0755
+assert_bundle_mode_rejected main-setgid "$MODE_EXECUTABLE" 02755 0755
+assert_bundle_mode_rejected main-non-executable "$MODE_EXECUTABLE" 0644 0755
+
+/bin/chmod +a \
+  'everyone allow add_file,add_subdirectory,file_inherit,directory_inherit' \
+  "$MODE_BUNDLE"
+if verify_bundle_tree_entry_safety "$MODE_BUNDLE" >/dev/null 2>&1; then
+  fail "bundle root with an inherited-write ACL was accepted"
+fi
+/bin/chmod -RN "$MODE_BUNDLE"
+verify_bundle_tree_entry_safety "$MODE_BUNDLE"
+
+ASSEMBLY_ICON_FUNCTION="$(declare -f waal_build_app_icon)"
+ASSEMBLY_PLIST_FUNCTION="$(declare -f waal_write_info_plist)"
+waal_build_app_icon() {
+  /usr/bin/printf 'icon fixture\n' >"$2/AppIcon.icns"
+}
+waal_write_info_plist() {
+  /usr/bin/printf 'plist fixture\n' >"$1/Info.plist"
+}
+ASSEMBLY_SOURCE="$STAGE_DIR/assembly-source"
+/usr/bin/printf 'assembly executable\n' >"$ASSEMBLY_SOURCE"
+/bin/chmod 0777 "$ASSEMBLY_SOURCE"
+for assembly_umask in 002 000; do
+  ASSEMBLY_BUNDLE="$STAGE_DIR/assembly-$assembly_umask.app"
+  (
+    umask "$assembly_umask"
+    waal_assemble_app_bundle \
+      "$ROOT_DIR" "$ASSEMBLY_BUNDLE" "$BINARY_NAME" "$ASSEMBLY_SOURCE" \
+      "$PRODUCTION_BUNDLE_ID" "Windows App AutoLogin" 1.0.0 1.0.0
+  )
+  verify_bundle_tree_entry_safety "$ASSEMBLY_BUNDLE"
+done
+ASSEMBLY_ACL_PARENT="$STAGE_DIR/assembly-acl-parent"
+ASSEMBLY_ACL_BUNDLE="$ASSEMBLY_ACL_PARENT/assembly-acl.app"
+/bin/mkdir -p "$ASSEMBLY_ACL_PARENT"
+/bin/chmod +a \
+  'everyone allow add_file,add_subdirectory,file_inherit,directory_inherit' \
+  "$ASSEMBLY_ACL_PARENT"
+waal_assemble_app_bundle \
+  "$ROOT_DIR" "$ASSEMBLY_ACL_BUNDLE" "$BINARY_NAME" "$ASSEMBLY_SOURCE" \
+  "$PRODUCTION_BUNDLE_ID" "Windows App AutoLogin" 1.0.0 1.0.0
+verify_bundle_tree_entry_safety "$ASSEMBLY_ACL_BUNDLE"
+/bin/chmod -RN "$ASSEMBLY_ACL_PARENT"
+eval "$ASSEMBLY_ICON_FUNCTION"
+eval "$ASSEMBLY_PLIST_FUNCTION"
+
 ZIP_ROOT_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f
 ZIP_CONTENTS_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f
 ZIP_FILE_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f66696c65
 ZIP_FILE_UPPER_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f46494c45
+ZIP_EXECUTABLE_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f4d61634f532f77696e646f77732d6170702d6175746f6c6f67696e
+CANONICAL_MODE_ZIP="$STAGE_DIR/canonical-modes.zip"
+write_crafted_stored_zip "$CANONICAL_MODE_ZIP" \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0100755|$ZIP_EXECUTABLE_HEX|-|78" \
+  "0100644|$ZIP_FILE_HEX|-|79"
+validate_archive_entries "$CANONICAL_MODE_ZIP"
+assert_archive_rejected_before_extraction root-world-writable-mode \
+  "040777|$ZIP_ROOT_HEX|-|" \
+  "0100644|$ZIP_FILE_HEX|-|78"
+assert_archive_rejected_before_extraction directory-group-writable-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "040775|$ZIP_CONTENTS_HEX|-|"
+assert_archive_rejected_before_extraction resource-world-writable-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0100666|$ZIP_FILE_HEX|-|78"
+assert_archive_rejected_before_extraction resource-group-writable-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0100664|$ZIP_FILE_HEX|-|78"
+assert_archive_rejected_before_extraction resource-executable-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0100755|$ZIP_FILE_HEX|-|78"
+assert_archive_rejected_before_extraction main-setuid-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0104755|$ZIP_EXECUTABLE_HEX|-|78"
+assert_archive_rejected_before_extraction main-setgid-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0102755|$ZIP_EXECUTABLE_HEX|-|78"
+assert_archive_rejected_before_extraction main-non-executable-mode \
+  "040755|$ZIP_ROOT_HEX|-|" \
+  "0100644|$ZIP_EXECUTABLE_HEX|-|78"
 assert_archive_rejected_before_extraction traversal \
   "040755|$ZIP_ROOT_HEX|-|" \
   '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f2e2e2f657363617065|-|78'
@@ -1288,6 +1401,59 @@ assert_archive_resource_limit_rejected \
   path-depth "$RESOURCE_DEPTH_ZIP" 'path depth'
 
 PUBLICATION_DIST="$RELEASE_PRIVATE_ROOT_PARENT"
+UMASK_ZIP_SOURCE="$STAGE_DIR/umask-zip-source"
+/bin/mkdir -p "$UMASK_ZIP_SOURCE"
+/usr/bin/printf 'outer ZIP mode fixture\n' >"$UMASK_ZIP_SOURCE/payload.txt"
+for archive_umask in 002 000; do
+  UMASK_ZIP="$STAGE_DIR/umask-$archive_umask.zip"
+  (
+    umask "$archive_umask"
+    cd "$UMASK_ZIP_SOURCE"
+    sanitized_zip -q "$UMASK_ZIP" payload.txt
+  )
+  [ "$(/usr/bin/stat -f '%Lp' "$UMASK_ZIP")" = 644 ] \
+    || fail "outer ZIP inherited ambient umask $archive_umask"
+  require_public_release_file "$UMASK_ZIP" "Ambient-umask ZIP fixture"
+
+  UMASK_SIDECAR="$STAGE_DIR/umask-$archive_umask.zip.sha256"
+  UMASK_ZIP_SHA256="$(release_tool_sha256 "$UMASK_ZIP")"
+  (
+    umask "$archive_umask"
+    write_release_sha256_sidecar_candidate \
+      "$UMASK_SIDECAR" "$UMASK_ZIP" "$UMASK_ZIP_SHA256"
+  )
+  [ "$(/usr/bin/stat -f '%Lp' "$UMASK_SIDECAR")" = 644 ] \
+    || fail "SHA-256 sidecar inherited ambient umask $archive_umask"
+done
+
+UNSAFE_MODE_CANDIDATE="$STAGE_DIR/unsafe-mode-publication-candidate.zip"
+UNSAFE_MODE_DESTINATION="$PUBLICATION_DIST/unsafe-mode-publication.zip"
+/usr/bin/printf 'unsafe publication mode fixture\n' >"$UNSAFE_MODE_CANDIDATE"
+UNSAFE_MODE_SHA256="$(release_tool_sha256 "$UNSAFE_MODE_CANDIDATE")"
+/bin/chmod 0666 "$UNSAFE_MODE_CANDIDATE"
+if atomic_publish_file_no_replace \
+  "$UNSAFE_MODE_CANDIDATE" "$UNSAFE_MODE_DESTINATION" \
+  "$UNSAFE_MODE_SHA256" >/dev/null 2>&1; then
+  fail "world-writable publication candidate was accepted"
+fi
+[ ! -e "$UNSAFE_MODE_DESTINATION" ] \
+  || fail "unsafe-mode candidate reached the publication directory"
+/bin/chmod 0644 "$UNSAFE_MODE_CANDIDATE"
+
+UNSAFE_ACL_CANDIDATE="$STAGE_DIR/unsafe-acl-publication-candidate.zip"
+UNSAFE_ACL_DESTINATION="$PUBLICATION_DIST/unsafe-acl-publication.zip"
+/usr/bin/printf 'unsafe publication ACL fixture\n' >"$UNSAFE_ACL_CANDIDATE"
+UNSAFE_ACL_SHA256="$(release_tool_sha256 "$UNSAFE_ACL_CANDIDATE")"
+/bin/chmod +a 'everyone allow write' "$UNSAFE_ACL_CANDIDATE"
+if atomic_publish_file_no_replace \
+  "$UNSAFE_ACL_CANDIDATE" "$UNSAFE_ACL_DESTINATION" \
+  "$UNSAFE_ACL_SHA256" >/dev/null 2>&1; then
+  fail "ACL-bearing publication candidate was accepted"
+fi
+[ ! -e "$UNSAFE_ACL_DESTINATION" ] \
+  || fail "ACL-bearing candidate reached the publication directory"
+/bin/chmod -N "$UNSAFE_ACL_CANDIDATE"
+
 HARDLINK_CANDIDATE="$STAGE_DIR/hardlink-publication-candidate.zip"
 HARDLINK_CANDIDATE_ALIAS="$STAGE_DIR/hardlink-publication-candidate.alias"
 HARDLINK_DESTINATION="$PUBLICATION_DIST/hardlink-publication-destination.zip"
@@ -1437,6 +1603,23 @@ atomic_publish_file_no_replace \
 verify_published_release_hash_evidence \
   "$PUBLISHED_RELEASE" "$PUBLISHED_SIDECAR" "$PUBLISHED_RELEASE_SHA256"
 
+/bin/chmod 0666 "$PUBLISHED_RELEASE"
+if verify_published_release_hash_evidence \
+  "$PUBLISHED_RELEASE" "$PUBLISHED_SIDECAR" \
+  "$PUBLISHED_RELEASE_SHA256" >/dev/null 2>&1; then
+  fail "published archive with a mutable mode passed final hash evidence"
+fi
+/bin/chmod 0644 "$PUBLISHED_RELEASE"
+/bin/chmod +a 'everyone allow write' "$PUBLISHED_SIDECAR"
+if verify_published_release_hash_evidence \
+  "$PUBLISHED_RELEASE" "$PUBLISHED_SIDECAR" \
+  "$PUBLISHED_RELEASE_SHA256" >/dev/null 2>&1; then
+  fail "published sidecar with an ACL passed final hash evidence"
+fi
+/bin/chmod -N "$PUBLISHED_SIDECAR"
+verify_published_release_hash_evidence \
+  "$PUBLISHED_RELEASE" "$PUBLISHED_SIDECAR" "$PUBLISHED_RELEASE_SHA256"
+
 SIDECAR_COLLISION="$STAGE_DIR/sidecar-collision"
 /usr/bin/printf 'must not replace sidecar\n' >"$SIDECAR_COLLISION"
 PUBLISHED_SIDECAR_SHA256="$(release_tool_sha256 "$PUBLISHED_SIDECAR")"
@@ -1581,6 +1764,26 @@ fi
   || fail "failed orphan adoption changed immutable archive bytes"
 [ ! -e "$ADOPTION_SIDECAR" ] \
   || fail "failed orphan adoption published misleading hash evidence"
+
+UNSAFE_ADOPTION_COMMIT="$(/usr/bin/printf '6%.0s' {1..40})"
+UNSAFE_ADOPTION_ARCHIVE="$PUBLICATION_DIST/Fixture-macos-$UNSAFE_ADOPTION_COMMIT.zip"
+UNSAFE_ADOPTION_SIDECAR="$UNSAFE_ADOPTION_ARCHIVE.sha256"
+UNSAFE_ADOPTION_CANDIDATE="$STAGE_DIR/unsafe-adoption-candidate.zip"
+UNSAFE_ADOPTION_SIDECAR_CANDIDATE="$STAGE_DIR/unsafe-adoption-candidate.zip.sha256"
+/usr/bin/printf 'same bytes but unsafe published mode\n' >"$UNSAFE_ADOPTION_ARCHIVE"
+/bin/cp "$UNSAFE_ADOPTION_ARCHIVE" "$UNSAFE_ADOPTION_CANDIDATE"
+/bin/chmod 0666 "$UNSAFE_ADOPTION_ARCHIVE"
+UNSAFE_ADOPTION_SHA256="$(release_tool_sha256 "$UNSAFE_ADOPTION_CANDIDATE")"
+ZIP_PATH="$UNSAFE_ADOPTION_ARCHIVE"
+ZIP_SHA256_PATH="$UNSAFE_ADOPTION_SIDECAR"
+if publish_verified_release_pair \
+  "$UNSAFE_ADOPTION_CANDIDATE" "$UNSAFE_ADOPTION_SIDECAR_CANDIDATE" \
+  "$UNSAFE_ADOPTION_SHA256" >/dev/null 2>&1; then
+  fail "unsafe-mode pre-existing archive was adopted"
+fi
+[ ! -e "$UNSAFE_ADOPTION_SIDECAR" ] \
+  || fail "unsafe-mode pre-existing archive received a sidecar"
+/bin/chmod 0644 "$UNSAFE_ADOPTION_ARCHIVE"
 
 SIDECAR_ONLY_COMMIT="$(/usr/bin/printf '3%.0s' {1..40})"
 SIDECAR_ONLY_ARCHIVE="$PUBLICATION_DIST/Fixture-macos-$SIDECAR_ONLY_COMMIT.zip"
@@ -1772,6 +1975,21 @@ if prepare_dist_root_for_root "$DIST_FIXTURE_ROOT" 2>/dev/null; then
   fail "symlinked dist root was accepted"
 fi
 
+ACL_DIST_FIXTURE_ROOT="$TEST_ROOT/acl-dist-root"
+/bin/mkdir -p "$ACL_DIST_FIXTURE_ROOT/dist"
+/bin/chmod +a \
+  'everyone allow add_file,add_subdirectory,file_inherit,directory_inherit' \
+  "$ACL_DIST_FIXTURE_ROOT/dist"
+if verify_private_release_parent_security \
+  "$ACL_DIST_FIXTURE_ROOT/dist" >/dev/null 2>&1; then
+  fail "release dist parent with an inherited-write ACL was accepted"
+fi
+if (create_private_release_root_for_root "$ACL_DIST_FIXTURE_ROOT") \
+  >/dev/null 2>&1; then
+  fail "private release root was created below an ACL-bearing dist parent"
+fi
+/bin/chmod -RN "$ACL_DIST_FIXTURE_ROOT/dist"
+
 ADHOC_BINARY="$TEST_ROOT/development-signature-test"
 /bin/cp /usr/bin/true "$ADHOC_BINARY"
 waal_codesign_development_bundle "$ADHOC_BINARY" "obcardinal.windows-app-autologin"
@@ -1822,6 +2040,8 @@ BUNDLE_GUARD_CANONICAL_B="$(canonical_unsigned_macho_sha256 "$BUNDLE_GUARD_BINAR
   || fail "different arm64 Mach-O payloads produced one canonical signing digest"
 
 BUNDLE_GUARD_BUNDLE="$TEST_ROOT/BundleGuard.app"
+SAVED_BINARY_NAME="$BINARY_NAME"
+BINARY_NAME=BundleGuard
 /bin/mkdir -p \
   "$BUNDLE_GUARD_BUNDLE/Contents/MacOS" \
   "$BUNDLE_GUARD_BUNDLE/Contents/Resources"
@@ -1858,6 +2078,7 @@ verify_release_bundle_payload_baseline "$BUNDLE_GUARD_BUNDLE"
   "$BUNDLE_GUARD_BUNDLE/Contents/MacOS/BundleGuard")" = "$BUNDLE_GUARD_CANONICAL_A" ] \
   || fail "codesign changed executable bytes outside normalized signature metadata"
 RELEASE_BUNDLE_PAYLOAD_SHA256=""
+BINARY_NAME="$SAVED_BINARY_NAME"
 
 [ "$(/usr/bin/head -n 1 "$ROOT_DIR/script/package_macos.sh")" = '#!/bin/bash -p' ] \
   || fail "macOS local packager does not enter privileged Bash through an absolute shebang"

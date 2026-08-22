@@ -1767,12 +1767,22 @@ fn ensure_live_prompt_window_title(
 }
 
 fn prompt_text_snapshot_changed(snapshot: &PromptTextSnapshot) -> bool {
-    let attrs = snapshot
-        .element
-        .string_attrs(&[AX_TITLE, AX_PLACEHOLDER, AX_VALUE]);
-    attrs.first().cloned().unwrap_or_default() != snapshot.title
-        || attrs.get(1).cloned().unwrap_or_default() != snapshot.placeholder
-        || attrs.get(2).cloned().unwrap_or_default() != snapshot.value
+    if is_hidden(&snapshot.element) || has_sensitive_password_field_identity(&snapshot.element) {
+        return true;
+    }
+    let title = snapshot.element.string_attr(AX_TITLE);
+    let placeholder = snapshot.element.string_attr(AX_PLACEHOLDER);
+    // Reclassify immediately before AXValue. A previously ordinary identity
+    // element that became password-sensitive must be treated as changed
+    // without ever materializing its value in an ordinary String.
+    let value = if is_text_or_static_text(&snapshot.element)
+        && !has_sensitive_password_field_identity(&snapshot.element)
+    {
+        snapshot.element.string_attr(AX_VALUE)
+    } else {
+        None
+    };
+    title != snapshot.title || placeholder != snapshot.placeholder || value != snapshot.value
 }
 
 fn prompt_text_snapshots_match(
@@ -2307,8 +2317,8 @@ fn collect_prompt_text(window_title: &str, elements: &[AxElement]) -> String {
         if !prompt_text_element_should_contribute(
             hidden,
             false,
-            !hidden && is_native_password_field(element),
-            !hidden && is_password_like_text_field(element),
+            has_secure_password_field_identity(element),
+            has_password_like_text_field_identity(element),
         ) {
             continue;
         }
@@ -2316,7 +2326,7 @@ fn collect_prompt_text(window_title: &str, elements: &[AxElement]) -> String {
         push_text(&mut text, element.string_attr(AX_TITLE));
         push_text(&mut text, element.string_attr(AX_PLACEHOLDER));
 
-        if is_text_or_static_text(element) {
+        if is_text_or_static_text(element) && !has_sensitive_password_field_identity(element) {
             push_text(&mut text, element.string_attr(AX_VALUE));
         }
     }
@@ -2336,21 +2346,27 @@ fn prompt_text_snapshots(
             prompt_text_element_should_contribute(
                 hidden,
                 false,
-                !hidden && is_native_password_field(element),
-                !hidden && is_password_like_text_field(element),
+                has_secure_password_field_identity(element),
+                has_password_like_text_field_identity(element),
             )
         })
         .map(|element| {
-            let attrs = element.string_attrs(&[AX_TITLE, AX_PLACEHOLDER, AX_VALUE]);
+            let title = element.string_attr(AX_TITLE);
+            let placeholder = element.string_attr(AX_PLACEHOLDER);
+            // Keep AXValue out of bulk reads and repeat the sensitivity check
+            // immediately before the only possible value query.
+            let value = if is_text_or_static_text(element)
+                && !has_sensitive_password_field_identity(element)
+            {
+                element.string_attr(AX_VALUE)
+            } else {
+                None
+            };
             PromptTextSnapshot {
                 element: element.clone(),
-                title: attrs.first().cloned().unwrap_or_default(),
-                placeholder: attrs.get(1).cloned().unwrap_or_default(),
-                value: if is_text_or_static_text(element) {
-                    attrs.get(2).cloned().unwrap_or_default()
-                } else {
-                    None
-                },
+                title,
+                placeholder,
+                value,
             }
         })
         .collect::<Vec<_>>();
@@ -2523,11 +2539,13 @@ fn has_secure_password_field_identity(element: &AxElement) -> bool {
     })
 }
 
-fn is_password_like_text_field(element: &AxElement) -> bool {
-    !is_hidden(element)
-        && element_enabled(element)
-        && role_matches(element, AX_TEXT_FIELD_ROLE)
+fn has_password_like_text_field_identity(element: &AxElement) -> bool {
+    role_matches(element, AX_TEXT_FIELD_ROLE)
         && text_contains_password_cue(&element_label_text(element))
+}
+
+fn has_sensitive_password_field_identity(element: &AxElement) -> bool {
+    has_secure_password_field_identity(element) || has_password_like_text_field_identity(element)
 }
 
 fn role_matches(element: &AxElement, expected: &str) -> bool {
@@ -3367,7 +3385,10 @@ mod tests {
         let detector = implementation
             .split("fn is_secure_password_insertion_field")
             .nth(1)
-            .and_then(|tail| tail.split("fn is_password_like_text_field").next())
+            .and_then(|tail| {
+                tail.split("fn has_password_like_text_field_identity")
+                    .next()
+            })
             .unwrap();
 
         assert!(detector.contains("AX_SECURE_TEXT_FIELD_ROLE"));
@@ -3378,6 +3399,52 @@ mod tests {
             !detector.contains("contains_keyword(&role_text, \"secure\")"),
             "plain AXTextField must not become a password target from loose role description text"
         );
+    }
+
+    #[test]
+    fn prompt_text_never_reads_axvalue_from_password_sensitive_identity() {
+        let implementation = include_str!("macos_ax.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let collector = implementation
+            .split("fn collect_prompt_text")
+            .nth(1)
+            .and_then(|tail| tail.split("fn prompt_text_snapshots").next())
+            .unwrap();
+        let snapshots = implementation
+            .split("fn prompt_text_snapshots(\n")
+            .nth(1)
+            .and_then(|tail| tail.split("fn select_identity_snapshots").next())
+            .unwrap();
+        let snapshot_revalidation = implementation
+            .split("fn prompt_text_snapshot_changed")
+            .nth(1)
+            .and_then(|tail| tail.split("fn prompt_text_snapshots_match").next())
+            .unwrap();
+        let sensitive_identity = implementation
+            .split("fn has_password_like_text_field_identity")
+            .nth(1)
+            .and_then(|tail| tail.split("fn role_matches").next())
+            .unwrap();
+
+        for reader in [collector, snapshots, snapshot_revalidation] {
+            let sensitivity_check = reader
+                .find("has_sensitive_password_field_identity")
+                .expect("password sensitivity check before AXValue");
+            let value_read = reader.find("AX_VALUE").expect("guarded AXValue read");
+            assert!(sensitivity_check < value_read);
+        }
+        assert!(collector.contains("has_secure_password_field_identity(element)"));
+        assert!(collector.contains("has_password_like_text_field_identity(element)"));
+        assert!(snapshots.contains("has_secure_password_field_identity(element)"));
+        assert!(snapshots.contains("has_password_like_text_field_identity(element)"));
+        assert!(!snapshots.contains("string_attrs(&[AX_TITLE, AX_PLACEHOLDER, AX_VALUE])"));
+        assert!(
+            !snapshot_revalidation.contains("string_attrs(&[AX_TITLE, AX_PLACEHOLDER, AX_VALUE])")
+        );
+        assert!(!sensitive_identity.contains("element_enabled"));
+        assert!(!sensitive_identity.contains("is_hidden"));
     }
 
     #[test]

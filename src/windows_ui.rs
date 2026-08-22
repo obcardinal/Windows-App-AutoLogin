@@ -66,7 +66,12 @@ struct ZeroizingBstr(BSTR);
 
 impl ZeroizingBstr {
     fn from_secret(value: &str) -> Self {
-        let wide = Zeroizing::new(value.encode_utf16().collect::<Vec<_>>());
+        // Wrap the allocation before encoding so every plaintext UTF-16 byte
+        // is owned by a zeroizing buffer. The UTF-8 byte length is an upper
+        // bound for the number of UTF-16 code units, which also prevents a
+        // growth reallocation from leaving an unwiped copy behind.
+        let mut wide = Zeroizing::new(Vec::with_capacity(value.len()));
+        wide.extend(value.encode_utf16());
         Self(BSTR::from_wide(wide.as_slice()))
     }
 
@@ -568,6 +573,7 @@ pub(crate) fn fill_password(
     strategy: WindowsFillStrategy,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> Result<WindowsFillResult, WindowsFillFailure> {
+    guard().map_err(WindowsFillFailure::before_write)?;
     activate_window(prompt.target.window_handle).map_err(WindowsFillFailure::before_write)?;
     guard().map_err(WindowsFillFailure::before_write)?;
     let prompt =
@@ -654,6 +660,7 @@ pub(crate) fn submit_prompt(
     prompt: &WindowsPrompt,
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<WindowsSubmitResult> {
+    guard()?;
     activate_window(prompt.target.window_handle)?;
     guard()?;
     let prompt = revalidate_prompt(target_app_name, prompt)?;
@@ -1552,7 +1559,7 @@ fn target_window_should_be_scanned_for_prompt(
 ) -> bool {
     !is_builtin_target_name(target_app_name)
         || login_title_like(&target.window_title)
-        || credential_dialog_class_like(class_name)
+        || credential_specific_dialog_class_like(class_name)
 }
 
 fn prompt_candidate_is_trusted_autofill_target(
@@ -2860,12 +2867,18 @@ fn credential_dialog_title_like(title: &str) -> bool {
     contains_keyword(title, "Windows Security") || contains_keyword(title, "Enter your credentials")
 }
 
+#[cfg(test)]
 fn credential_dialog_class_like(class_name: &str) -> bool {
     let class_name = normalized_identifier(class_name);
     class_name.contains("credential")
         || class_name.contains("windowssecurity")
         || class_name.contains("corewindow")
         || class_name.contains("xaml")
+}
+
+fn credential_specific_dialog_class_like(class_name: &str) -> bool {
+    let class_name = normalized_identifier(class_name);
+    class_name.contains("credential") || class_name.contains("windowssecurity")
 }
 
 #[cfg(test)]
@@ -4202,6 +4215,36 @@ mod tests {
             super::WindowsPromptTrust::TrustedTargetProcess
         )
         .is_ok());
+    }
+
+    #[test]
+    fn generic_xaml_session_window_is_not_scanned_as_a_prompt() {
+        let mut target = trusted_remote_desktop_prompt_target();
+        target.window_title = "Finance Desktop 01".to_string();
+
+        assert!(is_probable_session_window_title(&target.window_title));
+        assert!(!super::target_window_should_be_scanned_for_prompt(
+            "Windows App",
+            &target,
+            "Windows.UI.Core.CoreWindow"
+        ));
+        assert!(!super::target_window_should_be_scanned_for_prompt(
+            "Windows App",
+            &target,
+            "Xaml_WindowedPopupClass"
+        ));
+        assert!(super::target_window_should_be_scanned_for_prompt(
+            "Windows App",
+            &target,
+            "Credential Dialog Xaml Host"
+        ));
+
+        target.window_title = "Windows Security - Sign in".to_string();
+        assert!(super::target_window_should_be_scanned_for_prompt(
+            "Windows App",
+            &target,
+            "Windows.UI.Core.CoreWindow"
+        ));
     }
 
     #[test]

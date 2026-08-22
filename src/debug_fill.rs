@@ -611,11 +611,15 @@ fn run_platform(args: &[String]) -> anyhow::Result<()> {
     let method = FillMethod::parse(args)?;
     let report = with_exclusive_settings_recovery_lease(
         crate::single_instance::SettingsRecoveryLease::try_acquire,
-        |_recovery_lease| {
-            let config = storage::load_config();
-            fill_current_prompt_once(&config.settings, &config.accounts, method)
+        |_recovery_lease| -> anyhow::Result<_> {
+            let config = storage::load_config()?;
+            Ok(fill_current_prompt_once(
+                &config.settings,
+                &config.accounts,
+                method,
+            ))
         },
-    )?;
+    )??;
     report.print();
     if let Some(reason) = report.failure_reason {
         anyhow::bail!(reason);
@@ -1379,12 +1383,18 @@ fn fill_current_prompt_once_windows(
     apply_windows_prompt_fields(&mut log, &prompt);
     if !prompt.target.frontmost {
         let activation_prompt = prompt.clone();
+        if let Err(e) = guard() {
+            return log.fail(format!("attempt_cancelled_{e}"));
+        }
         if let Err(e) = crate::windows_ui::activate_window(prompt.target.window_handle) {
             log.set(
                 "credential_prompt_activation_error_kind",
                 windows_activation_error_kind(&e),
             );
             return log.fail(format!("credential_prompt_activation_failed_{e}"));
+        }
+        if let Err(e) = guard() {
+            return log.fail(format!("attempt_cancelled_{e}"));
         }
         prompt = match crate::windows_ui::revalidate_prompt_after_activation(
             app_name,
@@ -2871,6 +2881,75 @@ mod tests {
                 && !activation_block.contains("inspection.prompt"),
             "post-activation flow must not replace the selected prompt with a broad re-scan result"
         );
+    }
+
+    #[test]
+    fn windows_focus_changes_are_guarded_before_and_after_activation() {
+        let implementation = include_str!("debug_fill.rs");
+        let activation_block = source_between(
+            implementation,
+            "if !prompt.target.frontmost {\n        let activation_prompt = prompt.clone();",
+            "    if !prompt.target.frontmost {\n        return log.fail(\"windows_app_not_frontmost\");",
+        );
+        let pre_guard = activation_block
+            .find("if let Err(e) = guard()")
+            .expect("cancellation guard before activation");
+        let activation = activation_block
+            .find("crate::windows_ui::activate_window")
+            .expect("Windows prompt activation");
+        let post_guard = activation_block[activation..]
+            .find("if let Err(e) = guard()")
+            .map(|offset| activation + offset)
+            .expect("immediate cancellation guard after activation");
+        let revalidation = activation_block
+            .find("revalidate_prompt_after_activation")
+            .expect("post-activation prompt revalidation");
+
+        assert!(pre_guard < activation);
+        assert!(activation < post_guard);
+        assert!(post_guard < revalidation);
+
+        let windows_ui = include_str!("windows_ui.rs");
+        for action in [
+            source_between(
+                windows_ui,
+                "pub(crate) fn fill_password(",
+                "fn set_password_value(",
+            ),
+            source_between(
+                windows_ui,
+                "pub(crate) fn submit_prompt(",
+                "pub(crate) fn clear_filled_password(",
+            ),
+        ] {
+            let pre_guard = action.find("guard()").expect("pre-activation guard");
+            let activation = action.find("activate_window(").expect("activation");
+            let post_guard = action[activation..]
+                .find("guard()")
+                .map(|offset| activation + offset)
+                .expect("post-activation guard");
+            assert!(pre_guard < activation);
+            assert!(activation < post_guard);
+        }
+    }
+
+    #[test]
+    fn windows_utf16_secret_buffer_is_zeroizing_before_encoding() {
+        let windows_ui = include_str!("windows_ui.rs");
+        let constructor = source_between(
+            windows_ui,
+            "fn from_secret(value: &str) -> Self {",
+            "    fn as_bstr(&self) -> &BSTR {",
+        );
+
+        let wrap = constructor
+            .find("Zeroizing::new(Vec::with_capacity(value.len()))")
+            .expect("zeroizing buffer allocation");
+        let encode = constructor
+            .find("wide.extend(value.encode_utf16())")
+            .expect("UTF-16 encoding into the protected buffer");
+        assert!(wrap < encode);
+        assert!(!constructor.contains("collect::<Vec<_>>()"));
     }
 
     #[test]

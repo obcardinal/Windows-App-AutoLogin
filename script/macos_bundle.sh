@@ -191,19 +191,32 @@ waal_assemble_app_bundle() {
     exit 1
   fi
 
-  /bin/rm -rf "$bundle_dir"
-  /bin/mkdir -p "$macos_dir" "$resources_dir"
-  /bin/cp "$source_executable" "$macos_dir/$binary_name"
-  /bin/chmod +x "$macos_dir/$binary_name"
+  (
+    set -e
+    umask 022
+    /bin/rm -rf "$bundle_dir" || exit 1
+    /bin/mkdir -p "$macos_dir" "$resources_dir" || exit 1
+    /bin/cp "$source_executable" "$macos_dir/$binary_name" || exit 1
+    /bin/chmod +x "$macos_dir/$binary_name" || exit 1
 
-  waal_build_app_icon "$root_dir/assets/icon.png" "$resources_dir"
-  waal_write_info_plist \
-    "$contents_dir" \
-    "$binary_name" \
-    "$bundle_id" \
-    "$app_display_name" \
-    "$cargo_version" \
-    "$build_version"
+    waal_build_app_icon "$root_dir/assets/icon.png" "$resources_dir" || exit 1
+    waal_write_info_plist \
+      "$contents_dir" \
+      "$binary_name" \
+      "$bundle_id" \
+      "$app_display_name" \
+      "$cargo_version" \
+      "$build_version" || exit 1
+
+    # Bundle permissions are part of the release payload. Do not let an
+    # inherited ACL, ambient umask, source-executable mode, or image tool decide
+    # them. The bundle was freshly created by this function, so it is safe to
+    # strip inherited ACLs from this exact tree.
+    /bin/chmod -RN "$bundle_dir" || exit 1
+    /usr/bin/find "$bundle_dir" -type d -exec /bin/chmod 755 {} + || exit 1
+    /usr/bin/find "$bundle_dir" -type f -exec /bin/chmod 644 {} + || exit 1
+    /bin/chmod 755 "$macos_dir/$binary_name" || exit 1
+  )
 }
 
 waal_codesign_development_bundle() {

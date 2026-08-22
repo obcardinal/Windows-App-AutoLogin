@@ -2042,6 +2042,24 @@ directory_identity() {
   /usr/bin/stat -f '%d:%i' "$path"
 }
 
+require_no_acl() {
+  local path="$1"
+  local description="${2:-Release path}"
+  local listing
+
+  if ! listing="$(/usr/bin/env -i \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+    /bin/ls -lde "$path" 2>/dev/null)"; then
+    echo "Unable to inspect access controls for $description: $path" >&2
+    return 1
+  fi
+  if /usr/bin/printf '%s\n' "$listing" \
+    | /usr/bin/grep -Eq '^[[:space:]]+[0-9]+:'; then
+    echo "$description must not have an access control list: $path" >&2
+    return 1
+  fi
+}
+
 verify_private_release_parent_security() {
   local path="$1"
   local owner_uid
@@ -2055,6 +2073,7 @@ verify_private_release_parent_security() {
     echo "Private release parent must be a physical directory: $path" >&2
     return 1
   fi
+  require_no_acl "$path" "Private release parent" || return 1
   owner_uid="$(/usr/bin/stat -f '%u' "$path")"
   current_uid="$(/usr/bin/id -u)"
   mode="$(/usr/bin/stat -f '%Lp' "$path")"
@@ -2129,6 +2148,7 @@ verify_private_release_root() {
     echo "Private release root identity changed." >&2
     return 1
   fi
+  require_no_acl "$RELEASE_PRIVATE_ROOT" "Private release root" || return 1
 }
 
 create_private_release_root_for_root() {
@@ -2165,6 +2185,7 @@ create_private_release_root_for_root() {
   umask "$previous_umask"
 
   RELEASE_PRIVATE_ROOT="$private_root"
+  /bin/chmod -N "$RELEASE_PRIVATE_ROOT"
   /bin/chmod 700 "$RELEASE_PRIVATE_ROOT"
   if [ -L "$RELEASE_PRIVATE_ROOT" ] \
     || [ "$(cd "$RELEASE_PRIVATE_ROOT" 2>/dev/null && /bin/pwd -P)" != "$RELEASE_PRIVATE_ROOT" ]; then
@@ -2291,14 +2312,8 @@ release_publication_state() {
       return 1
     fi
     if [ -e "$path" ]; then
-      if [ ! -f "$path" ]; then
-        echo "Immutable release artifact must be a regular file: $path" >&2
-        return 1
-      fi
-      if [ "$(/usr/bin/stat -f '%l' "$path")" != "1" ]; then
-        echo "Immutable release artifact must not have additional hard links: $path" >&2
-        return 1
-      fi
+      require_public_release_file "$path" \
+        "Immutable release artifact" || return 1
       if [ "$path" = "$ZIP_PATH" ]; then
         archive_exists=true
       else
@@ -2327,6 +2342,20 @@ require_single_link_regular_file() {
   if [ ! -f "$path" ] || [ -L "$path" ] \
     || [ "$(/usr/bin/stat -f '%l' "$path" 2>/dev/null)" != 1 ]; then
     echo "$description must be a single-link regular file: $path" >&2
+    return 1
+  fi
+}
+
+require_public_release_file() {
+  local path="$1"
+  local description="${2:-Release artifact}"
+  local mode
+
+  require_single_link_regular_file "$path" "$description" || return 1
+  require_no_acl "$path" "$description" || return 1
+  mode="$(/usr/bin/stat -f '%Mp%Lp' "$path" 2>/dev/null)" || return 1
+  if [ "$mode" != 0644 ]; then
+    echo "$description must have mode 0644: $path" >&2
     return 1
   fi
 }
@@ -2407,6 +2436,13 @@ run_archive_snapshot_operation() {
           unless @status && S_ISREG($status[2]) && $status[3] == 1;
         return @status;
       }
+      sub public_status {
+        my ($handle) = @_;
+        my @status = regular_status($handle);
+        die "published archive does not have mode 0644\n"
+          unless (($status[2] & 07777) == 0644);
+        return @status;
+      }
       sub same_status {
         my ($left, $right) = @_;
         return $left->[0] == $right->[0] && $left->[1] == $right->[1]
@@ -2462,7 +2498,7 @@ run_archive_snapshot_operation() {
         my $destination_directory = open_directory($destination_path, $destination_id);
         my $source = open_regular_at($source_directory, $source_leaf,
           O_RDONLY | $O_NOFOLLOW | $O_CLOEXEC);
-        my @source_initial = regular_status($source);
+        my @source_initial = public_status($source);
         my $destination = open_regular_at($destination_directory, $destination_leaf,
           O_WRONLY | O_CREAT | O_EXCL | $O_NOFOLLOW | $O_CLOEXEC, 0600);
         while (1) {
@@ -2479,10 +2515,10 @@ run_archive_snapshot_operation() {
         }
         syscall($SYS_FSYNC, fileno($destination)) == 0
           or die "flush archive snapshot: $!\n";
-        my @source_final = regular_status($source);
+        my @source_final = public_status($source);
         my $source_path_check = open_regular_at($source_directory, $source_leaf,
           O_RDONLY | $O_NOFOLLOW | $O_CLOEXEC);
-        my @source_path_status = regular_status($source_path_check);
+        my @source_path_status = public_status($source_path_check);
         die "published archive changed during snapshot\n"
           unless same_status(\@source_initial, \@source_final)
             && same_status(\@source_initial, \@source_path_status);
@@ -2498,19 +2534,19 @@ run_archive_snapshot_operation() {
           O_RDONLY | $O_NOFOLLOW | $O_CLOEXEC);
         my $snapshot = open_regular_at($snapshot_directory, $snapshot_leaf,
           O_RDONLY | $O_NOFOLLOW | $O_CLOEXEC);
-        my @source_initial = regular_status($source);
+        my @source_initial = public_status($source);
         my @snapshot_initial = regular_status($snapshot);
         die "published archive identity changed\n"
           unless identity(\@source_initial) eq $expected
             && $source_initial[7] == $snapshot_initial[7];
         compare_streams($source, $snapshot);
-        my @source_final = regular_status($source);
+        my @source_final = public_status($source);
         my @snapshot_final = regular_status($snapshot);
         my $source_path_check = open_regular_at($source_directory, $source_leaf,
           O_RDONLY | $O_NOFOLLOW | $O_CLOEXEC);
         my $snapshot_path_check = open_regular_at($snapshot_directory, $snapshot_leaf,
           O_RDONLY | $O_NOFOLLOW | $O_CLOEXEC);
-        my @source_path_status = regular_status($source_path_check);
+        my @source_path_status = public_status($source_path_check);
         my @snapshot_path_status = regular_status($snapshot_path_check);
         die "archive changed during final comparison\n"
           unless same_status(\@source_initial, \@source_final)
@@ -2533,6 +2569,8 @@ capture_published_archive_snapshot() {
   verify_release_publication_parent || return 1
   verify_private_release_root || return 1
   verify_archive_snapshot_helper_integrity || return 1
+  require_public_release_file "$published_path" \
+    "Published archive" || return 1
   published_parent="$(/usr/bin/dirname "$published_path")"
   snapshot_parent="$(/usr/bin/dirname "$snapshot_path")"
   if [ "$published_parent" != "$RELEASE_PRIVATE_ROOT_PARENT" ] \
@@ -2582,7 +2620,7 @@ verify_published_archive_matches_snapshot() {
   fi
   require_single_link_regular_file "$snapshot_path" \
     "Verified archive snapshot" || return 1
-  require_single_link_regular_file "$published_path" \
+  require_public_release_file "$published_path" \
     "Published archive" || return 1
   snapshot_sha256="$(release_tool_sha256 "$snapshot_path")"
   if [ "$snapshot_sha256" != "$expected_sha256" ]; then
@@ -2609,7 +2647,7 @@ atomic_publish_file_no_replace() {
   local source_parent_id
   local destination_parent_id
 
-  require_single_link_regular_file "$source_path" \
+  require_public_release_file "$source_path" \
     "Publication candidate" || return 1
   if ! valid_sha256 "$expected_sha256"; then
     echo "Publication candidate requires an exact expected SHA-256." >&2
@@ -2673,8 +2711,9 @@ atomic_publish_file_no_replace() {
       sub file_status {
         my ($handle) = @_;
         my @status = stat($handle);
-        die "publication file is not single-link regular content\n"
-          unless @status && S_ISREG($status[2]) && $status[3] == 1;
+        die "publication file is not single-link regular mode-0644 content\n"
+          unless @status && S_ISREG($status[2]) && $status[3] == 1
+            && (($status[2] & 07777) == 0644);
         return @status;
       }
       sub same_file {
@@ -2740,7 +2779,7 @@ atomic_publish_file_no_replace() {
     echo "Atomic publication left the candidate at its staging path." >&2
     return 1
   fi
-  require_single_link_regular_file "$destination_path" \
+  require_public_release_file "$destination_path" \
     "Atomic publication destination" || return 1
 }
 
@@ -2766,7 +2805,7 @@ write_release_sha256_sidecar_candidate() {
   fi
   release_sha256_sidecar_contents "$archive_sha256" "$archive_path" >"$sidecar_path"
   /bin/chmod 644 "$sidecar_path"
-  require_single_link_regular_file "$sidecar_path" \
+  require_public_release_file "$sidecar_path" \
     "SHA-256 sidecar candidate" || return 1
 }
 
@@ -2777,7 +2816,7 @@ verify_release_sha256_sidecar() {
   local expected_sidecar_sha256
   local actual_sidecar_sha256
 
-  require_single_link_regular_file "$sidecar_path" \
+  require_public_release_file "$sidecar_path" \
     "Published release SHA-256 sidecar" || return 1
   expected_sidecar_sha256="$(
     release_sha256_sidecar_contents "$archive_sha256" "$archive_path" \
@@ -2797,7 +2836,7 @@ verify_published_release_hash_evidence() {
   local expected_sha256="$3"
   local actual_sha256
 
-  require_single_link_regular_file "$archive_path" \
+  require_public_release_file "$archive_path" \
     "Published release archive" || return 1
   actual_sha256="$(release_tool_sha256 "$archive_path")"
   if [ "$actual_sha256" != "$expected_sha256" ]; then
@@ -2817,9 +2856,9 @@ verify_published_archive_matches_candidate() {
     echo "Exact immutable archive adoption requires two regular files and a valid digest." >&2
     return 1
   fi
-  require_single_link_regular_file "$candidate_path" \
+  require_public_release_file "$candidate_path" \
     "Verified archive candidate" || return 1
-  require_single_link_regular_file "$archive_path" \
+  require_public_release_file "$archive_path" \
     "Existing immutable archive" || return 1
   actual_sha256="$(release_tool_sha256 "$archive_path")"
   if [ "$actual_sha256" != "$expected_sha256" ] \
@@ -2837,9 +2876,9 @@ publish_sidecar_candidate_no_replace_or_adopt() {
   local sidecar_sha256
 
   if [ -e "$sidecar_path" ] || [ -L "$sidecar_path" ]; then
-    if ! require_single_link_regular_file "$sidecar_path" \
+    if ! require_public_release_file "$sidecar_path" \
       "Existing immutable SHA-256 sidecar" \
-      || ! require_single_link_regular_file "$candidate_path" \
+      || ! require_public_release_file "$candidate_path" \
         "Verified SHA-256 sidecar candidate" \
       || ! /usr/bin/cmp -s "$candidate_path" "$sidecar_path"; then
       echo "Existing immutable SHA-256 sidecar differs from the verified candidate." >&2
@@ -2859,9 +2898,9 @@ publish_sidecar_candidate_no_replace_or_adopt() {
   # The helper can report a directory-fsync failure after the no-replace
   # rename has already happened, or another publisher can win the race. Only
   # exact expected bytes are adoptable; no existing file is ever replaced.
-  if require_single_link_regular_file "$candidate_path" \
+  if require_public_release_file "$candidate_path" \
     "Verified SHA-256 sidecar candidate" 2>/dev/null; then
-    if ! require_single_link_regular_file "$sidecar_path" \
+    if ! require_public_release_file "$sidecar_path" \
       "Published SHA-256 sidecar" \
       || ! /usr/bin/cmp -s "$candidate_path" "$sidecar_path"; then
       return 1
@@ -2878,7 +2917,7 @@ publish_verified_release_pair() {
   local state
 
   if ! valid_sha256 "$expected_sha256" \
-    || ! require_single_link_regular_file "$archive_candidate" \
+    || ! require_public_release_file "$archive_candidate" \
       "Verified release archive candidate"; then
     echo "Verified release archive candidate is unavailable." >&2
     return 1
@@ -2893,11 +2932,11 @@ publish_verified_release_pair() {
     empty)
       if ! atomic_publish_file_no_replace \
         "$archive_candidate" "$ZIP_PATH" "$expected_sha256"; then
-        if require_single_link_regular_file "$archive_candidate" \
+        if require_public_release_file "$archive_candidate" \
           "Verified release archive candidate" 2>/dev/null; then
           verify_published_archive_matches_candidate \
             "$archive_candidate" "$ZIP_PATH" "$expected_sha256" || return 1
-        elif ! require_single_link_regular_file "$ZIP_PATH" \
+        elif ! require_public_release_file "$ZIP_PATH" \
           "Published release archive" \
           || [ "$(release_tool_sha256 "$ZIP_PATH")" != "$expected_sha256" ]; then
           return 1
@@ -2914,7 +2953,7 @@ publish_verified_release_pair() {
       ;;
   esac
 
-  if ! require_single_link_regular_file "$ZIP_PATH" \
+  if ! require_public_release_file "$ZIP_PATH" \
       "Published release archive" \
     || [ "$(release_tool_sha256 "$ZIP_PATH")" != "$expected_sha256" ]; then
     echo "Published release archive does not match the verified candidate digest." >&2
@@ -3436,12 +3475,13 @@ notarize_and_staple_bundle() {
   verify_release_notarization_tools_integrity
 }
 
-sanitized_zip() {
+sanitized_zip() (
+  umask 022
   /usr/bin/env -i \
     PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     COPYFILE_DISABLE=1 \
     /usr/bin/zip "$@"
-}
+)
 
 write_empty_entitlements_plist() {
   /bin/cat <<'PLIST'
@@ -3699,13 +3739,17 @@ require_info_plist_string() {
 verify_bundle_tree_entry_safety() {
   local bundle_dir="$1"
   local unsafe_entries="$STAGE_DIR/unsafe-bundle-entries.bin"
+  local directory_entries="$STAGE_DIR/directory-bundle-entries.bin"
   local regular_entries="$STAGE_DIR/regular-bundle-entries.bin"
+  local expected_executable="$bundle_dir/Contents/MacOS/$BINARY_NAME"
   local entry
+  local mode
 
   if [ ! -d "$bundle_dir" ] || [ -L "$bundle_dir" ]; then
     echo "Release bundle root must be a physical directory." >&2
     return 1
   fi
+  require_no_acl "$bundle_dir" "Release bundle root" || return 1
   if ! /usr/bin/find "$bundle_dir" -mindepth 1 \
     ! -type d ! -type f -print0 >"$unsafe_entries"; then
     echo "Unable to inspect release bundle entry types." >&2
@@ -3715,13 +3759,36 @@ verify_bundle_tree_entry_safety() {
     echo "Release bundle contains a link or special filesystem entry." >&2
     return 1
   fi
+  if ! /usr/bin/find "$bundle_dir" -type d -print0 >"$directory_entries"; then
+    echo "Unable to inspect release bundle directories." >&2
+    return 1
+  fi
+  while IFS= read -r -d '' entry; do
+    require_no_acl "$entry" "Release bundle directory" || return 1
+    mode="$(/usr/bin/stat -f '%Mp%Lp' "$entry" 2>/dev/null)" || return 1
+    if [ "$mode" != 0755 ]; then
+      echo "Release bundle directory does not have mode 0755: $entry" >&2
+      return 1
+    fi
+  done <"$directory_entries"
   if ! /usr/bin/find "$bundle_dir" -mindepth 1 -type f -print0 >"$regular_entries"; then
     echo "Unable to inspect release bundle regular files." >&2
     return 1
   fi
   while IFS= read -r -d '' entry; do
+    require_no_acl "$entry" "Release bundle file" || return 1
     if [ "$(/usr/bin/stat -f '%l' "$entry")" != 1 ]; then
       echo "Release bundle contains a multiply linked regular file: $entry" >&2
+      return 1
+    fi
+    mode="$(/usr/bin/stat -f '%Mp%Lp' "$entry" 2>/dev/null)" || return 1
+    if [ "$entry" = "$expected_executable" ]; then
+      if [ "$mode" != 0755 ]; then
+        echo "Release bundle main executable does not have mode 0755: $entry" >&2
+        return 1
+      fi
+    elif [ "$mode" != 0644 ]; then
+      echo "Release bundle non-executable file does not have mode 0644: $entry" >&2
       return 1
     fi
   done <"$regular_entries"
@@ -3870,7 +3937,7 @@ validate_archive_entries_from_open_session() {
         use warnings;
         use bytes;
 
-        my ($root) = @ARGV;
+        my ($root, $binary_name) = @ARGV;
         open my $zip, "<&=0" or die "open ZIP descriptor: $!\n";
         binmode($zip);
         my $size = -s $zip;
@@ -3995,6 +4062,11 @@ validate_archive_entries_from_open_session() {
           die "ZIP entry is a link or unsupported special file\n"
             unless ($directory && $file_type == 0040000)
               || (!$directory && $file_type == 0100000);
+          my $expected_mode = $directory ? 0040755
+            : ($logical_name eq "$root/Contents/MacOS/$binary_name"
+              ? 0100755 : 0100644);
+          die "ZIP entry has a non-canonical mode\n"
+            unless $mode == $expected_mode;
           die "directory ZIP entry contains data\n"
             if $directory && ($compressed_size != 0 || $uncompressed_size != 0 || $crc != 0);
 
@@ -4129,7 +4201,7 @@ validate_archive_entries_from_open_session() {
             if $actual_crc != $declared_crc;
         }
         close $zip or die "close ZIP descriptor: $!\n";
-      ' "$expected_root" <&7; then
+      ' "$expected_root" "$BINARY_NAME" <&7; then
     echo "Release archive failed structural preflight: $ARCHIVE_SESSION_PATH" >&2
     return 1
   fi
@@ -4553,6 +4625,10 @@ restore_and_verify_snapshot_execution() {
 }
 
 package_macos_main() {
+  # Every release-capable execution, including the committed snapshot child,
+  # starts from a deterministic creation mask. Exact mode allowlists below
+  # remain authoritative for staged, archived, extracted, and published data.
+  umask 022
   trap cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -4643,6 +4719,9 @@ package_macos_main() {
     sanitized_zip -r -X "$(/usr/bin/basename "$TMP_ZIP")" "$APP_NAME.app" \
       -x "*/.DS_Store" "*/._*" "__MACOSX/*" "*/__MACOSX/*" >/dev/null
   )
+  /bin/chmod 644 "$TMP_ZIP"
+  require_public_release_file "$TMP_ZIP" \
+    "Verified release archive candidate"
   verify_release_bundle_payload_baseline "$STAGED_BUNDLE"
 
   extract_and_verify_archive "$TMP_ZIP" candidate-extracted
