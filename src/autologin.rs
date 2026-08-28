@@ -266,11 +266,35 @@ pub(crate) fn request_accessibility_access_prompt() -> bool {
 pub(crate) fn open_accessibility_settings() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("/usr/bin/open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .status()?;
+        let mut command = std::process::Command::new("/usr/bin/open");
+        command
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+        let status = suppress_inherited_subprocess_output(&mut command)
+            .status()
+            .map_err(|error| anyhow::anyhow!("could not launch System Settings: {error}"))?;
+        ensure_accessibility_settings_opened(status.success())?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ensure_accessibility_settings_opened(success: bool) -> anyhow::Result<()> {
+    if !success {
+        anyhow::bail!("System Settings did not open Accessibility settings");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn suppress_inherited_subprocess_output(
+    command: &mut std::process::Command,
+) -> &mut std::process::Command {
+    command
+        // The full UI's stdin/stdout are protocol handles owned by its
+        // supervisor. Never leak either endpoint into a helper process.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
 }
 
 fn app_bundle_path_for_process(process_path: &str) -> Option<String> {
@@ -309,7 +333,10 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod accessibility_tests {
-    use super::app_bundle_path_for_process;
+    use super::{
+        app_bundle_path_for_process, ensure_accessibility_settings_opened,
+        suppress_inherited_subprocess_output,
+    };
 
     #[test]
     fn app_bundle_path_is_derived_from_bundled_executable() {
@@ -326,6 +353,51 @@ mod accessibility_tests {
         let path = "/tmp/project/target/debug/windows-app-autologin";
 
         assert_eq!(app_bundle_path_for_process(path), None);
+    }
+
+    #[test]
+    fn accessibility_settings_open_failure_is_not_silently_accepted() {
+        assert!(ensure_accessibility_settings_opened(true).is_ok());
+
+        let error = ensure_accessibility_settings_opened(false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not open Accessibility settings"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_subprocess_output_is_suppressed() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf protocol-contaminant; printf diagnostic-contaminant >&2");
+        let output = suppress_inherited_subprocess_output(&mut command)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inherited_subprocess_output_is_suppressed() {
+        let mut command = std::process::Command::new("cmd.exe");
+        command.args([
+            "/D",
+            "/Q",
+            "/C",
+            "(echo protocol-contaminant)&(echo diagnostic-contaminant 1>&2)",
+        ]);
+        let output = suppress_inherited_subprocess_output(&mut command)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
     }
 }
 

@@ -157,8 +157,20 @@ waal_assemble_app_bundle \
   "$BUILD_VERSION"
 
 if command -v codesign >/dev/null 2>&1; then
-  waal_codesign_development_bundle "$BUNDLE_DIR" "$BUNDLE_ID"
+  DEVELOPMENT_CODESIGN_IDENTITY="-"
+  if detected_identity="$(waal_development_codesign_identity)"; then
+    DEVELOPMENT_CODESIGN_IDENTITY="$detected_identity"
+  fi
+  waal_codesign_development_bundle \
+    "$BUNDLE_DIR" \
+    "$BUNDLE_ID" \
+    "$DEVELOPMENT_CODESIGN_IDENTITY"
   codesign --verify --strict "$BUNDLE_DIR"
+  if [ "$DEVELOPMENT_CODESIGN_IDENTITY" = "-" ]; then
+    echo "Development bundle uses a cdhash-bound ad-hoc signature; macOS permissions may need to be granted again after rebuilding." >&2
+  else
+    echo "Development bundle uses a stable local Developer ID signature; it is still not a publishable release." >&2
+  fi
 fi
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"

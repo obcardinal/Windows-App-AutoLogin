@@ -21,7 +21,7 @@ use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
@@ -645,7 +645,14 @@ fn run_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> anyhow::Result<std::process::Output> {
-    let mut child = command.spawn()?;
+    // The supervised settings UI reserves its inherited stdin/stdout for a
+    // private presentation protocol. Disconnect every helper stream here so a
+    // verifier cannot consume commands or emit bytes that look like ACKs.
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     let started = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
@@ -667,10 +674,27 @@ mod tests {
     use super::{
         code_sign_requirement_source, live_code_validation_flags, native_process_ids_with_reader,
         path_has_symlink_component, proc_pidpath_buffer_to_path, process_identities_from_pids,
-        static_code_validation_flags, trusted_process_infos_from_identities, valid_team_id,
-        CodeSignFlags, ProcessIdentity, TrustedIdentity,
+        run_command_with_timeout, static_code_validation_flags,
+        trusted_process_infos_from_identities, valid_team_id, CodeSignFlags, ProcessIdentity,
+        TrustedIdentity,
     };
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn timed_helper_process_suppresses_protocol_sensitive_output() {
+        let output = run_command_with_timeout(
+            Command::new("/bin/sh")
+                .args(["-c", "printf protocol-output; printf diagnostic-output >&2"]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
 
     #[test]
     fn untrusted_bundle_location_is_rejected_before_signature_check() {

@@ -219,25 +219,111 @@ waal_assemble_app_bundle() {
   )
 }
 
+waal_unique_developer_id_application_hash() {
+  local line candidate selected="" count=0
+  while IFS= read -r line; do
+    candidate="$(/usr/bin/printf '%s\n' "$line" | /usr/bin/awk '
+      index($0, "\"Developer ID Application:") { print $2 }
+    ')"
+    [ -n "$candidate" ] || continue
+    case "$candidate" in
+      *[!0-9A-Fa-f]*) continue ;;
+    esac
+    [ "${#candidate}" -eq 40 ] || continue
+    selected="$candidate"
+    count=$((count + 1))
+  done
+
+  [ "$count" -eq 1 ] || return 1
+  /usr/bin/printf '%s\n' "$selected"
+}
+
+waal_development_codesign_identity() {
+  if [ -n "${WAAL_DEVELOPMENT_CODESIGN_IDENTITY:-}" ]; then
+    /usr/bin/printf '%s\n' "$WAAL_DEVELOPMENT_CODESIGN_IDENTITY"
+    return 0
+  fi
+  [ -x /usr/bin/security ] || return 1
+
+  local identity_output
+  identity_output="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null)" \
+    || return 1
+  /usr/bin/printf '%s\n' "$identity_output" \
+    | waal_unique_developer_id_application_hash
+}
+
 waal_codesign_development_bundle() {
   local bundle_dir="$1"
   local bundle_id="$2"
-  local designated_requirement
+  local signing_identity="${3:--}"
+  local designated_requirement signature
 
-  /usr/bin/codesign \
-    --force \
-    --sign - \
-    --identifier "$bundle_id" \
-    "$bundle_dir"
+  if [ "$signing_identity" = "-" ]; then
+    /usr/bin/codesign \
+      --force \
+      --sign - \
+      --identifier "$bundle_id" \
+      "$bundle_dir"
+  else
+    /usr/bin/codesign \
+      --force \
+      --options runtime \
+      --timestamp=none \
+      --sign "$signing_identity" \
+      --identifier "$bundle_id" \
+      "$bundle_dir"
+  fi
 
   if ! designated_requirement="$(/usr/bin/codesign -d -r- "$bundle_dir" 2>&1)"; then
     echo "Unable to inspect the development bundle designated requirement." >&2
     return 1
   fi
-  case "$designated_requirement" in
-    *'designated => cdhash H"'*) ;;
+
+  if [ "$signing_identity" = "-" ]; then
+    case "$designated_requirement" in
+      *'designated => cdhash H"'*) ;;
+      *)
+        echo "Development ad-hoc signature is not cdhash-bound." >&2
+        return 1
+        ;;
+    esac
+    return 0
+  fi
+
+  if ! signature="$(/usr/bin/codesign -d --verbose=4 "$bundle_dir" 2>&1)"; then
+    echo "Unable to inspect the stable development signature." >&2
+    return 1
+  fi
+  case "$signature" in
+    *'Authority=Developer ID Application:'*'TeamIdentifier='*) ;;
     *)
-      echo "Development ad-hoc signature is not cdhash-bound." >&2
+      echo "Stable development signing requires a Developer ID Application identity." >&2
+      return 1
+      ;;
+  esac
+  case "$signature" in
+    *'TeamIdentifier=not set'*)
+      echo "Stable development signature is missing its Team ID." >&2
+      return 1
+      ;;
+  esac
+  case "$designated_requirement" in
+    *'designated => '*'anchor apple generic'*) ;;
+    *)
+      echo "Stable development signature is not anchored to Apple." >&2
+      return 1
+      ;;
+  esac
+  case "$designated_requirement" in
+    *'identifier "'"$bundle_id"'"'*) ;;
+    *)
+      echo "Stable development signature does not bind the expected bundle identifier." >&2
+      return 1
+      ;;
+  esac
+  case "$designated_requirement" in
+    *'cdhash H"'*)
+      echo "Stable development signature unexpectedly remains cdhash-bound." >&2
       return 1
       ;;
   esac
