@@ -64,18 +64,19 @@ impl WorkerInvalidator {
 
     pub(crate) fn pause_latch(&self) -> WorkerPauseLatch {
         WorkerPauseLatch {
-            paused: Arc::new(AtomicBool::new(false)),
+            pause_state: Arc::new(AtomicU64::new(0)),
             generation: self.generation.clone(),
-            pause_epoch: Arc::new(Mutex::new(0)),
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct WorkerPauseLatch {
-    paused: Arc<AtomicBool>,
+    // Packed as `(epoch << 1) | paused`. Keeping both values in one atomic
+    // lets a release compare-and-swap the exact epoch without a mutex and
+    // prevents an older release from reopening a newer safety pause.
+    pause_state: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
-    pause_epoch: Arc<Mutex<u64>>,
 }
 
 impl WorkerPauseLatch {
@@ -84,40 +85,60 @@ impl WorkerPauseLatch {
     }
 
     pub(crate) fn pause_with_epoch(&self) -> u64 {
-        let mut pause_epoch = self
-            .pause_epoch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *pause_epoch = pause_epoch.saturating_add(1);
-        // Close the start gate before publishing the cancellation generation.
-        // Stable admission snapshots and every automation guard check both
-        // values, so a post-pause generation can never be mistaken for a fresh
-        // unpaused attempt generation.
-        self.paused.store(true, Ordering::SeqCst);
-        // Every pause creates a new epoch and immediately cancels any password
-        // load or UI automation. A queued release from an older epoch cannot
-        // reopen the latch after a newer safety event.
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        *pause_epoch
+        const MAX_PAUSE_EPOCH: u64 = u64::MAX >> 1;
+        // Publishing `paused` is itself enough to reject every automation
+        // guard. Generation is advanced immediately before a successful
+        // release so no observer can ever see an open latch with a stale
+        // attempt generation.
+        loop {
+            let current = self.pause_state.load(Ordering::SeqCst);
+            let current_epoch = current >> 1;
+            // Never wrap: reusing an epoch would let a years-old release pass
+            // an ABA check. Exhaustion is a terminal fail-closed pause.
+            if current_epoch == MAX_PAUSE_EPOCH {
+                let terminal = (MAX_PAUSE_EPOCH << 1) | 1;
+                let _ = self.pause_state.compare_exchange(
+                    current,
+                    terminal,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                break MAX_PAUSE_EPOCH;
+            }
+            let next_epoch = current_epoch + 1;
+            let next = (next_epoch << 1) | 1;
+            if self
+                .pause_state
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break next_epoch;
+            }
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn current_epoch(&self) -> u64 {
-        *self
-            .pause_epoch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.pause_state.load(Ordering::SeqCst) >> 1
     }
 
-    fn resume_if_epoch(&self, expected_epoch: u64) -> bool {
-        let pause_epoch = self
-            .pause_epoch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *pause_epoch != expected_epoch {
+    pub(crate) fn resume_if_epoch(&self, expected_epoch: u64) -> bool {
+        let expected = (expected_epoch << 1) | 1;
+        const MAX_PAUSE_EPOCH: u64 = u64::MAX >> 1;
+        if expected_epoch == 0
+            || expected_epoch == MAX_PAUSE_EPOCH
+            || self.pause_state.load(Ordering::SeqCst) != expected
+        {
             return false;
         }
-        self.paused.store(false, Ordering::SeqCst);
-        true
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.pause_state
+            .compare_exchange(expected, expected - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub(crate) fn owns_pause(&self, expected_epoch: u64) -> bool {
+        expected_epoch != 0 && self.pause_state.load(Ordering::SeqCst) == (expected_epoch << 1) | 1
     }
 
     pub(crate) fn apply_config_command(
@@ -138,7 +159,7 @@ impl WorkerPauseLatch {
     }
 
     pub(crate) fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::SeqCst)
+        self.pause_state.load(Ordering::SeqCst) & 1 == 1
     }
 
     fn stable_unpaused_generation(&self) -> Option<u64> {
@@ -182,6 +203,9 @@ const AUTOMATION_SLEEP: Duration = Duration::from_millis(250);
 const PROMPT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_FALLBACK_PROMPT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const MACOS_RETRY_REARM_NO_PROMPT_OBSERVATIONS: u8 = 3;
+const MACOS_RETRY_REARM_PROCESS_EXIT_OBSERVATIONS: u8 = 2;
+const MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS: u8 = 3;
 const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const UNKNOWN_POLL_BACKOFF_MAX: Duration = Duration::from_secs(3);
 const PRE_PASSWORD_REPORT_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -490,6 +514,31 @@ fn reserve_prompt_retry_suppression(suppression: Option<&PromptRetrySuppression>
     true
 }
 
+fn release_prompt_retry_suppression_after_authenticated_success(
+    suppression: Option<&PromptRetrySuppression>,
+    report: &FillAttemptReport,
+) -> bool {
+    if !report.success || report.field("post_check_state") != Some("authenticated") {
+        return true;
+    }
+    let Some(suppression) = suppression else {
+        return true;
+    };
+    let Ok(mut prompts) = suppression.recent_prompt_attempts.lock() else {
+        return false;
+    };
+
+    // Suppression is checked account-wide for one visible prompt identity,
+    // not by the transient PID/window observations stored in the map key.
+    // Release that same account/email identity after authentication so a
+    // future connection can start a fresh retry episode.
+    prompts.retain(|attempted, _| {
+        attempted.account_id != suppression.prompt_key.account_id
+            || attempted.prompt_email != suppression.prompt_key.prompt_email
+    });
+    true
+}
+
 fn ensure_generation_current(
     generation: &AtomicU64,
     expected_generation: u64,
@@ -548,13 +597,16 @@ fn stable_status_backoff_max(status: &MonitorStatus) -> Option<Duration> {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn prompt_account_decision_allows_macos_probe(decision: &PromptAccountDecision<'_>) -> bool {
-    matches!(
-        decision,
-        PromptAccountDecision::MissingEmail
-            | PromptAccountDecision::NoEnabledMatch
-            | PromptAccountDecision::Ambiguous
-    )
+fn should_run_macos_fallback_prompt_probe(
+    prompt_attempt_started: bool,
+    monitor_snapshot_available: bool,
+    status_allows_probe: bool,
+    prompt_probe_due: bool,
+) -> bool {
+    !prompt_attempt_started
+        && !monitor_snapshot_available
+        && status_allows_probe
+        && prompt_probe_due
 }
 
 fn clear_recent_prompt_attempts(
@@ -565,31 +617,401 @@ fn clear_recent_prompt_attempts(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedProcessPresence {
+    Present,
+    Absent,
+    Indeterminate,
+}
+
+#[derive(Debug, Default)]
+struct DefinitiveProcessExitTracker {
+    consecutive_absence_by_pid: HashMap<i32, u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SuppressedSheetEpisode {
+    process_id: i32,
+    parent_window_title: String,
+}
+
+impl SuppressedSheetEpisode {
+    fn from_prompt_key(prompt_key: &LoginPromptKey) -> Option<Self> {
+        (prompt_key.prompt_origin == "sheet" && prompt_key.process_id > 0).then(|| Self {
+            process_id: prompt_key.process_id,
+            parent_window_title: prompt_key.window_title.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct DefinitiveSheetExitTracker {
+    consecutive_absence_by_episode: HashMap<SuppressedSheetEpisode, u8>,
+}
+
+impl DefinitiveSheetExitTracker {
+    fn reset(&mut self) {
+        self.consecutive_absence_by_episode.clear();
+    }
+
+    fn begin_tick(&mut self, suppressed_episodes: &[SuppressedSheetEpisode]) {
+        self.consecutive_absence_by_episode
+            .retain(|episode, _| suppressed_episodes.contains(episode));
+    }
+
+    fn observe(
+        &mut self,
+        episode: &SuppressedSheetEpisode,
+        presence: TrustedProcessPresence,
+        recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    ) -> bool {
+        match presence {
+            TrustedProcessPresence::Present | TrustedProcessPresence::Indeterminate => {
+                self.consecutive_absence_by_episode.remove(episode);
+                false
+            }
+            TrustedProcessPresence::Absent => {
+                let consecutive_absence = self
+                    .consecutive_absence_by_episode
+                    .entry(episode.clone())
+                    .or_default();
+                *consecutive_absence = consecutive_absence.saturating_add(1);
+                if *consecutive_absence < MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS {
+                    return false;
+                }
+
+                self.consecutive_absence_by_episode.remove(episode);
+                clear_recent_prompt_attempts_for_sheet_episode(recent_prompt_attempts, episode)
+            }
+        }
+    }
+}
+
+impl DefinitiveProcessExitTracker {
+    fn reset(&mut self) {
+        self.consecutive_absence_by_pid.clear();
+    }
+
+    fn begin_tick(&mut self, suppressed_process_ids: &[i32]) {
+        // Dropping evidence for PIDs no longer represented in the suppression
+        // map prevents a later PID reuse from inheriting an older episode.
+        self.consecutive_absence_by_pid
+            .retain(|process_id, _| suppressed_process_ids.contains(process_id));
+    }
+
+    fn observe(
+        &mut self,
+        process_id: i32,
+        presence: TrustedProcessPresence,
+        recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    ) -> bool {
+        match presence {
+            TrustedProcessPresence::Present | TrustedProcessPresence::Indeterminate => {
+                self.consecutive_absence_by_pid.remove(&process_id);
+                false
+            }
+            TrustedProcessPresence::Absent => {
+                let consecutive_absence = self
+                    .consecutive_absence_by_pid
+                    .entry(process_id)
+                    .or_default();
+                *consecutive_absence = consecutive_absence.saturating_add(1);
+                if *consecutive_absence < MACOS_RETRY_REARM_PROCESS_EXIT_OBSERVATIONS {
+                    return false;
+                }
+
+                self.consecutive_absence_by_pid.remove(&process_id);
+                clear_recent_prompt_attempts_for_process_id(recent_prompt_attempts, process_id)
+            }
+        }
+    }
+}
+
+fn clear_recent_prompt_attempts_for_process_id(
+    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    process_id: i32,
+) -> bool {
+    let Ok(mut prompts) = recent_prompt_attempts.lock() else {
+        return false;
+    };
+    let previous_len = prompts.len();
+    prompts.retain(|attempted, _| attempted.process_id != process_id);
+    prompts.len() != previous_len
+}
+
+fn clear_recent_prompt_attempts_for_sheet_episode(
+    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    episode: &SuppressedSheetEpisode,
+) -> bool {
+    let Ok(mut prompts) = recent_prompt_attempts.lock() else {
+        return false;
+    };
+    let previous_len = prompts.len();
+    prompts.retain(|attempted, _| {
+        attempted.process_id != episode.process_id
+            || attempted.window_title != episode.parent_window_title
+            || attempted.prompt_origin != "sheet"
+    });
+    prompts.len() != previous_len
+}
+
+#[cfg(target_os = "macos")]
+fn suppressed_prompt_keys(
+    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+) -> anyhow::Result<Vec<LoginPromptKey>> {
+    let prompts = recent_prompt_attempts
+        .lock()
+        .map_err(|_| anyhow::anyhow!("prompt retry suppression lock is poisoned"))?;
+    Ok(prompts.keys().cloned().collect())
+}
+
+#[cfg(target_os = "macos")]
+fn observe_suppressed_macos_episode_exits(
+    process_exit_tracker: &mut DefinitiveProcessExitTracker,
+    sheet_exit_tracker: &mut DefinitiveSheetExitTracker,
+    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    guard: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<(usize, usize)> {
+    guard()?;
+    // Snapshot under the mutex, then release it before any native identity
+    // probe. One sorted/deduplicated snapshot guarantees one probe per PID in
+    // this worker tick even if multiple prompt identities reference it.
+    let prompt_keys = suppressed_prompt_keys(recent_prompt_attempts)?;
+    let mut process_ids = prompt_keys
+        .iter()
+        .map(|attempted| attempted.process_id)
+        .filter(|process_id| *process_id > 0)
+        .collect::<Vec<_>>();
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    let mut sheet_episodes = prompt_keys
+        .iter()
+        .filter_map(SuppressedSheetEpisode::from_prompt_key)
+        .collect::<Vec<_>>();
+    sheet_episodes.sort_by(|left, right| {
+        left.process_id
+            .cmp(&right.process_id)
+            .then_with(|| left.parent_window_title.cmp(&right.parent_window_title))
+    });
+    sheet_episodes.dedup();
+    process_exit_tracker.begin_tick(&process_ids);
+    sheet_exit_tracker.begin_tick(&sheet_episodes);
+
+    let mut released_processes = 0;
+    let mut released_sheet_episodes = 0;
+    for process_id in process_ids {
+        guard()?;
+        let (process_presence, trusted_process) =
+            match crate::macos_identity::trusted_process_info_for_pid(
+                crate::config::TARGET_APP_NAME,
+                process_id,
+            ) {
+                Ok(Some(trusted_process)) => {
+                    (TrustedProcessPresence::Present, Some(trusted_process))
+                }
+                Ok(None) => (TrustedProcessPresence::Absent, None),
+                Err(error) => {
+                    debug!(
+                        process_id,
+                        reason = %error,
+                        "macOS suppressed-process identity probe was indeterminate"
+                    );
+                    (TrustedProcessPresence::Indeterminate, None)
+                }
+            };
+        // A pause or generation change while the native probe was running
+        // invalidates the observation before it can affect retry state.
+        guard()?;
+        if process_exit_tracker.observe(process_id, process_presence, recent_prompt_attempts) {
+            released_processes += 1;
+        }
+
+        for episode in sheet_episodes
+            .iter()
+            .filter(|episode| episode.process_id == process_id)
+        {
+            let sheet_presence = if let Some(trusted_process) = &trusted_process {
+                guard()?;
+                let result = crate::macos_ax::suppressed_sheet_episode_has_visible_direct_sheet(
+                    trusted_process,
+                    &episode.parent_window_title,
+                );
+                guard()?;
+                match result {
+                    Ok(true) => TrustedProcessPresence::Present,
+                    Ok(false) => TrustedProcessPresence::Absent,
+                    Err(error) => {
+                        debug!(
+                            process_id,
+                            parent_window_title = %episode.parent_window_title,
+                            reason = %error,
+                            "macOS suppressed-sheet observation was indeterminate"
+                        );
+                        TrustedProcessPresence::Indeterminate
+                    }
+                }
+            } else {
+                TrustedProcessPresence::Indeterminate
+            };
+            if sheet_exit_tracker.observe(episode, sheet_presence, recent_prompt_attempts) {
+                released_sheet_episodes += 1;
+            }
+        }
+    }
+
+    Ok((released_processes, released_sheet_episodes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosForegroundNoPromptEvidence {
+    process_id: i32,
+    window_title: String,
+}
+
+impl MacosForegroundNoPromptEvidence {
+    fn new(process_id: i32, window_title: &str) -> Self {
+        Self {
+            process_id,
+            window_title: canonical_prompt_component(window_title),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MacosNoPromptSnapshot<'a> {
+    process_found: bool,
+    target_process_id: Option<i32>,
+    target_window_title: Option<&'a str>,
+    target_frontmost: Option<bool>,
+    target_window_observed: bool,
+    selected_prompt_present: bool,
+    prompt_candidate_count: usize,
+}
+
+fn macos_foreground_no_prompt_evidence(
+    snapshot: MacosNoPromptSnapshot<'_>,
+) -> Option<MacosForegroundNoPromptEvidence> {
+    if !snapshot.process_found
+        || snapshot.target_frontmost != Some(true)
+        || !snapshot.target_window_observed
+        || snapshot.selected_prompt_present
+        || snapshot.prompt_candidate_count != 0
+    {
+        return None;
+    }
+
+    let process_id = snapshot
+        .target_process_id
+        .filter(|process_id| *process_id > 0)?;
+    Some(MacosForegroundNoPromptEvidence::new(
+        process_id,
+        snapshot.target_window_title?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_foreground_no_prompt_evidence_from_monitor_snapshot(
+    snapshot: &crate::monitor::MacosMonitorSnapshot,
+) -> Option<MacosForegroundNoPromptEvidence> {
+    macos_foreground_no_prompt_evidence(MacosNoPromptSnapshot {
+        process_found: snapshot.process_found,
+        target_process_id: snapshot.target_process_id,
+        target_window_title: snapshot.target_window_title.as_deref(),
+        target_frontmost: snapshot.target_frontmost,
+        target_window_observed: snapshot.target_window_observed,
+        selected_prompt_present: snapshot.selected_prompt_present,
+        prompt_candidate_count: snapshot.prompt_candidate_count,
+    })
+}
+
+fn clear_recent_prompt_attempts_for_macos_foreground_window(
+    recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    evidence: &MacosForegroundNoPromptEvidence,
+) -> bool {
+    let Ok(mut prompts) = recent_prompt_attempts.lock() else {
+        return false;
+    };
+    // First bind the foreground no-prompt proof to a reserved prompt from the
+    // same trusted process and parent window. Then release that prompt's
+    // account/email identity across transient window observations, matching
+    // the account-wide suppression predicate.
+    let identities = prompts
+        .keys()
+        .filter(|attempted| {
+            attempted.process_id == evidence.process_id
+                && attempted.window_title == evidence.window_title
+        })
+        .map(|attempted| (attempted.account_id.clone(), attempted.prompt_email.clone()))
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        return false;
+    }
+
+    let previous_len = prompts.len();
+    prompts.retain(|attempted, _| {
+        !identities.iter().any(|(account_id, prompt_email)| {
+            attempted.account_id == *account_id && attempted.prompt_email == *prompt_email
+        })
+    });
+    prompts.len() != previous_len
+}
+
 #[derive(Debug, Default)]
 struct DefinitiveNoPromptTracker {
     consecutive_polls: u8,
+    macos_foreground_evidence: Option<MacosForegroundNoPromptEvidence>,
 }
 
 impl DefinitiveNoPromptTracker {
-    fn observe_prompt(&mut self) {
+    fn reset(&mut self) {
         self.consecutive_polls = 0;
+        self.macos_foreground_evidence = None;
+    }
+
+    fn observe_prompt(&mut self) {
+        self.reset();
     }
 
     fn observe_indeterminate(&mut self) {
-        self.consecutive_polls = 0;
+        self.reset();
     }
 
     fn observe_definitive_no_prompt(
         &mut self,
         recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
     ) -> bool {
+        if self.macos_foreground_evidence.is_some() {
+            self.reset();
+        }
         self.consecutive_polls = self.consecutive_polls.saturating_add(1);
         if self.consecutive_polls < 2 {
             return false;
         }
         clear_recent_prompt_attempts(recent_prompt_attempts);
-        self.consecutive_polls = 0;
+        self.reset();
         true
+    }
+
+    fn observe_macos_foreground_no_prompt(
+        &mut self,
+        evidence: MacosForegroundNoPromptEvidence,
+        recent_prompt_attempts: &Arc<Mutex<HashMap<LoginPromptKey, Instant>>>,
+    ) -> bool {
+        if self.macos_foreground_evidence.as_ref() != Some(&evidence) {
+            self.reset();
+            self.macos_foreground_evidence = Some(evidence.clone());
+        }
+        self.consecutive_polls = self.consecutive_polls.saturating_add(1);
+        if self.consecutive_polls < MACOS_RETRY_REARM_NO_PROMPT_OBSERVATIONS {
+            return false;
+        }
+
+        let released = clear_recent_prompt_attempts_for_macos_foreground_window(
+            recent_prompt_attempts,
+            &evidence,
+        );
+        self.reset();
+        released
     }
 }
 
@@ -769,7 +1191,7 @@ async fn handle_command(
             start_monitor,
             pause_epoch,
         } => {
-            if pause_latch.current_epoch() != pause_epoch {
+            if !pause_latch.owns_pause(pause_epoch) {
                 warn!("Stale worker config and pause release ignored after a newer safety event");
                 return;
             }
@@ -995,7 +1417,7 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                 pause_latch,
                 expected_generation,
                 prompt_context,
-                prompt_retry_suppression: _,
+                prompt_retry_suppression,
                 activity_tracker: _,
                 ..
             } = job;
@@ -1010,6 +1432,12 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                         .ensure_attempt_current(expected_generation, "accounts/settings changed")
                 },
             );
+            if !release_prompt_retry_suppression_after_authenticated_success(
+                prompt_retry_suppression.as_ref(),
+                &report,
+            ) {
+                warn!("Could not release retry suppression after authenticated fill attempt");
+            }
             if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
                 warn!("Could not persist fill attempt report: {e}");
             }
@@ -1054,6 +1482,10 @@ pub(crate) fn spawn(
         let mut last_macos_prompt_probe: Option<Instant> = None;
         let mut poll_cadence = PollCadence::default();
         let mut no_prompt_tracker = DefinitiveNoPromptTracker::default();
+        #[cfg(target_os = "macos")]
+        let mut process_exit_tracker = DefinitiveProcessExitTracker::default();
+        #[cfg(target_os = "macos")]
+        let mut sheet_exit_tracker = DefinitiveSheetExitTracker::default();
         let mut pre_password_report_persistence = PrePasswordReportPersistence::default();
         let mut pre_password_generation = generation.load(Ordering::SeqCst);
 
@@ -1075,7 +1507,12 @@ pub(crate) fn spawn(
             }
 
             if !running {
-                no_prompt_tracker.consecutive_polls = 0;
+                no_prompt_tracker.reset();
+                #[cfg(target_os = "macos")]
+                {
+                    process_exit_tracker.reset();
+                    sheet_exit_tracker.reset();
+                }
                 pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
                     IDLE_SLEEP,
@@ -1100,7 +1537,12 @@ pub(crate) fn spawn(
                 continue;
             };
             if current_generation != pre_password_generation {
-                no_prompt_tracker.consecutive_polls = 0;
+                no_prompt_tracker.reset();
+                #[cfg(target_os = "macos")]
+                {
+                    process_exit_tracker.reset();
+                    sheet_exit_tracker.reset();
+                }
                 pre_password_report_persistence.reset_observed_state();
                 pre_password_generation = current_generation;
             }
@@ -1151,12 +1593,61 @@ pub(crate) fn spawn(
 
             let monitor = AppMonitor::new(runtime_config(&settings));
             let tick_start = Instant::now();
+            #[cfg(target_os = "macos")]
+            match observe_suppressed_macos_episode_exits(
+                &mut process_exit_tracker,
+                &mut sheet_exit_tracker,
+                &recent_prompt_attempts,
+                || {
+                    pause_latch.ensure_attempt_current(
+                        current_generation,
+                        "accounts/settings changed during suppressed-process probe",
+                    )
+                },
+            ) {
+                Ok((released_processes, released_sheet_episodes))
+                    if released_processes > 0 || released_sheet_episodes > 0 =>
+                {
+                    debug!(
+                        released_processes,
+                        released_sheet_episodes,
+                        "macOS prompt retry suppression re-armed after confirmed episode exit"
+                    );
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    process_exit_tracker.reset();
+                    sheet_exit_tracker.reset();
+                    debug!(
+                        reason = %reason,
+                        "macOS suppressed-process probe was cancelled"
+                    );
+                    continue;
+                }
+            }
             #[cfg(target_os = "windows")]
             let status_check_start = Instant::now();
+            #[cfg(target_os = "macos")]
+            let (monitor_observation, macos_monitor_snapshot_this_tick) =
+                monitor.check_status_with_snapshot();
+            #[cfg(target_os = "macos")]
+            if let Err(reason) = pause_latch.ensure_attempt_current(
+                current_generation,
+                "accounts/settings changed during macOS monitor inspection",
+            ) {
+                no_prompt_tracker.reset();
+                debug!(
+                    reason = %reason,
+                    "macOS monitor snapshot was cancelled before it could affect automation state"
+                );
+                continue;
+            }
+            #[cfg(not(target_os = "macos"))]
+            let monitor_observation = monitor.check_status();
             let MonitorObservation {
                 status,
                 definitive_no_prompt,
-            } = monitor.check_status();
+            } = monitor_observation;
             #[cfg(target_os = "windows")]
             let monitor_check_ms = status_check_start.elapsed().as_millis();
             let status_poll_delay = poll_cadence.next_delay(&settings, &status);
@@ -1185,9 +1676,7 @@ pub(crate) fn spawn(
             );
 
             #[cfg(target_os = "macos")]
-            let mut status_allows_macos_probe = !matches!(status, MonitorStatus::ProcessNotFound);
-            #[cfg(target_os = "macos")]
-            let mut force_macos_prompt_probe = false;
+            let status_allows_macos_probe = matches!(status, MonitorStatus::Unknown);
             #[cfg(target_os = "macos")]
             let mut prompt_attempt_started = false;
             pre_password_report_persistence.begin_poll_tick();
@@ -1195,6 +1684,23 @@ pub(crate) fn spawn(
             #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut definitive_no_prompt_this_tick = definitive_no_prompt;
             let mut prompt_observed_this_tick = false;
+            #[cfg(target_os = "macos")]
+            let macos_foreground_no_prompt_evidence_this_tick = macos_monitor_snapshot_this_tick
+                .as_ref()
+                .and_then(macos_foreground_no_prompt_evidence_from_monitor_snapshot);
+            #[cfg(not(target_os = "macos"))]
+            let macos_foreground_no_prompt_evidence_this_tick = None;
+
+            #[cfg(target_os = "macos")]
+            if macos_monitor_snapshot_this_tick
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.prompt_candidate_count == 0)
+            {
+                // This is the same complete prompt-negative observation that
+                // the old fallback probe reported, now reused without another
+                // process/signature/AX traversal.
+                pre_password_report_persistence.observe_no_prompt();
+            }
 
             match status {
                 MonitorStatus::Connected => {}
@@ -1215,11 +1721,6 @@ pub(crate) fn spawn(
                     no_prompt_tracker.observe_prompt();
                     let account_decision =
                         account_for_visible_prompt_email(&accounts, prompt_email.as_deref());
-                    #[cfg(target_os = "macos")]
-                    if prompt_account_decision_allows_macos_probe(&account_decision) {
-                        status_allows_macos_probe = true;
-                        force_macos_prompt_probe = true;
-                    }
 
                     match account_decision {
                         PromptAccountDecision::Allow(account) => {
@@ -1283,7 +1784,6 @@ pub(crate) fn spawn(
                                     #[cfg(target_os = "macos")]
                                     {
                                         prompt_attempt_started = true;
-                                        last_macos_prompt_probe = Some(Instant::now());
                                     }
                                     let _ = event_tx.try_send(log_event(
                                         LogLevel::Info,
@@ -1345,16 +1845,33 @@ pub(crate) fn spawn(
                 let prompt_probe_due = last_macos_prompt_probe
                     .map(|attempt| attempt.elapsed() >= MACOS_FALLBACK_PROMPT_PROBE_INTERVAL)
                     .unwrap_or(true);
-                if !prompt_attempt_started
-                    && status_allows_macos_probe
-                    && (prompt_probe_due || force_macos_prompt_probe)
-                {
+                if should_run_macos_fallback_prompt_probe(
+                    prompt_attempt_started,
+                    macos_monitor_snapshot_this_tick.is_some(),
+                    status_allows_macos_probe,
+                    prompt_probe_due,
+                ) {
                     let now = Instant::now();
                     last_macos_prompt_probe = Some(now);
-                    match debug_fill::detect_current_prompt_context(&accounts, || {
-                        pause_latch
-                            .ensure_attempt_current(current_generation, "accounts/settings changed")
-                    }) {
+                    let prompt_probe_result =
+                        debug_fill::detect_current_prompt_context(&accounts, || {
+                            pause_latch.ensure_attempt_current(
+                                current_generation,
+                                "accounts/settings changed",
+                            )
+                        });
+                    if let Err(reason) = pause_latch.ensure_attempt_current(
+                        current_generation,
+                        "accounts/settings changed during macOS fallback prompt inspection",
+                    ) {
+                        no_prompt_tracker.reset();
+                        debug!(
+                            reason = %reason,
+                            "macOS fallback prompt snapshot was cancelled before it could affect automation state"
+                        );
+                        continue;
+                    }
+                    match prompt_probe_result {
                         Ok(Some(prompt_context)) => {
                             prompt_observed_this_tick = true;
                             definitive_no_prompt_this_tick = false;
@@ -1425,8 +1942,9 @@ pub(crate) fn spawn(
                         }
                         Ok(None) => {
                             pre_password_report_persistence.observe_no_prompt();
+                            definitive_no_prompt_this_tick = false;
                             trace!(
-                                "macOS foreground-only preflight found no prompt; suppression remains until process exit"
+                                "macOS fallback found no prompt after the monitor inspection failed; observation remains indeterminate"
                             );
                         }
                         Err(reason) => {
@@ -1448,6 +1966,14 @@ pub(crate) fn spawn(
 
             if prompt_observed_this_tick {
                 no_prompt_tracker.observe_prompt();
+            } else if let Some(evidence) = macos_foreground_no_prompt_evidence_this_tick {
+                if no_prompt_tracker
+                    .observe_macos_foreground_no_prompt(evidence, &recent_prompt_attempts)
+                {
+                    debug!(
+                        "macOS prompt retry suppression re-armed after repeated foreground no-prompt observations"
+                    );
+                }
             } else if definitive_no_prompt_this_tick {
                 no_prompt_tracker.observe_definitive_no_prompt(&recent_prompt_attempts);
             } else {
@@ -1497,13 +2023,18 @@ pub(crate) fn spawn(
 mod tests {
     use super::{
         account_for_visible_prompt_email, ensure_generation_current, handle_command,
-        prompt_account_decision_allows_macos_probe, prompt_retry_is_suppressed,
-        reserve_prompt_retry_suppression, wait_or_handle_command, DefinitiveNoPromptTracker,
-        LoginPromptKey, MonitorStatus, PollCadence, PrePasswordReportPersistence,
-        PromptAccountDecision, PromptRetrySuppression, WorkerActivityTracker, WorkerCommand,
-        WorkerEvent, WorkerInvalidator, WorkerPauseLatch, WorkerQuiescenceAck,
-        MACOS_FALLBACK_PROMPT_PROBE_INTERVAL, PRE_PASSWORD_REPORT_PERSIST_INTERVAL,
-        PROMPT_STATUS_POLL_INTERVAL,
+        macos_foreground_no_prompt_evidence, prompt_retry_is_suppressed,
+        release_prompt_retry_suppression_after_authenticated_success,
+        reserve_prompt_retry_suppression, should_run_macos_fallback_prompt_probe,
+        wait_or_handle_command, DefinitiveNoPromptTracker, DefinitiveProcessExitTracker,
+        DefinitiveSheetExitTracker, LoginPromptKey, MacosForegroundNoPromptEvidence,
+        MacosNoPromptSnapshot, MonitorStatus, PollCadence, PrePasswordReportPersistence,
+        PromptAccountDecision, PromptRetrySuppression, SuppressedSheetEpisode,
+        TrustedProcessPresence, WorkerActivityTracker, WorkerCommand, WorkerEvent,
+        WorkerInvalidator, WorkerPauseLatch, WorkerQuiescenceAck,
+        MACOS_FALLBACK_PROMPT_PROBE_INTERVAL, MACOS_RETRY_REARM_NO_PROMPT_OBSERVATIONS,
+        MACOS_RETRY_REARM_PROCESS_EXIT_OBSERVATIONS, MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS,
+        PRE_PASSWORD_REPORT_PERSIST_INTERVAL, PROMPT_STATUS_POLL_INTERVAL,
     };
     use crate::debug_fill;
     use crate::models::{Account, AppSettings, WorkerStatus};
@@ -1581,21 +2112,67 @@ mod tests {
     }
 
     #[test]
-    fn macos_probe_fallback_rechecks_monitor_account_eligibility_misses() {
-        let account = account("account-1", "user@example.com", true);
+    fn macos_successful_monitor_snapshot_prevents_redundant_fallback_probe() {
+        assert!(!should_run_macos_fallback_prompt_probe(
+            false, true, true, true
+        ));
+        assert!(should_run_macos_fallback_prompt_probe(
+            false, false, true, true
+        ));
+        assert!(!should_run_macos_fallback_prompt_probe(
+            true, false, true, true
+        ));
+        assert!(!should_run_macos_fallback_prompt_probe(
+            false, false, false, true
+        ));
+        assert!(!should_run_macos_fallback_prompt_probe(
+            false, false, true, false
+        ));
+    }
 
-        assert!(!prompt_account_decision_allows_macos_probe(
-            &PromptAccountDecision::Allow(&account)
-        ));
-        assert!(prompt_account_decision_allows_macos_probe(
-            &PromptAccountDecision::MissingEmail
-        ));
-        assert!(prompt_account_decision_allows_macos_probe(
-            &PromptAccountDecision::NoEnabledMatch
-        ));
-        assert!(prompt_account_decision_allows_macos_probe(
-            &PromptAccountDecision::Ambiguous
-        ));
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_monitor_snapshot_rearms_only_complete_unambiguous_no_prompt() {
+        let mut snapshot = crate::monitor::MacosMonitorSnapshot {
+            process_found: true,
+            target_process_id: Some(42),
+            target_window_title: Some("Sign in".to_string()),
+            target_frontmost: Some(true),
+            target_window_observed: true,
+            selected_prompt_present: false,
+            prompt_candidate_count: 0,
+        };
+
+        assert_eq!(
+            super::macos_foreground_no_prompt_evidence_from_monitor_snapshot(&snapshot),
+            Some(MacosForegroundNoPromptEvidence::new(42, "Sign in"))
+        );
+
+        snapshot.prompt_candidate_count = 2;
+        assert_eq!(
+            super::macos_foreground_no_prompt_evidence_from_monitor_snapshot(&snapshot),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_worker_reuses_monitor_snapshot_for_no_prompt_evidence() {
+        let implementation = include_str!("mod.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            implementation
+                .matches("monitor.check_status_with_snapshot()")
+                .count(),
+            1
+        );
+        assert!(
+            implementation.contains("macos_foreground_no_prompt_evidence_from_monitor_snapshot")
+        );
+        assert!(!implementation.contains("complete_macos_foreground_no_prompt_evidence"));
+        assert!(!implementation.contains("crate::macos_ax::inspect("));
     }
 
     #[test]
@@ -1885,6 +2462,141 @@ mod tests {
     }
 
     #[test]
+    fn macos_replacement_prompt_rearms_after_original_process_exit() {
+        assert_eq!(MACOS_RETRY_REARM_PROCESS_EXIT_OBSERVATIONS, 2);
+        let original_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let replacement_key = make_prompt_key("account-1", 84, "Replacement", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(
+            original_key.clone(),
+            Instant::now(),
+        )])));
+        let mut tracker = DefinitiveProcessExitTracker::default();
+
+        tracker.begin_tick(&[42]);
+        assert!(!tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &replacement_key,
+        ));
+
+        // Merely observing the replacement prompt does not reset exit
+        // evidence for the original process episode.
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &replacement_key,
+        ));
+        tracker.begin_tick(&[42]);
+        assert!(tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+
+        let attempts = attempts.lock().unwrap();
+        assert!(!attempts.contains_key(&original_key));
+        assert!(!prompt_retry_is_suppressed(&attempts, &replacement_key));
+    }
+
+    #[test]
+    fn macos_indeterminate_process_presence_resets_exit_evidence() {
+        let original_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(
+            original_key.clone(),
+            Instant::now(),
+        )])));
+        let mut tracker = DefinitiveProcessExitTracker::default();
+
+        tracker.begin_tick(&[42]);
+        assert!(!tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+        tracker.begin_tick(&[42]);
+        assert!(!tracker.observe(42, TrustedProcessPresence::Indeterminate, &attempts));
+        tracker.begin_tick(&[42]);
+        assert!(!tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+        assert!(attempts.lock().unwrap().contains_key(&original_key));
+
+        tracker.begin_tick(&[42]);
+        assert!(tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+        assert!(attempts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn macos_exited_pid_release_preserves_live_same_identity_suppression() {
+        let exited_key = make_prompt_key("account-1", 42, "Old", "user@example.com");
+        let live_key = make_prompt_key("account-1", 84, "Current", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([
+            (exited_key.clone(), Instant::now()),
+            (live_key.clone(), Instant::now()),
+        ])));
+        let mut tracker = DefinitiveProcessExitTracker::default();
+
+        tracker.begin_tick(&[42, 84]);
+        assert!(!tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+        assert!(!tracker.observe(84, TrustedProcessPresence::Present, &attempts));
+        tracker.begin_tick(&[42, 84]);
+        assert!(tracker.observe(42, TrustedProcessPresence::Absent, &attempts));
+        assert!(!tracker.observe(84, TrustedProcessPresence::Present, &attempts));
+
+        let attempts = attempts.lock().unwrap();
+        assert!(!attempts.contains_key(&exited_key));
+        assert!(attempts.contains_key(&live_key));
+        assert!(prompt_retry_is_suppressed(&attempts, &live_key));
+    }
+
+    #[test]
+    fn macos_same_pid_replacement_prompt_rearms_after_original_sheet_exit() {
+        assert_eq!(MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS, 3);
+        let original_key =
+            make_sheet_prompt_key("account-1", 42, "Original resource", "user@example.com");
+        let replacement_key =
+            make_sheet_prompt_key("account-1", 42, "Other resource", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(
+            original_key.clone(),
+            Instant::now(),
+        )])));
+        let original_episode = SuppressedSheetEpisode::from_prompt_key(&original_key).unwrap();
+        let mut tracker = DefinitiveSheetExitTracker::default();
+
+        for _ in 1..MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS {
+            tracker.begin_tick(std::slice::from_ref(&original_episode));
+            assert!(!tracker.observe(&original_episode, TrustedProcessPresence::Absent, &attempts,));
+            // A prompt on another foreground parent in the same live PID must
+            // not reset absence evidence for the original attached sheet.
+            assert!(prompt_retry_is_suppressed(
+                &attempts.lock().unwrap(),
+                &replacement_key,
+            ));
+        }
+
+        tracker.begin_tick(std::slice::from_ref(&original_episode));
+        assert!(tracker.observe(&original_episode, TrustedProcessPresence::Absent, &attempts,));
+        let attempts = attempts.lock().unwrap();
+        assert!(!attempts.contains_key(&original_key));
+        assert!(!prompt_retry_is_suppressed(&attempts, &replacement_key));
+    }
+
+    #[test]
+    fn macos_visible_or_ambiguous_original_sheet_never_releases_suppression() {
+        let original_key =
+            make_sheet_prompt_key("account-1", 42, "Original resource", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(
+            original_key.clone(),
+            Instant::now(),
+        )])));
+        let episode = SuppressedSheetEpisode::from_prompt_key(&original_key).unwrap();
+        let mut tracker = DefinitiveSheetExitTracker::default();
+
+        for presence in [
+            TrustedProcessPresence::Absent,
+            TrustedProcessPresence::Absent,
+            TrustedProcessPresence::Present,
+            TrustedProcessPresence::Absent,
+            TrustedProcessPresence::Absent,
+            TrustedProcessPresence::Indeterminate,
+        ] {
+            tracker.begin_tick(std::slice::from_ref(&episode));
+            assert!(!tracker.observe(&episode, presence, &attempts));
+        }
+
+        assert!(attempts.lock().unwrap().contains_key(&original_key));
+    }
+
+    #[test]
     fn suppression_rearms_only_after_two_definitive_no_prompt_polls() {
         let key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
         let attempts = Arc::new(Mutex::new(HashMap::from([(key.clone(), Instant::now())])));
@@ -1902,6 +2614,166 @@ mod tests {
     }
 
     #[test]
+    fn windows_closed_session_rearms_a_new_same_account_prompt_after_complete_no_prompt_polls() {
+        let original_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let next_connection_key = make_prompt_key("account-1", 84, "Sign in", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(original_key, Instant::now())])));
+        let mut tracker = DefinitiveNoPromptTracker::default();
+
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &next_connection_key
+        ));
+        assert!(!tracker.observe_definitive_no_prompt(&attempts));
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &next_connection_key
+        ));
+        assert!(tracker.observe_definitive_no_prompt(&attempts));
+        assert!(!prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &next_connection_key
+        ));
+    }
+
+    #[test]
+    fn macos_no_prompt_evidence_requires_complete_foreground_snapshot() {
+        let complete = MacosNoPromptSnapshot {
+            process_found: true,
+            target_process_id: Some(42),
+            target_window_title: Some("Sign in"),
+            target_frontmost: Some(true),
+            target_window_observed: true,
+            selected_prompt_present: false,
+            prompt_candidate_count: 0,
+        };
+
+        assert_eq!(
+            macos_foreground_no_prompt_evidence(complete),
+            Some(MacosForegroundNoPromptEvidence::new(42, "Sign in"))
+        );
+
+        for incomplete in [
+            MacosNoPromptSnapshot {
+                process_found: false,
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                target_process_id: None,
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                target_process_id: Some(0),
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                target_window_title: None,
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                target_frontmost: None,
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                target_frontmost: Some(false),
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                target_window_observed: false,
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                selected_prompt_present: true,
+                ..complete
+            },
+            MacosNoPromptSnapshot {
+                prompt_candidate_count: 1,
+                ..complete
+            },
+        ] {
+            assert_eq!(macos_foreground_no_prompt_evidence(incomplete), None);
+        }
+    }
+
+    #[test]
+    fn macos_suppression_rearms_after_three_same_foreground_no_prompt_observations() {
+        assert_eq!(MACOS_RETRY_REARM_NO_PROMPT_OBSERVATIONS, 3);
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let same_identity_transient_window =
+            make_prompt_key("account-1", 84, "Other", "user@example.com");
+        let unrelated_key = make_prompt_key("account-2", 99, "Other", "other@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([
+            (prompt_key.clone(), Instant::now()),
+            (same_identity_transient_window, Instant::now()),
+            (unrelated_key.clone(), Instant::now()),
+        ])));
+        let evidence = MacosForegroundNoPromptEvidence::new(42, " SIGN IN ");
+        let mut tracker = DefinitiveNoPromptTracker::default();
+
+        assert!(!tracker.observe_macos_foreground_no_prompt(evidence.clone(), &attempts));
+        assert!(!tracker.observe_macos_foreground_no_prompt(evidence.clone(), &attempts));
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &prompt_key
+        ));
+
+        assert!(tracker.observe_macos_foreground_no_prompt(evidence, &attempts));
+        let attempts = attempts.lock().unwrap();
+        assert!(!prompt_retry_is_suppressed(&attempts, &prompt_key));
+        assert!(attempts.contains_key(&unrelated_key));
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[test]
+    fn macos_suppression_evidence_resets_on_indeterminate_prompt_or_window_change() {
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(
+            prompt_key.clone(),
+            Instant::now(),
+        )])));
+        let original_window = MacosForegroundNoPromptEvidence::new(42, "Sign in");
+        let other_window = MacosForegroundNoPromptEvidence::new(42, "Devices");
+        let mut tracker = DefinitiveNoPromptTracker::default();
+
+        assert!(!tracker.observe_macos_foreground_no_prompt(original_window.clone(), &attempts));
+        assert!(!tracker.observe_macos_foreground_no_prompt(original_window.clone(), &attempts));
+        assert!(!tracker.observe_macos_foreground_no_prompt(other_window, &attempts));
+        assert!(!tracker.observe_macos_foreground_no_prompt(original_window.clone(), &attempts));
+        tracker.observe_indeterminate();
+        assert!(!tracker.observe_macos_foreground_no_prompt(original_window.clone(), &attempts));
+        tracker.observe_prompt();
+        assert!(!tracker.observe_macos_foreground_no_prompt(original_window.clone(), &attempts));
+        assert!(!tracker.observe_macos_foreground_no_prompt(original_window.clone(), &attempts));
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &prompt_key
+        ));
+
+        assert!(tracker.observe_macos_foreground_no_prompt(original_window, &attempts));
+        assert!(attempts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn macos_no_prompt_from_different_window_never_releases_reserved_identity() {
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([(
+            prompt_key.clone(),
+            Instant::now(),
+        )])));
+        let other_window = MacosForegroundNoPromptEvidence::new(42, "Devices");
+        let mut tracker = DefinitiveNoPromptTracker::default();
+
+        for _ in 0..MACOS_RETRY_REARM_NO_PROMPT_OBSERVATIONS {
+            tracker.observe_macos_foreground_no_prompt(other_window.clone(), &attempts);
+        }
+
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &prompt_key
+        ));
+    }
+
+    #[test]
     fn prompt_retry_suppression_reserves_before_attempt_start() {
         let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
         let attempts = Arc::new(Mutex::new(HashMap::new()));
@@ -1912,6 +2784,84 @@ mod tests {
 
         assert!(reserve_prompt_retry_suppression(Some(&suppression)));
         assert!(attempts.lock().unwrap().contains_key(&prompt_key));
+    }
+
+    #[test]
+    fn authenticated_success_releases_the_reserved_prompt_identity() {
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let same_identity_other_window =
+            make_prompt_key("account-1", 84, "Other desktop", "user@example.com");
+        let unrelated_key = make_prompt_key("account-2", 43, "Sign in", "other@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::from([
+            (prompt_key.clone(), Instant::now()),
+            (same_identity_other_window, Instant::now()),
+            (unrelated_key.clone(), Instant::now()),
+        ])));
+        let suppression = PromptRetrySuppression {
+            recent_prompt_attempts: attempts.clone(),
+            prompt_key: prompt_key.clone(),
+        };
+        let report = debug_fill::FillAttemptReport {
+            fields: vec![("post_check_state".to_string(), "authenticated".to_string())],
+            success: true,
+            failure_reason: None,
+        };
+
+        assert!(
+            release_prompt_retry_suppression_after_authenticated_success(
+                Some(&suppression),
+                &report,
+            )
+        );
+        let attempts = attempts.lock().unwrap();
+        assert!(!prompt_retry_is_suppressed(&attempts, &prompt_key));
+        assert!(attempts.contains_key(&unrelated_key));
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[test]
+    fn failed_or_unauthenticated_reports_retain_prompt_retry_suppression() {
+        for report in [
+            debug_fill::FillAttemptReport {
+                fields: vec![("post_check_state".to_string(), "authenticated".to_string())],
+                success: false,
+                failure_reason: Some("submit_failed".to_string()),
+            },
+            debug_fill::FillAttemptReport {
+                fields: vec![("post_check_state".to_string(), "still_prompt".to_string())],
+                success: true,
+                failure_reason: None,
+            },
+            debug_fill::FillAttemptReport {
+                fields: vec![(
+                    "post_check_state".to_string(),
+                    "prompt_replaced".to_string(),
+                )],
+                success: false,
+                failure_reason: Some("credential_prompt_replaced_after_submit".to_string()),
+            },
+        ] {
+            let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+            let attempts = Arc::new(Mutex::new(HashMap::from([(
+                prompt_key.clone(),
+                Instant::now(),
+            )])));
+            let suppression = PromptRetrySuppression {
+                recent_prompt_attempts: attempts.clone(),
+                prompt_key: prompt_key.clone(),
+            };
+
+            assert!(
+                release_prompt_retry_suppression_after_authenticated_success(
+                    Some(&suppression),
+                    &report,
+                )
+            );
+            assert!(prompt_retry_is_suppressed(
+                &attempts.lock().unwrap(),
+                &prompt_key,
+            ));
+        }
     }
 
     #[test]
@@ -2229,7 +3179,7 @@ mod tests {
         );
 
         assert!(!running);
-        assert_eq!(generation.load(Ordering::SeqCst), 18);
+        assert_eq!(generation.load(Ordering::SeqCst), 17);
         assert!(event_rx.try_recv().is_err());
     }
 
@@ -2246,7 +3196,7 @@ mod tests {
         }
 
         assert!(!running);
-        assert_eq!(generation.load(Ordering::SeqCst), 25);
+        assert_eq!(generation.load(Ordering::SeqCst), 24);
         assert!(matches!(
             event_rx.try_recv(),
             Ok(WorkerEvent::StatusChanged(WorkerStatus::Idle))
@@ -2369,7 +3319,7 @@ mod tests {
         assert!(accounts.is_empty());
         assert!(pause_latch.is_paused());
         assert!(!running);
-        assert_eq!(generation.load(Ordering::SeqCst), 39);
+        assert_eq!(generation.load(Ordering::SeqCst), 37);
         assert!(event_rx.try_recv().is_err());
     }
 
@@ -2673,6 +3623,55 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    #[test]
+    fn exact_pause_release_advances_generation_once_and_rejects_duplicates() {
+        let generation = Arc::new(AtomicU64::new(101));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let pause_epoch = pause_latch.pause_with_epoch();
+
+        assert!(pause_latch.owns_pause(pause_epoch));
+        assert_eq!(generation.load(Ordering::SeqCst), 101);
+        assert!(pause_latch.resume_if_epoch(pause_epoch));
+        assert!(!pause_latch.is_paused());
+        assert_eq!(generation.load(Ordering::SeqCst), 102);
+        assert!(!pause_latch.resume_if_epoch(pause_epoch));
+        assert_eq!(generation.load(Ordering::SeqCst), 102);
+    }
+
+    #[test]
+    fn newer_pause_cannot_be_opened_by_a_stale_release() {
+        let generation = Arc::new(AtomicU64::new(211));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let stale_epoch = pause_latch.pause_with_epoch();
+        let fresh_epoch = pause_latch.pause_with_epoch();
+
+        assert!(!pause_latch.owns_pause(stale_epoch));
+        assert!(pause_latch.owns_pause(fresh_epoch));
+        assert!(!pause_latch.resume_if_epoch(stale_epoch));
+        assert!(pause_latch.owns_pause(fresh_epoch));
+        assert_eq!(generation.load(Ordering::SeqCst), 211);
+        assert!(pause_latch.resume_if_epoch(fresh_epoch));
+        assert_eq!(generation.load(Ordering::SeqCst), 212);
+    }
+
+    #[test]
+    fn exhausted_pause_epoch_is_terminal_fail_closed_without_aba_wrap() {
+        let generation = Arc::new(AtomicU64::new(307));
+        let pause_latch = pause_latch_for_generation(&generation);
+        let terminal_epoch = u64::MAX >> 1;
+        pause_latch
+            .pause_state
+            .store((terminal_epoch - 1) << 1, Ordering::SeqCst);
+
+        assert_eq!(pause_latch.pause_with_epoch(), terminal_epoch);
+        assert!(pause_latch.owns_pause(terminal_epoch));
+        assert!(!pause_latch.resume_if_epoch(terminal_epoch));
+        assert!(pause_latch.is_paused());
+        assert_eq!(generation.load(Ordering::SeqCst), 307);
+        assert_eq!(pause_latch.pause_with_epoch(), terminal_epoch);
+        assert!(pause_latch.owns_pause(terminal_epoch));
+    }
+
     fn account(id: &str, username: &str, enabled: bool) -> Account {
         Account {
             id: id.to_string(),
@@ -2695,6 +3694,22 @@ mod tests {
             window_title.to_string(),
             prompt_email.to_string(),
             "window".to_string(),
+        )
+    }
+
+    fn make_sheet_prompt_key(
+        account_id: &str,
+        process_id: i32,
+        window_title: &str,
+        prompt_email: &str,
+    ) -> LoginPromptKey {
+        LoginPromptKey::new(
+            account_id.to_string(),
+            process_id,
+            process_id as isize,
+            window_title.to_string(),
+            prompt_email.to_string(),
+            "sheet".to_string(),
         )
     }
 

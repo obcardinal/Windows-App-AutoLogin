@@ -92,6 +92,47 @@ pub enum WorkerStatus {
     Running,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitorControlState {
+    Running,
+    PausedWithStartIntent,
+    Stopped,
+}
+
+impl MonitorControlState {
+    pub(crate) fn from_worker_and_intent(
+        worker_status: WorkerStatus,
+        desired_monitor_running: bool,
+    ) -> Self {
+        if !desired_monitor_running {
+            Self::Stopped
+        } else if worker_status == WorkerStatus::Running {
+            Self::Running
+        } else {
+            Self::PausedWithStartIntent
+        }
+    }
+
+    pub(crate) fn worker_status(self) -> WorkerStatus {
+        match self {
+            Self::Running => WorkerStatus::Running,
+            Self::PausedWithStartIntent | Self::Stopped => WorkerStatus::Idle,
+        }
+    }
+
+    pub(crate) fn toggle_requests_stop(self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+
+    pub(crate) fn toggle_label(self) -> &'static str {
+        if self.toggle_requests_stop() {
+            "Stop Monitor"
+        } else {
+            "Start Monitor"
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -108,7 +149,7 @@ pub enum LogLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, AppSettings};
+    use super::{AppConfig, AppSettings, MonitorControlState, WorkerStatus};
 
     #[test]
     fn app_config_serialization_omits_fixed_and_removed_settings() {
@@ -144,5 +185,44 @@ mod tests {
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(!serialized.contains("target_window_title"));
         assert!(!serialized.contains("Legacy Target"));
+    }
+
+    #[test]
+    fn monitor_control_state_keeps_runtime_and_deferred_intent_distinct() {
+        for (worker_status, desired, expected, published_worker_status, label) in [
+            (
+                WorkerStatus::Running,
+                true,
+                MonitorControlState::Running,
+                WorkerStatus::Running,
+                "Stop Monitor",
+            ),
+            (
+                WorkerStatus::Running,
+                false,
+                MonitorControlState::Stopped,
+                WorkerStatus::Idle,
+                "Start Monitor",
+            ),
+            (
+                WorkerStatus::Idle,
+                true,
+                MonitorControlState::PausedWithStartIntent,
+                WorkerStatus::Idle,
+                "Stop Monitor",
+            ),
+            (
+                WorkerStatus::Idle,
+                false,
+                MonitorControlState::Stopped,
+                WorkerStatus::Idle,
+                "Start Monitor",
+            ),
+        ] {
+            let state = MonitorControlState::from_worker_and_intent(worker_status, desired);
+            assert_eq!(state, expected);
+            assert_eq!(state.worker_status(), published_worker_status);
+            assert_eq!(state.toggle_label(), label);
+        }
     }
 }

@@ -1,3 +1,4 @@
+use crate::models::MonitorControlState;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::{Duration, Instant};
@@ -93,6 +94,10 @@ const IPC_COMMAND_ACTIVATE: &str = "activate";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_SETTINGS_BOOTSTRAP: &str = "settings:bootstrap";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+const IPC_COMMAND_SETTINGS_MUTATION_BEGIN: &str = "settings:mutation:begin";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const IPC_COMMAND_SETTINGS_MUTATION_CANCEL: &str = "settings:mutation:cancel";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_MONITOR_PREFIX: &str = "monitor:";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_RELOAD_CONFIG: &str = "config:reload";
@@ -100,6 +105,8 @@ const IPC_COMMAND_RELOAD_CONFIG: &str = "config:reload";
 const SETTINGS_BOOTSTRAP_MAX_ATTEMPTS: usize = 4;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const SETTINGS_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SETTINGS_MUTATION_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "windows")]
 const WINDOWS_SINGLE_INSTANCE_LOCK_FILE_NAME: &str = "single-instance.lock";
 #[cfg(target_os = "macos")]
@@ -165,6 +172,8 @@ pub(crate) struct LocalIpcServer {
 pub(crate) enum LocalIpcCommand {
     Activate,
     SettingsBootstrap,
+    SettingsMutationBegin,
+    SettingsMutationCancel,
     ReloadConfig,
     Monitor(MonitorControlCommand),
 }
@@ -789,6 +798,29 @@ pub(crate) fn request_settings_bootstrap() -> anyhow::Result<()> {
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn request_settings_mutation_begin() -> anyhow::Result<()> {
+    send_local_ipc_command_with_ack_timeout(
+        IPC_COMMAND_SETTINGS_MUTATION_BEGIN,
+        SETTINGS_MUTATION_ACK_TIMEOUT,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn request_settings_mutation_cancel() -> anyhow::Result<()> {
+    send_local_ipc_command(IPC_COMMAND_SETTINGS_MUTATION_CANCEL)
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+pub(crate) fn request_settings_mutation_cancel() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+pub(crate) fn request_settings_mutation_begin() -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) fn request_settings_bootstrap() -> anyhow::Result<()> {
     anyhow::bail!("settings bootstrap requires authenticated local IPC")
@@ -847,26 +879,43 @@ pub(crate) fn request_config_reload() -> anyhow::Result<()> {
 }
 
 pub(crate) fn write_monitor_status(running: bool) -> anyhow::Result<()> {
-    write_private_text(
-        &monitor_status_path()?,
-        if running { "running\n" } else { "idle\n" },
-    )
+    write_monitor_control_state(if running {
+        MonitorControlState::Running
+    } else {
+        MonitorControlState::Stopped
+    })
 }
 
-pub(crate) fn read_monitor_status() -> Option<bool> {
+pub(crate) fn write_monitor_control_state(state: MonitorControlState) -> anyhow::Result<()> {
+    write_private_text(&monitor_status_path()?, monitor_control_state_status(state))
+}
+
+fn monitor_control_state_status(state: MonitorControlState) -> &'static str {
+    match state {
+        MonitorControlState::Running => "running\nstop\n",
+        MonitorControlState::PausedWithStartIntent => "idle\nstop\n",
+        MonitorControlState::Stopped => "idle\nstart\n",
+    }
+}
+
+pub(crate) fn read_monitor_control_state() -> Option<MonitorControlState> {
     let status = read_private_text_limited(&monitor_status_path().ok()?, MAX_MONITOR_STATUS_BYTES)
         .ok()
         .flatten()?;
-    parse_monitor_status(&status)
+    parse_monitor_control_state(&status)
 }
 
-fn parse_monitor_status(status: &str) -> Option<bool> {
+fn parse_monitor_control_state(status: &str) -> Option<MonitorControlState> {
     if status.len() > MAX_MONITOR_STATUS_BYTES as usize {
         return None;
     }
-    match status.trim() {
-        "running" => Some(true),
-        "idle" => Some(false),
+    match status {
+        // Accept one-line snapshots written by older builds. New writes always
+        // include the second line so the settings child can distinguish a
+        // deliberate stop from the credential-window safety pause.
+        "running\n" | "running\nstop\n" => Some(MonitorControlState::Running),
+        "idle\nstop\n" => Some(MonitorControlState::PausedWithStartIntent),
+        "idle\n" | "idle\nstart\n" => Some(MonitorControlState::Stopped),
         _ => None,
     }
 }
@@ -1346,6 +1395,14 @@ fn windows_local_ipc_pipe_name() -> anyhow::Result<String> {
 
 #[cfg(target_os = "macos")]
 fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
+    send_local_ipc_command_with_ack_timeout(command, Duration::from_secs(2))
+}
+
+#[cfg(target_os = "macos")]
+fn send_local_ipc_command_with_ack_timeout(
+    command: &str,
+    acknowledgement_timeout: Duration,
+) -> anyhow::Result<()> {
     let socket_path = ipc_socket_path()?;
     let root = lock_root()?;
     prepare_lock_root(&root)?;
@@ -1357,12 +1414,15 @@ fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
     let challenge = read_local_ipc_challenge(&mut stream)?;
     stream.write_all(format!("{}:{}\n", challenge, command.trim()).as_bytes())?;
     stream.shutdown(Shutdown::Write)?;
-    read_macos_local_ipc_ack(&mut stream)?;
+    read_macos_local_ipc_ack(&mut stream, acknowledgement_timeout)?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn read_macos_local_ipc_ack(stream: &mut UnixStream) -> anyhow::Result<()> {
+fn read_macos_local_ipc_ack(
+    stream: &mut UnixStream,
+    acknowledgement_timeout: Duration,
+) -> anyhow::Result<()> {
     stream.set_nonblocking(true)?;
     let started = Instant::now();
     let mut acknowledgement = Vec::with_capacity(4);
@@ -1378,7 +1438,7 @@ fn read_macos_local_ipc_ack(stream: &mut UnixStream) -> anyhow::Result<()> {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                if started.elapsed() >= Duration::from_secs(2) {
+                if started.elapsed() >= acknowledgement_timeout {
                     anyhow::bail!("macOS local IPC acknowledgement timed out");
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -1398,6 +1458,14 @@ fn read_macos_local_ipc_ack(stream: &mut UnixStream) -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
+    send_local_ipc_command_with_ack_timeout(command, Duration::from_secs(2))
+}
+
+#[cfg(target_os = "windows")]
+fn send_local_ipc_command_with_ack_timeout(
+    command: &str,
+    acknowledgement_timeout: Duration,
+) -> anyhow::Result<()> {
     let command = format!("{}\n", command.trim());
     if command.len() > WINDOWS_LOCAL_IPC_MAX_BYTES {
         anyhow::bail!("Windows local IPC command is too large");
@@ -1421,12 +1489,15 @@ fn send_local_ipc_command(command: &str) -> anyhow::Result<()> {
     if bytes_written as usize != command.len() {
         anyhow::bail!("Windows local IPC command was only partially written");
     }
-    read_windows_local_ipc_ack(pipe.0)?;
+    read_windows_local_ipc_ack(pipe.0, acknowledgement_timeout)?;
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn read_windows_local_ipc_ack(pipe: HANDLE) -> anyhow::Result<()> {
+fn read_windows_local_ipc_ack(
+    pipe: HANDLE,
+    acknowledgement_timeout: Duration,
+) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut ack = [0_u8; 3];
     let mut received = 0_usize;
@@ -1457,7 +1528,7 @@ fn read_windows_local_ipc_ack(pipe: HANDLE) -> anyhow::Result<()> {
         if received == ack.len() {
             break;
         }
-        if started.elapsed() >= Duration::from_secs(2) {
+        if started.elapsed() >= acknowledgement_timeout {
             anyhow::bail!("Windows local IPC acknowledgement timed out");
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -1705,6 +1776,14 @@ fn parse_local_ipc_command(message: &str) -> Option<LocalIpcCommand> {
 
     if message == IPC_COMMAND_SETTINGS_BOOTSTRAP {
         return Some(LocalIpcCommand::SettingsBootstrap);
+    }
+
+    if message == IPC_COMMAND_SETTINGS_MUTATION_BEGIN {
+        return Some(LocalIpcCommand::SettingsMutationBegin);
+    }
+
+    if message == IPC_COMMAND_SETTINGS_MUTATION_CANCEL {
+        return Some(LocalIpcCommand::SettingsMutationCancel);
     }
 
     if message == IPC_COMMAND_RELOAD_CONFIG {
@@ -1974,10 +2053,7 @@ fn process_looks_like_this_app(pid: u32) -> bool {
     let Some(process_path) = windows_process_path(pid) else {
         return false;
     };
-    match (process_path.canonicalize(), current_path.canonicalize()) {
-        (Ok(process_path), Ok(current_path)) => process_path == current_path,
-        _ => false,
-    }
+    crate::app_identity::windows_local_ipc_peer_path_is_trusted(&current_path, &process_path)
 }
 
 #[cfg(target_os = "windows")]
@@ -3488,6 +3564,41 @@ mod tests {
         assert!(windows_server.contains("process_looks_like_this_app(peer_pid)"));
     }
 
+    #[test]
+    fn windows_sibling_ipc_keeps_path_and_exact_spawned_pid_authorization_layers() {
+        let implementation = include_str!("single_instance.rs");
+        let windows_process_identity = source_between(
+            implementation,
+            "#[cfg(target_os = \"windows\")]\nfn process_looks_like_this_app(pid: u32)",
+            "#[cfg(all(unix, not(target_os = \"macos\")))]",
+        );
+        let windows_server = source_between(
+            implementation,
+            "#[cfg(target_os = \"windows\")]\nimpl LocalIpcServer",
+            "impl Drop for SingleInstanceGuard",
+        );
+        let windows_client = source_between(
+            implementation,
+            "#[cfg(target_os = \"windows\")]\nfn send_local_ipc_command(command: &str)",
+            "#[cfg(target_os = \"windows\")]\nfn read_windows_local_ipc_ack",
+        );
+        let main = include_str!("main.rs");
+        let authorization = source_between(
+            main,
+            "fn local_ipc_command_authorized(",
+            "fn initial_full_ui_tab(",
+        );
+
+        assert!(windows_process_identity.contains("windows_process_path(pid)"));
+        assert!(windows_process_identity
+            .contains("app_identity::windows_local_ipc_peer_path_is_trusted"));
+        assert!(windows_server.contains("GetNamedPipeClientProcessId"));
+        assert!(windows_server.contains("process_looks_like_this_app(peer_pid)"));
+        assert!(windows_client.contains("validate_windows_local_ipc_server(pipe.0)?"));
+        assert!(authorization.contains("Some(peer_pid) == settings_child_pid"));
+        assert!(authorization.contains("settings_child_bootstrapped"));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_local_ipc_client_waits_for_supervisor_acknowledgement() {
@@ -3509,11 +3620,13 @@ mod tests {
             "fn handle_authorized_local_ipc_command",
         );
 
-        assert!(send_command.contains("read_windows_local_ipc_ack(pipe.0)?;"));
+        assert!(
+            send_command.contains("read_windows_local_ipc_ack(pipe.0, acknowledgement_timeout)?;")
+        );
         assert!(
             send_command.find("WriteFile(").unwrap()
                 < send_command
-                    .find("read_windows_local_ipc_ack(pipe.0)?;")
+                    .find("read_windows_local_ipc_ack(pipe.0, acknowledgement_timeout)?;")
                     .unwrap()
         );
         assert!(consume_command.contains("let acknowledgement = self.pipe.take();"));
@@ -3552,11 +3665,12 @@ mod tests {
             "fn handle_authorized_local_ipc_command",
         );
 
-        assert!(send_command.contains("read_macos_local_ipc_ack(&mut stream)?;"));
+        assert!(send_command
+            .contains("read_macos_local_ipc_ack(&mut stream, acknowledgement_timeout)?;"));
         assert!(
             send_command.find("stream.write_all(").unwrap()
                 < send_command
-                    .find("read_macos_local_ipc_ack(&mut stream)?;")
+                    .find("read_macos_local_ipc_ack(&mut stream, acknowledgement_timeout)?;")
                     .unwrap()
         );
         assert!(consume_command.contains("acknowledgement: Some(stream)"));
@@ -3584,7 +3698,7 @@ mod tests {
                 client_stream.write_all(chunk).unwrap();
                 std::thread::sleep(Duration::from_millis(2));
             }
-            read_macos_local_ipc_ack(&mut client_stream).unwrap();
+            read_macos_local_ipc_ack(&mut client_stream, Duration::from_secs(1)).unwrap();
         });
 
         let peer_command =
@@ -3642,7 +3756,7 @@ mod tests {
                 client_stream.shutdown(Shutdown::Write).map_err(|error| {
                     anyhow::anyhow!("could not shut down test IPC command stream: {error}")
                 })?;
-                read_macos_local_ipc_ack(&mut client_stream)
+                read_macos_local_ipc_ack(&mut client_stream, Duration::from_secs(1))
                     .map_err(|error| anyhow::anyhow!("could not read test IPC ack: {error}"))
             })()
             .map_err(|error: anyhow::Error| error.to_string());
@@ -3682,7 +3796,7 @@ mod tests {
                 client_stream
                     .write_all(format!("{challenge}:{IPC_COMMAND_ACTIVATE}\n").as_bytes())?;
                 client_stream.shutdown(Shutdown::Write)?;
-                read_macos_local_ipc_ack(&mut client_stream)
+                read_macos_local_ipc_ack(&mut client_stream, Duration::from_secs(1))
             })()
             .map_err(|error: anyhow::Error| error.to_string());
             result_tx.send(result).unwrap();
@@ -3914,14 +4028,45 @@ mod tests {
     }
 
     #[test]
-    fn monitor_status_accepts_only_exact_states() {
-        assert_eq!(parse_monitor_status("running\n"), Some(true));
-        assert_eq!(parse_monitor_status("idle\n"), Some(false));
-        assert_eq!(parse_monitor_status("RUNNING\n"), None);
-        assert_eq!(parse_monitor_status("running:extra\n"), None);
-        assert_eq!(parse_monitor_status("running\0\n"), None);
+    fn monitor_status_accepts_only_consistent_bounded_control_snapshots() {
+        for state in [
+            MonitorControlState::Running,
+            MonitorControlState::PausedWithStartIntent,
+            MonitorControlState::Stopped,
+        ] {
+            assert_eq!(
+                parse_monitor_control_state(monitor_control_state_status(state)),
+                Some(state)
+            );
+        }
+
         assert_eq!(
-            parse_monitor_status(&"running".repeat(MAX_MONITOR_STATUS_BYTES as usize)),
+            parse_monitor_control_state("running\nstop\n"),
+            Some(MonitorControlState::Running)
+        );
+        assert_eq!(
+            parse_monitor_control_state("idle\nstop\n"),
+            Some(MonitorControlState::PausedWithStartIntent)
+        );
+        assert_eq!(
+            parse_monitor_control_state("idle\nstart\n"),
+            Some(MonitorControlState::Stopped)
+        );
+        assert_eq!(
+            parse_monitor_control_state("running\n"),
+            Some(MonitorControlState::Running)
+        );
+        assert_eq!(
+            parse_monitor_control_state("idle\n"),
+            Some(MonitorControlState::Stopped)
+        );
+        assert_eq!(parse_monitor_control_state("running\nstart\n"), None);
+        assert_eq!(parse_monitor_control_state("paused\nstop\n"), None);
+        assert_eq!(parse_monitor_control_state("RUNNING\n"), None);
+        assert_eq!(parse_monitor_control_state("running:extra\n"), None);
+        assert_eq!(parse_monitor_control_state("running\0\n"), None);
+        assert_eq!(
+            parse_monitor_control_state(&"running".repeat(MAX_MONITOR_STATUS_BYTES as usize)),
             None
         );
     }

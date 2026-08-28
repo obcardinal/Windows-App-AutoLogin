@@ -15,35 +15,38 @@ compile_error!(
     "diagnostics-ui is development-only in release builds; enable release-diagnostics only for intentional support artifacts"
 );
 
-mod app;
-mod app_identity;
-mod autologin;
-mod autostart;
-mod background;
-mod config;
-mod debug_fill;
+pub(crate) mod app;
+pub(crate) mod app_identity;
+pub(crate) mod autologin;
+pub(crate) mod autostart;
+pub(crate) mod background;
+pub(crate) mod config;
+pub(crate) mod debug_fill;
 #[cfg(target_os = "macos")]
-mod macos_ax;
-mod macos_identity;
-mod models;
-mod monitor;
-mod private_permissions;
-mod single_instance;
-mod storage;
-mod tray;
-mod ui;
-mod user_paths;
+pub(crate) mod macos_ax;
+pub(crate) mod macos_identity;
+pub(crate) mod models;
+pub(crate) mod monitor;
+pub(crate) mod private_permissions;
+pub(crate) mod single_instance;
+pub(crate) mod storage;
+pub(crate) mod tray;
+pub(crate) mod ui;
+pub(crate) mod user_paths;
 #[cfg(target_os = "windows")]
-mod windows_ui;
+pub(crate) mod windows_ui;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 include!(concat!(env!("OUT_DIR"), "/waal_build_metadata.rs"));
 
+use crate::models::MonitorControlState;
+use anyhow::Context;
 use eframe::egui;
-use std::process::{Child, Command};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel as std_channel, Receiver as StdReceiver, Sender as StdSender};
 use std::time::{Duration, Instant};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 use tokio::sync::mpsc::{
     channel as tokio_channel, Receiver as TokioReceiver, Sender as TokioSender,
 };
@@ -57,26 +60,65 @@ const SUPERVISOR_TICK: Duration = Duration::from_millis(250);
 const STORAGE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SETTINGS_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const SETTINGS_SESSION_TOKEN_ENV: &str = "WAAL_SETTINGS_SESSION_TOKEN";
+const FULL_UI_CONTROL_MAX_LINE_BYTES: usize = 32;
+const FULL_UI_CONTROL_SHOW_ACCOUNTS: &[u8] = b"show:accounts\n";
+const FULL_UI_CONTROL_SHOW_SETTINGS: &[u8] = b"show:settings\n";
+const FULL_UI_CONTROL_EXIT: &[u8] = b"exit\n";
+const FULL_UI_EXIT_CONFIRMATION_GRACE: Duration = Duration::from_secs(5);
+const FULL_UI_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const LEGACY_IPC_TOKEN_ENV: &str = "WAAL_IPC_TOKEN";
 #[cfg(target_os = "windows")]
 const LEGACY_MONITOR_CONTROL_TOKEN_ENV: &str = "WAAL_MONITOR_CONTROL_TOKEN";
 
-fn main() -> anyhow::Result<()> {
+pub(crate) fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        // The supervised full UI reserves stdout exclusively for its bounded
+        // presentation protocol. Keeping diagnostics on stderr prevents a log
+        // line from being mistaken for a child acknowledgement.
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "windows")]
+    match app_identity::windows_binary_role()? {
+        app_identity::WindowsBinaryRole::FullUi => {
+            return run_windows_full_ui_binary(&args);
+        }
+        app_identity::WindowsBinaryRole::Supervisor => {
+            if args.iter().any(|arg| arg == "--full-ui") {
+                anyhow::bail!("the Windows UIAccess supervisor cannot run in full UI mode");
+            }
+        }
+    }
     #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
     if args.iter().any(|arg| arg == "--debug-fill-once") {
         return debug_fill::run_from_args(&args);
     }
+    #[cfg(not(target_os = "windows"))]
     if args.iter().any(|arg| arg == "--full-ui") {
         return run_full_ui(initial_full_ui_tab(&args));
     }
 
     run_lightweight_supervisor()
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_full_ui_binary(args: &[String]) -> anyhow::Result<()> {
+    if args.len() != 2
+        || args.first().map(String::as_str) != Some("--full-ui")
+        || !windows_full_ui_initial_tab_arg_is_valid(&args[1])
+    {
+        anyhow::bail!("the Windows full UI helper requires an exact supervisor launch command");
+    }
+    run_full_ui(initial_full_ui_tab(args))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_full_ui_initial_tab_arg_is_valid(arg: &str) -> bool {
+    matches!(arg, "--initial-tab=accounts" | "--initial-tab=settings")
+        || cfg!(feature = "diagnostics-ui") && arg == "--initial-tab=diagnose"
 }
 
 fn run_lightweight_supervisor() -> anyhow::Result<()> {
@@ -105,7 +147,7 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let _single_instance = single_instance;
 
-    let rt = Runtime::new()?;
+    let rt = build_background_runtime()?;
     let _rt_guard = rt.enter();
 
     let (worker_tx, worker_rx) = tokio_channel::<background::WorkerCommand>(32);
@@ -115,29 +157,32 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     let worker_pause_latch = worker_invalidator.pause_latch();
     let settings_session_token = single_instance::SettingsSessionToken::generate();
 
-    let (startup, storage_recovery_sticky_blocked) = match load_startup_config_for_session(
-        &settings_session_token,
-    ) {
-        Ok(Some(startup)) => {
-            let sticky_blocked = !startup.storage_recovery_ready;
-            (startup, sticky_blocked)
-        }
-        Ok(None) => {
-            tracing::warn!(
+    let (startup, storage_recovery_sticky_blocked, startup_window_preference_known) =
+        match load_startup_config_for_session(&settings_session_token) {
+            Ok(Some(startup_load)) => {
+                let sticky_blocked = !startup_load.startup.storage_recovery_ready;
+                (
+                    startup_load.startup,
+                    sticky_blocked,
+                    startup_load.window_preference_known,
+                )
+            }
+            Ok(None) => {
+                tracing::warn!(
                 "Password storage recovery deferred while an existing settings session is active"
             );
-            worker_pause_latch.pause();
-            (blocked_startup_config(), false)
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "Password storage recovery could not be locked safely; monitor will remain stopped"
-            );
-            worker_pause_latch.pause();
-            (blocked_startup_config(), false)
-        }
-    };
+                worker_pause_latch.pause();
+                (blocked_startup_config(), false, false)
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "Password storage recovery could not be locked safely; monitor will remain stopped"
+                );
+                worker_pause_latch.pause();
+                (blocked_startup_config(), false, false)
+            }
+        };
     let config = startup.config;
     let storage_recovery_ready = startup.storage_recovery_ready;
     if !storage_recovery_ready {
@@ -155,7 +200,6 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
         worker_pause_latch.clone(),
     );
     publish_initial_monitor_status(single_instance::write_monitor_status);
-    start_monitor_on_launch_if_accessibility_trusted(&worker_tx, storage_recovery_ready);
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -179,9 +223,24 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     {
         supervisor.resume_monitor_after_settings = true;
     }
+    supervisor.apply_startup_runtime_preferences(startup_window_preference_known);
     event_loop.run_app(&mut supervisor)?;
 
     Ok(())
+}
+
+const BACKGROUND_RUNTIME_WORKER_THREADS: usize = 1;
+
+fn build_background_runtime() -> anyhow::Result<Runtime> {
+    // AutoLogin owns one long-lived async monitor task. Its native AX work is
+    // sequential and command handling is part of that same task, so the
+    // machine-wide default worker count only creates idle threads (28 on the
+    // current Mac) without adding concurrency or responsiveness.
+    TokioRuntimeBuilder::new_multi_thread()
+        .worker_threads(BACKGROUND_RUNTIME_WORKER_THREADS)
+        .enable_time()
+        .build()
+        .context("unable to create the background monitor runtime")
 }
 
 fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
@@ -205,14 +264,15 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let ui_worker_invalidator = background::WorkerInvalidator::new();
     let ui_worker_pause_latch = ui_worker_invalidator.pause_latch();
     let (_worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
-    let (_tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
+    let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 420.0])
             .with_min_inner_size([560.0, 360.0])
             .with_icon(load_icon()?)
-            .with_visible(true),
+            .with_visible(true)
+            .with_active(true),
         renderer: full_ui_renderer(),
         ..Default::default()
     };
@@ -220,8 +280,9 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let result = eframe::run_native(
         "Windows App AutoLogin",
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             ui::theme::apply(&cc.egui_ctx);
+            spawn_full_ui_control_reader(tray_tx, cc.egui_ctx.clone())?;
             let app = app::AutoLoginApp::new(
                 worker_tx,
                 ui_worker_pause_latch,
@@ -254,6 +315,223 @@ fn full_ui_renderer() -> eframe::Renderer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullUiControlRead {
+    EndOfStream,
+    Invalid,
+    Exit,
+    Show(models::Tab),
+}
+
+fn full_ui_control_message(initial_tab: models::Tab) -> anyhow::Result<&'static [u8]> {
+    match initial_tab {
+        models::Tab::Accounts => Ok(FULL_UI_CONTROL_SHOW_ACCOUNTS),
+        models::Tab::Settings => Ok(FULL_UI_CONTROL_SHOW_SETTINGS),
+        #[cfg(feature = "diagnostics-ui")]
+        models::Tab::Diagnose => {
+            anyhow::bail!("the diagnostics tab is not available through full UI control")
+        }
+    }
+}
+
+fn parse_full_ui_control_line(line: &[u8]) -> FullUiControlRead {
+    if line.len() > FULL_UI_CONTROL_MAX_LINE_BYTES {
+        return FullUiControlRead::Invalid;
+    }
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    match line {
+        b"exit" => FullUiControlRead::Exit,
+        b"show:accounts" => FullUiControlRead::Show(models::Tab::Accounts),
+        b"show:settings" => FullUiControlRead::Show(models::Tab::Settings),
+        _ => FullUiControlRead::Invalid,
+    }
+}
+
+fn read_full_ui_control_command(reader: &mut impl BufRead) -> std::io::Result<FullUiControlRead> {
+    let mut line = Vec::with_capacity(FULL_UI_CONTROL_MAX_LINE_BYTES);
+    let mut overlong = false;
+    let mut saw_input = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if !saw_input {
+                return Ok(FullUiControlRead::EndOfStream);
+            }
+            break;
+        }
+        saw_input = true;
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let payload_len = newline.unwrap_or(available.len());
+        if !overlong {
+            let remaining = FULL_UI_CONTROL_MAX_LINE_BYTES.saturating_sub(line.len());
+            let copy_len = payload_len.min(remaining);
+            line.extend_from_slice(&available[..copy_len]);
+            if payload_len > remaining {
+                overlong = true;
+            }
+        }
+
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    if overlong {
+        Ok(FullUiControlRead::Invalid)
+    } else {
+        Ok(parse_full_ui_control_line(&line))
+    }
+}
+
+fn spawn_full_ui_control_reader(
+    tray_tx: StdSender<tray::TrayCommand>,
+    egui_ctx: egui::Context,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("full-ui-control".to_string())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            let mut writer = std::io::stdout();
+            loop {
+                match read_full_ui_control_command(&mut reader) {
+                    Ok(FullUiControlRead::Show(models::Tab::Accounts)) => {
+                        if !dispatch_full_ui_presentation(
+                            &tray_tx,
+                            &egui_ctx,
+                            models::Tab::Accounts,
+                            &mut writer,
+                        ) {
+                            break;
+                        }
+                    }
+                    Ok(FullUiControlRead::Show(models::Tab::Settings)) => {
+                        if !dispatch_full_ui_presentation(
+                            &tray_tx,
+                            &egui_ctx,
+                            models::Tab::Settings,
+                            &mut writer,
+                        ) {
+                            break;
+                        }
+                    }
+                    Ok(FullUiControlRead::Exit) => {
+                        let _ = dispatch_full_ui_exit(&tray_tx, &egui_ctx);
+                        break;
+                    }
+                    #[cfg(feature = "diagnostics-ui")]
+                    Ok(FullUiControlRead::Show(models::Tab::Diagnose)) => {
+                        tracing::warn!("Rejected unsupported full UI control tab");
+                    }
+                    Ok(FullUiControlRead::Invalid) => {
+                        tracing::warn!("Rejected invalid full UI control command");
+                    }
+                    Ok(FullUiControlRead::EndOfStream) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "Full UI control channel failed");
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
+fn dispatch_full_ui_exit(tray_tx: &StdSender<tray::TrayCommand>, egui_ctx: &egui::Context) -> bool {
+    if tray_tx.send(tray::TrayCommand::Exit).is_err() {
+        return false;
+    }
+    egui_ctx.request_repaint();
+    true
+}
+
+fn dispatch_full_ui_presentation(
+    tray_tx: &StdSender<tray::TrayCommand>,
+    egui_ctx: &egui::Context,
+    tab: models::Tab,
+    writer: &mut impl Write,
+) -> bool {
+    let (acknowledgement_tx, acknowledgement_rx) = std_channel();
+    let command = match tab {
+        models::Tab::Accounts => tray::TrayCommand::PresentAccounts(acknowledgement_tx),
+        models::Tab::Settings => tray::TrayCommand::PresentSettings(acknowledgement_tx),
+        #[cfg(feature = "diagnostics-ui")]
+        models::Tab::Diagnose => return false,
+    };
+    if tray_tx.send(command).is_err() {
+        return false;
+    }
+    egui_ctx.request_repaint();
+
+    // A Keychain operation or system prompt can legitimately keep the UI
+    // thread busy for an arbitrary amount of time. The control reader is not
+    // the process owner, so it must never turn that delay into a process exit.
+    if acknowledgement_rx.recv().is_err() {
+        return false;
+    }
+
+    let Ok(response) = full_ui_control_message(tab) else {
+        return false;
+    };
+    if writer
+        .write_all(response)
+        .and_then(|()| writer.flush())
+        .is_err()
+    {
+        tracing::warn!("Full UI presentation acknowledgement channel failed");
+        return false;
+    }
+    true
+}
+
+fn send_full_ui_presentation(child: &mut Child, tab: models::Tab) -> anyhow::Result<()> {
+    let message = full_ui_control_message(tab)?;
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("full UI control channel is unavailable"))?;
+    stdin.write_all(message)?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn send_full_ui_exit(child: &mut Child) -> anyhow::Result<()> {
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("full UI control channel is unavailable"))?;
+    stdin.write_all(FULL_UI_CONTROL_EXIT)?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn spawn_full_ui_ack_reader(
+    child: &mut Child,
+) -> anyhow::Result<StdReceiver<std::io::Result<FullUiControlRead>>> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("full UI acknowledgement channel is unavailable"))?;
+    let (result_tx, result_rx) = std_channel();
+    std::thread::Builder::new()
+        .name("full-ui-ack".to_string())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let response = read_full_ui_control_command(&mut reader);
+                let finished = matches!(response, Ok(FullUiControlRead::EndOfStream) | Err(_));
+                if result_tx.send(response).is_err() || finished {
+                    break;
+                }
+            }
+        })?;
+    Ok(result_rx)
+}
+
 fn acquire_authorized_settings_session_with<Token, Lease>(
     load_token: impl FnOnce() -> anyhow::Result<Token>,
     request_supervisor_bootstrap: impl FnOnce() -> anyhow::Result<()>,
@@ -272,11 +550,21 @@ struct StartupConfig {
     storage_recovery_ready: bool,
 }
 
-fn load_startup_config() -> StartupConfig {
+struct StartupConfigLoad {
+    startup: StartupConfig,
+    window_preference_known: bool,
+}
+
+fn load_startup_config() -> StartupConfigLoad {
     let _ = autostart::cleanup_stale();
-    let mut startup = load_config_with_storage_recovery_inner(true);
-    sync_startup_auto_start_with(&mut startup, autostart::is_enabled(), storage::save_config);
-    startup
+    let mut startup_load =
+        load_config_with_storage_recovery_inner_with_loader(true, storage::load_config);
+    sync_startup_auto_start_with(
+        &mut startup_load.startup,
+        autostart::is_enabled(),
+        storage::save_config,
+    );
+    startup_load
 }
 
 fn sync_startup_auto_start_with(
@@ -325,7 +613,7 @@ fn blocked_startup_config() -> StartupConfig {
 
 fn load_startup_config_for_session(
     session_token: &single_instance::SettingsSessionToken,
-) -> anyhow::Result<Option<StartupConfig>> {
+) -> anyhow::Result<Option<StartupConfigLoad>> {
     let Some(mut recovery_lease) = single_instance::SettingsRecoveryLease::try_acquire()? else {
         return Ok(None);
     };
@@ -350,11 +638,25 @@ fn load_config_with_storage_recovery() -> StartupConfig {
 }
 
 fn load_config_with_storage_recovery_inner(clear_startup_block: bool) -> StartupConfig {
-    let mut config = match storage::load_config() {
+    load_config_with_storage_recovery_inner_with_loader(clear_startup_block, storage::load_config)
+        .startup
+}
+
+fn load_config_with_storage_recovery_inner_with_loader<L>(
+    clear_startup_block: bool,
+    load_config: L,
+) -> StartupConfigLoad
+where
+    L: FnOnce() -> anyhow::Result<models::AppConfig>,
+{
+    let mut config = match load_config() {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(%error, "Config could not be loaded safely; password storage recovery remains blocked");
-            return blocked_startup_config();
+            return StartupConfigLoad {
+                startup: blocked_startup_config(),
+                window_preference_known: false,
+            };
         }
     };
     let storage_recovery_ready = match storage::reconcile_pending_storage_operations(&mut config) {
@@ -404,14 +706,20 @@ fn load_config_with_storage_recovery_inner(clear_startup_block: bool) -> Startup
         tracing::warn!(
             "Password storage recovery block remained present after recovery verification"
         );
-        return StartupConfig {
-            config,
-            storage_recovery_ready: false,
+        return StartupConfigLoad {
+            startup: StartupConfig {
+                config,
+                storage_recovery_ready: false,
+            },
+            window_preference_known: true,
         };
     }
-    StartupConfig {
-        config,
-        storage_recovery_ready,
+    StartupConfigLoad {
+        startup: StartupConfig {
+            config,
+            storage_recovery_ready,
+        },
+        window_preference_known: true,
     }
 }
 
@@ -433,17 +741,6 @@ where
     } else {
         recovery_block_is_clear()
     }
-}
-
-fn start_monitor_on_launch_if_accessibility_trusted(
-    worker_tx: &TokioSender<background::WorkerCommand>,
-    storage_recovery_ready: bool,
-) {
-    queue_monitor_start_if_accessibility_trusted(
-        worker_tx,
-        autologin::accessibility_is_trusted(),
-        storage_recovery_ready,
-    );
 }
 
 fn queue_monitor_start_if_accessibility_trusted(
@@ -486,29 +783,16 @@ struct PendingSettingsLaunch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MonitorControlState {
-    Running,
-    PausedWithStartIntent,
-    Stopped,
+struct PendingSettingsPresentation {
+    in_flight_tab: models::Tab,
+    requested_tab: models::Tab,
+    phase: SettingsPresentationPhase,
 }
 
-impl MonitorControlState {
-    fn from_worker_and_intent(
-        worker_status: models::WorkerStatus,
-        desired_monitor_running: bool,
-    ) -> Self {
-        if worker_status == models::WorkerStatus::Running {
-            Self::Running
-        } else if desired_monitor_running {
-            Self::PausedWithStartIntent
-        } else {
-            Self::Stopped
-        }
-    }
-
-    fn toggle_requests_stop(self) -> bool {
-        !matches!(self, Self::Stopped)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsPresentationPhase {
+    AwaitingAcknowledgement,
+    AwaitingConfirmedExit { deadline: Instant },
 }
 
 struct LightweightSupervisor {
@@ -522,6 +806,7 @@ struct LightweightSupervisor {
     config: models::AppConfig,
     storage_recovery_ready: bool,
     storage_recovery_sticky_blocked: bool,
+    startup_window_preference_pending: bool,
     worker_status: models::WorkerStatus,
     desired_monitor_running: bool,
     accessibility_trusted: bool,
@@ -529,16 +814,24 @@ struct LightweightSupervisor {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     monitor_command_watcher: single_instance::MonitorCommandWatcher,
     settings_child: Option<Child>,
+    settings_child_acknowledgements: Option<StdReceiver<std::io::Result<FullUiControlRead>>>,
+    settings_child_control_broken: bool,
+    pending_settings_presentation: Option<PendingSettingsPresentation>,
     settings_child_bootstrapped: bool,
+    settings_mutation_active: bool,
     pending_settings_launch: Option<PendingSettingsLaunch>,
     next_settings_launch_request_id: u64,
     settings_session_token: single_instance::SettingsSessionToken,
     settings_session_lease: Option<single_instance::SettingsSessionLease>,
     #[cfg(test)]
     settings_lock_root: std::path::PathBuf,
+    #[cfg(test)]
+    last_published_monitor_control_state: std::cell::Cell<Option<MonitorControlState>>,
     last_storage_recovery_attempt: Instant,
     resume_monitor_after_settings: bool,
     exit_requested: bool,
+    settings_child_exit_deadline: Option<Instant>,
+    exit_shutdown_finalized: bool,
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     activation_watcher: single_instance::ActivationWatcher,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -569,6 +862,7 @@ impl LightweightSupervisor {
             config,
             storage_recovery_ready: true,
             storage_recovery_sticky_blocked: false,
+            startup_window_preference_pending: false,
             worker_status: models::WorkerStatus::Idle,
             desired_monitor_running: true,
             accessibility_trusted: autologin::accessibility_is_trusted(),
@@ -576,7 +870,11 @@ impl LightweightSupervisor {
             #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             monitor_command_watcher: single_instance::MonitorCommandWatcher::new(),
             settings_child: None,
+            settings_child_acknowledgements: None,
+            settings_child_control_broken: false,
+            pending_settings_presentation: None,
             settings_child_bootstrapped: false,
+            settings_mutation_active: false,
             pending_settings_launch: None,
             next_settings_launch_request_id: 0,
             settings_session_token: single_instance::SettingsSessionToken::generate(),
@@ -586,11 +884,15 @@ impl LightweightSupervisor {
                 "windows-app-autologin-supervisor-test-{}",
                 uuid::Uuid::new_v4().hyphenated()
             )),
+            #[cfg(test)]
+            last_published_monitor_control_state: std::cell::Cell::new(None),
             last_storage_recovery_attempt: Instant::now()
                 .checked_sub(STORAGE_RECOVERY_RETRY_INTERVAL)
                 .unwrap_or_else(Instant::now),
             resume_monitor_after_settings: false,
             exit_requested: false,
+            settings_child_exit_deadline: None,
+            exit_shutdown_finalized: false,
             #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             activation_watcher: single_instance::ActivationWatcher::new(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -631,6 +933,50 @@ impl LightweightSupervisor {
         self
     }
 
+    fn apply_startup_runtime_preferences(&mut self, window_preference_known: bool) {
+        if window_preference_known {
+            self.apply_known_startup_window_preference();
+        } else {
+            // The in-memory blocked config contains safe defaults, not the
+            // user's durable preference. Remember the one startup-only intent
+            // until the deferred recovery path has loaded authoritative data.
+            self.startup_window_preference_pending = true;
+        }
+
+        // Window presentation closes the synchronous worker gate before any
+        // monitor Start can be queued. The bootstrapped window will resume the
+        // desired monitor intent; queuing Start first could admit an automation
+        // attempt and make this one-shot launch time out behind quiescence.
+        if self.pending_settings_launch.is_none() {
+            queue_monitor_start_if_accessibility_trusted(
+                &self.worker_tx,
+                self.accessibility_trusted,
+                self.storage_recovery_ready,
+            );
+        }
+    }
+
+    fn apply_known_startup_window_preference(&mut self) {
+        self.startup_window_preference_pending = false;
+        if !self.config.settings.start_minimized {
+            self.open_accounts_window();
+        }
+    }
+
+    fn apply_deferred_startup_runtime_preferences(&mut self, start_monitor: bool) {
+        if !self.startup_window_preference_pending {
+            return;
+        }
+        self.apply_known_startup_window_preference();
+        if self.pending_settings_launch.is_none() && start_monitor {
+            // The recovery reload was queued first with start_monitor=false,
+            // so this Start is ordered after the fresh config releases its
+            // pause. A visible-window preference instead keeps the pause closed
+            // until the settings child bootstraps and resumes the same intent.
+            self.queue_worker_start_fail_closed();
+        }
+    }
+
     fn ensure_tray(&mut self) {
         if self.tray.is_some() {
             return;
@@ -648,9 +994,15 @@ impl LightweightSupervisor {
 
     fn process_tray_commands(&mut self, event_loop: &ActiveEventLoop) -> bool {
         while let Ok(command) = self.tray_rx.try_recv() {
+            if self.exit_requested && !matches!(&command, tray::TrayCommand::Exit) {
+                continue;
+            }
             match command {
                 tray::TrayCommand::OpenAccounts => self.open_accounts_window(),
                 tray::TrayCommand::OpenSettings => self.open_settings_window(),
+                tray::TrayCommand::PresentAccounts(_) | tray::TrayCommand::PresentSettings(_) => {
+                    tracing::warn!("Rejected a child-only presentation command in the supervisor");
+                }
                 tray::TrayCommand::ToggleMonitor => self.toggle_monitor(),
                 tray::TrayCommand::RequestAccessibilityAccess => {
                     let trusted = autologin::request_accessibility_access_prompt();
@@ -664,37 +1016,71 @@ impl LightweightSupervisor {
                     }
                 }
                 tray::TrayCommand::Exit => {
-                    self.handle_exit_request();
-                    event_loop.exit();
-                    return true;
+                    if self.handle_exit_request() {
+                        event_loop.exit();
+                        return true;
+                    }
                 }
             }
         }
         false
     }
 
-    fn handle_exit_request(&mut self) {
-        self.handle_exit_request_with_monitor_status_writer(single_instance::write_monitor_status);
+    fn handle_exit_request(&mut self) -> bool {
+        #[cfg(not(test))]
+        return self
+            .handle_exit_request_with_monitor_status_writer(single_instance::write_monitor_status);
+        #[cfg(test)]
+        return self.handle_exit_request_with_monitor_status_writer(|_| Ok(()));
     }
 
     fn handle_exit_request_with_monitor_status_writer(
         &mut self,
         mut write_monitor_status: impl FnMut(bool) -> anyhow::Result<()>,
-    ) {
-        if self.exit_requested {
-            self.close_settings_child_for_exit();
-            return;
+    ) -> bool {
+        if !self.exit_requested {
+            self.exit_requested = true;
+            self.worker_pause_latch.pause();
+            self.worker_invalidator.invalidate();
+            self.desired_monitor_running = false;
+            self.resume_monitor_after_settings = false;
+            self.pending_settings_launch = None;
+            self.pending_settings_presentation = None;
+
+            if let Some(child) = self.settings_child.as_mut() {
+                self.settings_child_exit_deadline = Some(
+                    Instant::now()
+                        .checked_add(FULL_UI_GRACEFUL_EXIT_TIMEOUT)
+                        .unwrap_or_else(Instant::now),
+                );
+                if let Err(error) = send_full_ui_exit(child) {
+                    tracing::warn!(%error, "Could not request graceful settings window exit");
+                }
+            }
         }
-        self.exit_requested = true;
+
+        if self.settings_child.is_some() {
+            // The child may be waiting for mutation/reload IPC while its
+            // background save chain drains. Preserve that state and keep the
+            // supervisor event loop alive until try_wait confirms process
+            // exit. The pause latch above prevents any new automation work.
+            return false;
+        }
+        if self.exit_shutdown_finalized {
+            return true;
+        }
+
+        self.exit_shutdown_finalized = true;
+        self.settings_child_exit_deadline = None;
         self.worker_pause_latch.pause();
         self.worker_invalidator.invalidate();
         self.worker_status = models::WorkerStatus::Idle;
-        self.desired_monitor_running = false;
+        self.settings_mutation_active = false;
         if let Err(e) = write_monitor_status(false) {
             tracing::warn!("Could not publish stopped monitor status during quit: {e}");
         }
         let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
-        self.close_settings_child_for_exit();
+        true
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -704,9 +1090,19 @@ impl LightweightSupervisor {
             return;
         };
 
+        if self.exit_requested
+            && matches!(
+                command,
+                single_instance::MonitorControlCommand::Start
+                    | single_instance::MonitorControlCommand::Stop
+            )
+        {
+            return;
+        }
+
         match command {
             single_instance::MonitorControlCommand::Start => {
-                self.start_monitor_from_control_command()
+                let _ = self.start_monitor_from_control_command();
             }
             single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
             single_instance::MonitorControlCommand::StorageRecoveryBlocked => {
@@ -769,6 +1165,35 @@ impl LightweightSupervisor {
                 continue;
             }
 
+            if peer_command.command == single_instance::LocalIpcCommand::ReloadConfig {
+                let peer_pid = peer_command.peer_pid;
+                if !self.acknowledge_live_settings_commit_with_loader(
+                    || peer_command.acknowledge(),
+                    load_full_ui_config,
+                ) {
+                    tracing::warn!(
+                        peer_pid,
+                        "Authorized settings commit could not be acknowledged safely"
+                    );
+                }
+                continue;
+            }
+
+            if let single_instance::LocalIpcCommand::Monitor(command) = peer_command.command {
+                let peer_pid = peer_command.peer_pid;
+                if !self.acknowledge_monitor_control_command_with(
+                    command,
+                    single_instance::write_monitor_control_state,
+                    || peer_command.acknowledge(),
+                ) {
+                    tracing::warn!(
+                        peer_pid,
+                        "Authorized monitor command could not be published and acknowledged safely"
+                    );
+                }
+                continue;
+            }
+
             if !self.handle_authorized_local_ipc_command(peer_command.command) {
                 tracing::warn!(
                     peer_pid = peer_command.peer_pid,
@@ -787,30 +1212,86 @@ impl LightweightSupervisor {
         &mut self,
         command: single_instance::LocalIpcCommand,
     ) -> bool {
+        if self.exit_requested
+            && matches!(
+                command,
+                single_instance::LocalIpcCommand::Activate
+                    | single_instance::LocalIpcCommand::Monitor(
+                        single_instance::MonitorControlCommand::Start
+                            | single_instance::MonitorControlCommand::Stop
+                    )
+            )
+        {
+            return false;
+        }
         match command {
             single_instance::LocalIpcCommand::Activate => self.handle_activation_request(),
             single_instance::LocalIpcCommand::SettingsBootstrap => false,
-            single_instance::LocalIpcCommand::ReloadConfig => {
-                self.reload_config_after_settings();
-                true
+            single_instance::LocalIpcCommand::SettingsMutationBegin => {
+                self.begin_settings_mutation()
             }
-            single_instance::LocalIpcCommand::Monitor(command) => {
-                match command {
-                    single_instance::MonitorControlCommand::Start => {
-                        self.start_monitor_from_control_command()
-                    }
-                    single_instance::MonitorControlCommand::Stop => self.stop_monitor(),
-                    single_instance::MonitorControlCommand::StorageRecoveryBlocked => {
-                        self.block_storage_recovery_until_restart()
-                    }
-                    #[cfg(target_os = "windows")]
-                    single_instance::MonitorControlCommand::ReloadConfig => {
-                        self.reload_config_after_settings()
-                    }
+            single_instance::LocalIpcCommand::SettingsMutationCancel => {
+                self.cancel_settings_mutation()
+            }
+            // Live commit reload has ACK-before-release ordering and is
+            // handled directly by process_local_ipc_commands.
+            single_instance::LocalIpcCommand::ReloadConfig => false,
+            single_instance::LocalIpcCommand::Monitor(command) => match command {
+                single_instance::MonitorControlCommand::Start => {
+                    self.start_monitor_from_control_command()
                 }
-                true
-            }
+                single_instance::MonitorControlCommand::Stop => {
+                    self.stop_monitor();
+                    true
+                }
+                single_instance::MonitorControlCommand::StorageRecoveryBlocked => {
+                    self.block_storage_recovery_until_restart();
+                    true
+                }
+                #[cfg(target_os = "windows")]
+                single_instance::MonitorControlCommand::ReloadConfig => {
+                    self.reload_config_after_settings();
+                    true
+                }
+            },
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn acknowledge_monitor_control_command_with(
+        &mut self,
+        command: single_instance::MonitorControlCommand,
+        mut publish_control_state: impl FnMut(MonitorControlState) -> anyhow::Result<()>,
+        acknowledge: impl FnOnce() -> anyhow::Result<()>,
+    ) -> bool {
+        if !self
+            .handle_authorized_local_ipc_command(single_instance::LocalIpcCommand::Monitor(command))
+        {
+            return false;
+        }
+
+        let control_state = match command {
+            single_instance::MonitorControlCommand::Stop
+            | single_instance::MonitorControlCommand::StorageRecoveryBlocked => {
+                MonitorControlState::Stopped
+            }
+            single_instance::MonitorControlCommand::Start => self.monitor_control_state(),
+            #[cfg(target_os = "windows")]
+            single_instance::MonitorControlCommand::ReloadConfig => self.monitor_control_state(),
+        };
+        if let Err(error) = publish_control_state(control_state) {
+            tracing::warn!(
+                %error,
+                ?control_state,
+                "Committed monitor command was not acknowledged because its control state could not be published"
+            );
+            return false;
+        }
+        if let Err(error) = acknowledge() {
+            tracing::warn!(%error, "Could not acknowledge committed monitor command");
+            return false;
+        }
+        true
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -848,6 +1329,165 @@ impl LightweightSupervisor {
             return false;
         }
         self.settings_child_bootstrapped = true;
+        self.resume_monitor_after_settings_bootstrap();
+        true
+    }
+
+    fn resume_monitor_after_settings_bootstrap(&mut self) {
+        if !self.desired_monitor_running || self.storage_recovery_sticky_blocked {
+            self.resume_monitor_after_settings = false;
+            self.update_tray_status();
+            return;
+        }
+        if !self.storage_recovery_ready {
+            self.resume_monitor_after_settings = true;
+            self.update_tray_status();
+            return;
+        }
+        if !self.accessibility_ready_for_start() {
+            self.resume_monitor_after_settings = false;
+            self.update_tray_status();
+            return;
+        }
+        let _ = self.queue_fresh_config_and_start();
+        // Preserve the desired intent for the authoritative reload on child
+        // exit. The monitor is allowed to run during a bootstrapped, idle UI,
+        // but closing that UI must not turn an explicit running intent into a
+        // stop request.
+        self.resume_monitor_after_settings = self.desired_monitor_running;
+        self.update_tray_status();
+    }
+
+    fn begin_settings_mutation(&mut self) -> bool {
+        if !self.settings_child_bootstrapped
+            || self.storage_recovery_sticky_blocked
+            || !self.storage_recovery_ready
+        {
+            return false;
+        }
+        if self.settings_mutation_active {
+            // A previous request may have reached the pause latch but lost its
+            // quiescence acknowledgement or its IPC ACK. Never let a retry
+            // convert that uncertainty into permission to mutate.
+            return false;
+        }
+
+        // Close the synchronous gate before ACK. Stop and Quiesce are ordered
+        // behind every already-started worker decision, so no credential or
+        // config mutation can overlap an active fill or admit a new one.
+        self.settings_mutation_active = true;
+        self.resume_monitor_after_settings = self.desired_monitor_running;
+        self.worker_pause_latch.pause();
+        self.worker_invalidator.invalidate();
+        if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
+            tracing::warn!(%error, "Could not queue settings mutation worker stop; pause remains active");
+            return false;
+        }
+        let Some(request_id) = self.next_settings_launch_request_id.checked_add(1) else {
+            tracing::warn!("Settings mutation quiescence request identifier space is exhausted");
+            return false;
+        };
+        self.next_settings_launch_request_id = request_id;
+        let (acknowledgement, acknowledgement_receiver) = std_channel();
+        if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Quiesce {
+            request_id,
+            acknowledgement,
+        }) {
+            tracing::warn!(%error, "Could not queue settings mutation quiescence; pause remains active");
+            return false;
+        }
+        match acknowledgement_receiver.recv_timeout(SETTINGS_QUIESCENCE_TIMEOUT) {
+            Ok(acknowledgement) if acknowledgement.request_id == request_id => {
+                self.worker_status = models::WorkerStatus::Idle;
+                self.update_tray_status();
+                true
+            }
+            Ok(acknowledgement) => {
+                tracing::warn!(
+                    expected_request_id = request_id,
+                    received_request_id = acknowledgement.request_id,
+                    "Settings mutation quiescence acknowledgement mismatch; pause remains active"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Settings mutation quiescence was not acknowledged; pause remains active");
+                false
+            }
+        }
+    }
+
+    fn cancel_settings_mutation(&mut self) -> bool {
+        if !self.settings_mutation_active {
+            return true;
+        }
+        self.settings_mutation_active = false;
+        let should_resume = self.resume_monitor_after_settings
+            && self.desired_monitor_running
+            && self.storage_recovery_ready
+            && !self.storage_recovery_sticky_blocked
+            && self.accessibility_ready_for_start();
+        let resumed = !should_resume || self.queue_fresh_config_and_start();
+        self.resume_monitor_after_settings = self.desired_monitor_running;
+        self.update_tray_status();
+        resumed
+    }
+
+    fn acknowledge_live_settings_commit_with_loader(
+        &mut self,
+        acknowledge: impl FnOnce() -> anyhow::Result<()>,
+        load_config: impl FnOnce() -> StartupConfig,
+    ) -> bool {
+        if !self.settings_mutation_active {
+            tracing::warn!("Rejected settings commit without an acknowledged mutation pause");
+            return false;
+        }
+        let startup = load_config();
+        if !startup.storage_recovery_ready {
+            self.block_storage_recovery_until_restart();
+            tracing::error!(
+                "Saved config could not be verified as a clean durable commit; monitor remains stopped"
+            );
+            return false;
+        }
+        if self.storage_recovery_sticky_blocked {
+            self.worker_pause_latch.pause();
+            return false;
+        }
+        let should_resume = self.desired_monitor_running
+            && !self.storage_recovery_sticky_blocked
+            && self.accessibility_ready_for_start();
+
+        let Some((next_config, apply_command)) =
+            self.prepare_reloaded_config(startup, should_resume)
+        else {
+            return false;
+        };
+        // Reserve capacity before ACK, but do not publish the release command
+        // yet. This makes a successful IPC acknowledgement mean that the new
+        // config can be delivered, while still ensuring automation cannot be
+        // released before the child receives that acknowledgement.
+        let apply_permit = match self.worker_tx.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.fail_reloaded_config_delivery(&error);
+                return false;
+            }
+        };
+
+        // Do not release automation until the child knows its durable commit
+        // notification was accepted. If the peer disappeared before ACK, its
+        // Drop guard is already terminal and the supervisor stays paused until
+        // confirmed child exit performs authoritative recovery.
+        if let Err(error) = acknowledge() {
+            tracing::warn!(%error, "Could not acknowledge the clean settings commit; pause remains active");
+            return false;
+        }
+        apply_permit.send(apply_command);
+        self.finish_reloaded_config(next_config);
+        self.settings_mutation_active = false;
+        self.resume_monitor_after_settings = self.desired_monitor_running;
+        self.update_tray_status();
         true
     }
 
@@ -866,10 +1506,6 @@ impl LightweightSupervisor {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn handle_activation_request(&mut self) -> bool {
-        self.poll_settings_window();
-        if self.settings_transition_active() {
-            return true;
-        }
         self.open_accounts_window_for_activation()
     }
 
@@ -960,6 +1596,7 @@ impl LightweightSupervisor {
             return;
         }
         self.desired_monitor_running = true;
+        self.update_tray_status();
         if !self.storage_recovery_ready {
             self.resume_monitor_after_settings = true;
             tracing::warn!(
@@ -971,7 +1608,7 @@ impl LightweightSupervisor {
             tracing::warn!("Automation permission is required before starting monitor");
             return;
         }
-        if self.settings_transition_active() {
+        if self.monitor_pause_transition_active() {
             self.resume_monitor_after_settings = true;
             return;
         }
@@ -1004,7 +1641,7 @@ impl LightweightSupervisor {
             );
             return;
         }
-        if self.settings_transition_active() {
+        if self.monitor_pause_transition_active() {
             self.resume_monitor_after_settings = true;
             return;
         }
@@ -1018,46 +1655,47 @@ impl LightweightSupervisor {
         self.queue_worker_start_fail_closed();
     }
 
-    fn start_monitor_from_control_command(&mut self) {
-        self.start_monitor_from_control_command_with_loader(load_config_with_storage_recovery);
+    fn start_monitor_from_control_command(&mut self) -> bool {
+        self.start_monitor_from_control_command_with_loader(load_config_with_storage_recovery)
     }
 
     fn start_monitor_from_control_command_with_loader(
         &mut self,
         load_config: impl FnOnce() -> StartupConfig,
-    ) {
+    ) -> bool {
         if self.storage_recovery_sticky_blocked {
             tracing::warn!(
                 "Monitor remains stopped until password storage recovery completes after restart"
             );
-            return;
+            return false;
         }
         self.desired_monitor_running = true;
+        self.update_tray_status();
         if !self.storage_recovery_ready && !self.settings_transition_active() {
             self.resume_monitor_after_settings = true;
             tracing::warn!(
                 "Monitor remains stopped because password storage recovery is incomplete"
             );
-            return;
+            return true;
         }
         if !self.accessibility_ready_for_start() {
             tracing::warn!("Automation permission is required before starting monitor");
-            return;
+            return true;
         }
         self.resume_monitor_after_settings = false;
-        if self.settings_transition_active() {
-            // The child may be between journal creation, credential migration,
-            // and config commit. Never interpret its live transaction as crash
-            // recovery; reload exactly once after the child exits.
+        if self.monitor_pause_transition_active() {
+            // A not-yet-bootstrapped child or an acknowledged live mutation is
+            // a safety pause. Do not interpret its journal as crash recovery.
             let _ = load_config;
             self.resume_monitor_after_settings = true;
-            return;
+            return true;
         }
         if self.worker_pause_latch.is_paused() {
             self.queue_fresh_config_and_start();
         } else if self.worker_status == models::WorkerStatus::Idle {
             self.queue_worker_start_fail_closed();
         }
+        true
     }
 
     fn queue_worker_start_fail_closed(&mut self) {
@@ -1074,6 +1712,9 @@ impl LightweightSupervisor {
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
             tracing::warn!(%error, "Monitor stop command could not be queued; pause latch remains active");
         }
+        // An already-idle worker does not emit another StatusChanged event.
+        // Publish the changed control intent now so both UI surfaces update.
+        self.update_tray_status();
     }
 
     fn pause_monitor_preserving_intent(&mut self) {
@@ -1092,6 +1733,7 @@ impl LightweightSupervisor {
         // clear it.
         self.storage_recovery_ready = false;
         self.storage_recovery_sticky_blocked = true;
+        self.settings_mutation_active = false;
         self.pending_settings_launch = None;
         self.desired_monitor_running = false;
         self.resume_monitor_after_settings = false;
@@ -1109,10 +1751,10 @@ impl LightweightSupervisor {
         self.update_tray_status();
     }
 
-    fn queue_fresh_config_and_start(&mut self) {
+    fn queue_fresh_config_and_start(&mut self) -> bool {
         if !self.desired_monitor_running || self.storage_recovery_sticky_blocked {
             self.worker_pause_latch.pause();
-            return;
+            return false;
         }
         let pause_epoch = self.worker_pause_latch.pause_with_epoch();
         let command = self.worker_pause_latch.apply_config_command(
@@ -1128,7 +1770,9 @@ impl LightweightSupervisor {
                 %error,
                 "Monitor start could not be queued safely; pause latch remains active"
             );
+            return false;
         }
+        true
     }
 
     fn open_accounts_window(&mut self) {
@@ -1153,6 +1797,30 @@ impl LightweightSupervisor {
         initial_tab: models::Tab,
         pause_monitor: bool,
     ) -> bool {
+        if let Some(pending) = self.pending_settings_launch.as_mut() {
+            pending.initial_tab = initial_tab;
+            return true;
+        }
+
+        self.poll_settings_presentation_acknowledgements();
+        if let Some(pending) = self.pending_settings_presentation.as_mut() {
+            // Serialize presentation commands so a late acknowledgement can
+            // never be mistaken for a newer request. Only the latest tab
+            // matters; it is sent as soon as the in-flight request completes.
+            pending.requested_tab = initial_tab;
+            return true;
+        }
+
+        if self.settings_child.is_some() {
+            // Reap a child that exited immediately before this user action. A
+            // confirmed live child keeps the same settings lease and receives
+            // a private presentation command through its inherited stdin.
+            self.poll_settings_window();
+        }
+        if self.settings_child.is_some() {
+            return self.queue_settings_child_presentation(initial_tab);
+        }
+
         if self.settings_transition_active() {
             return true;
         }
@@ -1199,8 +1867,154 @@ impl LightweightSupervisor {
         true
     }
 
+    fn queue_settings_child_presentation(&mut self, tab: models::Tab) -> bool {
+        if let Some(pending) = self.pending_settings_presentation.as_mut() {
+            pending.requested_tab = tab;
+            return true;
+        }
+        if self.settings_child_control_broken {
+            tracing::warn!(
+                "Could not present the settings window because its control channel is closed"
+            );
+            return false;
+        }
+        if self.settings_child.is_none() {
+            return false;
+        }
+
+        if self.settings_child_acknowledgements.is_none() {
+            let reader = self
+                .settings_child
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("settings child is unavailable"))
+                .and_then(spawn_full_ui_ack_reader);
+            match reader {
+                Ok(acknowledgements) => {
+                    self.settings_child_acknowledgements = Some(acknowledgements);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not establish the settings presentation acknowledgement reader");
+                    self.settings_child_control_broken = true;
+                }
+            }
+        }
+
+        // Record the user's intent even if the write races process shutdown.
+        // A live child is never killed for failing to ACK; once try_wait proves
+        // it exited, poll_settings_window reopens the latest requested tab.
+        self.pending_settings_presentation = Some(PendingSettingsPresentation {
+            in_flight_tab: tab,
+            requested_tab: tab,
+            phase: SettingsPresentationPhase::AwaitingAcknowledgement,
+        });
+        let send_result = self
+            .settings_child
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("settings child is unavailable"))
+            .and_then(|child| send_full_ui_presentation(child, tab));
+        if let Err(error) = send_result {
+            tracing::warn!(%error, "Could not send a presentation command to the existing settings window");
+            self.mark_settings_child_control_broken();
+        } else if self.settings_child_control_broken {
+            // The command was best-effort delivered, but without an ACK reader
+            // it is safe to reopen only if this process is confirmed to exit
+            // promptly. Never retain stale reopen intent indefinitely.
+            self.mark_settings_child_control_broken();
+        }
+        true
+    }
+
+    fn mark_settings_child_control_broken(&mut self) {
+        self.settings_child_control_broken = true;
+        self.settings_child_acknowledgements = None;
+        let deadline = Instant::now()
+            .checked_add(FULL_UI_EXIT_CONFIRMATION_GRACE)
+            .unwrap_or_else(Instant::now);
+        if let Some(pending) = self.pending_settings_presentation.as_mut() {
+            pending.phase = SettingsPresentationPhase::AwaitingConfirmedExit { deadline };
+        }
+    }
+
+    fn expire_unconfirmed_settings_presentation(&mut self, now: Instant) {
+        let expired = self
+            .pending_settings_presentation
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.phase,
+                    SettingsPresentationPhase::AwaitingConfirmedExit { deadline }
+                        if now >= deadline
+                )
+            });
+        if expired {
+            self.pending_settings_presentation = None;
+            tracing::warn!(
+                "Abandoned stale settings presentation intent because the control channel failed but the child remained live"
+            );
+        }
+    }
+
+    fn poll_settings_presentation_acknowledgements(&mut self) {
+        loop {
+            let response = match self.settings_child_acknowledgements.as_ref() {
+                Some(acknowledgements) => acknowledgements.try_recv(),
+                None => return,
+            };
+            match response {
+                Ok(Ok(FullUiControlRead::Show(acknowledged_tab))) => {
+                    let Some(pending) = self.pending_settings_presentation else {
+                        tracing::warn!(?acknowledged_tab, "Settings presentation protocol returned an unsolicited acknowledgement");
+                        self.mark_settings_child_control_broken();
+                        return;
+                    };
+                    if acknowledged_tab != pending.in_flight_tab {
+                        tracing::warn!(
+                            ?acknowledged_tab,
+                            expected_tab = ?pending.in_flight_tab,
+                            "Settings presentation protocol returned an out-of-order acknowledgement"
+                        );
+                        self.mark_settings_child_control_broken();
+                        return;
+                    }
+
+                    self.pending_settings_presentation = None;
+                    if pending.requested_tab != acknowledged_tab {
+                        let _ = self.queue_settings_child_presentation(pending.requested_tab);
+                    }
+                }
+                Ok(Ok(FullUiControlRead::Invalid | FullUiControlRead::Exit)) => {
+                    tracing::warn!(
+                        "Settings presentation protocol returned an invalid acknowledgement"
+                    );
+                    self.mark_settings_child_control_broken();
+                    return;
+                }
+                Ok(Ok(FullUiControlRead::EndOfStream)) => {
+                    self.mark_settings_child_control_broken();
+                    return;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Settings presentation acknowledgement reader failed");
+                    self.mark_settings_child_control_broken();
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mark_settings_child_control_broken();
+                    return;
+                }
+            }
+        }
+    }
+
     fn settings_transition_active(&self) -> bool {
         self.settings_child.is_some() || self.pending_settings_launch.is_some()
+    }
+
+    fn monitor_pause_transition_active(&self) -> bool {
+        self.pending_settings_launch.is_some()
+            || self.settings_child.is_some()
+                && (!self.settings_child_bootstrapped || self.settings_mutation_active)
     }
 
     fn poll_pending_settings_launch(&mut self) {
@@ -1287,7 +2101,11 @@ impl LightweightSupervisor {
 
         match spawn(pending.initial_tab, &session_token) {
             Ok(child) => {
+                self.settings_child_acknowledgements = None;
+                self.settings_child_control_broken = false;
+                self.pending_settings_presentation = None;
                 self.settings_child_bootstrapped = false;
+                self.settings_mutation_active = false;
                 self.settings_child = Some(child);
                 self.settings_session_lease = Some(session_lease);
             }
@@ -1336,6 +2154,7 @@ impl LightweightSupervisor {
         drop(session_lease);
         self.settings_session_lease = None;
         self.settings_child_bootstrapped = false;
+        self.settings_mutation_active = false;
         self.resume_monitor_after_settings = false;
         if should_resume {
             self.reload_config_after_settings_with_recovery_lease(true);
@@ -1347,33 +2166,87 @@ impl LightweightSupervisor {
     }
 
     fn poll_settings_window(&mut self) {
+        self.poll_settings_presentation_acknowledgements();
         self.poll_settings_window_with_loader(|_| load_config_with_storage_recovery());
+        self.expire_unconfirmed_settings_presentation(Instant::now());
     }
 
-    fn close_settings_child_for_exit(&mut self) {
-        self.resume_monitor_after_settings = false;
-        self.pending_settings_launch = None;
-        self.settings_child_bootstrapped = false;
+    fn poll_exit_request(&mut self, now: Instant) -> bool {
+        #[cfg(not(test))]
+        return self.poll_exit_request_with_monitor_status_writer(
+            now,
+            single_instance::write_monitor_status,
+        );
+        #[cfg(test)]
+        return self.poll_exit_request_with_monitor_status_writer(now, |_| Ok(()));
+    }
+
+    fn poll_exit_request_with_monitor_status_writer(
+        &mut self,
+        now: Instant,
+        write_monitor_status: impl FnMut(bool) -> anyhow::Result<()>,
+    ) -> bool {
+        if !self.exit_requested {
+            return false;
+        }
+        if self
+            .settings_child_exit_deadline
+            .is_some_and(|deadline| now >= deadline)
+            && self.settings_child.is_some()
+        {
+            self.force_settings_child_exit_after_timeout(now);
+        }
+        self.handle_exit_request_with_monitor_status_writer(write_monitor_status)
+    }
+
+    fn force_settings_child_exit_after_timeout(&mut self, now: Instant) {
         let Some(mut child) = self.settings_child.take() else {
-            self.settings_session_lease = None;
+            self.settings_child_exit_deadline = None;
             return;
         };
-
-        if child_has_exited(&mut child) {
-            self.settings_session_lease = None;
-            self.revoke_settings_session_authorization_fail_closed(
-                "Could not revoke settings authorization during supervisor exit",
+        let mutation_was_active = self.settings_mutation_active;
+        let exited = child_has_exited(&mut child)
+            || terminate_child_process(&mut child, "settings window after save timeout");
+        if !exited {
+            // Do not drop the process handle or the shared settings lease
+            // without confirmed exit. Keep automation synchronously gated and
+            // retry the forced close on a later supervisor tick.
+            self.settings_child = Some(child);
+            self.settings_child_exit_deadline = Some(
+                now.checked_add(FULL_UI_EXIT_CONFIRMATION_GRACE)
+                    .unwrap_or(now),
             );
+            if mutation_was_active {
+                self.mark_settings_exit_storage_recovery_required();
+            }
             return;
         }
 
-        terminate_child_process(&mut child, "settings window");
+        self.settings_child_acknowledgements = None;
+        self.settings_child_control_broken = false;
+        self.settings_child_bootstrapped = false;
+        self.settings_mutation_active = false;
+        self.settings_child_exit_deadline = None;
         self.settings_session_lease = None;
-        if child_has_exited(&mut child) {
-            self.revoke_settings_session_authorization_fail_closed(
-                "Could not revoke settings authorization during supervisor exit",
-            );
+        if mutation_was_active {
+            self.mark_settings_exit_storage_recovery_required();
         }
+        self.revoke_settings_session_authorization_fail_closed(
+            "Could not revoke settings authorization after forced settings exit",
+        );
+    }
+
+    fn mark_settings_exit_storage_recovery_required(&mut self) {
+        self.storage_recovery_ready = false;
+        self.storage_recovery_sticky_blocked = true;
+        self.desired_monitor_running = false;
+        self.resume_monitor_after_settings = false;
+        #[cfg(not(test))]
+        if let Err(error) = storage::mark_storage_recovery_blocked() {
+            tracing::error!(%error, "Ambiguous settings exit recovery block could not be persisted; supervisor-local pause remains active");
+        }
+        self.worker_pause_latch.pause();
+        self.worker_invalidator.invalidate();
     }
 
     fn poll_settings_window_with_loader(
@@ -1386,10 +2259,26 @@ impl LightweightSupervisor {
 
         match child.try_wait() {
             Ok(Some(_)) => {
+                // Reload/cancel/recovery ACKs all clear this flag before a
+                // healthy child is allowed to close. Seeing it at confirmed
+                // process exit means the background transaction ended
+                // ambiguously (including panic=abort release builds), so the
+                // supervisor must make the pause sticky before any reload.
+                let mutation_was_active = self.settings_mutation_active;
+                let requested_replacement_tab = self
+                    .pending_settings_presentation
+                    .take()
+                    .map(|pending| pending.requested_tab);
                 self.settings_child = None;
+                self.settings_child_acknowledgements = None;
+                self.settings_child_control_broken = false;
                 self.settings_child_bootstrapped = false;
+                self.settings_mutation_active = false;
                 self.settings_session_lease = None;
-                let should_resume = self.resume_monitor_after_settings
+                if mutation_was_active {
+                    self.mark_settings_exit_storage_recovery_required();
+                }
+                let should_resume = requested_replacement_tab.is_none()
                     && self.desired_monitor_running
                     && !self.storage_recovery_sticky_blocked
                     && self.accessibility_ready_for_start();
@@ -1400,6 +2289,12 @@ impl LightweightSupervisor {
                     tracing::warn!(
                         "Monitor left stopped because settings reload could not be delivered safely"
                     );
+                }
+                if let Some(tab) = requested_replacement_tab {
+                    // The presentation command raced a confirmed process exit.
+                    // Reopen the requested tab only after the old child's
+                    // storage lease has been released and recovery/reload ran.
+                    let _ = self.open_full_ui_window_with_monitor_policy(tab, true);
                 }
             }
             Ok(None) => {}
@@ -1412,6 +2307,8 @@ impl LightweightSupervisor {
         }
     }
 
+    #[cfg_attr(test, allow(dead_code))]
+    #[cfg(any(target_os = "windows", test))]
     fn reload_config_after_settings(&mut self) {
         if self.settings_transition_active() {
             // A reload request from the live child is only a hint. The child
@@ -1551,6 +2448,24 @@ impl LightweightSupervisor {
     }
 
     fn apply_reloaded_config(&mut self, startup: StartupConfig, start_monitor: bool) -> bool {
+        let Some((next_config, apply_command)) =
+            self.prepare_reloaded_config(startup, start_monitor)
+        else {
+            return false;
+        };
+        if let Err(error) = self.worker_tx.try_send(apply_command) {
+            self.fail_reloaded_config_delivery(&error);
+            return false;
+        }
+        self.finish_reloaded_config(next_config);
+        true
+    }
+
+    fn prepare_reloaded_config(
+        &mut self,
+        startup: StartupConfig,
+        start_monitor: bool,
+    ) -> Option<(models::AppConfig, background::WorkerCommand)> {
         let pause_epoch = self.worker_pause_latch.pause_with_epoch();
         self.worker_invalidator.invalidate();
         if !startup.storage_recovery_ready {
@@ -1558,11 +2473,11 @@ impl LightweightSupervisor {
             tracing::error!(
                 "Saved config was not delivered to the worker because password storage recovery is incomplete; monitor will remain stopped"
             );
-            return false;
+            return None;
         }
         if self.storage_recovery_sticky_blocked {
             self.worker_pause_latch.pause();
-            return false;
+            return None;
         }
         let next_config = startup.config;
         let start_monitor = start_monitor && self.desired_monitor_running;
@@ -1573,23 +2488,26 @@ impl LightweightSupervisor {
             true,
             start_monitor,
         );
-        if let Err(e) = self.worker_tx.try_send(apply_command) {
-            self.storage_recovery_ready = false;
-            self.resume_monitor_after_settings = false;
-            self.worker_pause_latch.pause();
-            if self.worker_status == models::WorkerStatus::Running {
-                let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
-            }
-            tracing::error!(
-                error = %e,
-                "Could not deliver saved config to worker; monitor will remain stopped"
-            );
-            return false;
+        Some((next_config, apply_command))
+    }
+
+    fn fail_reloaded_config_delivery(&mut self, error: &impl std::fmt::Display) {
+        self.storage_recovery_ready = false;
+        self.resume_monitor_after_settings = false;
+        self.worker_pause_latch.pause();
+        if self.worker_status == models::WorkerStatus::Running {
+            let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
         }
+        tracing::error!(
+            %error,
+            "Could not deliver saved config to worker; monitor will remain stopped"
+        );
+    }
+
+    fn finish_reloaded_config(&mut self, next_config: models::AppConfig) {
         self.config = next_config;
         self.storage_recovery_ready = true;
         self.update_tray_status();
-        true
     }
 
     fn retry_blocked_storage_recovery(&mut self) {
@@ -1606,16 +2524,42 @@ impl LightweightSupervisor {
         let should_resume = self.resume_monitor_after_settings
             && self.desired_monitor_running
             && self.accessibility_ready_for_start();
-        if self.reload_config_after_settings_with_recovery_lease(should_resume) {
-            self.resume_monitor_after_settings = false;
+        if self.complete_blocked_storage_recovery_with(
+            should_resume,
+            |supervisor, start_monitor| {
+                supervisor.reload_config_after_settings_with_recovery_lease(start_monitor)
+            },
+        ) {
             tracing::info!("Deferred password storage recovery completed safely");
         }
     }
 
+    fn complete_blocked_storage_recovery_with<R>(&mut self, should_resume: bool, reload: R) -> bool
+    where
+        R: FnOnce(&mut Self, bool) -> bool,
+    {
+        let startup_preference_deferred = self.startup_window_preference_pending;
+        let start_during_reload = should_resume && !startup_preference_deferred;
+        if !reload(self, start_during_reload) {
+            return false;
+        }
+        self.resume_monitor_after_settings = false;
+        if startup_preference_deferred {
+            self.apply_deferred_startup_runtime_preferences(should_resume);
+        }
+        true
+    }
+
     fn update_tray_status(&self) {
-        let running = self.worker_status == models::WorkerStatus::Running;
-        if let Err(e) = single_instance::write_monitor_status(running) {
-            tracing::warn!("Could not write monitor status: {e}");
+        let control_state = self.monitor_control_state();
+        #[cfg(test)]
+        self.last_published_monitor_control_state
+            .set(Some(control_state));
+        #[cfg(not(test))]
+        {
+            if let Err(e) = single_instance::write_monitor_control_state(control_state) {
+                tracing::warn!("Could not write monitor status: {e}");
+            }
         }
 
         let Some(tray) = &self.tray else {
@@ -1623,7 +2567,7 @@ impl LightweightSupervisor {
         };
         tray.set_accessibility_trusted(self.accessibility_trusted);
         tray.set_keychain_enabled(self.config.settings.use_keyring);
-        tray.set_monitor_running(self.monitor_control_state().toggle_requests_stop());
+        tray.set_monitor_control_state(control_state);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1666,16 +2610,34 @@ impl ApplicationHandler for LightweightSupervisor {
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             self.process_monitor_commands();
-            self.process_activation_requests();
+            if !self.exit_requested {
+                self.process_activation_requests();
+            }
         }
         self.poll_settings_window();
+        if self.exit_requested {
+            if self.poll_exit_request(Instant::now()) {
+                event_loop.exit();
+                return;
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + SUPERVISOR_TICK));
+            return;
+        }
         self.retry_blocked_storage_recovery();
         self.poll_accessibility();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + SUPERVISOR_TICK));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.handle_exit_request();
+        if self.handle_exit_request() {
+            return;
+        }
+        // This callback also covers an externally initiated event-loop exit,
+        // where there is no future tick in which to honor the normal grace
+        // period. Force the already-gated child down and leave recovery
+        // blocked if a mutation may have been interrupted.
+        self.force_settings_child_exit_after_timeout(Instant::now());
+        let _ = self.handle_exit_request();
     }
 }
 
@@ -1696,7 +2658,9 @@ fn local_ipc_command_authorized(
     match command {
         single_instance::LocalIpcCommand::Activate => true,
         single_instance::LocalIpcCommand::SettingsBootstrap => Some(peer_pid) == settings_child_pid,
-        single_instance::LocalIpcCommand::ReloadConfig
+        single_instance::LocalIpcCommand::SettingsMutationBegin
+        | single_instance::LocalIpcCommand::SettingsMutationCancel
+        | single_instance::LocalIpcCommand::ReloadConfig
         | single_instance::LocalIpcCommand::Monitor(_) => {
             settings_child_bootstrapped && Some(peer_pid) == settings_child_pid
         }
@@ -1731,8 +2695,13 @@ fn spawn_full_ui_window(
     privileged_ipc_available: bool,
     settings_session_token: &single_instance::SettingsSessionToken,
 ) -> anyhow::Result<Child> {
+    #[cfg(target_os = "windows")]
+    let executable = app_identity::windows_full_ui_executable_path()?;
+    #[cfg(not(target_os = "windows"))]
+    let executable = std::env::current_exe()?;
+
     Ok(full_ui_command(
-        std::env::current_exe()?,
+        executable,
         initial_tab,
         privileged_ipc_available,
         Some(settings_session_token),
@@ -1747,7 +2716,11 @@ fn full_ui_command(
     settings_session_token: Option<&single_instance::SettingsSessionToken>,
 ) -> Command {
     let mut command = Command::new(current_exe);
-    command.arg("--full-ui").arg(initial_tab_arg(initial_tab));
+    command
+        .arg("--full-ui")
+        .arg(initial_tab_arg(initial_tab))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
     if let Some(token) = settings_session_token {
         command.env(SETTINGS_SESSION_TOKEN_ENV, token.as_str());
     } else {
@@ -1776,22 +2749,22 @@ fn child_has_exited(child: &mut Child) -> bool {
         Ok(None) => false,
         Err(e) => {
             tracing::warn!("Could not check child process state before exit: {e}");
-            true
+            false
         }
     }
 }
 
-fn terminate_child_process(child: &mut Child, label: &str) {
+fn terminate_child_process(child: &mut Child, label: &str) -> bool {
     request_child_termination(child, label);
     if wait_for_child_exit(child, Duration::from_millis(500)) {
-        return;
+        return true;
     }
 
     if let Err(e) = child.kill() {
         tracing::warn!("Could not force quit {label}: {e}");
-        return;
+        return false;
     }
-    let _ = wait_for_child_exit(child, Duration::from_millis(500));
+    wait_for_child_exit(child, Duration::from_millis(500))
 }
 
 #[cfg(unix)]
@@ -1858,14 +2831,135 @@ fn load_icon() -> anyhow::Result<egui::IconData> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_authorized_settings_session_with, fill_result_label,
-        finish_startup_storage_recovery_after_journals_with_ops, full_ui_command, full_ui_renderer,
-        initial_tab_arg, publish_initial_monitor_status, std_channel, sync_startup_auto_start_with,
-        tokio_channel, LightweightSupervisor, MonitorControlState, StartupConfig,
+        acquire_authorized_settings_session_with, build_background_runtime, dispatch_full_ui_exit,
+        fill_result_label, finish_startup_storage_recovery_after_journals_with_ops,
+        full_ui_command, full_ui_control_message, full_ui_renderer, initial_tab_arg,
+        publish_initial_monitor_status, read_full_ui_control_command, send_full_ui_presentation,
+        spawn_full_ui_ack_reader, std_channel, sync_startup_auto_start_with, tokio_channel,
+        FullUiControlRead, LightweightSupervisor, MonitorControlState, SettingsPresentationPhase,
+        StartupConfig, BACKGROUND_RUNTIME_WORKER_THREADS,
     };
     use crate::background::{WorkerCommand, WorkerInvalidator, WorkerQuiescenceAck};
     use crate::debug_fill::FillAttemptReport;
     use crate::models::{Account, AppConfig};
+    use crate::tray::TrayCommand;
+    use eframe::egui;
+    use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn background_runtime_uses_one_worker_for_the_one_monitor_task() {
+        let runtime = build_background_runtime().unwrap();
+
+        assert_eq!(BACKGROUND_RUNTIME_WORKER_THREADS, 1);
+        assert_eq!(runtime.metrics().num_workers(), 1);
+    }
+
+    #[test]
+    fn live_settings_commit_acknowledges_only_after_worker_capacity_is_reserved() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.settings_mutation_active = true;
+        let mut next_config = AppConfig::default();
+        next_config.settings.start_minimized = true;
+        let expected = next_config.clone();
+        let ack_saw_no_released_command = std::cell::Cell::new(false);
+
+        assert!(supervisor.acknowledge_live_settings_commit_with_loader(
+            || {
+                ack_saw_no_released_command.set(worker_rx.try_recv().is_err());
+                Ok(())
+            },
+            || StartupConfig {
+                config: next_config,
+                storage_recovery_ready: true,
+            },
+        ));
+
+        assert!(ack_saw_no_released_command.get());
+        assert_eq!(supervisor.config, expected);
+        assert!(!supervisor.settings_mutation_active);
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Ok(WorkerCommand::ApplyConfigAndReleasePause { .. })
+        ));
+    }
+
+    #[test]
+    fn live_settings_commit_does_not_ack_when_worker_capacity_is_unavailable() {
+        let (worker_tx, mut worker_rx) = tokio_channel(1);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        worker_tx.try_send(WorkerCommand::Start).unwrap();
+        let original_config = AppConfig::default();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            original_config.clone(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.settings_mutation_active = true;
+        let acknowledged = std::cell::Cell::new(false);
+
+        assert!(!supervisor.acknowledge_live_settings_commit_with_loader(
+            || {
+                acknowledged.set(true);
+                Ok(())
+            },
+            || StartupConfig {
+                config: AppConfig::default(),
+                storage_recovery_ready: true,
+            },
+        ));
+
+        assert!(!acknowledged.get());
+        assert!(supervisor.settings_mutation_active);
+        assert_eq!(supervisor.config, original_config);
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Start)));
+    }
+
+    #[test]
+    fn live_settings_commit_ack_failure_never_publishes_release_command() {
+        let (worker_tx, mut worker_rx) = tokio_channel(1);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.settings_mutation_active = true;
+
+        assert!(!supervisor.acknowledge_live_settings_commit_with_loader(
+            || anyhow::bail!("test acknowledgement failure"),
+            || StartupConfig {
+                config: AppConfig::default(),
+                storage_recovery_ready: true,
+            },
+        ));
+
+        assert!(supervisor.settings_mutation_active);
+        assert!(worker_rx.try_recv().is_err());
+    }
 
     fn report(success: bool, fields: &[(&str, &str)], failure: Option<&str>) -> FillAttemptReport {
         FillAttemptReport {
@@ -1951,6 +3045,18 @@ mod tests {
     }
 
     #[test]
+    fn config_load_failure_keeps_startup_window_preference_unknown() {
+        let startup_load =
+            super::load_config_with_storage_recovery_inner_with_loader(false, || {
+                anyhow::bail!("simulated unreadable config")
+            });
+
+        assert!(!startup_load.window_preference_known);
+        assert!(!startup_load.startup.storage_recovery_ready);
+        assert!(!startup_load.startup.config.settings.start_minimized);
+    }
+
+    #[test]
     fn verified_startup_reconciles_and_persists_auto_start() {
         let mut startup = StartupConfig {
             config: AppConfig::default(),
@@ -1965,6 +3071,186 @@ mod tests {
 
         assert_eq!(saved_auto_start.get(), Some(true));
         assert!(startup.config.settings.auto_start);
+    }
+
+    #[test]
+    fn launch_requests_accounts_when_main_window_is_not_hidden() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut config = AppConfig::default();
+        config.settings.start_minimized = false;
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            config,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+
+        supervisor.apply_startup_runtime_preferences(true);
+
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+        // Startup presentation closes the worker gate before monitor intent is
+        // applied, so a fill cannot race this one-shot window launch.
+        assert_eq!(
+            supervisor
+                .pending_settings_launch
+                .as_ref()
+                .map(|pending| pending.initial_tab),
+            Some(crate::models::Tab::Accounts)
+        );
+        assert!(supervisor.settings_child.is_none());
+
+        complete_pending_settings_launch(
+            &mut supervisor,
+            &mut worker_rx,
+            crate::models::Tab::Accounts,
+        );
+
+        assert!(supervisor.pending_settings_launch.is_none());
+        assert!(supervisor.settings_child.is_some());
+        // The child must bootstrap before monitor intent can resume, so no
+        // Start is allowed merely because the native UI process was spawned.
+        assert!(worker_rx.try_recv().is_err());
+        let _ = supervisor.settings_child.take().unwrap().kill();
+    }
+
+    #[test]
+    fn launch_stays_tray_only_when_main_window_is_hidden() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut config = AppConfig::default();
+        config.settings.start_minimized = true;
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            config,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.accessibility_trusted = true;
+
+        supervisor.apply_startup_runtime_preferences(true);
+
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Start)));
+        assert!(worker_rx.try_recv().is_err());
+        assert!(supervisor.pending_settings_launch.is_none());
+        assert!(supervisor.settings_child.is_none());
+        assert!(!supervisor.worker_pause_latch.is_paused());
+    }
+
+    #[test]
+    fn launch_does_not_guess_window_preference_from_blocked_defaults() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            super::blocked_startup_config().config,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        )
+        .with_storage_recovery_state(false);
+        supervisor.resume_monitor_after_settings = true;
+
+        supervisor.apply_startup_runtime_preferences(false);
+
+        assert!(worker_rx.try_recv().is_err());
+        assert!(supervisor.pending_settings_launch.is_none());
+        assert!(supervisor.settings_child.is_none());
+        assert!(supervisor.worker_pause_latch.is_paused());
+        assert!(supervisor.resume_monitor_after_settings);
+        assert!(supervisor.startup_window_preference_pending);
+    }
+
+    #[test]
+    fn deferred_startup_window_preference_uses_recovered_value_exactly_once() {
+        for start_minimized in [false, true] {
+            let (worker_tx, mut worker_rx) = tokio_channel(8);
+            let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+            let (tray_tx, tray_rx) = std_channel();
+            let mut supervisor = LightweightSupervisor::new(
+                worker_tx,
+                worker_event_rx,
+                tray_tx,
+                tray_rx,
+                WorkerInvalidator::new(),
+                super::blocked_startup_config().config,
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                None,
+            )
+            .with_storage_recovery_state(false);
+
+            supervisor.apply_startup_runtime_preferences(false);
+            assert!(supervisor.startup_window_preference_pending);
+            assert!(worker_rx.try_recv().is_err());
+
+            let mut recovered = AppConfig::default();
+            recovered.settings.start_minimized = start_minimized;
+            let start_during_reload = std::cell::Cell::new(None);
+            assert!(supervisor.complete_blocked_storage_recovery_with(
+                true,
+                |supervisor, start_monitor| {
+                    start_during_reload.set(Some(start_monitor));
+                    supervisor.apply_reloaded_config(
+                        StartupConfig {
+                            config: recovered,
+                            storage_recovery_ready: true,
+                        },
+                        start_monitor,
+                    )
+                },
+            ));
+
+            // A deferred preference always loads and publishes the recovered
+            // config without starting automation. Window presentation (or the
+            // tray-only Start) is deliberately ordered after that reload.
+            assert_eq!(start_during_reload.get(), Some(false));
+            assert!(!supervisor.startup_window_preference_pending);
+            match worker_rx.try_recv().unwrap() {
+                WorkerCommand::ApplyConfigAndReleasePause {
+                    settings,
+                    start_monitor,
+                    ..
+                } => {
+                    assert_eq!(settings.start_minimized, start_minimized);
+                    assert!(!start_monitor);
+                }
+                other => panic!("expected recovered config apply, got {other:?}"),
+            }
+            if start_minimized {
+                assert!(supervisor.pending_settings_launch.is_none());
+                assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Start)));
+                assert!(worker_rx.try_recv().is_err());
+            } else {
+                assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+                let (_request_id, _acknowledgement) = take_quiescence_request(&mut worker_rx);
+                assert_eq!(
+                    supervisor
+                        .pending_settings_launch
+                        .as_ref()
+                        .map(|pending| pending.initial_tab),
+                    Some(crate::models::Tab::Accounts)
+                );
+                assert!(worker_rx.try_recv().is_err());
+            }
+
+            supervisor.apply_deferred_startup_runtime_preferences(true);
+            assert!(worker_rx.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -1988,6 +3274,258 @@ mod tests {
                 initial_tab_arg(crate::models::Tab::Accounts).to_string()
             ]
         );
+    }
+
+    #[test]
+    fn windows_full_ui_helper_accepts_only_the_bounded_supervisor_arguments() {
+        assert!(super::windows_full_ui_initial_tab_arg_is_valid(
+            "--initial-tab=accounts"
+        ));
+        assert!(super::windows_full_ui_initial_tab_arg_is_valid(
+            "--initial-tab=settings"
+        ));
+        assert_eq!(
+            super::windows_full_ui_initial_tab_arg_is_valid("--initial-tab=diagnose"),
+            cfg!(feature = "diagnostics-ui")
+        );
+        for rejected in [
+            "--accounts",
+            "--settings",
+            "--full-ui",
+            "--debug-fill-once",
+            "--initial-tab=unknown",
+            "--initial-tab=settings --extra",
+        ] {
+            assert!(
+                !super::windows_full_ui_initial_tab_arg_is_valid(rejected),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_helper_split_is_feature_gated_and_fails_closed_off_windows() {
+        let source = include_str!("main.rs");
+        let entrypoint = source
+            .split_once("pub(crate) fn main()")
+            .and_then(|(_, tail)| tail.split_once("fn run_lightweight_supervisor()"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let spawn = source
+            .split_once("fn spawn_full_ui_window(")
+            .and_then(|(_, tail)| tail.split_once("fn full_ui_command("))
+            .map(|(body, _)| body)
+            .unwrap();
+        let helper = include_str!("bin/windows-app-autologin-ui.rs");
+        let manifest = include_str!("../Cargo.toml");
+
+        assert!(entrypoint.contains("app_identity::windows_binary_role()?"));
+        assert!(entrypoint.contains("WindowsBinaryRole::FullUi"));
+        assert!(entrypoint.contains("WindowsBinaryRole::Supervisor"));
+        assert!(entrypoint.contains("run_windows_full_ui_binary(&args)"));
+        assert!(entrypoint.contains("cannot run in full UI mode"));
+        assert!(spawn.contains("app_identity::windows_full_ui_executable_path()?"));
+        assert!(spawn.contains("#[cfg(not(target_os = \"windows\"))]"));
+        assert!(spawn.contains("std::env::current_exe()?"));
+        assert!(manifest.contains("required-features = [\"windows-ui-helper\"]"));
+        assert!(manifest.contains("windows-ui-helper = []"));
+        assert!(helper.contains("#[cfg(target_os = \"windows\")]\n#[path = \"../main.rs\"]"));
+        assert!(helper.contains("#[cfg(target_os = \"windows\")]\nfn main()"));
+        assert!(helper.contains("#[cfg(not(target_os = \"windows\"))]\nfn main()"));
+        assert!(helper.contains("unavailable on this platform"));
+        assert!(helper.contains("#[path = \"../main.rs\"]"));
+        assert!(helper.contains("application::main()"));
+    }
+
+    #[test]
+    fn full_ui_control_protocol_is_bounded_and_cross_platform() {
+        assert_eq!(
+            full_ui_control_message(crate::models::Tab::Accounts).unwrap(),
+            b"show:accounts\n"
+        );
+        assert_eq!(
+            full_ui_control_message(crate::models::Tab::Settings).unwrap(),
+            b"show:settings\n"
+        );
+
+        let input = b"show:accounts\nshow:settings\r\nexit\nunknown\n";
+        let mut reader = BufReader::with_capacity(3, Cursor::new(input));
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::Show(crate::models::Tab::Accounts)
+        );
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::Show(crate::models::Tab::Settings)
+        );
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::Exit
+        );
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::Invalid
+        );
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::EndOfStream
+        );
+
+        let overlong = format!(
+            "{}\nshow:accounts\n",
+            "x".repeat(super::FULL_UI_CONTROL_MAX_LINE_BYTES + 1)
+        );
+        let mut reader = BufReader::with_capacity(5, Cursor::new(overlong.into_bytes()));
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::Invalid
+        );
+        assert_eq!(
+            read_full_ui_control_command(&mut reader).unwrap(),
+            FullUiControlRead::Show(crate::models::Tab::Accounts)
+        );
+    }
+
+    #[test]
+    fn full_ui_exit_control_dispatches_to_the_ui_owner() {
+        let (tray_tx, tray_rx) = std_channel();
+        let ctx = egui::Context::default();
+
+        assert!(dispatch_full_ui_exit(&tray_tx, &ctx));
+        assert!(matches!(tray_rx.try_recv(), Ok(TrayCommand::Exit)));
+    }
+
+    #[test]
+    fn presentation_ack_channel_is_not_contaminated_by_stderr_diagnostics() {
+        let mut child = spawn_test_control_child_with_stderr_noise();
+        let acknowledgements = spawn_full_ui_ack_reader(&mut child).unwrap();
+
+        send_full_ui_presentation(&mut child, crate::models::Tab::Accounts).unwrap();
+
+        assert_eq!(
+            acknowledgements
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            FullUiControlRead::Show(crate::models::Tab::Accounts)
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn busy_live_ui_is_not_terminated_for_a_delayed_presentation_acknowledgement() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        let child = spawn_test_unacknowledging_control_child();
+        let child_pid = child.id();
+        supervisor.settings_child = Some(child);
+
+        assert!(
+            supervisor.open_full_ui_window_with_monitor_policy(crate::models::Tab::Accounts, true,)
+        );
+        assert_eq!(
+            supervisor
+                .settings_child
+                .as_ref()
+                .map(std::process::Child::id),
+            Some(child_pid)
+        );
+        assert!(supervisor
+            .settings_child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            supervisor
+                .pending_settings_presentation
+                .as_ref()
+                .map(|pending| pending.requested_tab),
+            Some(crate::models::Tab::Accounts)
+        );
+        assert!(worker_rx.try_recv().is_err());
+
+        let mut child = supervisor.settings_child.take().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn broken_presentation_protocol_does_not_kill_child_or_retain_stale_reopen_intent() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        let child = spawn_test_invalid_ack_control_child();
+        let child_pid = child.id();
+        supervisor.settings_child = Some(child);
+
+        assert!(
+            supervisor.open_full_ui_window_with_monitor_policy(crate::models::Tab::Accounts, true,)
+        );
+        for _ in 0..100 {
+            supervisor.poll_settings_presentation_acknowledgements();
+            if supervisor.settings_child_control_broken {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(supervisor.settings_child_control_broken);
+        let deadline = match supervisor
+            .pending_settings_presentation
+            .as_ref()
+            .map(|pending| pending.phase)
+        {
+            Some(SettingsPresentationPhase::AwaitingConfirmedExit { deadline }) => deadline,
+            other => panic!("expected exit-confirmation phase, got {other:?}"),
+        };
+        assert!(supervisor
+            .settings_child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
+
+        supervisor.expire_unconfirmed_settings_presentation(deadline);
+
+        assert!(supervisor.pending_settings_presentation.is_none());
+        assert!(!supervisor
+            .open_full_ui_window_with_monitor_policy(crate::models::Tab::Settings, true,));
+        assert_eq!(
+            supervisor
+                .settings_child
+                .as_ref()
+                .map(std::process::Child::id),
+            Some(child_pid)
+        );
+        assert!(supervisor.pending_settings_presentation.is_none());
+        assert!(worker_rx.try_recv().is_err());
+
+        let mut child = supervisor.settings_child.take().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -2285,6 +3823,7 @@ mod tests {
 
         let mut recovered = AppConfig::default();
         recovered.settings.use_keyring = false;
+        recovered.settings.start_minimized = true;
         let mut account = Account::new("user@example.com");
         account.id = "account-1".to_string();
         account.has_saved_password = true;
@@ -2537,6 +4076,157 @@ mod tests {
         assert!(!supervisor.acknowledge_settings_bootstrap_with(4242, || Ok(())));
     }
 
+    #[test]
+    fn repeated_full_ui_requests_present_the_live_child_without_requiescing() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        let child = spawn_test_control_child();
+        let child_pid = child.id();
+        supervisor.settings_child = Some(child);
+        supervisor.resume_monitor_after_settings = true;
+        let session_token = supervisor.settings_session_token.as_str().to_string();
+        let pause_epoch = supervisor.worker_pause_latch.current_epoch();
+        let was_paused = supervisor.worker_pause_latch.is_paused();
+
+        assert!(
+            supervisor.open_full_ui_window_with_monitor_policy(crate::models::Tab::Accounts, true,)
+        );
+        assert!(
+            supervisor.open_full_ui_window_with_monitor_policy(crate::models::Tab::Settings, true,)
+        );
+        for _ in 0..100 {
+            supervisor.poll_settings_presentation_acknowledgements();
+            if supervisor.pending_settings_presentation.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            supervisor
+                .settings_child
+                .as_ref()
+                .map(std::process::Child::id),
+            Some(child_pid)
+        );
+        assert!(supervisor.pending_settings_presentation.is_none());
+        assert!(supervisor.pending_settings_launch.is_none());
+        assert_eq!(supervisor.settings_session_token.as_str(), session_token);
+        assert!(supervisor.resume_monitor_after_settings);
+        assert_eq!(supervisor.worker_pause_latch.current_epoch(), pause_epoch);
+        assert_eq!(supervisor.worker_pause_latch.is_paused(), was_paused);
+        assert!(worker_rx.try_recv().is_err());
+
+        let mut child = supervisor.settings_child.take().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn presentation_racing_child_exit_reopens_the_latest_tab_only_after_confirmed_exit() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.settings_child = Some(spawn_test_exiting_control_child());
+        supervisor.resume_monitor_after_settings = true;
+
+        assert!(
+            supervisor.open_full_ui_window_with_monitor_policy(crate::models::Tab::Accounts, true,)
+        );
+        assert!(
+            supervisor.open_full_ui_window_with_monitor_policy(crate::models::Tab::Settings, true,)
+        );
+        assert!(supervisor.pending_settings_launch.is_none());
+        assert_eq!(
+            supervisor
+                .pending_settings_presentation
+                .as_ref()
+                .map(|pending| pending.requested_tab),
+            Some(crate::models::Tab::Settings)
+        );
+
+        wait_for_test_child_exit(&mut supervisor);
+        supervisor.poll_settings_window_with_loader(|_| StartupConfig {
+            config: AppConfig::default(),
+            storage_recovery_ready: true,
+        });
+
+        assert!(supervisor.settings_child.is_none());
+        assert!(supervisor.pending_settings_presentation.is_none());
+        assert_eq!(
+            supervisor
+                .pending_settings_launch
+                .as_ref()
+                .map(|pending| pending.initial_tab),
+            Some(crate::models::Tab::Settings)
+        );
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Ok(WorkerCommand::ApplyConfigAndReleasePause {
+                start_monitor: false,
+                ..
+            })
+        ));
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+        let (_request_id, _acknowledgement) = take_quiescence_request(&mut worker_rx);
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn repeated_request_retargets_pending_launch_without_duplicate_worker_commands() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+
+        supervisor.open_settings_window();
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+        let (request_id, _acknowledgement) = take_quiescence_request(&mut worker_rx);
+        let session_token = supervisor.settings_session_token.as_str().to_string();
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(supervisor.handle_activation_request());
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        supervisor.open_accounts_window();
+
+        let pending = supervisor.pending_settings_launch.as_ref().unwrap();
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.initial_tab, crate::models::Tab::Accounts);
+        assert_eq!(supervisor.settings_session_token.as_str(), session_token);
+        assert!(supervisor.settings_child.is_none());
+        assert!(worker_rx.try_recv().is_err());
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn activate_ipc_pauses_running_monitor_before_opening_accounts() {
@@ -2555,6 +4245,7 @@ mod tests {
             None,
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.desired_monitor_running = true;
         supervisor.accessibility_trusted = true;
         supervisor.resume_monitor_after_settings = false;
 
@@ -2596,6 +4287,7 @@ mod tests {
             None,
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.desired_monitor_running = true;
         supervisor.accessibility_trusted = true;
         supervisor.resume_monitor_after_settings = false;
         let initial_token = supervisor.settings_session_token.clone();
@@ -2977,6 +4669,85 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
+    fn monitor_ipc_is_not_acknowledged_when_control_state_publish_fails() {
+        use super::single_instance::MonitorControlCommand;
+
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        supervisor.desired_monitor_running = true;
+        let published_state = std::cell::Cell::new(None);
+        let (acknowledged_tx, acknowledged_rx) = std_channel();
+
+        let committed_and_acknowledged = supervisor.acknowledge_monitor_control_command_with(
+            MonitorControlCommand::Stop,
+            |state| {
+                published_state.set(Some(state));
+                anyhow::bail!("synthetic monitor status publication failure")
+            },
+            || {
+                acknowledged_tx.send(())?;
+                Ok(())
+            },
+        );
+
+        assert!(!committed_and_acknowledged);
+        assert_eq!(published_state.get(), Some(MonitorControlState::Stopped));
+        assert!(acknowledged_rx.try_recv().is_err());
+        assert!(!supervisor.desired_monitor_running);
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn monitor_start_ipc_blocked_by_recovery_is_neither_published_nor_acknowledged() {
+        use super::single_instance::MonitorControlCommand;
+
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.storage_recovery_sticky_blocked = true;
+        supervisor.desired_monitor_running = false;
+        let publish_count = std::cell::Cell::new(0);
+        let acknowledge_count = std::cell::Cell::new(0);
+
+        assert!(!supervisor.acknowledge_monitor_control_command_with(
+            MonitorControlCommand::Start,
+            |_| {
+                publish_count.set(publish_count.get() + 1);
+                Ok(())
+            },
+            || {
+                acknowledge_count.set(acknowledge_count.get() + 1);
+                Ok(())
+            },
+        ));
+        assert_eq!(publish_count.get(), 0);
+        assert_eq!(acknowledge_count.get(), 0);
+        assert!(!supervisor.desired_monitor_running);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
     fn storage_block_ipc_is_sticky_after_immediately_exited_settings_child_is_reaped() {
         use super::single_instance::{LocalIpcCommand, MonitorControlCommand};
 
@@ -3157,7 +4928,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_request_terminates_settings_child_and_stops_worker() {
+    fn exit_request_marks_active_mutation_recovery_before_shutdown() {
         let (worker_tx, mut worker_rx) = tokio_channel(8);
         let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
         let (tray_tx, tray_rx) = std_channel();
@@ -3173,32 +4944,85 @@ mod tests {
         );
         supervisor.worker_status = crate::models::WorkerStatus::Running;
         supervisor.resume_monitor_after_settings = true;
-        let child = spawn_test_child("exec sleep 30");
-        #[cfg(unix)]
-        let child_pid = child.id();
+        supervisor.settings_mutation_active = true;
+        let child = spawn_test_exiting_control_child();
         supervisor.settings_child = Some(child);
+        let mut published_statuses = Vec::new();
 
-        supervisor.handle_exit_request();
+        assert!(
+            !supervisor.handle_exit_request_with_monitor_status_writer(|running| {
+                published_statuses.push(running);
+                Ok(())
+            })
+        );
 
         assert!(supervisor.exit_requested);
-        assert!(supervisor.settings_child.is_none());
+        assert!(supervisor.settings_child.is_some());
+        assert!(supervisor.settings_mutation_active);
         assert!(!supervisor.resume_monitor_after_settings);
-        match worker_rx.try_recv().unwrap() {
-            WorkerCommand::Stop => {}
-            other => panic!("expected Stop, got {other:?}"),
-        }
-        #[cfg(unix)]
-        {
-            let still_running = process_is_running(child_pid);
-            if still_running {
-                unsafe {
-                    libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-            assert!(!still_running);
-        }
+        assert!(published_statuses.is_empty());
+        assert!(worker_rx.try_recv().is_err());
 
-        supervisor.handle_exit_request();
+        wait_for_test_child_exit(&mut supervisor);
+        supervisor.poll_settings_window_with_loader(|_| StartupConfig {
+            config: AppConfig::default(),
+            storage_recovery_ready: true,
+        });
+        assert!(supervisor.settings_child.is_none());
+        assert!(supervisor.storage_recovery_sticky_blocked);
+        assert!(!supervisor.storage_recovery_ready);
+
+        assert!(
+            supervisor.handle_exit_request_with_monitor_status_writer(|running| {
+                published_statuses.push(running);
+                Ok(())
+            })
+        );
+        assert_eq!(published_statuses, vec![false]);
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn settings_exit_timeout_forces_fail_closed_shutdown_for_active_mutation() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.settings_mutation_active = true;
+        supervisor.settings_child = Some(spawn_test_unacknowledging_control_child());
+        let mut published_statuses = Vec::new();
+
+        assert!(
+            !supervisor.handle_exit_request_with_monitor_status_writer(|running| {
+                published_statuses.push(running);
+                Ok(())
+            })
+        );
+        assert!(worker_rx.try_recv().is_err());
+        let deadline = supervisor.settings_child_exit_deadline.unwrap();
+
+        assert!(
+            supervisor.poll_exit_request_with_monitor_status_writer(deadline, |running| {
+                published_statuses.push(running);
+                Ok(())
+            })
+        );
+
+        assert!(supervisor.settings_child.is_none());
+        assert!(supervisor.storage_recovery_sticky_blocked);
+        assert!(!supervisor.settings_mutation_active);
+        assert_eq!(published_statuses, vec![false]);
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
         assert!(worker_rx.try_recv().is_err());
     }
 
@@ -3267,21 +5091,65 @@ mod tests {
                 crate::models::WorkerStatus::Running,
                 false,
             ),
-            MonitorControlState::Running
+            MonitorControlState::Stopped
         );
         assert!(MonitorControlState::Running.toggle_requests_stop());
+        assert_eq!(MonitorControlState::Running.toggle_label(), "Stop Monitor");
 
         assert_eq!(
             MonitorControlState::from_worker_and_intent(crate::models::WorkerStatus::Idle, true,),
             MonitorControlState::PausedWithStartIntent
         );
         assert!(MonitorControlState::PausedWithStartIntent.toggle_requests_stop());
+        assert_eq!(
+            MonitorControlState::PausedWithStartIntent.toggle_label(),
+            "Stop Monitor"
+        );
 
         assert_eq!(
             MonitorControlState::from_worker_and_intent(crate::models::WorkerStatus::Idle, false,),
             MonitorControlState::Stopped
         );
         assert!(!MonitorControlState::Stopped.toggle_requests_stop());
+        assert_eq!(MonitorControlState::Stopped.toggle_label(), "Start Monitor");
+    }
+
+    #[test]
+    fn stopping_an_idle_deferred_monitor_updates_control_state_without_worker_event() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.worker_status = crate::models::WorkerStatus::Idle;
+        supervisor.desired_monitor_running = true;
+        supervisor.resume_monitor_after_settings = true;
+        assert_eq!(
+            supervisor.monitor_control_state(),
+            MonitorControlState::PausedWithStartIntent
+        );
+
+        supervisor.stop_monitor();
+
+        assert_eq!(
+            supervisor.monitor_control_state(),
+            MonitorControlState::Stopped
+        );
+        assert_eq!(
+            supervisor.last_published_monitor_control_state.get(),
+            Some(MonitorControlState::Stopped)
+        );
+        assert!(!supervisor.resume_monitor_after_settings);
+        assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+        assert!(worker_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3327,6 +5195,10 @@ mod tests {
         assert_eq!(supervisor.config, original);
         assert!(worker_rx.try_recv().is_err());
         assert!(supervisor.resume_monitor_after_settings);
+        assert_eq!(
+            supervisor.monitor_control_state(),
+            MonitorControlState::PausedWithStartIntent
+        );
         assert!(supervisor.settings_child.is_some());
         let _ = supervisor.settings_child.take().unwrap().kill();
     }
@@ -3523,14 +5395,167 @@ mod tests {
 
         let (program, args): (&str, &[&str]) = match command {
             "exit 0" => ("cmd.exe", &["/C", "exit 0"]),
-            "sleep 1" => ("timeout.exe", &["/T", "1", "/NOBREAK"]),
-            "exec sleep 30" => ("timeout.exe", &["/T", "30", "/NOBREAK"]),
+            // `timeout.exe` exits immediately when stdin is redirected, which
+            // makes live-child lifecycle tests pass without exercising their
+            // intended wait. `ping.exe` does not depend on console stdin; its
+            // first reply is immediate and each additional reply adds roughly
+            // one second.
+            "sleep 1" => ("ping.exe", &["-n", "2", "127.0.0.1"]),
+            "exec sleep 30" => ("ping.exe", &["-n", "31", "127.0.0.1"]),
             other => panic!("unsupported Windows test child command: {other}"),
         };
         std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_control_child() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while IFS= read -r line; do printf '%s\\n' \"$line\"; done")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_control_child() -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        std::process::Command::new("more.com")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_control_child_with_stderr_noise() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("IFS= read -r line; printf 'ordinary diagnostic\\n' >&2; printf '%s\\n' \"$line\"")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_control_child_with_stderr_noise() -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        std::process::Command::new("cmd.exe")
+            .args([
+                "/D",
+                "/Q",
+                "/V:ON",
+                "/C",
+                "set /p line=& echo ordinary diagnostic 1>&2 & echo !line!",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_unacknowledging_control_child() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_unacknowledging_control_child() -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        std::process::Command::new("cmd.exe")
+            .args(["/D", "/Q", "/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_exiting_control_child() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("IFS= read -r line; exit 0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_exiting_control_child() -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        std::process::Command::new("cmd.exe")
+            .args(["/D", "/Q", "/C", "set /p line=& exit /b 0"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_invalid_ack_control_child() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("IFS= read -r line; printf 'invalid\\n'; exec sleep 30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_invalid_ack_control_child() -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        std::process::Command::new("cmd.exe")
+            .args([
+                "/D",
+                "/Q",
+                "/C",
+                "set /p line=& echo invalid & ping -n 30 127.0.0.1 >NUL",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -3548,10 +5573,5 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-    }
-
-    #[cfg(unix)]
-    fn process_is_running(pid: u32) -> bool {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 }

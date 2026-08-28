@@ -68,7 +68,12 @@ fn current_launch_path() -> anyhow::Result<String> {
         Ok(exe_path.to_string_lossy().to_string())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    return Ok(crate::app_identity::windows_supervisor_executable_path()?
+        .to_string_lossy()
+        .to_string());
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     Ok(std::env::current_exe()?.to_string_lossy().to_string())
 }
 
@@ -1605,6 +1610,20 @@ mod tests {
         assert!(policy.contains("WAAL_WINDOWS_AUTHENTICODE_PUBLISHER"));
         assert!(policy.contains("WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256"));
         assert!(policy.contains("windows_executable_authenticode_identity_matches"));
+    }
+
+    #[test]
+    fn windows_full_ui_process_always_registers_the_sibling_supervisor_for_startup() {
+        let implementation = include_str!("autostart.rs");
+        let current_launch_path = implementation
+            .split_once("fn current_launch_path()")
+            .and_then(|(_, tail)| tail.split_once("fn containing_app_bundle("))
+            .map(|(body, _)| body)
+            .unwrap();
+
+        assert!(current_launch_path
+            .contains("crate::app_identity::windows_supervisor_executable_path()?"));
+        assert!(current_launch_path.contains("#[cfg(target_os = \"windows\")]"));
     }
 
     #[test]

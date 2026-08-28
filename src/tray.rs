@@ -1,3 +1,4 @@
+use crate::models::MonitorControlState;
 use std::sync::mpsc::Sender;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -8,6 +9,8 @@ use tray_icon::{
 pub(crate) enum TrayCommand {
     OpenAccounts,
     OpenSettings,
+    PresentAccounts(Sender<()>),
+    PresentSettings(Sender<()>),
     ToggleMonitor,
     RequestAccessibilityAccess,
     OpenAccessibilitySettings,
@@ -24,12 +27,8 @@ pub(crate) struct AppTray {
 }
 
 impl AppTray {
-    pub(crate) fn set_monitor_running(&self, running: bool) {
-        self.monitor_i.set_text(if running {
-            "Stop Monitor"
-        } else {
-            "Start Monitor"
-        });
+    pub(crate) fn set_monitor_control_state(&self, state: MonitorControlState) {
+        self.monitor_i.set_text(state.toggle_label());
     }
 
     pub(crate) fn set_accessibility_trusted(&self, trusted: bool) {

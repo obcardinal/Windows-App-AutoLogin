@@ -16,6 +16,11 @@ name = "windows-app-autologin"
 path = "src/main.rs"
 
 [[bin]]
+name = "windows-app-autologin-ui"
+path = "src/bin/windows-app-autologin-ui.rs"
+required-features = ["windows-ui-helper"]
+
+[[bin]]
 name = "diagnose-macos-ui"
 path = "src/bin/diagnose-macos-ui.rs"
 required-features = ["diagnostics-ui"]
@@ -76,10 +81,11 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
+[target.'cfg(all(not(target_os = "windows"), not(target_os = "macos")))'.dependencies]
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 core-foundation = "0.10"
 security-framework = "3.7"
 
@@ -93,6 +99,7 @@ debug-fill = []
 diagnostics-ui = []
 dev-tools = ["debug-fill", "diagnostics-ui"]
 release-diagnostics = ["diagnostics-ui"]
+windows-ui-helper = []
 
 [profile.release]
 opt-level = 3
