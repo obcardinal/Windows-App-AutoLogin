@@ -7,7 +7,10 @@ use std::{
 
 const DEVELOPMENT_MACOS_BUNDLE_ID: &str = "obcardinal.windows-app-autologin";
 const PRODUCTION_APP_NAME: &str = "WindowsAppAutoLogin";
+const PRODUCTION_WINDOWS_BINARY: &str = "windows-app-autologin";
+const FULL_UI_WINDOWS_BINARY: &str = "windows-app-autologin-ui";
 const DIAGNOSTICS_APP_NAME: &str = "WindowsAppAutoLoginDiagnostics";
+const WINDOWS_UIACCESS_MANIFEST_ENV: &str = "WAAL_WINDOWS_UIACCESS_MANIFEST";
 const RELEASE_GIT_COMMIT_ENV: &str = "WAAL_RELEASE_GIT_COMMIT";
 const RELEASE_GIT_TREE_ENV: &str = "WAAL_RELEASE_GIT_TREE";
 const RELEASE_CARGO_VERSION_ENV: &str = "WAAL_RELEASE_CARGO_VERSION";
@@ -45,6 +48,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={RELEASE_MATERIALS_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed=WAAL_PUBLISHABLE_RELEASE");
     println!("cargo:rerun-if-env-changed=WAAL_LOCAL_SIGNED_RELEASE");
+    println!("cargo:rerun-if-env-changed={WINDOWS_UIACCESS_MANIFEST_ENV}");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_PUBLISHER_ENV}");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_CERT_SHA256_ENV}");
     println!("cargo:rustc-check-cfg=cfg(waal_release_profile)");
@@ -102,19 +106,66 @@ fn embed_windows_resources(icon: &Path) -> Result<(), Box<dyn Error>> {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is set")?);
     let ico_path = out_dir.join("WindowsAppAutoLogin.ico");
-    let rc_path = out_dir.join("WindowsAppAutoLogin.rc");
+    let manifest_path = out_dir.join("WindowsAppAutoLogin.manifest");
+    let icon_rc_path = out_dir.join("WindowsAppAutoLoginIcon.rc");
+    let uiaccess_rc_path = out_dir.join("WindowsAppAutoLoginUIAccess.rc");
+    let include_uiaccess_manifest = windows_uiaccess_manifest_requested();
     write_windows_icon(icon, &ico_path)?;
 
-    let rc = format!("1 ICON \"{}\"\n", rc_escaped_path(&ico_path));
-    fs::write(&rc_path, rc)?;
-    let result = embed_resource::compile(&rc_path, embed_resource::NONE);
-    let result = if env::var("PROFILE").as_deref() == Ok("release") {
-        result.manifest_required()
-    } else {
-        result.manifest_optional()
-    };
-    result.map_err(|err| format!("failed to compile Windows resources: {err}"))?;
+    let icon_rc = format!("1 ICON \"{}\"\n", rc_escaped_path(&ico_path));
+    fs::write(&icon_rc_path, icon_rc)?;
+    embed_resource::compile_for(
+        &icon_rc_path,
+        [PRODUCTION_WINDOWS_BINARY, FULL_UI_WINDOWS_BINARY],
+        embed_resource::NONE,
+    )
+    .manifest_optional()
+    .map_err(|err| format!("failed to compile Windows icon resource: {err}"))?;
+
+    if include_uiaccess_manifest {
+        fs::write(&manifest_path, windows_application_manifest())?;
+        let uiaccess_rc = format!("1 24 \"{}\"\n", rc_escaped_path(&manifest_path));
+        fs::write(&uiaccess_rc_path, uiaccess_rc)?;
+        // The full-UI helper must run without UIAccess. Only the signed,
+        // trusted-location production supervisor receives this manifest.
+        embed_resource::compile_for(
+            &uiaccess_rc_path,
+            [PRODUCTION_WINDOWS_BINARY],
+            embed_resource::NONE,
+        )
+        .manifest_required()
+        .map_err(|err| format!("failed to compile Windows UIAccess manifest: {err}"))?;
+    }
     Ok(())
+}
+
+fn windows_uiaccess_manifest_requested() -> bool {
+    if !truthy_env(WINDOWS_UIACCESS_MANIFEST_ENV) {
+        return false;
+    }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        || env::var("PROFILE").as_deref() != Ok("release")
+    {
+        panic!(
+            "{WINDOWS_UIACCESS_MANIFEST_ENV}=1 is accepted only for Windows release-profile builds that will be signed and installed in a trusted location"
+        );
+    }
+    true
+}
+
+fn windows_application_manifest() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="obcardinal.WindowsAppAutoLogin" type="win32"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="true"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
+"#
 }
 
 fn write_windows_icon(png_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {

@@ -2077,12 +2077,32 @@ fi
 
 ADHOC_BINARY="$TEST_ROOT/development-signature-test"
 /bin/cp /usr/bin/true "$ADHOC_BINARY"
-waal_codesign_development_bundle "$ADHOC_BINARY" "obcardinal.windows-app-autologin"
+waal_codesign_development_bundle "$ADHOC_BINARY" "obcardinal.windows-app-autologin" "-"
 ADHOC_REQUIREMENT="$(/usr/bin/codesign -d -r- "$ADHOC_BINARY" 2>&1)"
 case "$ADHOC_REQUIREMENT" in
   *'designated => cdhash H"'*) ;;
   *) fail "development ad-hoc signature is not cdhash-bound" ;;
 esac
+
+DEVELOPER_ID_HASH_A="0123456789ABCDEF0123456789ABCDEF01234567"
+DEVELOPER_ID_HASH_B="89ABCDEF0123456789ABCDEF0123456789ABCDEF"
+DETECTED_DEVELOPER_ID_HASH="$(/usr/bin/printf '%s\n' \
+  "  1) $DEVELOPER_ID_HASH_A \"Developer ID Application: Example Corp (ABCDE12345)\"" \
+  '  2) FEDCBA9876543210FEDCBA9876543210FEDCBA98 "Apple Development: Example Corp (ABCDE12345)"' \
+  | waal_unique_developer_id_application_hash)"
+[ "$DETECTED_DEVELOPER_ID_HASH" = "$DEVELOPER_ID_HASH_A" ] \
+  || fail "a unique Developer ID Application identity was not selected"
+if /usr/bin/printf '%s\n' \
+  "  1) $DEVELOPER_ID_HASH_A \"Developer ID Application: Example A (ABCDE12345)\"" \
+  "  2) $DEVELOPER_ID_HASH_B \"Developer ID Application: Example B (FGHIJ67890)\"" \
+  | waal_unique_developer_id_application_hash >/dev/null; then
+  fail "multiple Developer ID Application identities were selected ambiguously"
+fi
+if /usr/bin/printf '%s\n' \
+  '  1) FEDCBA9876543210FEDCBA9876543210FEDCBA98 "Apple Development: Example Corp (ABCDE12345)"' \
+  | waal_unique_developer_id_application_hash >/dev/null; then
+  fail "an Apple Development identity was selected as Developer ID Application"
+fi
 case "$ADHOC_REQUIREMENT" in
   *'designated => identifier "obcardinal.windows-app-autologin"'*)
     fail "development ad-hoc signature still trusts only the public bundle identifier"
@@ -2649,6 +2669,18 @@ fi
   || fail "Windows packager does not publish a SHA-256 manifest"
 /usr/bin/grep -Fq '$hashes["BUILD-METADATA.txt"]' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows SHA-256 manifest does not cover BUILD-METADATA.txt"
+/usr/bin/grep -Fq '$UiBinaryName = "windows-app-autologin-ui"' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows packager does not bind the fixed UI-helper Cargo binary"
+/usr/bin/grep -Fq '$UiExeName = "WindowsAppAutoLoginUI.exe"' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows packager does not publish the fixed UI-helper executable name"
+/usr/bin/grep -Fq '"--features", "windows-ui-helper"' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows packager release build does not enable the gated UI helper"
+/usr/bin/grep -Fq '"ui-helper-executable-sha256=$uiExeSha256"' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows informational metadata does not cover the UI helper"
 /usr/bin/grep -Fq '"attestation=none-local-shared-security-context"' \
   "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows local build metadata does not disclaim attestation"
@@ -2889,7 +2921,10 @@ for windows_handle_contract in \
   'LockTrackedBuildOutputAfterBuild(' \
   'Copy-SingleLinkExecutableFromHandleAndCaptureBytes `' \
   'Copy-CommittedReleasePayloadFiles $stagedDist' \
-  'Assert-StagedExecutableHandle $stagedExe' \
+  'Assert-StagedExecutableHandles $stagedExe $stagedUiExe' \
+  '-RetainBuiltUiExecutablePath $targetUiExe `' \
+  '$BuiltUiExecutableHandle = $builtExecutableState.UiExecutableHandle' \
+  '$StagedUiExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(' \
   'Lock-PublicationCandidateDirectory' \
   '$PublicationPayloadHandles = Open-DistributionPayloadHandles $PublicationCandidateHandle' \
   'Lock-DistributionPayloadHandlesAfterRename `' \
@@ -2914,10 +2949,36 @@ if ! /usr/bin/perl -0777 -e '
   exit 1 if $open_start < 0 || $open_end <= $open_start;
   my $open = substr($text, $open_start, $open_end - $open_start);
   exit 1 unless $open =~ /foreach\s*\(\$fileName\s+in\s+\@\(\s*
-    \$ExeName\s*,\s*"README\.md"\s*,\s*"LICENSE"\s*,\s*"config\.example\.json"\s*,\s*
+    \$ExeName\s*,\s*\$UiExeName\s*,\s*"README\.md"\s*,\s*"LICENSE"\s*,\s*
+    "config\.example\.json"\s*,\s*
     "SHA256SUMS\.txt"\s*,\s*"BUILD-METADATA\.txt"\s*\)\s*\)/xms;
   my $open_count = () = $open =~ /OpenTrackedRegularSingleLinkForRename\s*\(/g;
   exit 1 if $open_count != 1;
+
+  my $manifest_start = index($text, "function Get-Sha256ManifestContent {");
+  my $distribution_start = index($text, "function Assert-WindowsDistribution {", $manifest_start);
+  exit 1 if $manifest_start < 0 || $distribution_start <= $manifest_start ||
+    $open_start <= $distribution_start;
+  my $manifest = substr($text, $manifest_start, $distribution_start - $manifest_start);
+  exit 1 unless $manifest =~ /\$ExeName\s*,\s*\$UiExeName\s*,\s*"README\.md"/ms;
+  my $distribution = substr($text, $distribution_start, $open_start - $distribution_start);
+  exit 1 unless $distribution =~ /\$expectedNames\s*=\s*\@\(\s*
+    \$ExeName\s*,\s*\$UiExeName\s*,\s*"README\.md"\s*,\s*"LICENSE"\s*,\s*
+    "config\.example\.json"\s*,\s*"SHA256SUMS\.txt"\s*,\s*
+    "BUILD-METADATA\.txt"\s*\)/xms;
+  exit 1 if index($distribution, q{Verify-ExecutableMetadata $uiExecutable}) < 0;
+
+  my $stop_start = index($text, "function Stop-DistProcesses {");
+  my $stop_end = index($text, "function Initialize-ReleaseTreeCleanup {", $stop_start);
+  exit 1 if $stop_start < 0 || $stop_end <= $stop_start;
+  my $stop = substr($text, $stop_start, $stop_end - $stop_start);
+  for my $process_name (
+    q{WindowsAppAutoLogin.exe},
+    q{windows-app-autologin.exe},
+    q{WindowsAppAutoLoginUI.exe},
+    q{windows-app-autologin-ui.exe}) {
+    exit 1 if index($stop, $process_name) < 0;
+  }
 
   my $normalized = $text;
   $normalized =~ s/`\r?\n\s*/ /g;
@@ -2955,6 +3016,15 @@ if ! /usr/bin/perl -0777 -e '
   my $cargo = substr($text, $cargo_start, $cargo_end - $cargo_start);
   exit 1 if index($cargo, q{Open-MaterializedReleaseSourceHandles}) < 0;
   exit 1 if index($cargo, q{Assert-AndCloseMaterializedReleaseSourceHandles}) < 0;
+  for my $retention_needle (
+    q{[string]$RetainBuiltUiExecutablePath = ""},
+    q{"$BinaryName.exe"},
+    q{"$UiBinaryName.exe"},
+    q{foreach ($outputSpec in $retainedOutputSpecs)},
+    q{ExecutableHandle = $retainedOutputStates[0].Handle},
+    q{UiExecutableHandle = $retainedOutputStates[1].Handle}) {
+    exit 1 if index($cargo, $retention_needle) < 0;
+  }
   my $cargo_invoke = index($cargo, q{Invoke-Checked $Cargo $Arguments});
   my $cargo_output_lock = index($cargo, q{LockTrackedBuildOutputAfterBuild(}, $cargo_invoke);
   exit 1 if $cargo_invoke < 0 || $cargo_output_lock <= $cargo_invoke;
@@ -3185,16 +3255,25 @@ if ! /usr/bin/perl -0777 -e '
   my @build_flow = (
     q{$BuiltExecutableDirectoryHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::TrackRoot(},
     q{$targetExe = Microsoft.PowerShell.Management\Join-Path `},
+    q{$targetUiExe = Microsoft.PowerShell.Management\Join-Path `},
     q{$builtExecutableState = Invoke-SanitizedCargo @(},
+    q{"--bin", $BinaryName, "--bin", $UiBinaryName},
+    q{"--features", "windows-ui-helper"},
+    q{-RetainBuiltExecutablePath $targetExe `},
+    q{-RetainBuiltUiExecutablePath $targetUiExe `},
     q{-RetainBuiltExecutableDirectoryHandle $BuiltExecutableDirectoryHandle},
-    q{$BuiltExecutableHandle = $builtExecutableState.Handle},
+    q{$BuiltExecutableHandle = $builtExecutableState.ExecutableHandle},
+    q{$BuiltUiExecutableHandle = $builtExecutableState.UiExecutableHandle},
+    q{Copy-SingleLinkExecutableFromHandleAndCaptureBytes `},
     q{Copy-SingleLinkExecutableFromHandleAndCaptureBytes `},
     q{Verify-ExecutableMetadataBytes $UnsignedExecutableBytes},
+    q{Verify-ExecutableMetadataBytes $UnsignedUiExecutableBytes},
     q{HashTrackedRegularSingleLinkSha256(},
     q{$committedPayloadState = Copy-CommittedReleasePayloadFiles $stagedDist},
     q{$StagedPayloadHandles = @($committedPayloadState.Handles)},
     q{$StagedExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(},
-    q{Assert-StagedExecutableHandle $stagedExe},
+    q{$StagedUiExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(},
+    q{Assert-StagedExecutableHandles $stagedExe $stagedUiExe},
     q{Close-BuiltExecutableHandles},
     q{Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes},
     q{Assert-CommittedReleasePayloadHashes $corePayloadHashes $CommittedPayloadHashes}
@@ -3211,17 +3290,27 @@ if ! /usr/bin/perl -0777 -e '
   my $copy_exe = index(
     $main,
     q{Copy-SingleLinkExecutableFromHandleAndCaptureBytes `});
+  my $copy_ui_exe = index(
+    $main,
+    q{Copy-SingleLinkExecutableFromHandleAndCaptureBytes `},
+    $copy_exe + 1);
   my $retain_staged_exe = index(
     $main,
     q{$StagedExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(},
-    $copy_exe);
+    $copy_ui_exe);
+  my $retain_staged_ui_exe = index(
+    $main,
+    q{$StagedUiExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(},
+    $retain_staged_exe);
   my $assert_staged_exe = index(
     $main,
-    q{Assert-StagedExecutableHandle $stagedExe},
-    $retain_staged_exe);
+    q{Assert-StagedExecutableHandles $stagedExe $stagedUiExe},
+    $retain_staged_ui_exe);
   my $close_exe = index($main, q{Close-BuiltExecutableHandles}, $assert_staged_exe);
-  exit 1 if $copy_exe < 0 ||
-    $retain_staged_exe <= $copy_exe || $assert_staged_exe <= $retain_staged_exe ||
+  exit 1 if $copy_exe < 0 || $copy_ui_exe <= $copy_exe ||
+    $retain_staged_exe <= $copy_ui_exe ||
+    $retain_staged_ui_exe <= $retain_staged_exe ||
+    $assert_staged_exe <= $retain_staged_ui_exe ||
     $close_exe <= $assert_staged_exe;
   exit 1 if index($main, q{Sign-AndVerify-Executable}) >= 0 ||
     index($main, q{Assert-AuthenticodeExecutable}) >= 0;
@@ -3234,11 +3323,11 @@ if ! /usr/bin/perl -0777 -e '
   my $close_staged_docs = index($main, q{Close-StagedPayloadHandles}, $assert_staged_docs);
   my $assert_candidate_exe = index(
     $main,
-    q{Assert-StagedExecutableHandle $stagedExe},
+    q{Assert-StagedExecutableHandles $stagedExe $stagedUiExe},
     $candidate_docs);
   my $close_staged_exe = index(
     $main,
-    q{Close-StagedExecutableHandle},
+    q{Close-StagedExecutableHandles},
     $assert_candidate_exe);
   exit 1 if $copy_docs < 0 || $candidate_docs <= $copy_docs ||
     $assert_candidate_exe <= $candidate_docs || $close_staged_exe <= $assert_candidate_exe ||
@@ -3286,7 +3375,7 @@ if ! /usr/bin/perl -0777 -e '
   exit 1 if $final_enumeration < 0 || $complete_flag <= $final_enumeration;
   exit 1 if index($complete, q{mutable, non-attested development output}) < 0;
 ' "$ROOT_DIR/script/build_windows_dist.ps1"; then
-  fail "Windows packager no longer holds exact single-link source and six-file publication handles"
+  fail "Windows packager no longer holds exact single-link source and seven-file publication handles"
 fi
 for forbidden_git_input in \
   GIT_ALLOW_PROTOCOL \
@@ -3417,6 +3506,12 @@ done
   || fail "Windows packager does not pass the Rust sysroot hash to Cargo"
 /usr/bin/grep -Fq 'WAAL_RELEASE_NATIVE_TOOLCHAIN_SHA256 = $NativeToolchainSha256' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not pass the native toolchain hash to Cargo"
+/usr/bin/grep -Fq '$windowsUiAccessManifest = if ($retainBuiltExecutables) { "1" } else { "" }' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows packager does not scope UIAccess to the final retained two-binary build"
+/usr/bin/grep -Fq 'WAAL_WINDOWS_UIACCESS_MANIFEST = $windowsUiAccessManifest' \
+  "$ROOT_DIR/script/build_windows_dist.ps1" \
+  || fail "Windows sanitized Cargo environment does not request the supervisor UIAccess manifest"
 /usr/bin/grep -Fq 'New-PublicationCandidate' "$ROOT_DIR/script/build_windows_dist.ps1" \
   || fail "Windows packager does not stage an in-dist publication candidate"
 /usr/bin/grep -Fq 'Activate-PublicationCandidate' "$ROOT_DIR/script/build_windows_dist.ps1" \

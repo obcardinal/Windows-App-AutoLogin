@@ -504,6 +504,8 @@ $executingPackagerSource = $null
 $RootDir = $verifiedRepositoryRoot
 $BinaryName = "windows-app-autologin"
 $ExeName = "WindowsAppAutoLogin.exe"
+$UiBinaryName = "windows-app-autologin-ui"
+$UiExeName = "WindowsAppAutoLoginUI.exe"
 $TargetTriple = "x86_64-pc-windows-msvc"
 $ProductionDistName = "WindowsAppAutoLogin-windows-x86_64"
 $DevelopmentDistName = "WindowsAppAutoLogin-windows-x86_64-development"
@@ -578,10 +580,14 @@ $GitRuntimeLockState = $null
 $TarLockState = $null
 $ToolchainDirectoryLocks = @{}
 $UnsignedExecutableBytes = $null
+$UnsignedUiExecutableBytes = $null
 $BuiltExecutableHandle = $null
+$BuiltUiExecutableHandle = $null
 $BuiltExecutableDirectoryHandle = $null
 $StagedExecutableHandle = $null
 $StagedExecutableSha256 = $null
+$StagedUiExecutableHandle = $null
+$StagedUiExecutableSha256 = $null
 $StagedPayloadHandles = @()
 $CommittedPayloadHashes = $null
 $CodeDomCompiler = $null
@@ -1881,7 +1887,7 @@ function Complete-DevelopmentPublication {
         [Parameter(Mandatory = $true)][string]$ExpectedMetadata
     )
 
-    # Re-enumerate the exact six-file set at the completion boundary. The
+    # Re-enumerate the exact seven-file set at the completion boundary. The
     # resulting directory remains a mutable, non-attested development output;
     # consumers must validate SHA256SUMS.txt again before using its payload.
     Assert-WindowsDistribution $Directory $ExpectedPayloadHashes $ExpectedMetadata
@@ -1893,13 +1899,16 @@ function Stop-DistProcesses {
     $normalizedDistRoot = Normalize-Path (Microsoft.PowerShell.Management\Resolve-Path $DistRoot).ProviderPath
     $productionPattern = '^' + [regex]::Escape($ProductionDistName) + '-[0-9a-f]{40}$'
     $developmentPattern = '^' + [regex]::Escape($DevelopmentDistName) + '-[0-9a-f]{40}$'
-    $processes = CimCmdlets\Get-CimInstance Win32_Process -Filter "Name = 'WindowsAppAutoLogin.exe' OR Name = 'windows-app-autologin.exe'" |
+    $processes = CimCmdlets\Get-CimInstance Win32_Process -Filter "Name = 'WindowsAppAutoLogin.exe' OR Name = 'windows-app-autologin.exe' OR Name = 'WindowsAppAutoLoginUI.exe' OR Name = 'windows-app-autologin-ui.exe'" |
         Microsoft.PowerShell.Core\Where-Object {
             if (-not $_.ExecutablePath) { return $false }
             try {
                 $physicalProcessPath = [IO.Path]::GetFullPath($_.ExecutablePath)
                 $processLeaf = Microsoft.PowerShell.Management\Split-Path -Leaf $physicalProcessPath
-                if ($processLeaf -ine $ExeName -and $processLeaf -ine "$BinaryName.exe") {
+                if ($processLeaf -ine $ExeName -and
+                    $processLeaf -ine "$BinaryName.exe" -and
+                    $processLeaf -ine $UiExeName -and
+                    $processLeaf -ine "$UiBinaryName.exe") {
                     return $false
                 }
                 $processDirectory = Microsoft.PowerShell.Management\Split-Path -Parent $physicalProcessPath
@@ -5125,35 +5134,66 @@ function Invoke-SanitizedCargo {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [switch]$CaptureOutput,
         [string]$RetainBuiltExecutablePath = "",
+        [string]$RetainBuiltUiExecutablePath = "",
         $RetainBuiltExecutableDirectoryHandle = $null
     )
 
-    if ($CaptureOutput -and $RetainBuiltExecutablePath) {
+    $retainBuiltExecutables = [bool]$RetainBuiltExecutablePath -or
+        [bool]$RetainBuiltUiExecutablePath
+    if ($CaptureOutput -and $retainBuiltExecutables) {
         throw "Cargo output capture and executable-handle retention are mutually exclusive."
     }
-    if ([bool]$RetainBuiltExecutablePath -ne [bool]$RetainBuiltExecutableDirectoryHandle) {
-        throw "Cargo executable retention requires its exact tracked output directory."
+    if ([bool]$RetainBuiltExecutablePath -ne [bool]$RetainBuiltUiExecutablePath -or
+        $retainBuiltExecutables -ne [bool]$RetainBuiltExecutableDirectoryHandle) {
+        throw "Cargo executable retention requires both fixed outputs and their exact tracked directory."
     }
-    if ($RetainBuiltExecutablePath) {
-        Assert-AbsoluteLocalPath $RetainBuiltExecutablePath
-        $retainedOutputParent = Microsoft.PowerShell.Management\Split-Path `
-            -Parent `
-            $RetainBuiltExecutablePath
-        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryPath(
-            $retainedOutputParent,
-            $RetainBuiltExecutableDirectoryHandle
+    $retainedOutputParent = ""
+    $retainedOutputSpecs = @()
+    if ($retainBuiltExecutables) {
+        $retainedOutputPaths = @(
+            $RetainBuiltExecutablePath,
+            $RetainBuiltUiExecutablePath
         )
-        $retainedOutputLeaf = Microsoft.PowerShell.Management\Split-Path `
-            -Leaf `
-            $RetainBuiltExecutablePath
-        if ($retainedOutputLeaf -cne "$BinaryName.exe") {
-            throw "Cargo executable retention received an unexpected output leaf name."
+        $expectedOutputLeaves = @(
+            "$BinaryName.exe",
+            "$UiBinaryName.exe"
+        )
+        for ($outputIndex = 0; $outputIndex -lt $retainedOutputPaths.Count; $outputIndex++) {
+            $retainedOutputPath = $retainedOutputPaths[$outputIndex]
+            Assert-AbsoluteLocalPath $retainedOutputPath
+            $outputParent = Microsoft.PowerShell.Management\Split-Path `
+                -Parent `
+                $retainedOutputPath
+            if ($outputIndex -eq 0) {
+                $retainedOutputParent = $outputParent
+            }
+            elseif ((Normalize-Path $outputParent) -cne (Normalize-Path $retainedOutputParent)) {
+                throw "Cargo executable retention outputs must have the same exact parent directory."
+            }
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryPath(
+                $outputParent,
+                $RetainBuiltExecutableDirectoryHandle
+            )
+            $retainedOutputLeaf = Microsoft.PowerShell.Management\Split-Path `
+                -Leaf `
+                $retainedOutputPath
+            if ($retainedOutputLeaf -cne $expectedOutputLeaves[$outputIndex]) {
+                throw "Cargo executable retention received an unexpected output leaf name."
+            }
+            $retainedOutputSpecs += [PSCustomObject]@{
+                Leaf = $retainedOutputLeaf
+                Path = $retainedOutputPath
+            }
         }
     }
     Assert-NoCargoConfigInAncestors $CargoWorkingDir
     Assert-ReleaseToolchainIntegrity
     $sourceHandles = @()
-    $retainedOutputHandle = $null
+    $retainedOutputStates = [System.Collections.Generic.List[object]]::new()
+    # Only the final optimized two-executable build receives UIAccess. Cargo
+    # metadata and test builds stay ordinary processes, while build.rs applies
+    # the manifest exclusively to the fixed supervisor binary.
+    $windowsUiAccessManifest = if ($retainBuiltExecutables) { "1" } else { "" }
     $existingEnvironment = [Environment]::GetEnvironmentVariables("Process")
     $managedNames = @()
     $captured = $null
@@ -5222,6 +5262,7 @@ function Invoke-SanitizedCargo {
             WAAL_RELEASE_MATERIALS_SHA256 = $ReleaseMaterialsSha256
             WAAL_WINDOWS_AUTHENTICODE_PUBLISHER = $WindowsPublisher
             WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256 = $WindowsSignerCertSha256
+            WAAL_WINDOWS_UIACCESS_MANIFEST = $windowsUiAccessManifest
             LIB = $TrustedLib
             INCLUDE = $TrustedInclude
             LIBPATH = $TrustedLibPath
@@ -5266,16 +5307,23 @@ function Invoke-SanitizedCargo {
         }
         else {
             Invoke-Checked $Cargo $Arguments
-            if ($RetainBuiltExecutablePath) {
-                $retainedOutputHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::LockTrackedBuildOutputAfterBuild(
-                    $RetainBuiltExecutableDirectoryHandle,
-                    $retainedOutputLeaf
-                )
-                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
-                    $RetainBuiltExecutableDirectoryHandle,
-                    $retainedOutputLeaf,
-                    $retainedOutputHandle
-                )
+            if ($retainBuiltExecutables) {
+                foreach ($outputSpec in $retainedOutputSpecs) {
+                    $retainedOutputHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::LockTrackedBuildOutputAfterBuild(
+                        $RetainBuiltExecutableDirectoryHandle,
+                        $outputSpec.Leaf
+                    )
+                    $null = $retainedOutputStates.Add([PSCustomObject]@{
+                        Leaf = $outputSpec.Leaf
+                        Path = $outputSpec.Path
+                        Handle = $retainedOutputHandle
+                    })
+                    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+                        $RetainBuiltExecutableDirectoryHandle,
+                        $outputSpec.Leaf,
+                        $retainedOutputHandle
+                    )
+                }
             }
         }
     }
@@ -5315,10 +5363,12 @@ function Invoke-SanitizedCargo {
         }
     }
     if ($operationFailure) {
-        if ($retainedOutputHandle -and -not $retainedOutputHandle.IsClosed) {
-            $retainedOutputHandle.Dispose()
-            $retainedOutputHandle = $null
+        foreach ($outputState in $retainedOutputStates) {
+            if ($outputState.Handle -and -not $outputState.Handle.IsClosed) {
+                $outputState.Handle.Dispose()
+            }
         }
+        $retainedOutputStates.Clear()
         foreach ($cleanupFailure in $cleanupFailures) {
             Microsoft.PowerShell.Utility\Write-Warning `
                 "Cargo cleanup also failed after the primary error: $($cleanupFailure.Exception.Message)"
@@ -5326,10 +5376,12 @@ function Invoke-SanitizedCargo {
         throw $operationFailure
     }
     if ($cleanupFailures.Count -gt 0) {
-        if ($retainedOutputHandle -and -not $retainedOutputHandle.IsClosed) {
-            $retainedOutputHandle.Dispose()
-            $retainedOutputHandle = $null
+        foreach ($outputState in $retainedOutputStates) {
+            if ($outputState.Handle -and -not $outputState.Handle.IsClosed) {
+                $outputState.Handle.Dispose()
+            }
         }
+        $retainedOutputStates.Clear()
         for ($index = 1; $index -lt $cleanupFailures.Count; $index++) {
             Microsoft.PowerShell.Utility\Write-Warning `
                 "Additional Cargo cleanup failure: $($cleanupFailures[$index].Exception.Message)"
@@ -5338,33 +5390,50 @@ function Invoke-SanitizedCargo {
     }
     try {
         Assert-ReleaseToolchainIntegrity
-        if ($RetainBuiltExecutablePath) {
+        if ($retainBuiltExecutables) {
             [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryPath(
                 $retainedOutputParent,
                 $RetainBuiltExecutableDirectoryHandle
             )
-            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
-                $RetainBuiltExecutableDirectoryHandle,
-                $retainedOutputLeaf,
-                $retainedOutputHandle
-            )
+            foreach ($outputState in $retainedOutputStates) {
+                [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+                    $RetainBuiltExecutableDirectoryHandle,
+                    $outputState.Leaf,
+                    $outputState.Handle
+                )
+            }
         }
     }
     catch {
-        if ($retainedOutputHandle -and -not $retainedOutputHandle.IsClosed) {
-            $retainedOutputHandle.Dispose()
-            $retainedOutputHandle = $null
+        foreach ($outputState in $retainedOutputStates) {
+            if ($outputState.Handle -and -not $outputState.Handle.IsClosed) {
+                $outputState.Handle.Dispose()
+            }
         }
+        $retainedOutputStates.Clear()
         throw
     }
     if ($CaptureOutput) { return $captured }
-    if ($RetainBuiltExecutablePath) {
-        if (-not $retainedOutputHandle -or $retainedOutputHandle.IsInvalid -or
-            $retainedOutputHandle.IsClosed) {
-            throw "Cargo completed without returning a retained executable handle."
+    if ($retainBuiltExecutables) {
+        $invalidRetainedOutput = $retainedOutputStates.Count -ne 2
+        foreach ($outputState in $retainedOutputStates) {
+            if (-not $outputState.Handle -or $outputState.Handle.IsInvalid -or
+                $outputState.Handle.IsClosed) {
+                $invalidRetainedOutput = $true
+            }
+        }
+        if ($invalidRetainedOutput) {
+            foreach ($outputState in $retainedOutputStates) {
+                if ($outputState.Handle -and -not $outputState.Handle.IsClosed) {
+                    $outputState.Handle.Dispose()
+                }
+            }
+            $retainedOutputStates.Clear()
+            throw "Cargo completed without both valid retained executable handles."
         }
         return [PSCustomObject]@{
-            Handle = $retainedOutputHandle
+            ExecutableHandle = $retainedOutputStates[0].Handle
+            UiExecutableHandle = $retainedOutputStates[1].Handle
         }
     }
 }
@@ -5603,7 +5672,9 @@ function Get-CoreDistributionPayloadHashes {
     param([Parameter(Mandatory = $true)][string]$Directory)
 
     $hashes = [ordered]@{}
-    foreach ($fileName in @($ExeName, "README.md", "LICENSE", "config.example.json")) {
+    foreach ($fileName in @(
+        $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json"
+    )) {
         $path = Microsoft.PowerShell.Management\Join-Path $Directory $fileName
         if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $path -PathType Leaf) -or
             (((Microsoft.PowerShell.Management\Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
@@ -5644,7 +5715,8 @@ function Get-Sha256ManifestContent {
     param([Parameter(Mandatory = $true)]$PayloadHashes)
 
     $lines = foreach ($fileName in @(
-        $ExeName, "README.md", "LICENSE", "config.example.json", "BUILD-METADATA.txt"
+        $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json",
+        "BUILD-METADATA.txt"
     )) {
         "$($PayloadHashes[$fileName])  $fileName"
     }
@@ -5660,7 +5732,7 @@ function Assert-WindowsDistribution {
 
     Assert-RealDirectory $Directory
     $expectedNames = @(
-        $ExeName, "README.md", "LICENSE", "config.example.json",
+        $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json",
         "SHA256SUMS.txt", "BUILD-METADATA.txt"
     )
     $actualNames = @()
@@ -5678,10 +5750,13 @@ function Assert-WindowsDistribution {
     }
 
     $executable = Microsoft.PowerShell.Management\Join-Path $Directory $ExeName
+    $uiExecutable = Microsoft.PowerShell.Management\Join-Path $Directory $UiExeName
     Verify-ExecutableMetadata $executable
+    Verify-ExecutableMetadata $uiExecutable
     $actualPayloadHashes = Get-DistributionPayloadHashes $Directory
     foreach ($fileName in @(
-        $ExeName, "README.md", "LICENSE", "config.example.json", "BUILD-METADATA.txt"
+        $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json",
+        "BUILD-METADATA.txt"
     )) {
         if ($actualPayloadHashes[$fileName] -cne $ExpectedPayloadHashes[$fileName]) {
             throw "Distribution payload hash changed during publication: $fileName"
@@ -5702,7 +5777,7 @@ function Open-DistributionPayloadHandles {
     $handles = [System.Collections.Generic.List[object]]::new()
     try {
         foreach ($fileName in @(
-            $ExeName, "README.md", "LICENSE", "config.example.json",
+            $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json",
             "SHA256SUMS.txt", "BUILD-METADATA.txt"
         )) {
             $null = $handles.Add([PSCustomObject]@{
@@ -5766,12 +5841,12 @@ function Assert-DistributionPayloadHandles {
     )
 
     $expectedNames = @(
-        $ExeName, "README.md", "LICENSE", "config.example.json",
+        $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json",
         "SHA256SUMS.txt", "BUILD-METADATA.txt"
     )
     if ($Handles.Count -ne $expectedNames.Count -or
         $ExpectedFileHashes.Count -ne $expectedNames.Count) {
-        throw "Publication must retain exactly six expected payload identities."
+        throw "Publication must retain exactly seven expected payload identities."
     }
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($state in $Handles) {
@@ -5817,6 +5892,7 @@ function Close-BuiltExecutableHandles {
     $failure = $null
     foreach ($handle in @(
         $BuiltExecutableHandle,
+        $BuiltUiExecutableHandle,
         $BuiltExecutableDirectoryHandle
     )) {
         try {
@@ -5827,46 +5903,70 @@ function Close-BuiltExecutableHandles {
         }
     }
     $script:BuiltExecutableHandle = $null
+    $script:BuiltUiExecutableHandle = $null
     $script:BuiltExecutableDirectoryHandle = $null
     if ($failure) { throw $failure }
 }
 
-function Assert-StagedExecutableHandle {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if (-not $StagedExecutableHandle -or $StagedExecutableHandle.IsInvalid -or
-        $StagedExecutableHandle.IsClosed -or -not (Test-LowerHex $StagedExecutableSha256 64)) {
-        throw "Authenticated staged executable handle is unavailable."
-    }
-    try {
-        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
-            $Path,
-            $StagedExecutableHandle
-        )
-    }
-    catch {
-        throw "Staged executable path changed identity while its exact object was retained."
-    }
-    $actualHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
-        $StagedExecutableHandle
+function Assert-StagedExecutableHandles {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [Parameter(Mandatory = $true)][string]$UiExecutablePath
     )
-    if ($actualHash -cne $StagedExecutableSha256) {
-        throw "Exact staged executable bytes changed while retained."
+
+    $states = @(
+        [PSCustomObject]@{
+            Name = $ExeName
+            Path = $ExecutablePath
+            Handle = $StagedExecutableHandle
+            ExpectedSha256 = $StagedExecutableSha256
+        },
+        [PSCustomObject]@{
+            Name = $UiExeName
+            Path = $UiExecutablePath
+            Handle = $StagedUiExecutableHandle
+            ExpectedSha256 = $StagedUiExecutableSha256
+        }
+    )
+    foreach ($state in $states) {
+        if (-not $state.Handle -or $state.Handle.IsInvalid -or
+            $state.Handle.IsClosed -or -not (Test-LowerHex $state.ExpectedSha256 64)) {
+            throw "Authenticated staged executable handle is unavailable: $($state.Name)"
+        }
+        try {
+            [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+                $state.Path,
+                $state.Handle
+            )
+        }
+        catch {
+            throw "Staged executable path changed identity while retained: $($state.Name)"
+        }
+        $actualHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+            $state.Handle
+        )
+        if ($actualHash -cne $state.ExpectedSha256) {
+            throw "Exact staged executable bytes changed while retained: $($state.Name)"
+        }
     }
 }
 
-function Close-StagedExecutableHandle {
+function Close-StagedExecutableHandles {
     $failure = $null
-    try {
-        if ($StagedExecutableHandle -and -not $StagedExecutableHandle.IsClosed) {
-            $StagedExecutableHandle.Dispose()
+    foreach ($handle in @($StagedExecutableHandle, $StagedUiExecutableHandle)) {
+        try {
+            if ($handle -and -not $handle.IsClosed) {
+                $handle.Dispose()
+            }
         }
-    }
-    catch {
-        $failure = $_
+        catch {
+            if (-not $failure) { $failure = $_ }
+        }
     }
     $script:StagedExecutableHandle = $null
     $script:StagedExecutableSha256 = $null
+    $script:StagedUiExecutableHandle = $null
+    $script:StagedUiExecutableSha256 = $null
     if ($failure) { throw $failure }
 }
 
@@ -5930,7 +6030,7 @@ try {
         )
     }
 
-    Microsoft.PowerShell.Utility\Write-Host "Building an optimized unsigned development executable from the captured source snapshot..."
+    Microsoft.PowerShell.Utility\Write-Host "Building optimized unsigned development executables from the captured source snapshot..."
     $targetExeDirectory = Microsoft.PowerShell.Management\Join-Path `
         $BuildTargetDir `
         "$TargetTriple\release"
@@ -5947,21 +6047,34 @@ try {
     $targetExe = Microsoft.PowerShell.Management\Join-Path `
         $targetExeDirectory `
         "$BinaryName.exe"
+    $targetUiExe = Microsoft.PowerShell.Management\Join-Path `
+        $targetExeDirectory `
+        "$UiBinaryName.exe"
     $builtExecutableState = Invoke-SanitizedCargo @(
         "build", "--locked", "--release", "--target", $TargetTriple,
-        "--bin", $BinaryName, "--manifest-path", $manifestPath
+        "--bin", $BinaryName, "--bin", $UiBinaryName,
+        "--features", "windows-ui-helper", "--manifest-path", $manifestPath
     ) `
         -RetainBuiltExecutablePath $targetExe `
+        -RetainBuiltUiExecutablePath $targetUiExe `
         -RetainBuiltExecutableDirectoryHandle $BuiltExecutableDirectoryHandle
-    if (-not $builtExecutableState -or -not $builtExecutableState.Handle) {
-        throw "Cargo did not return a complete retained build-output state."
+    if (-not $builtExecutableState -or
+        -not $builtExecutableState.ExecutableHandle -or
+        -not $builtExecutableState.UiExecutableHandle) {
+        throw "Cargo did not return both retained build-output states."
     }
-    $BuiltExecutableHandle = $builtExecutableState.Handle
+    $BuiltExecutableHandle = $builtExecutableState.ExecutableHandle
+    $BuiltUiExecutableHandle = $builtExecutableState.UiExecutableHandle
     $builtExecutableState = $null
     [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
         $BuiltExecutableDirectoryHandle,
         "$BinaryName.exe",
         $BuiltExecutableHandle
+    )
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+        $BuiltExecutableDirectoryHandle,
+        "$UiBinaryName.exe",
+        $BuiltUiExecutableHandle
     )
     Assert-ReleaseSourceUnchanged $Git
 
@@ -5969,20 +6082,36 @@ try {
     Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $stagedDist | Microsoft.PowerShell.Core\Out-Null
     Assert-RealDirectory $stagedDist
     $stagedExe = Microsoft.PowerShell.Management\Join-Path $stagedDist $ExeName
+    $stagedUiExe = Microsoft.PowerShell.Management\Join-Path $stagedDist $UiExeName
     $UnsignedExecutableBytes = Copy-SingleLinkExecutableFromHandleAndCaptureBytes `
         $BuiltExecutableHandle `
         $stagedExe
+    $UnsignedUiExecutableBytes = Copy-SingleLinkExecutableFromHandleAndCaptureBytes `
+        $BuiltUiExecutableHandle `
+        $stagedUiExe
     Verify-ExecutableMetadataBytes $UnsignedExecutableBytes
+    Verify-ExecutableMetadataBytes $UnsignedUiExecutableBytes
     if ((Get-ByteArraySha256 $UnsignedExecutableBytes) -cne
         [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
             $BuiltExecutableHandle
         )) {
-        throw "Staged executable bytes do not match the exact retained Cargo output."
+        throw "Staged supervisor bytes do not match the exact retained Cargo output."
+    }
+    if ((Get-ByteArraySha256 $UnsignedUiExecutableBytes) -cne
+        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+            $BuiltUiExecutableHandle
+        )) {
+        throw "Staged UI helper bytes do not match the exact retained Cargo output."
     }
     [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
         $BuiltExecutableDirectoryHandle,
         "$BinaryName.exe",
         $BuiltExecutableHandle
+    )
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+        $BuiltExecutableDirectoryHandle,
+        "$UiBinaryName.exe",
+        $BuiltUiExecutableHandle
     )
     $committedPayloadState = Copy-CommittedReleasePayloadFiles $stagedDist
     $CommittedPayloadHashes = $committedPayloadState.ExpectedHashes
@@ -5994,52 +6123,87 @@ try {
     Microsoft.PowerShell.Utility\Write-Warning "Creating an unsigned DEVELOPMENT distribution. It is not a publishable release, and its local build metadata is informational rather than an attestation."
     if ((Get-SingleLinkSha256 $stagedExe) -cne
         (Get-ByteArraySha256 $UnsignedExecutableBytes)) {
-        throw "Unsigned development executable changed after its exact Cargo-output copy."
+        throw "Unsigned development supervisor changed after its exact Cargo-output copy."
     }
-    # Authenticate and retain the exact staged executable object before the
-    # Cargo-output handle is released. Once opened, this handle denies writers
-    # and replacement until candidate transfer is complete. This preserves the
-    # selected local test bytes but deliberately does not claim who authored
-    # the build output within the shared Windows security context.
+    if ((Get-SingleLinkSha256 $stagedUiExe) -cne
+        (Get-ByteArraySha256 $UnsignedUiExecutableBytes)) {
+        throw "Unsigned development UI helper changed after its exact Cargo-output copy."
+    }
+    # Authenticate and retain both exact staged executable objects before the
+    # Cargo-output handles are released. Once opened, these handles deny
+    # writers and replacement until candidate transfer is complete. This
+    # preserves the selected local test bytes but deliberately does not claim
+    # who authored the build outputs within the shared Windows security context.
     $StagedExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(
         $stagedExe
+    )
+    $StagedUiExecutableHandle = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::OpenRegularSingleLink(
+        $stagedUiExe
     )
     [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
         $stagedExe,
         $StagedExecutableHandle
     )
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularPath(
+        $stagedUiExe,
+        $StagedUiExecutableHandle
+    )
     $stagedHandleHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
         $StagedExecutableHandle
     )
+    $stagedUiHandleHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+        $StagedUiExecutableHandle
+    )
     if ($stagedHandleHash -cne (Get-ByteArraySha256 $UnsignedExecutableBytes)) {
-        throw "Retained development executable is not the exact Cargo-output copy."
+        throw "Retained development supervisor is not the exact Cargo-output copy."
+    }
+    if ($stagedUiHandleHash -cne (Get-ByteArraySha256 $UnsignedUiExecutableBytes)) {
+        throw "Retained development UI helper is not the exact Cargo-output copy."
     }
     $StagedExecutableSha256 = $stagedHandleHash
-    Assert-StagedExecutableHandle $stagedExe
+    $StagedUiExecutableSha256 = $stagedUiHandleHash
+    Assert-StagedExecutableHandles $stagedExe $stagedUiExe
     if ((Get-ByteArraySha256 $UnsignedExecutableBytes) -cne
         [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
             $BuiltExecutableHandle
         )) {
-        throw "Exact retained Cargo output changed before development validation completed."
+        throw "Exact retained supervisor Cargo output changed before development validation completed."
+    }
+    if ((Get-ByteArraySha256 $UnsignedUiExecutableBytes) -cne
+        [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+            $BuiltUiExecutableHandle
+        )) {
+        throw "Exact retained UI-helper Cargo output changed before development validation completed."
     }
     [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
         $BuiltExecutableDirectoryHandle,
         "$BinaryName.exe",
         $BuiltExecutableHandle
     )
+    [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedRegularChild(
+        $BuiltExecutableDirectoryHandle,
+        "$UiBinaryName.exe",
+        $BuiltUiExecutableHandle
+    )
     Close-BuiltExecutableHandles
     $UnsignedExecutableBytes = $null
-    Assert-StagedExecutableHandle $stagedExe
+    $UnsignedUiExecutableBytes = $null
+    Assert-StagedExecutableHandles $stagedExe $stagedUiExe
     Verify-ExecutableMetadata $stagedExe
+    Verify-ExecutableMetadata $stagedUiExe
 
     $corePayloadHashes = Get-CoreDistributionPayloadHashes $stagedDist
-    Assert-StagedExecutableHandle $stagedExe
+    Assert-StagedExecutableHandles $stagedExe $stagedUiExe
     if ($corePayloadHashes[$ExeName] -cne $StagedExecutableSha256) {
-        throw "Core payload hash does not match the exact retained staged executable."
+        throw "Core payload hash does not match the exact retained staged supervisor."
+    }
+    if ($corePayloadHashes[$UiExeName] -cne $StagedUiExecutableSha256) {
+        throw "Core payload hash does not match the exact retained staged UI helper."
     }
     Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
     Assert-CommittedReleasePayloadHashes $corePayloadHashes $CommittedPayloadHashes
     $exeSha256 = $corePayloadHashes[$ExeName]
+    $uiExeSha256 = $corePayloadHashes[$UiExeName]
     $metadataDocument = @(
         "WAAL_WINDOWS_LOCAL_BUILD_METADATA_V1",
         "artifact-kind=development-unsigned",
@@ -6072,6 +6236,7 @@ try {
         "msvc-include-content-sha256=$TrustedIncludeSha256",
         "msvc-libpath-content-sha256=$TrustedLibPathSha256",
         "executable-sha256=$exeSha256",
+        "ui-helper-executable-sha256=$uiExeSha256",
         "readme-sha256=$($corePayloadHashes['README.md'])",
         "license-sha256=$($corePayloadHashes['LICENSE'])",
         "config-example-sha256=$($corePayloadHashes['config.example.json'])"
@@ -6083,22 +6248,23 @@ try {
     $completeDistributionHashes = Get-CompleteDistributionFileHashes $stagedDist
 
     Assert-ReleaseSourceUnchanged $Git
-    Assert-StagedExecutableHandle $stagedExe
+    Assert-StagedExecutableHandles $stagedExe $stagedUiExe
     Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
     Assert-WindowsDistribution $stagedDist $payloadHashes $expectedMetadata
     Assert-ReleaseToolchainIntegrity
     if ($StopRunning) { Stop-DistProcesses }
     $candidateDir = New-PublicationCandidate
     foreach ($fileName in @(
-        $ExeName, "README.md", "LICENSE", "config.example.json", "SHA256SUMS.txt", "BUILD-METADATA.txt"
+        $ExeName, $UiExeName, "README.md", "LICENSE", "config.example.json",
+        "SHA256SUMS.txt", "BUILD-METADATA.txt"
     )) {
         Copy-SingleLinkFile `
             (Microsoft.PowerShell.Management\Join-Path $stagedDist $fileName) `
             (Microsoft.PowerShell.Management\Join-Path $candidateDir $fileName)
     }
-    Assert-StagedExecutableHandle $stagedExe
+    Assert-StagedExecutableHandles $stagedExe $stagedUiExe
     Assert-StagedPayloadHandles $stagedDist $StagedPayloadHandles $CommittedPayloadHashes
-    Close-StagedExecutableHandle
+    Close-StagedExecutableHandles
     Close-StagedPayloadHandles
     Assert-WindowsDistribution $candidateDir $payloadHashes $expectedMetadata
     Lock-PublicationCandidateDirectory
@@ -6119,6 +6285,7 @@ try {
     Assert-ReleaseToolchainIntegrity
     Activate-PublicationCandidate
     $finalExe = Microsoft.PowerShell.Management\Join-Path $DistDir $ExeName
+    $finalUiExe = Microsoft.PowerShell.Management\Join-Path $DistDir $UiExeName
     $PublicationPayloadHandles = Lock-DistributionPayloadHandlesAfterRename `
         $PublicationFinalHandle `
         $PublicationPayloadHandles
@@ -6132,11 +6299,17 @@ try {
     $finalExeHandles = @($PublicationPayloadHandles | Microsoft.PowerShell.Core\Where-Object {
         $_.Name -ceq $ExeName
     })
-    if ($finalExeHandles.Count -ne 1) {
-        throw "Final publication does not retain exactly one executable identity."
+    $finalUiExeHandles = @($PublicationPayloadHandles | Microsoft.PowerShell.Core\Where-Object {
+        $_.Name -ceq $UiExeName
+    })
+    if ($finalExeHandles.Count -ne 1 -or $finalUiExeHandles.Count -ne 1) {
+        throw "Final publication does not retain exactly both executable identities."
     }
     $finalHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
         $finalExeHandles[0].Handle
+    )
+    $finalUiHash = [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::HashTrackedRegularSingleLinkSha256(
+        $finalUiExeHandles[0].Handle
     )
     [Obcardinal.WindowsAppAutoLogin.ReleaseTreeCleaner]::AssertTrackedDirectoryChild(
         $PublicationParentHandle,
@@ -6155,6 +6328,8 @@ try {
     Microsoft.PowerShell.Utility\Write-Host "  $DistDir"
     Microsoft.PowerShell.Utility\Write-Host "  $finalExe"
     Microsoft.PowerShell.Utility\Write-Host "  SHA-256: $finalHash"
+    Microsoft.PowerShell.Utility\Write-Host "  $finalUiExe"
+    Microsoft.PowerShell.Utility\Write-Host "  SHA-256: $finalUiHash"
     Microsoft.PowerShell.Utility\Write-Warning "This output is unsigned and development-only."
 }
 catch {
@@ -6180,7 +6355,7 @@ finally {
         }
     }
     try {
-        Close-StagedExecutableHandle
+        Close-StagedExecutableHandles
     }
     catch {
         if ($cleanupFailure) {

@@ -127,7 +127,7 @@ The files are written as `dist/WindowsAppAutoLogin-macos-local-signed-<40-hex-ca
 
 Local invocations with `--release` or `--release-diagnostics-artifact` fail closed. The only local signed packaging entry point is `--local-signed-release`. A future publishable macOS artifact must be produced by a separately isolated builder and returned over an authenticated channel. Local publication still uses a same-volume atomic no-replace APFS clone followed by descriptor-bound verification and candidate cleanup: an existing artifact is never unlinked or overwritten, and older commit-labelled artifacts are preserved. These controls protect the selected package bytes; they do not provide producer attribution.
 
-For a local macOS development bundle, use `./script/build_and_run.sh --verify` instead.
+For a local macOS development bundle, use `./script/build_and_run.sh --verify` instead. When exactly one `Developer ID Application` identity is available, the script uses it automatically so Accessibility and other TCC approvals survive rebuilds. Set `WAAL_DEVELOPMENT_CODESIGN_IDENTITY=-` to force the older cdhash-bound ad-hoc behavior, or set it to a specific Developer ID identity when more than one is installed. This remains a local development artifact, not a publishable release.
 
 Build-check the Windows implementation from another host when the target is installed:
 
@@ -147,7 +147,7 @@ The development package is commit-addressed for traceability, but it is not an a
 
 The Windows packager still uses a clean PowerShell child, an isolated Cargo home, a freshly materialized committed source snapshot, retained directory/file handles, and no-replace publication for the development package. Cargo is allowed to create and uplift its normal executable destination; after Cargo exits, the packager opens the exact child relative to the retained output directory, verifies that it is a non-empty regular single-link file, and denies further writes or replacement while copying it. These controls keep the selected VM-test payload internally consistent; they deliberately do not claim producer attribution against another process running as the same user.
 
-Build and launch the local macOS development app bundle. This path uses the development bundle identity and ad-hoc signing; it is not a production release build:
+Build and launch the local macOS development app bundle. This path uses the separate development bundle identity and prefers the stable local Developer ID signer described below, with a cdhash-bound ad-hoc fallback; it is not a production release build:
 
 ```bash
 ./script/build_and_run.sh --verify
@@ -190,7 +190,7 @@ When the matching Windows App credential prompt is visible and Windows App is fr
 
 ## Menu-Bar App
 
-The default launch mode is a lightweight supervisor with no always-on egui window. The menu contains:
+The app always keeps a lightweight supervisor in the menu bar. On a fresh launch it opens the Accounts window unless **Hide main window at launch** is enabled; when that setting is enabled, startup remains menu-bar only. The menu contains:
 
 - **Open Accounts**
 - **Open Settings**
@@ -366,7 +366,7 @@ The test suite covers the main safety decisions: visible-email matching, missing
 
 ## Packaging Notes
 
-`script/build_and_run.sh` creates a local app bundle and ad-hoc signs it when `codesign` is available. The development signature uses the default cdhash-bound designated requirement; it does not trust every ad-hoc application that copies the public bundle identifier. Because the cdhash changes after a rebuild, Accessibility, Automation, and Keychain approval may need to be granted again.
+`script/build_and_run.sh` creates a local app bundle and, when exactly one `Developer ID Application` identity is available, uses that stable identity so Accessibility, Automation, and Keychain approval can survive rebuilds. The result still contains development build metadata and the development bundle ID; it is not a publishable or notarized release. If no unique Developer ID identity is available, or `WAAL_DEVELOPMENT_CODESIGN_IDENTITY=-` is set, the script falls back to the default cdhash-bound ad-hoc signature. That fallback does not trust every ad-hoc application that copies the public bundle identifier, but its identity changes after every rebuild and macOS permissions may need to be granted again.
 
 Current development bundle ID:
 
@@ -374,7 +374,7 @@ Current development bundle ID:
 obcardinal.windows-app-autologin
 ```
 
-The development script does not perform Developer ID signing or notarization. It opts into `WAAL_DEVELOPMENT_RELEASE=1` only for local non-production release-profile bundles.
+The development script does not perform release packaging or notarization. Even when it uses a local Developer ID identity for stable TCC behavior, it opts into `WAAL_DEVELOPMENT_RELEASE=1` and retains the separate development bundle identity.
 
 Local `script/package_macos.sh --release` and `script/package_macos.sh --release-diagnostics-artifact` invocations fail closed because this packager cannot create a publishable or producer-attested macOS artifact. Use `script/package_macos.sh --local-signed-release` only for the explicitly non-publishable local signed ZIP.
 
@@ -388,7 +388,7 @@ The current local signed macOS path intentionally produces an ARM64 binary. `CFB
 
 Local signed packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the production bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata contains the same expected bundle ID, Team ID, captured source commit/tree, target, observed toolchain hashes, and observed materials aggregate, and the bundle passes production identity checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, validates the staged bundle and extracted ZIP, writes the ZIP and SHA-256 sidecar under immutable commit-labelled names without replacing prior files, then re-hashes and verifies the final destination archive. Those labels and metadata remain traceability observations, not producer attribution.
 
-The project previously used development bundle ID `dev.codex.windows-app-autologin`; the current ID is `obcardinal.windows-app-autologin`. Release and development scripts do not reset privacy databases or alter Keychain access lists automatically. If an obsolete grant remains, remove only the old app entry from **System Settings → Privacy & Security → Accessibility** and **Automation**. If you deliberately want command-line cleanup, run the bundle-scoped `tccutil reset Accessibility dev.codex.windows-app-autologin` and `tccutil reset AppleEvents dev.codex.windows-app-autologin` yourself after reviewing the target. In Keychain Access, inspect the `WindowsAppAutoLogin` and `WindowsAppAutoLoginFallbackKey` items and remove only a stale application entry from Access Control; do not delete password items or the fallback key while fallback records exist. For the current ad-hoc development ID, prefer removing and re-adding the exact rebuilt app in System Settings rather than resetting unrelated applications.
+The project previously used development bundle ID `dev.codex.windows-app-autologin`; the current ID is `obcardinal.windows-app-autologin`. Release and development scripts do not reset privacy databases or alter Keychain access lists automatically. If an obsolete grant remains, remove only the old app entry from **System Settings → Privacy & Security → Accessibility** and **Automation**. If you deliberately want command-line cleanup, run the bundle-scoped `tccutil reset Accessibility dev.codex.windows-app-autologin` and `tccutil reset AppleEvents dev.codex.windows-app-autologin` yourself after reviewing the target. In Keychain Access, inspect the `WindowsAppAutoLogin` and `WindowsAppAutoLoginFallbackKey` items and remove only a stale application entry from Access Control; do not delete password items or the fallback key while fallback records exist. When migrating from an older or explicitly forced ad-hoc development build, remove and re-add the exact rebuilt app in System Settings once; the default stable development signature then lets that approval survive later rebuilds.
 
 `script/package_macos.sh --release-diagnostics-artifact` is intentionally disabled locally and fails closed, just like `--release`. `script/build_and_run.sh --dev-ui` remains a local development diagnostics path; it builds `dev-tools`, includes `debug-fill`, uses the development identity, and must not be treated as a signed support or release artifact. Any future publishable diagnostics artifact must use a separate diagnostics identity and be produced by the isolated authenticated builder.
 
