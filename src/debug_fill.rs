@@ -18,6 +18,10 @@ struct PromptInfo {
 }
 
 const LAST_FILL_ATTEMPT_REPORT_FILE: &str = "last-fill-attempt.json";
+#[cfg(target_os = "macos")]
+const MACOS_POST_SUBMIT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "windows")]
+const WINDOWS_POST_SUBMIT_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 static REPORT_TEMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn password_storage_recovery_is_clear() -> bool {
@@ -398,7 +402,7 @@ fn sync_report_parent_directory(_parent: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(feature = "diagnostics-ui")]
 pub(crate) fn read_last_fill_attempt_report() -> anyhow::Result<Option<FillAttemptReport>> {
     let path = crate::user_paths::runtime_dir()?.join(LAST_FILL_ATTEMPT_REPORT_FILE);
     match std::fs::read(path) {
@@ -588,6 +592,40 @@ fn record_password_cleanup_result(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_post_submit_requires_password_cleanup(post_state: &str) -> bool {
+    !matches!(
+        post_state,
+        "authenticated" | "prompt_gone_confirmed" | "prompt_replaced"
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn record_windows_post_submit_password_cleanup<F>(
+    log: &mut DebugLog,
+    post_state: &str,
+    cleanup: F,
+) -> bool
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    if !windows_post_submit_requires_password_cleanup(post_state) {
+        return true;
+    }
+    record_password_cleanup_result(log, Some(cleanup()))
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_ambiguous_submit_failure_fields(log: &mut DebugLog) {
+    log.set("submit_method", "invoke");
+    log.set("submit_attempted", "true");
+    log.set("submit_status", "unknown");
+    log.set("axpress_attempted", "true");
+    log.set("axpress_result", "reported_error");
+    log.set("enter_fallback_attempted", "false");
+    log.set("enter_fallback_result", "disabled");
+}
+
 #[cfg(all(feature = "debug-fill", debug_assertions, not(waal_release_profile)))]
 pub(crate) fn run_from_args(args: &[String]) -> anyhow::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -770,6 +808,7 @@ fn fill_current_prompt_once_macos(
             Ok(selection) => selection,
             Err(reason) => return log.fail(reason),
         };
+    log.set("prompt_origin", prompt.prompt_origin.clone());
 
     if let Err(e) = guard() {
         return log.fail(format!("attempt_cancelled_{e}"));
@@ -999,7 +1038,7 @@ fn fill_current_prompt_once_macos(
                 &prompt.window_title,
                 &prompt_email,
                 None,
-                Duration::from_millis(450),
+                MACOS_POST_SUBMIT_CHECK_TIMEOUT,
             );
             log.set("post_check_state", post_state);
             return if !cleanup_confirmed {
@@ -1023,9 +1062,10 @@ fn fill_current_prompt_once_macos(
         &prompt.window_title,
         &prompt_email,
         submit_result.submitted_prompt.as_ref(),
-        Duration::from_millis(450),
+        MACOS_POST_SUBMIT_CHECK_TIMEOUT,
     );
     log.set("post_check_state", post_state);
+    reconcile_macos_submit_fields_after_post_check(&mut log, &submit_result, post_state);
     if post_state != "authenticated" {
         let cleanup_confirmed = record_password_cleanup_result(
             &mut log,
@@ -1059,22 +1099,16 @@ fn detect_current_prompt_context_macos(
     accounts: &[Account],
     guard: &dyn Fn() -> anyhow::Result<()>,
 ) -> Result<Option<VerifiedPromptContext>, String> {
-    let trusted_infos = macos_identity::trusted_process_infos(app_name)
-        .map_err(|_| "windows_app_trust_check_failed".to_string())?;
-    if trusted_infos.is_empty() {
-        return Ok(None);
-    }
-
+    guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
+    // Prompt detection resolves and validates trusted process identities before
+    // inspecting Accessibility elements, and the returned prompt stays bound
+    // to that trusted process. A separate enumeration here would repeat the
+    // native process walk and code-signature validation for the same probe.
     let native_prompt = crate::macos_ax::detect_visible_prompt(app_name, None, None, None)
         .map_err(|e| format!("prompt_detection_failed_{e}"))?;
+    guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
     let Some(native_prompt) = native_prompt else {
         return Ok(None);
-    };
-    let Some(_target) = trusted_infos
-        .iter()
-        .find(|target| target.pid == native_prompt.target.process_id)
-    else {
-        return Err("prompt_pid_does_not_match_trusted_target".to_string());
     };
 
     let Some(prompt_email) = native_prompt
@@ -1084,8 +1118,6 @@ fn detect_current_prompt_context_macos(
     else {
         return Err("visible_prompt_email_missing".to_string());
     };
-    guard().map_err(|e| format!("attempt_cancelled_{e}"))?;
-
     let enabled_email_matches = enabled_email_match_count(accounts, &prompt_email);
     let matches = matching_macos_accounts(accounts, &prompt_email);
     let [selected_account] = matches.as_slice() else {
@@ -1625,21 +1657,24 @@ fn fill_current_prompt_once_windows(
                     "submit_duration_ms",
                     submit_start.elapsed().as_millis().to_string(),
                 );
-                let cleanup_confirmed = record_password_cleanup_result(
-                    &mut log,
-                    Some(crate::windows_ui::clear_filled_password(
-                        app_name,
-                        &fill_result.filled_prompt,
-                    )),
-                );
+                if e.invoke_result_is_ambiguous() {
+                    apply_windows_ambiguous_submit_failure_fields(&mut log);
+                }
                 let post_state = crate::windows_ui::post_check_state(
                     app_name,
                     fill_result.filled_prompt.target.process_id,
                     expected_email,
-                    None,
-                    Duration::from_millis(1200),
+                    e.submitted_prompt(),
+                    WINDOWS_POST_SUBMIT_CHECK_TIMEOUT,
                 );
                 log.set("post_check_state", post_state);
+                let cleanup_confirmed =
+                    record_windows_post_submit_password_cleanup(&mut log, post_state, || {
+                        crate::windows_ui::clear_filled_password(
+                            app_name,
+                            &fill_result.filled_prompt,
+                        )
+                    });
                 return if !cleanup_confirmed {
                     log.fail("password_cleanup_failed_after_submit_failure")
                 } else if post_state == "authenticated" {
@@ -1672,23 +1707,20 @@ fn fill_current_prompt_once_windows(
         fill_result.filled_prompt.target.process_id,
         expected_email,
         submit_result.submitted_prompt.as_ref(),
-        Duration::from_millis(1200),
+        WINDOWS_POST_SUBMIT_CHECK_TIMEOUT,
     );
     log.set("post_check_state", post_state);
-    if post_state != "authenticated" {
-        let cleanup_confirmed = record_password_cleanup_result(
-            &mut log,
-            Some(crate::windows_ui::clear_filled_password(
-                app_name,
-                &fill_result.filled_prompt,
-            )),
-        );
-        if !cleanup_confirmed {
-            return log.fail("password_cleanup_failed_after_post_check");
-        }
+    let cleanup_confirmed =
+        record_windows_post_submit_password_cleanup(&mut log, post_state, || {
+            crate::windows_ui::clear_filled_password(app_name, &fill_result.filled_prompt)
+        });
+    if !cleanup_confirmed {
+        return log.fail("password_cleanup_failed_after_post_check");
     }
     match post_state {
         "authenticated" => log.finish(None),
+        "prompt_gone_confirmed" => log.fail("post_submit_prompt_gone_confirmed"),
+        "prompt_replaced" => log.fail("credential_prompt_replaced_after_submit"),
         "prompt_mismatch" => log.fail("post_submit_prompt_mismatch"),
         "prompt_gone_unknown" => log.fail("post_submit_prompt_gone_unknown"),
         "still_prompt" => log.fail("credential_prompt_still_visible_after_submit"),
@@ -2225,9 +2257,7 @@ fn post_check_state(
 #[cfg(target_os = "macos")]
 fn macos_fill_method(method: FillMethod) -> crate::macos_ax::MacosFillMethod {
     match method {
-        // Keep the legacy debug-fill option name for compatibility; macOS password
-        // insertion itself is target-bound AXValue only.
-        FillMethod::Keyboard => crate::macos_ax::MacosFillMethod::DirectAxValue,
+        FillMethod::Keyboard => crate::macos_ax::MacosFillMethod::Keyboard,
     }
 }
 
@@ -2263,6 +2293,18 @@ fn apply_macos_submit_fields(log: &mut DebugLog, result: &crate::macos_ax::Macos
         result.enter_fallback_attempted.to_string(),
     );
     log.set("enter_fallback_result", result.enter_fallback_result);
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_macos_submit_fields_after_post_check(
+    log: &mut DebugLog,
+    result: &crate::macos_ax::MacosSubmitResult,
+    post_state: &str,
+) {
+    if post_state == "authenticated" && result.submit_status != "ok" {
+        log.set("submit_status", "ok");
+        log.set("axpress_result", "reported_error_but_authenticated");
+    }
 }
 #[cfg(target_os = "macos")]
 fn ax_is_process_trusted() -> bool {
@@ -2997,6 +3039,58 @@ mod tests {
     }
 
     #[test]
+    fn macos_context_probe_delegates_to_one_trusted_native_inspection() {
+        let implementation = include_str!("debug_fill.rs");
+        let context_probe = source_between(
+            implementation,
+            "fn detect_current_prompt_context_macos(",
+            "fn select_prompt_and_account<'a>(",
+        );
+
+        assert_eq!(
+            context_probe
+                .matches("crate::macos_ax::detect_visible_prompt(")
+                .count(),
+            1
+        );
+        assert!(!context_probe.contains("macos_identity::trusted_process_infos("));
+        assert!(context_probe.contains(".map_err(|e| format!(\"prompt_detection_failed_{e}\"))?"));
+        assert!(context_probe.contains("return Err(\"visible_prompt_email_missing\""));
+        assert!(context_probe.contains("enabled_email_match_count(accounts, &prompt_email)"));
+        assert!(context_probe.contains("matching_macos_accounts(accounts, &prompt_email)"));
+        assert!(context_probe.contains("visible_prompt_email_matches_multiple_enabled_accounts"));
+
+        let macos_ax = include_str!("macos_ax.rs");
+        let prompt_detector = source_between(
+            macos_ax,
+            "pub(crate) fn detect_visible_prompt(",
+            "fn record_prompt_candidate(",
+        );
+        assert_eq!(prompt_detector.matches("inspect_process(").count(), 1);
+
+        let process_inspector = source_between(
+            macos_ax,
+            "fn inspect_process(",
+            "fn trusted_process_infos_for_inspection(",
+        );
+        assert_eq!(
+            process_inspector
+                .matches("trusted_process_infos_for_inspection(app_name, expected_process_id)?")
+                .count(),
+            1
+        );
+
+        let trusted_process_resolver = source_between(
+            macos_ax,
+            "fn trusted_process_infos_for_inspection(",
+            "pub(crate) fn detect_visible_prompt(",
+        );
+        assert!(
+            trusted_process_resolver.contains("macos_identity::trusted_process_infos(app_name)")
+        );
+    }
+
+    #[test]
     fn ambiguous_password_write_is_cleaned_after_local_password_drop() {
         let implementation = include_str!("debug_fill.rs");
         for (fill, cleanup_call) in [
@@ -3067,6 +3161,155 @@ mod tests {
         assert_eq!(
             report.failure_reason.as_deref(),
             Some("password_cleanup_failed_after_post_check")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_post_submit_cleanup_is_required_only_while_the_original_prompt_may_exist() {
+        for state in ["authenticated", "prompt_gone_confirmed", "prompt_replaced"] {
+            assert!(!super::windows_post_submit_requires_password_cleanup(state));
+        }
+        for state in [
+            "still_prompt",
+            "prompt_mismatch",
+            "prompt_gone_unknown",
+            "failed",
+        ] {
+            assert!(super::windows_post_submit_requires_password_cleanup(state));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn confirmed_replacement_or_absence_leaves_cleanup_not_needed() {
+        for state in ["authenticated", "prompt_gone_confirmed", "prompt_replaced"] {
+            let cleanup_called = std::cell::Cell::new(false);
+            let mut log = super::DebugLog::new("test".to_string());
+            let confirmed =
+                super::record_windows_post_submit_password_cleanup(&mut log, state, || {
+                    cleanup_called.set(true);
+                    Ok(())
+                });
+            let report = log.finish(None);
+
+            assert!(confirmed);
+            assert!(!cleanup_called.get());
+            assert_eq!(report.field("password_cleanup_attempted"), Some("false"));
+            assert_eq!(report.field("password_cleanup_status"), Some("not_needed"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn present_original_prompt_is_cleared_and_indeterminate_cleanup_fails_closed() {
+        let mut cleared_log = super::DebugLog::new("test".to_string());
+        let cleared = super::record_windows_post_submit_password_cleanup(
+            &mut cleared_log,
+            "still_prompt",
+            || Ok(()),
+        );
+        let cleared_report = cleared_log.finish(None);
+        assert!(cleared);
+        assert_eq!(
+            cleared_report.field("password_cleanup_attempted"),
+            Some("true")
+        );
+        assert_eq!(cleared_report.field("password_cleanup_status"), Some("ok"));
+
+        let mut uncertain_log = super::DebugLog::new("test".to_string());
+        let cleared = super::record_windows_post_submit_password_cleanup(
+            &mut uncertain_log,
+            "prompt_gone_unknown",
+            || Err(anyhow::anyhow!("simulated indeterminate cleanup")),
+        );
+        let uncertain_report = uncertain_log.fail("password_cleanup_failed_after_post_check");
+        assert!(!cleared);
+        assert_eq!(
+            uncertain_report.field("password_cleanup_status"),
+            Some("failed")
+        );
+        assert_eq!(
+            uncertain_report.failure_reason.as_deref(),
+            Some("password_cleanup_failed_after_post_check")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ambiguous_submit_error_carries_any_captured_identity_and_remains_fail_closed() {
+        let implementation = include_str!("debug_fill.rs");
+        let windows_fill = source_between(
+            implementation,
+            "fn fill_current_prompt_once_windows(",
+            "fn inspect_windows_prompt_for_fill(",
+        );
+        let submit_error = source_between(
+            windows_fill,
+            "Err(e) => {\n                log.set(\n                    \"submit_duration_ms\"",
+            "            }\n        };",
+        );
+
+        assert!(submit_error.contains("expected_email,\n                    e.submitted_prompt(),"));
+        assert!(submit_error.contains("e.invoke_result_is_ambiguous()"));
+        assert!(submit_error.contains("apply_windows_ambiguous_submit_failure_fields"));
+        assert!(submit_error.contains("record_windows_post_submit_password_cleanup"));
+        assert!(submit_error.contains("password_cleanup_failed_after_submit_failure"));
+        assert!(submit_error.contains("post_state == \"authenticated\""));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ambiguous_invoke_failure_reports_the_submit_side_effect_honestly() {
+        let mut log = super::DebugLog::new("test".to_string());
+        super::apply_windows_ambiguous_submit_failure_fields(&mut log);
+        let report = log.finish(None);
+
+        assert_eq!(report.field("submit_method"), Some("invoke"));
+        assert_eq!(report.field("submit_attempted"), Some("true"));
+        assert_eq!(report.field("submit_status"), Some("unknown"));
+        assert_eq!(report.field("axpress_attempted"), Some("true"));
+        assert_eq!(report.field("axpress_result"), Some("reported_error"));
+        assert_eq!(report.field("enter_fallback_attempted"), Some("false"));
+        assert_eq!(report.field("enter_fallback_result"), Some("disabled"));
+
+        let before_submit = super::DebugLog::new("test".to_string()).finish(None);
+        assert_eq!(before_submit.field("submit_method"), Some("none"));
+        assert_eq!(before_submit.field("submit_attempted"), Some("false"));
+        assert_eq!(before_submit.field("submit_status"), Some("not_attempted"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_post_submit_check_allows_a_bounded_session_window_transition() {
+        let timeout = std::hint::black_box(super::MACOS_POST_SUBMIT_CHECK_TIMEOUT);
+
+        assert!(timeout >= std::time::Duration::from_secs(2));
+        assert!(timeout <= std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn authenticated_post_check_reconciles_ambiguous_axpress_report() {
+        let result = crate::macos_ax::MacosSubmitResult {
+            submit_method: "axpress_fallback",
+            submit_status: "unknown",
+            axpress_attempted: true,
+            axpress_result: "reported_error",
+            enter_fallback_attempted: false,
+            enter_fallback_result: "focus_not_verified",
+            submitted_prompt: None,
+        };
+        let mut log = super::DebugLog::new("test".to_string());
+        super::apply_macos_submit_fields(&mut log, &result);
+        super::reconcile_macos_submit_fields_after_post_check(&mut log, &result, "authenticated");
+        let report = log.finish(None);
+
+        assert!(report.success);
+        assert_eq!(report.field("submit_status"), Some("ok"));
+        assert_eq!(
+            report.field("axpress_result"),
+            Some("reported_error_but_authenticated")
         );
     }
 

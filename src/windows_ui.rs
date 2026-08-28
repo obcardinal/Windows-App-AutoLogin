@@ -2,9 +2,11 @@ use crate::config::Config;
 use crate::monitor::{MonitorObservation, MonitorStatus};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uiautomation::patterns::{UIInvokePattern, UIValuePattern};
@@ -14,9 +16,9 @@ use windows::core::{BOOL, BSTR, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, APPMODEL_ERROR_NO_PACKAGE, CERT_E_REVOKED, CRYPT_E_NO_SIGNER,
     CRYPT_E_REVOKED, CRYPT_E_SIGNER_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES,
-    ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, TRUST_E_BAD_DIGEST, TRUST_E_CERT_SIGNATURE,
-    TRUST_E_EXPLICIT_DISTRUST, TRUST_E_MALFORMED_SIGNATURE, TRUST_E_NOSIGNATURE,
-    TRUST_E_NO_SIGNER_CERT,
+    ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM, RECT, TRUST_E_BAD_DIGEST,
+    TRUST_E_CERT_SIGNATURE, TRUST_E_EXPLICIT_DISTRUST, TRUST_E_MALFORMED_SIGNATURE,
+    TRUST_E_NOSIGNATURE, TRUST_E_NO_SIGNER_CERT,
 };
 use windows::Win32::Security::Cryptography::{
     CertGetNameStringW, CERT_CONTEXT, CERT_NAME_SIMPLE_DISPLAY_TYPE,
@@ -35,8 +37,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWow64DirectoryW};
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::IUIAutomationValuePattern;
 use windows::Win32::UI::Shell::{
@@ -44,9 +46,9 @@ use windows::Win32::UI::Shell::{
     SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
-    ShowWindow, GA_ROOT, SW_RESTORE,
+    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    SetForegroundWindow, ShowWindow, GA_ROOT, GA_ROOTOWNER, GW_OWNER, SW_RESTORE,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -55,8 +57,12 @@ const UIA_SEARCH_DEPTH: u32 = 12;
 const SUBMIT_READY_TIMEOUT_MS: u64 = 1500;
 const PASSWORD_CLEANUP_ATTEMPTS: usize = 3;
 const PASSWORD_CLEANUP_RETRY_MS: u64 = 50;
+const POST_SUBMIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const POST_SUBMIT_BROAD_INSPECTION_INTERVAL: Duration = Duration::from_millis(300);
 const ACTIVATION_INITIAL_TIMEOUT_MS: u64 = 250;
 const ACTIVATION_ATTACHED_TIMEOUT_MS: u64 = 750;
+const PROCESS_TRUST_CACHE_CAPACITY: usize = 32;
+const PROCESS_TRUST_CACHE_TTL_SECS: u64 = 30;
 
 /// Owns the BSTR passed to UI Automation and scrubs its UTF-16 allocation
 /// before `BSTR` releases it. `BSTR::from(&str)` uses a temporary `Vec<u16>`
@@ -107,7 +113,6 @@ enum WindowsMicrosoftTargetKind {
     SystemMstsc,
     RemoteDesktopInstall,
     WindowsAppsPackage,
-    #[cfg(test)]
     CredentialBroker,
 }
 
@@ -170,10 +175,32 @@ pub(crate) struct WindowsPrompt {
     pub(crate) password_field_description: String,
     pub(crate) password_field_role: String,
     trust: WindowsPromptTrust,
+    binding: WindowsPromptBinding,
     prompt_root: UIElement,
     password_field: UIElement,
     submit_button: Option<UIElement>,
     identity_elements: Vec<UIElement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsPromptBinding {
+    prompt_process_creation_time: u64,
+    requester: WindowsRequesterBinding,
+    root_requester: Option<WindowsRequesterBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsRequesterBinding {
+    process_id: i32,
+    process_path: String,
+    process_creation_time: u64,
+    window_handle: isize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsRequesterChain {
+    direct: WindowsRequesterBinding,
+    root: WindowsRequesterBinding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +303,63 @@ impl std::error::Error for WindowsFillFailure {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct WindowsSubmitFailure {
+    error: anyhow::Error,
+    stage: WindowsSubmitFailureStage,
+    submitted_prompt: Option<WindowsSubmittedPrompt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSubmitFailureStage {
+    BeforeSubmit,
+    InvokeResultUnknown,
+}
+
+impl WindowsSubmitFailure {
+    fn before_submit(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            stage: WindowsSubmitFailureStage::BeforeSubmit,
+            submitted_prompt: None,
+        }
+    }
+
+    fn ambiguous_invoke(error: anyhow::Error, submitted_prompt: WindowsSubmittedPrompt) -> Self {
+        Self {
+            error,
+            stage: WindowsSubmitFailureStage::InvokeResultUnknown,
+            submitted_prompt: Some(submitted_prompt),
+        }
+    }
+
+    pub(crate) fn submitted_prompt(&self) -> Option<&WindowsSubmittedPrompt> {
+        self.submitted_prompt.as_ref()
+    }
+
+    pub(crate) fn invoke_result_is_ambiguous(&self) -> bool {
+        self.stage == WindowsSubmitFailureStage::InvokeResultUnknown
+    }
+}
+
+impl From<anyhow::Error> for WindowsSubmitFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::before_submit(error)
+    }
+}
+
+impl std::fmt::Display for WindowsSubmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for WindowsSubmitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WindowsSubmitResult {
     pub(crate) submit_method: &'static str,
@@ -294,7 +378,10 @@ pub(crate) struct WindowsSubmittedPrompt {
     prompt_window_title: String,
     email: String,
     trust: WindowsPromptTrust,
+    binding: WindowsPromptBinding,
     prompt_runtime_id: Vec<i32>,
+    password_field_runtime_id: Vec<i32>,
+    cached_prompt: WindowsPrompt,
     pre_submit_session_windows: Vec<WindowsSessionWindow>,
 }
 
@@ -307,42 +394,44 @@ enum SubmittedPromptPresence {
 
 pub(crate) fn check_status(config: &Config) -> MonitorObservation {
     match inspect(&config.macos_app_name) {
-        Ok(inspection) => {
-            let definitive_no_prompt = if inspection.target.is_none() {
-                inspection.target_process_scan_complete
-            } else {
-                inspection.prompt.is_none() && inspection.prompt_scan_complete
-            };
-            if inspection.target.is_some() {
-                if let Some(prompt) = inspection.prompt {
-                    return MonitorObservation::indeterminate(MonitorStatus::LoginWindowDetected {
-                        process_id: prompt.target.process_id,
-                        window_handle: prompt.target.window_handle,
-                        window_title: prompt.target.window_title,
-                        prompt_email: prompt.email,
-                        prompt_origin: "windows".to_string(),
-                    });
-                }
-            } else if inspection.prompt.is_some() {
-                return MonitorObservation::indeterminate(MonitorStatus::Unknown);
-            }
-
-            let status = if inspection.target.is_none() {
-                MonitorStatus::ProcessNotFound
-            } else if inspection.has_session {
-                MonitorStatus::Connected
-            } else {
-                MonitorStatus::Unknown
-            };
-            MonitorObservation {
-                status,
-                definitive_no_prompt,
-            }
-        }
+        Ok(inspection) => monitor_observation_from_inspection(inspection),
         Err(e) => {
             tracing::debug!(error = %e, "Unable to inspect Windows UI Automation tree");
             MonitorObservation::indeterminate(MonitorStatus::Unknown)
         }
+    }
+}
+
+fn monitor_observation_from_inspection(mut inspection: WindowsInspection) -> MonitorObservation {
+    let definitive_no_prompt = if inspection.target.is_none() {
+        inspection.target_process_scan_complete
+    } else {
+        inspection.prompt.is_none() && inspection.prompt_scan_complete
+    };
+    if inspection.target.is_some() {
+        if let Some(prompt) = inspection.prompt.take() {
+            return MonitorObservation::indeterminate(MonitorStatus::LoginWindowDetected {
+                process_id: prompt.target.process_id,
+                window_handle: prompt.target.window_handle,
+                window_title: prompt.target.window_title,
+                prompt_email: prompt.email,
+                prompt_origin: "windows".to_string(),
+            });
+        }
+    } else if inspection.prompt.is_some() {
+        return MonitorObservation::indeterminate(MonitorStatus::Unknown);
+    }
+
+    let status = if inspection.target.is_none() {
+        MonitorStatus::ProcessNotFound
+    } else if inspection.has_session {
+        MonitorStatus::Connected
+    } else {
+        MonitorStatus::Unknown
+    };
+    MonitorObservation {
+        status,
+        definitive_no_prompt,
     }
 }
 
@@ -359,6 +448,10 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
         .iter()
         .map(|target| target.process_id as u32)
         .collect::<Vec<_>>();
+    tracing::debug!(
+        trusted_target_process_count = trusted_running_targets.len(),
+        "Windows UI inspection captured trusted target processes"
+    );
 
     let mut inspection = WindowsInspection {
         target: trusted_running_target,
@@ -366,71 +459,132 @@ pub(crate) fn inspect(target_app_name: &str) -> anyhow::Result<WindowsInspection
         ..Default::default()
     };
     let mut target_prompt: Option<WindowsPrompt> = None;
+    let mut broker_prompt: Option<WindowsPrompt> = None;
     let mut all_trusted_windows_classified = true;
 
-    for candidate in native_visible_windows_for_trusted_process_ids(trusted_process_ids)? {
-        let target_alias_matches = target_aliases(target_app_name)
-            .contains(&normalized_identifier(&candidate.target.process_name));
-        let Some(target_kind) = microsoft_rdp_target_kind(
-            &candidate.target.process_name,
-            &candidate.target.process_path,
-        ) else {
-            anyhow::bail!("trusted target process path identity changed during window enumeration");
-        };
-        if !target_alias_matches {
-            anyhow::bail!("trusted target process name changed during window enumeration");
-        }
-        match windows_target_identity_trust(&candidate.target, target_kind) {
-            WindowsSignatureTrust::Trusted => {}
-            WindowsSignatureTrust::Rejected => anyhow::bail!(
-                "trusted target executable identity changed during window enumeration"
-            ),
-            WindowsSignatureTrust::Indeterminate => {
-                anyhow::bail!("trusted target executable signature state is indeterminate")
+    let native_candidates = native_visible_windows_for_trusted_process_ids(trusted_process_ids)?;
+    tracing::debug!(
+        native_candidate_count = native_candidates.len(),
+        "Windows UI inspection captured visible native candidates"
+    );
+    for candidate in native_candidates {
+        if matching_trusted_target_snapshot(&candidate.target, &trusted_running_targets).is_some() {
+            if inspection.target.is_none() {
+                inspection.target = Some(candidate.target.clone());
             }
-        }
-        if inspection.target.is_none() {
-            inspection.target = Some(candidate.target.clone());
+
+            if target_window_should_be_scanned_for_prompt(
+                target_app_name,
+                &candidate.target,
+                &candidate.class_name,
+            ) {
+                let Some((trust, binding)) = prompt_candidate_binding(
+                    target_app_name,
+                    &candidate.target,
+                    &candidate.class_name,
+                    candidate.window_handle,
+                    &trusted_running_targets,
+                )?
+                else {
+                    anyhow::bail!("trusted target prompt binding changed during inspection");
+                };
+                if trust != WindowsPromptTrust::TrustedTargetProcess {
+                    anyhow::bail!("trusted target prompt was classified as a credential broker");
+                }
+                let window = automation
+                    .element_from_handle(Handle::from(candidate.window_handle))
+                    .context("unable to inspect a trusted target prompt window")?;
+                let prompt_window = inspect_prompt_window(
+                    &automation,
+                    candidate.target.clone(),
+                    trust,
+                    binding,
+                    window,
+                )?;
+                inspection.password_like_plain_edit_rejected |=
+                    prompt_window.password_like_plain_edit_rejected;
+                all_trusted_windows_classified &= prompt_window.scan_complete;
+                if let Some(prompt) = prompt_window.prompt {
+                    if prompt.target.frontmost {
+                        inspection.prompt = Some(prompt);
+                        return Ok(inspection);
+                    } else if target_prompt.is_none() {
+                        target_prompt = Some(prompt);
+                    } else {
+                        anyhow::bail!("multiple trusted target credential prompts are visible");
+                    }
+                }
+            } else if is_probable_session_window_title(&candidate.target.window_title) {
+                inspection.has_session = true;
+                inspection.session_windows.push(WindowsSessionWindow {
+                    process_id: candidate.target.process_id,
+                    window_title: candidate.target.window_title.clone(),
+                    window_handle: candidate.target.window_handle,
+                });
+            } else if trusted_windows_app_launcher_shell_is_known_non_prompt(
+                target_app_name,
+                &candidate.target,
+                &candidate.class_name,
+            ) {
+                // The signed packaged Windows App keeps its device launcher
+                // visible while remote sessions and their credential broker
+                // prompts come and go. This exact shell is neither a session
+                // nor a prompt. Treating it as unknown would permanently make
+                // the global prompt-negative scan incomplete and leave the
+                // previous account-wide retry reservation armed forever.
+                tracing::trace!(
+                    process_id = candidate.target.process_id,
+                    "Known Windows App launcher shell classified as non-prompt"
+                );
+            } else {
+                all_trusted_windows_classified = false;
+            }
+            continue;
         }
 
-        if target_window_should_be_scanned_for_prompt(
+        let Some((trust, binding)) = prompt_candidate_binding(
             target_app_name,
             &candidate.target,
             &candidate.class_name,
-        ) {
-            let window = automation
-                .element_from_handle(Handle::from(candidate.window_handle))
-                .context("unable to inspect a trusted target prompt window")?;
-            let prompt_window = inspect_prompt_window(
-                &automation,
-                candidate.target.clone(),
-                WindowsPromptTrust::TrustedTargetProcess,
-                window,
-            )?;
-            inspection.password_like_plain_edit_rejected |=
-                prompt_window.password_like_plain_edit_rejected;
-            all_trusted_windows_classified &= prompt_window.scan_complete;
-            if let Some(prompt) = prompt_window.prompt {
-                if prompt.target.frontmost {
-                    inspection.prompt = Some(prompt);
-                    return Ok(inspection);
-                } else if target_prompt.is_none() {
-                    target_prompt = Some(prompt);
-                }
-            }
-        } else if is_probable_session_window_title(&candidate.target.window_title) {
-            inspection.has_session = true;
-            inspection.session_windows.push(WindowsSessionWindow {
-                process_id: candidate.target.process_id,
-                window_title: candidate.target.window_title.clone(),
-                window_handle: candidate.target.window_handle,
-            });
-        } else {
+            candidate.window_handle,
+            &trusted_running_targets,
+        )?
+        else {
+            // The native pass includes only credential-specific non-target
+            // windows. If one cannot be tied to the already verified target
+            // process, the prompt-negative result is indeterminate.
             all_trusted_windows_classified = false;
+            tracing::debug!(
+                "Credential-specific non-target window failed broker/requester binding"
+            );
+            continue;
+        };
+        if trust != WindowsPromptTrust::CredentialBrokerBoundToTarget {
+            anyhow::bail!("non-target credential window received the wrong trust class");
+        }
+        let window = automation
+            .element_from_handle(Handle::from(candidate.window_handle))
+            .context("unable to inspect the credential broker prompt window")?;
+        let prompt_window =
+            inspect_prompt_window(&automation, candidate.target, trust, binding, window)?;
+        tracing::debug!(
+            prompt_selected = prompt_window.prompt.is_some(),
+            scan_complete = prompt_window.scan_complete,
+            password_like_plain_edit_rejected = prompt_window.password_like_plain_edit_rejected,
+            "Credential broker UIA candidate inspection completed"
+        );
+        inspection.password_like_plain_edit_rejected |=
+            prompt_window.password_like_plain_edit_rejected;
+        all_trusted_windows_classified &= prompt_window.scan_complete;
+        if let Some(prompt) = prompt_window.prompt {
+            if broker_prompt.is_some() {
+                anyhow::bail!("multiple credential broker prompts are visible");
+            }
+            broker_prompt = Some(prompt);
         }
     }
 
-    inspection.prompt = target_prompt;
+    inspection.prompt = broker_prompt.or(target_prompt);
     inspection.prompt_scan_complete =
         all_trusted_windows_classified && !inspection.password_like_plain_edit_rejected;
 
@@ -449,22 +603,27 @@ pub(crate) fn inspect_prompt_snapshot(
         anyhow::bail!("credential prompt snapshot has no exact PID/HWND identity");
     }
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+    let trusted_running_targets = trusted_running_target_processes_checked(target_app_name)?;
     let mut matches = Vec::new();
 
     for candidate in native_prompt_snapshot_candidates(process_id, window_handle, window_title)? {
-        let Some(trust) = prompt_candidate_trust(
+        let Some((trust, binding)) = prompt_candidate_binding(
             target_app_name,
             &candidate.target,
             &candidate.class_name,
             candidate.window_handle,
-        ) else {
+            &trusted_running_targets,
+        )?
+        else {
             continue;
         };
 
         let window = automation
             .element_from_handle(Handle::from(candidate.window_handle))
             .context("unable to inspect the exact credential prompt snapshot")?;
-        let Some(prompt) = prompt_from_window(&automation, candidate.target, trust, window)? else {
+        let Some(prompt) =
+            prompt_from_window(&automation, candidate.target, trust, binding, window)?
+        else {
             continue;
         };
         if prompt_matches_snapshot(
@@ -659,7 +818,7 @@ pub(crate) fn submit_prompt(
     target_app_name: &str,
     prompt: &WindowsPrompt,
     guard: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<WindowsSubmitResult> {
+) -> Result<WindowsSubmitResult, WindowsSubmitFailure> {
     guard()?;
     activate_window(prompt.target.window_handle)?;
     guard()?;
@@ -674,8 +833,12 @@ pub(crate) fn submit_prompt(
     let pre_submit_session_windows = trusted_session_windows(target_app_name)?;
 
     guard()?;
-    let prompt = revalidate_prompt(target_app_name, &prompt)?;
-    ensure_prompt_sensitive_elements_bound(&prompt)?;
+    let submitted_prompt = WindowsSubmittedPrompt::new(&prompt, pre_submit_session_windows)?;
+    // Runtime-id collection and the session snapshot above may block. Repeat
+    // the exact cached-element, owner-chain, foreground, and native identity
+    // validation only after those reads, immediately before acquiring the
+    // final InvokePattern. This never performs another Descendants scan.
+    let prompt = revalidate_prompt_after_activation(target_app_name, &prompt)?;
     ensure_prompt_foreground_and_trusted(target_app_name, &prompt, "submit")?;
     let button = prompt
         .submit_button
@@ -685,14 +848,16 @@ pub(crate) fn submit_prompt(
     let invoke = button
         .get_pattern::<UIInvokePattern>()
         .map_err(|e| anyhow::anyhow!("submit button lost InvokePattern before submit: {e}"))?;
-    let submitted_prompt = WindowsSubmittedPrompt::new(&prompt, pre_submit_session_windows)?;
     // Keep cancellation/generation invalidation as the final operation before
     // the single submit side effect. All potentially blocking UIA reads above
     // may have yielded long enough for Stop or ApplyConfig to arrive.
     guard()?;
-    invoke
-        .invoke()
-        .map_err(|e| anyhow::anyhow!("UIA Invoke submit failed: {e}"))?;
+    if let Err(error) = invoke.invoke() {
+        return Err(WindowsSubmitFailure::ambiguous_invoke(
+            anyhow::anyhow!("UIA Invoke submit failed: {error}"),
+            submitted_prompt,
+        ));
+    }
     Ok(WindowsSubmitResult {
         submit_method: "invoke",
         submit_status: "ok",
@@ -725,45 +890,30 @@ fn clear_original_password_once(
     target_app_name: &str,
     filled_prompt: &WindowsPrompt,
 ) -> anyhow::Result<()> {
-    let expected = &filled_prompt.target;
-    if expected.process_id <= 0 || expected.window_handle == 0 {
-        anyhow::bail!("original filled prompt has no exact PID/HWND identity");
-    }
-    let hwnd = hwnd_from_handle(expected.window_handle);
-    if !native_window_is_visible_and_sized(hwnd) {
-        anyhow::bail!("original filled prompt window is no longer visible");
-    }
-    let (current_target, class_name) = target_details_from_hwnd_checked(hwnd)
-        .context("original filled prompt window disappeared before cleanup")?;
-    if current_target.process_id != expected.process_id
-        || current_target.window_handle != expected.window_handle
-    {
-        anyhow::bail!("original filled prompt PID/HWND identity changed before cleanup");
-    }
-    ensure_password_cleanup_target_is_trusted(
+    let prompt = revalidate_cached_prompt(
         target_app_name,
-        &current_target,
-        &class_name,
-        filled_prompt.trust,
+        filled_prompt,
+        filled_prompt.email.as_deref(),
+        false,
     )?;
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
     if !uia_element_bound_to_prompt_window_checked(
         &automation,
-        &filled_prompt.prompt_root,
-        &filled_prompt.prompt_root,
-        expected,
+        &prompt.prompt_root,
+        &prompt.prompt_root,
+        &prompt.target,
     )? || !uia_element_bound_to_prompt_window_checked(
         &automation,
-        &filled_prompt.password_field,
-        &filled_prompt.prompt_root,
-        expected,
+        &prompt.password_field,
+        &prompt.prompt_root,
+        &prompt.target,
     )? {
         anyhow::bail!("original filled password element is no longer bound to its PID/HWND/root");
     }
-    if !has_native_password_field_identity(&filled_prompt.password_field) {
+    if !has_native_password_field_identity(&prompt.password_field) {
         anyhow::bail!("original filled password element is no longer a secure field");
     }
-    let value = filled_prompt
+    let value = prompt
         .password_field
         .get_pattern::<UIValuePattern>()
         .map_err(|e| anyhow::anyhow!("password field no longer exposes ValuePattern: {e}"))?;
@@ -787,13 +937,23 @@ impl WindowsSubmittedPrompt {
         if prompt_runtime_id.is_empty() {
             anyhow::bail!("submitted prompt UI Automation identity is empty");
         }
+        let password_field_runtime_id = prompt
+            .password_field
+            .get_runtime_id()
+            .context("submitted password field UI Automation identity unavailable")?;
+        if password_field_runtime_id.is_empty() {
+            anyhow::bail!("submitted password field UI Automation identity is empty");
+        }
         Ok(Self {
             process_id: prompt.target.process_id,
             prompt_window_handle: prompt.target.window_handle,
             prompt_window_title: prompt.target.window_title.clone(),
             email: prompt.email.clone().unwrap_or_default(),
             trust: prompt.trust,
+            binding: prompt.binding.clone(),
             prompt_runtime_id,
+            password_field_runtime_id,
+            cached_prompt: prompt.clone(),
             pre_submit_session_windows,
         })
     }
@@ -812,70 +972,206 @@ pub(crate) fn post_check_state(
 
     let started = Instant::now();
     let mut consecutive_submitted_prompt_absences = 0_u8;
+    let mut last_broad_inspection_started = None;
+    let mut last_visible_prompt = None;
+    let expected_target_process_id = submitted_prompt
+        .map(|submitted| submitted.binding.requester.process_id)
+        .unwrap_or(expected_process_id);
     loop {
+        let mut submitted_presence = submitted_prompt
+            .map(|submitted| {
+                submitted_prompt_presence(
+                    target_app_name,
+                    submitted,
+                    expected_process_id,
+                    expected_email,
+                )
+                .unwrap_or(SubmittedPromptPresence::Indeterminate)
+            })
+            .unwrap_or(SubmittedPromptPresence::Indeterminate);
+        if submitted_presence == SubmittedPromptPresence::Indeterminate {
+            if let (Some(submitted), Some(current_prompt)) =
+                (submitted_prompt, last_visible_prompt.as_ref())
+            {
+                submitted_presence = submitted_prompt_presence_from_visible_prompt(
+                    target_app_name,
+                    submitted,
+                    current_prompt,
+                )
+                .unwrap_or(SubmittedPromptPresence::Indeterminate);
+            }
+        }
+
+        // The exact cached PID/HWND/root/secure-field probe does not enumerate
+        // UIA descendants. While the submitted prompt is still the same exact
+        // prompt there is nothing a broad scan can safely classify, so wait for
+        // the identity to transition instead of repeatedly walking the tree.
+        if submitted_presence == SubmittedPromptPresence::Present {
+            consecutive_submitted_prompt_absences = 0;
+            last_visible_prompt = None;
+            if started.elapsed() >= timeout {
+                return post_submit_timeout_state(submitted_presence, false);
+            }
+            thread::sleep(POST_SUBMIT_POLL_INTERVAL);
+            continue;
+        }
+
+        let now = Instant::now();
+        if !post_submit_broad_inspection_due(
+            last_broad_inspection_started
+                .map(|last_started| now.saturating_duration_since(last_started)),
+        ) {
+            consecutive_submitted_prompt_absences = next_submitted_prompt_absence_observations(
+                consecutive_submitted_prompt_absences,
+                submitted_presence,
+            );
+            if started.elapsed() >= timeout {
+                return post_submit_timeout_state(
+                    submitted_presence,
+                    submitted_prompt.is_some() && consecutive_submitted_prompt_absences >= 2,
+                );
+            }
+            thread::sleep(POST_SUBMIT_POLL_INTERVAL);
+            continue;
+        }
+        last_broad_inspection_started = Some(now);
+
         match inspect(target_app_name) {
             Ok(inspection) => {
-                let submitted_presence = submitted_prompt
-                    .map(|submitted| {
-                        submitted_prompt_presence(
+                if submitted_presence == SubmittedPromptPresence::Indeterminate {
+                    if let (Some(submitted), Some(current_prompt)) =
+                        (submitted_prompt, inspection.prompt.as_ref())
+                    {
+                        submitted_presence = submitted_prompt_presence_from_visible_prompt(
                             target_app_name,
                             submitted,
-                            expected_process_id,
-                            expected_email,
+                            current_prompt,
                         )
-                        .unwrap_or(SubmittedPromptPresence::Indeterminate)
-                    })
-                    .unwrap_or(SubmittedPromptPresence::Indeterminate);
+                        .unwrap_or(SubmittedPromptPresence::Indeterminate);
+                    }
+                }
+                last_visible_prompt = inspection.prompt.clone();
                 consecutive_submitted_prompt_absences = next_submitted_prompt_absence_observations(
                     consecutive_submitted_prompt_absences,
                     submitted_presence,
                 );
                 let submitted_prompt_confirmed_absent =
                     submitted_prompt.is_some() && consecutive_submitted_prompt_absences >= 2;
+
+                if submitted_presence == SubmittedPromptPresence::Present {
+                    if started.elapsed() >= timeout {
+                        return post_submit_timeout_state(submitted_presence, false);
+                    }
+                    thread::sleep(POST_SUBMIT_POLL_INTERVAL);
+                    continue;
+                }
+
                 let target_running = inspection.target.as_ref().is_some_and(|target| {
-                    target.process_id == expected_process_id
+                    target.process_id == expected_target_process_id
                         || target_app_matches(target_app_name, target)
                 });
 
-                if let Some(prompt) = inspection.prompt {
-                    return if prompt
-                        .email
-                        .as_deref()
-                        .is_some_and(|email| usernames_match(email, expected_email))
-                    {
-                        "still_prompt"
-                    } else if prompt.email.is_some() {
-                        "prompt_mismatch"
-                    } else {
-                        "prompt_gone_unknown"
-                    };
+                if let Some(prompt) = inspection.prompt.as_ref() {
+                    if let Some(state) = classify_visible_post_submit_prompt(
+                        prompt.email.as_deref(),
+                        submitted_prompt.is_some(),
+                        submitted_presence,
+                        submitted_prompt_confirmed_absent,
+                        expected_email,
+                    ) {
+                        return state;
+                    }
                 }
 
                 if let Some(state) = classify_post_submit_state(
                     None,
                     target_running,
-                    submitted_prompt_has_new_session(
-                        submitted_prompt,
-                        &inspection.session_windows,
-                        expected_process_id,
-                        expected_email,
-                    ) && submitted_prompt_confirmed_absent
-                        && inspection.prompt_scan_complete,
+                    submitted_prompt_authentication_is_confirmed(
+                        submitted_prompt_has_new_session(
+                            submitted_prompt,
+                            &inspection.session_windows,
+                            expected_target_process_id,
+                            expected_email,
+                        ),
+                        submitted_prompt_confirmed_absent,
+                        inspection.prompt_scan_complete,
+                    ),
                     expected_email,
                 ) {
-                    return state;
+                    match state {
+                        "authenticated" => return state,
+                        // Once the exact submitted prompt is confirmed gone,
+                        // cleanup is not needed even when the target process
+                        // also exited. Preserve that stronger cleanup fact.
+                        "failed" if submitted_prompt_confirmed_absent => {
+                            return "prompt_gone_confirmed";
+                        }
+                        // Without a submitted identity an ambiguous Invoke
+                        // error must remain fail-closed and require cleanup.
+                        "failed" if submitted_prompt.is_none() => return state,
+                        _ => {}
+                    }
                 }
             }
             Err(_) => {
                 consecutive_submitted_prompt_absences = 0;
+                submitted_presence = SubmittedPromptPresence::Indeterminate;
+                last_visible_prompt = None;
             }
         }
 
         if started.elapsed() >= timeout {
-            return "prompt_gone_unknown";
+            return post_submit_timeout_state(
+                submitted_presence,
+                submitted_prompt.is_some() && consecutive_submitted_prompt_absences >= 2,
+            );
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(POST_SUBMIT_POLL_INTERVAL);
     }
+}
+
+fn post_submit_broad_inspection_due(elapsed_since_last: Option<Duration>) -> bool {
+    elapsed_since_last.is_none_or(|elapsed| elapsed >= POST_SUBMIT_BROAD_INSPECTION_INTERVAL)
+}
+
+fn post_submit_timeout_state(
+    latest_presence: SubmittedPromptPresence,
+    submitted_prompt_confirmed_absent: bool,
+) -> &'static str {
+    if submitted_prompt_confirmed_absent {
+        "prompt_gone_confirmed"
+    } else if latest_presence == SubmittedPromptPresence::Present {
+        "still_prompt"
+    } else {
+        "prompt_gone_unknown"
+    }
+}
+
+fn classify_visible_post_submit_prompt(
+    prompt_email: Option<&str>,
+    submitted_prompt_identity_available: bool,
+    submitted_prompt_presence: SubmittedPromptPresence,
+    submitted_prompt_confirmed_absent: bool,
+    expected_email: &str,
+) -> Option<&'static str> {
+    if submitted_prompt_identity_available {
+        if submitted_prompt_confirmed_absent {
+            return Some("prompt_replaced");
+        }
+        if submitted_prompt_presence == SubmittedPromptPresence::Absent {
+            return None;
+        }
+    }
+
+    Some(
+        if prompt_email.is_some_and(|email| usernames_match(email, expected_email)) {
+            "still_prompt"
+        } else if prompt_email.is_some() {
+            "prompt_mismatch"
+        } else {
+            "prompt_gone_unknown"
+        },
+    )
 }
 
 fn next_submitted_prompt_absence_observations(
@@ -885,6 +1181,28 @@ fn next_submitted_prompt_absence_observations(
     match presence {
         SubmittedPromptPresence::Absent => previous.saturating_add(1),
         SubmittedPromptPresence::Present | SubmittedPromptPresence::Indeterminate => 0,
+    }
+}
+
+fn classify_submitted_prompt_runtime_identity(
+    expected_prompt_runtime_id: &[i32],
+    expected_password_field_runtime_id: &[i32],
+    current_prompt_runtime_id: &[i32],
+    current_password_field_runtime_id: &[i32],
+) -> SubmittedPromptPresence {
+    if expected_prompt_runtime_id.is_empty()
+        || expected_password_field_runtime_id.is_empty()
+        || current_prompt_runtime_id.is_empty()
+        || current_password_field_runtime_id.is_empty()
+    {
+        return SubmittedPromptPresence::Indeterminate;
+    }
+    if current_prompt_runtime_id != expected_prompt_runtime_id
+        || current_password_field_runtime_id != expected_password_field_runtime_id
+    {
+        SubmittedPromptPresence::Absent
+    } else {
+        SubmittedPromptPresence::Present
     }
 }
 
@@ -899,6 +1217,7 @@ fn submitted_prompt_presence(
         || submitted.prompt_window_handle == 0
         || submitted.prompt_window_title.trim().is_empty()
         || submitted.prompt_runtime_id.is_empty()
+        || submitted.password_field_runtime_id.is_empty()
         || !usernames_match(&submitted.email, expected_email)
     {
         return Ok(SubmittedPromptPresence::Indeterminate);
@@ -919,14 +1238,11 @@ fn submitted_prompt_presence(
 
     let (live_target, class_name) = target_details_from_hwnd_checked(hwnd)
         .context("submitted prompt native target details are unavailable")?;
-    if prompt_candidate_trust(
-        target_app_name,
-        &live_target,
-        &class_name,
-        submitted.prompt_window_handle,
-    ) != Some(submitted.trust)
-    {
-        return Ok(SubmittedPromptPresence::Indeterminate);
+    let Some(live_process_creation_time) = process_creation_time(live_target.process_id) else {
+        anyhow::bail!("submitted prompt process creation identity is unavailable");
+    };
+    if live_process_creation_time != submitted.binding.prompt_process_creation_time {
+        return Ok(SubmittedPromptPresence::Absent);
     }
 
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
@@ -936,11 +1252,91 @@ fn submitted_prompt_presence(
     let current_runtime_id = current_prompt_root
         .get_runtime_id()
         .context("submitted prompt UI Automation identity is unavailable")?;
-    if current_runtime_id == submitted.prompt_runtime_id {
-        Ok(SubmittedPromptPresence::Present)
-    } else {
-        submitted_prompt_absent_after_complete_native_enumeration(submitted)
+    if current_runtime_id != submitted.prompt_runtime_id {
+        return Ok(classify_submitted_prompt_runtime_identity(
+            &submitted.prompt_runtime_id,
+            &submitted.password_field_runtime_id,
+            &current_runtime_id,
+            &submitted.password_field_runtime_id,
+        ));
     }
+
+    let current_password_field_runtime_id = submitted
+        .cached_prompt
+        .password_field
+        .get_runtime_id()
+        .context("submitted password field UI Automation identity is unavailable")?;
+    let runtime_presence = classify_submitted_prompt_runtime_identity(
+        &submitted.prompt_runtime_id,
+        &submitted.password_field_runtime_id,
+        &current_runtime_id,
+        &current_password_field_runtime_id,
+    );
+    if runtime_presence != SubmittedPromptPresence::Present {
+        return Ok(runtime_presence);
+    }
+    if !submitted_prompt_binding_is_live(target_app_name, submitted, &live_target, &class_name)? {
+        return Ok(SubmittedPromptPresence::Indeterminate);
+    }
+    Ok(
+        match revalidate_cached_prompt(
+            target_app_name,
+            &submitted.cached_prompt,
+            Some(expected_email),
+            false,
+        ) {
+            Ok(_) => SubmittedPromptPresence::Present,
+            Err(_) => SubmittedPromptPresence::Indeterminate,
+        },
+    )
+}
+
+fn submitted_prompt_presence_from_visible_prompt(
+    target_app_name: &str,
+    submitted: &WindowsSubmittedPrompt,
+    current_prompt: &WindowsPrompt,
+) -> anyhow::Result<SubmittedPromptPresence> {
+    let current_prompt = match revalidate_cached_prompt(
+        target_app_name,
+        current_prompt,
+        current_prompt.email.as_deref(),
+        false,
+    ) {
+        Ok(prompt) => prompt,
+        Err(_) => return Ok(SubmittedPromptPresence::Indeterminate),
+    };
+    if current_prompt.target.process_id != submitted.process_id
+        || current_prompt.target.window_handle != submitted.prompt_window_handle
+    {
+        return Ok(SubmittedPromptPresence::Indeterminate);
+    }
+    let current_process_creation_time = process_creation_time(current_prompt.target.process_id)
+        .context("visible post-submit prompt process creation identity is unavailable")?;
+    if current_process_creation_time != submitted.binding.prompt_process_creation_time {
+        return Ok(SubmittedPromptPresence::Absent);
+    }
+
+    let current_prompt_runtime_id = current_prompt
+        .prompt_root
+        .get_runtime_id()
+        .context("visible post-submit prompt UI Automation identity is unavailable")?;
+    let current_password_field_runtime_id = current_prompt
+        .password_field
+        .get_runtime_id()
+        .context("visible post-submit password field UI Automation identity is unavailable")?;
+    let runtime_presence = classify_submitted_prompt_runtime_identity(
+        &submitted.prompt_runtime_id,
+        &submitted.password_field_runtime_id,
+        &current_prompt_runtime_id,
+        &current_password_field_runtime_id,
+    );
+    if runtime_presence != SubmittedPromptPresence::Present {
+        return Ok(runtime_presence);
+    }
+    if current_prompt.trust != submitted.trust || current_prompt.binding != submitted.binding {
+        return Ok(SubmittedPromptPresence::Indeterminate);
+    }
+    Ok(SubmittedPromptPresence::Present)
 }
 
 fn submitted_prompt_absent_after_complete_native_enumeration(
@@ -958,6 +1354,58 @@ fn submitted_prompt_absent_after_complete_native_enumeration(
     })
 }
 
+fn submitted_prompt_binding_is_live(
+    target_app_name: &str,
+    submitted: &WindowsSubmittedPrompt,
+    live_target: &WindowsTarget,
+    class_name: &str,
+) -> anyhow::Result<bool> {
+    ensure_fixed_target_app(target_app_name)?;
+    if process_creation_time(live_target.process_id)
+        != Some(submitted.binding.prompt_process_creation_time)
+    {
+        return Ok(false);
+    }
+    Ok(match submitted.trust {
+        WindowsPromptTrust::TrustedTargetProcess => {
+            live_target.process_id == submitted.binding.requester.process_id
+                && live_target.window_handle == submitted.binding.requester.window_handle
+                && live_target
+                    .process_path
+                    .eq_ignore_ascii_case(&submitted.binding.requester.process_path)
+                && process_creation_time(submitted.binding.requester.process_id)
+                    == Some(submitted.binding.requester.process_creation_time)
+                && microsoft_rdp_target_kind(&live_target.process_name, &live_target.process_path)
+                    .is_some()
+                && target_window_should_be_scanned_for_prompt(
+                    target_app_name,
+                    live_target,
+                    class_name,
+                )
+        }
+        WindowsPromptTrust::CredentialBrokerBoundToTarget => {
+            let requester_chain_is_live =
+                submitted
+                    .binding
+                    .root_requester
+                    .as_ref()
+                    .is_some_and(|root_requester| {
+                        ensure_live_requester_binding(
+                            live_target.window_handle,
+                            &submitted.binding.requester,
+                            root_requester,
+                        )
+                        .is_ok()
+                    });
+            credential_dialog_title_like(&live_target.window_title)
+                && credential_dialog_class_like(class_name)
+                && normalized_identifier(&live_target.process_name) == "credentialuibroker"
+                && trusted_windows_credential_broker_path(&live_target.process_path)
+                && requester_chain_is_live
+        }
+    })
+}
+
 fn submitted_prompt_has_new_session(
     submitted_prompt: Option<&WindowsSubmittedPrompt>,
     session_windows: &[WindowsSessionWindow],
@@ -967,21 +1415,58 @@ fn submitted_prompt_has_new_session(
     let Some(submitted) = submitted_prompt else {
         return false;
     };
-    if submitted.process_id != expected_process_id
-        || submitted.prompt_window_handle == 0
-        || submitted.prompt_window_title.trim().is_empty()
-        || !usernames_match(&submitted.email, expected_email)
+    submitted_prompt_identity_has_new_session(
+        &submitted.binding,
+        submitted.prompt_window_handle,
+        &submitted.prompt_window_title,
+        &submitted.email,
+        &submitted.pre_submit_session_windows,
+        session_windows,
+        expected_process_id,
+        expected_email,
+    )
+}
+
+fn submitted_prompt_identity_has_new_session(
+    binding: &WindowsPromptBinding,
+    prompt_window_handle: isize,
+    prompt_window_title: &str,
+    submitted_email: &str,
+    pre_submit_session_windows: &[WindowsSessionWindow],
+    session_windows: &[WindowsSessionWindow],
+    expected_process_id: i32,
+    expected_email: &str,
+) -> bool {
+    if !requester_process_id_matches(binding, expected_process_id)
+        || prompt_window_handle == 0
+        || prompt_window_title.trim().is_empty()
+        || !usernames_match(submitted_email, expected_email)
     {
         return false;
     }
 
     session_windows.iter().any(|session| {
-        session.process_id == submitted.process_id
-            && !submitted
-                .pre_submit_session_windows
+        requester_process_id_matches(binding, session.process_id)
+            && !pre_submit_session_windows
                 .iter()
                 .any(|before| same_windows_session_identity(before, session))
     })
+}
+
+fn submitted_prompt_authentication_is_confirmed(
+    has_new_session: bool,
+    submitted_prompt_confirmed_absent: bool,
+    prompt_scan_complete: bool,
+) -> bool {
+    has_new_session && submitted_prompt_confirmed_absent && prompt_scan_complete
+}
+
+fn requester_process_id_matches(binding: &WindowsPromptBinding, process_id: i32) -> bool {
+    binding.requester.process_id == process_id
+        || binding
+            .root_requester
+            .as_ref()
+            .is_some_and(|requester| requester.process_id == process_id)
 }
 
 fn same_windows_session_identity(
@@ -1026,17 +1511,7 @@ fn revalidate_prompt(
     target_app_name: &str,
     expected: &WindowsPrompt,
 ) -> anyhow::Result<WindowsPrompt> {
-    let Some(prompt) = inspect_prompt_snapshot(
-        target_app_name,
-        expected.target.process_id,
-        expected.target.window_handle,
-        &expected.target.window_title,
-        expected.email.as_deref(),
-    )?
-    else {
-        anyhow::bail!("credential prompt disappeared before automation");
-    };
-    ensure_same_revalidated_prompt(prompt, expected)
+    revalidate_cached_prompt(target_app_name, expected, expected.email.as_deref(), false)
 }
 
 pub(crate) fn preflight_password_load_prompt(
@@ -1044,105 +1519,193 @@ pub(crate) fn preflight_password_load_prompt(
     expected: &WindowsPrompt,
     expected_email: &str,
 ) -> anyhow::Result<WindowsPrompt> {
-    let Some(prompt) = inspect_prompt_snapshot(
-        target_app_name,
-        expected.target.process_id,
-        expected.target.window_handle,
-        &expected.target.window_title,
-        Some(expected_email),
-    )?
-    else {
-        anyhow::bail!("credential prompt disappeared before password load");
-    };
-    let prompt = ensure_same_revalidated_prompt(prompt, expected)?;
-    if !prompt.target.frontmost {
-        anyhow::bail!("credential prompt is not foreground before password load");
-    }
-    Ok(prompt)
+    revalidate_cached_prompt(target_app_name, expected, Some(expected_email), true)
 }
 
 pub(crate) fn revalidate_prompt_after_activation(
     target_app_name: &str,
     expected: &WindowsPrompt,
 ) -> anyhow::Result<WindowsPrompt> {
-    let Some(prompt) = inspect_prompt_snapshot(
-        target_app_name,
-        expected.target.process_id,
-        expected.target.window_handle,
-        &expected.target.window_title,
-        expected.email.as_deref(),
-    )?
-    else {
-        anyhow::bail!("credential prompt disappeared after activation");
-    };
-    let prompt = ensure_same_revalidated_prompt(prompt, expected)?;
-    if !prompt.target.frontmost || !window_handle_is_foreground(prompt.target.window_handle) {
-        anyhow::bail!("credential prompt is not foreground after activation");
-    }
-    Ok(prompt)
+    revalidate_cached_prompt(target_app_name, expected, expected.email.as_deref(), true)
 }
 
-fn ensure_same_revalidated_prompt(
-    prompt: WindowsPrompt,
+fn revalidate_cached_prompt(
+    target_app_name: &str,
     expected: &WindowsPrompt,
+    expected_email: Option<&str>,
+    require_foreground: bool,
 ) -> anyhow::Result<WindowsPrompt> {
-    if prompt.target.process_id != expected.target.process_id {
-        anyhow::bail!("credential prompt process changed before automation");
+    ensure_fixed_target_app(target_app_name)?;
+    if expected.target.process_id <= 0 || expected.target.window_handle == 0 {
+        anyhow::bail!("credential prompt has no exact PID/HWND identity");
     }
-    if prompt.target.window_handle != 0
-        && expected.target.window_handle != 0
-        && prompt.target.window_handle != expected.target.window_handle
-    {
-        anyhow::bail!("credential prompt window changed before automation");
+    let hwnd = hwnd_from_handle(expected.target.window_handle);
+    if !native_window_is_visible_and_sized(hwnd) {
+        anyhow::bail!("credential prompt window is no longer visible");
     }
-    if !prompt
-        .target
-        .window_title
-        .eq_ignore_ascii_case(&expected.target.window_title)
-    {
-        anyhow::bail!("credential prompt title changed before automation");
+    let (current_target, class_name) = target_details_from_hwnd_checked(hwnd)
+        .context("credential prompt native identity is unavailable")?;
+    ensure_direct_set_value_target_matches_expected(&current_target, &expected.target)?;
+    ensure_live_prompt_binding(target_app_name, expected, &current_target, &class_name)?;
+    if require_foreground && !window_handle_is_foreground(expected.target.window_handle) {
+        anyhow::bail!("credential prompt is not foreground");
     }
-    if prompt.email.as_deref().map(str::to_lowercase)
-        != expected.email.as_deref().map(str::to_lowercase)
+
+    let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+    let current_root = automation
+        .element_from_handle(Handle::from(expected.target.window_handle))
+        .context("credential prompt UI Automation root is unavailable")?;
+    if !automation
+        .compare_elements(&current_root, &expected.prompt_root)
+        .context("credential prompt root identity comparison failed")?
     {
+        anyhow::bail!("credential prompt UI Automation root changed");
+    }
+    ensure_prompt_sensitive_elements_bound_with_automation(&automation, expected)?;
+    if !password_field_ready_for_direct_set_value(&expected.password_field) {
+        anyhow::bail!("password field is no longer visible, enabled, and secure");
+    }
+
+    let current_email = cached_prompt_email_checked(expected)?;
+    let required_email = expected_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .or(expected.email.as_deref());
+    if current_email.as_deref().map(str::to_lowercase) != required_email.map(str::to_lowercase) {
         anyhow::bail!("credential prompt email changed before automation");
     }
-    let mut prompt = prompt;
-    prompt.trust = compatible_revalidated_prompt_trust(prompt.trust, expected.trust)?;
+
+    let mut prompt = expected.clone();
+    prompt.target = current_target;
+    prompt.email = current_email;
     Ok(prompt)
 }
 
-fn compatible_revalidated_prompt_trust(
-    current: WindowsPromptTrust,
-    expected: WindowsPromptTrust,
-) -> anyhow::Result<WindowsPromptTrust> {
-    match (current, expected) {
-        (WindowsPromptTrust::TrustedTargetProcess, WindowsPromptTrust::TrustedTargetProcess) => {
-            Ok(WindowsPromptTrust::TrustedTargetProcess)
+fn cached_prompt_email_checked(prompt: &WindowsPrompt) -> anyhow::Result<Option<String>> {
+    let mut text = String::new();
+    for element in &prompt.identity_elements {
+        if !prompt_text_element_should_contribute_checked(element)? {
+            continue;
         }
-        (
-            WindowsPromptTrust::CredentialBrokerBoundToTarget,
-            WindowsPromptTrust::CredentialBrokerBoundToTarget,
-        ) => Ok(WindowsPromptTrust::CredentialBrokerBoundToTarget),
-        _ => anyhow::bail!("credential prompt trust changed before automation"),
+        push_text(&mut text, element.get_name().ok());
+        push_text(&mut text, element.get_help_text().ok());
+        push_text(&mut text, element.get_item_status().ok());
+        if element
+            .get_control_type()
+            .context("cached prompt identity control type unavailable")?
+            == ControlType::Edit
+        {
+            if let Ok(value) = element.get_pattern::<UIValuePattern>() {
+                push_text(&mut text, value.get_value().ok());
+            }
+        }
     }
+    Ok(extract_email_like(&text))
+}
+
+fn ensure_live_prompt_binding(
+    target_app_name: &str,
+    prompt: &WindowsPrompt,
+    current_target: &WindowsTarget,
+    class_name: &str,
+) -> anyhow::Result<()> {
+    if process_creation_time(current_target.process_id)
+        != Some(prompt.binding.prompt_process_creation_time)
+    {
+        anyhow::bail!("credential prompt process instance changed");
+    }
+    match prompt.trust {
+        WindowsPromptTrust::TrustedTargetProcess => {
+            if prompt.binding.requester.process_id != current_target.process_id
+                || prompt.binding.requester.window_handle != current_target.window_handle
+                || !prompt
+                    .binding
+                    .requester
+                    .process_path
+                    .eq_ignore_ascii_case(&current_target.process_path)
+                || process_creation_time(prompt.binding.requester.process_id)
+                    != Some(prompt.binding.requester.process_creation_time)
+                || microsoft_rdp_target_kind(
+                    &current_target.process_name,
+                    &current_target.process_path,
+                )
+                .is_none()
+                || !target_window_should_be_scanned_for_prompt(
+                    target_app_name,
+                    current_target,
+                    class_name,
+                )
+            {
+                anyhow::bail!("trusted target prompt binding changed");
+            }
+        }
+        WindowsPromptTrust::CredentialBrokerBoundToTarget => {
+            if !credential_dialog_title_like(&current_target.window_title)
+                || !credential_dialog_class_like(class_name)
+                || normalized_identifier(&current_target.process_name) != "credentialuibroker"
+                || !trusted_windows_credential_broker_path(&current_target.process_path)
+            {
+                anyhow::bail!("credential broker prompt identity changed");
+            }
+            let root_requester = prompt
+                .binding
+                .root_requester
+                .as_ref()
+                .context("credential broker root requester binding is missing")?;
+            ensure_live_requester_binding(
+                current_target.window_handle,
+                &prompt.binding.requester,
+                root_requester,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_live_requester_binding(
+    prompt_window_handle: isize,
+    expected_direct: &WindowsRequesterBinding,
+    expected_root: &WindowsRequesterBinding,
+) -> anyhow::Result<()> {
+    let hwnd = hwnd_from_handle(prompt_window_handle);
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER).ok() }
+        .context("credential broker direct requester window is unavailable")?;
+    let root_owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    if owner.0.addr() as isize != expected_direct.window_handle
+        || root_owner.0.addr() as isize != expected_root.window_handle
+    {
+        anyhow::bail!("credential broker requester window chain changed");
+    }
+
+    ensure_live_requester_window_binding(expected_direct)?;
+    if expected_root != expected_direct {
+        ensure_live_requester_window_binding(expected_root)?;
+    }
+    Ok(())
+}
+
+fn ensure_live_requester_window_binding(expected: &WindowsRequesterBinding) -> anyhow::Result<()> {
+    let requester_hwnd = hwnd_from_handle(expected.window_handle);
+    let (current, _) = target_details_from_hwnd_checked(requester_hwnd)
+        .context("credential requester window identity is unavailable")?;
+    if current.process_id != expected.process_id
+        || !current
+            .process_path
+            .trim()
+            .eq_ignore_ascii_case(expected.process_path.trim())
+        || process_creation_time(current.process_id) != Some(expected.process_creation_time)
+        || microsoft_rdp_target_kind(&current.process_name, &current.process_path).is_none()
+    {
+        anyhow::bail!("credential broker requester process binding changed");
+    }
+    Ok(())
 }
 
 fn revalidate_prompt_for_direct_set_value(
     target_app_name: &str,
     expected: &WindowsPrompt,
 ) -> anyhow::Result<WindowsPrompt> {
-    let Some(prompt) = inspect_prompt_snapshot(
-        target_app_name,
-        expected.target.process_id,
-        expected.target.window_handle,
-        &expected.target.window_title,
-        expected.email.as_deref(),
-    )?
-    else {
-        anyhow::bail!("credential prompt disappeared before password insertion");
-    };
-    ensure_same_revalidated_prompt(prompt, expected)
+    revalidate_cached_prompt(target_app_name, expected, expected.email.as_deref(), true)
 }
 
 fn ensure_direct_set_value_target_ready(
@@ -1163,13 +1726,7 @@ fn ensure_direct_set_value_target_ready(
     let (current_target, class_name) = target_details_from_hwnd_checked(hwnd)
         .context("credential prompt window disappeared before password insertion")?;
     ensure_direct_set_value_target_matches_expected(&current_target, &prompt.target)?;
-    ensure_direct_set_value_target_is_trusted(
-        target_app_name,
-        &current_target,
-        &class_name,
-        prompt.target.window_handle,
-        prompt.trust,
-    )?;
+    ensure_live_prompt_binding(target_app_name, prompt, &current_target, &class_name)?;
     ensure_prompt_sensitive_elements_bound(prompt)?;
 
     if !password_field_ready_for_direct_set_value(&prompt.password_field) {
@@ -1202,13 +1759,7 @@ fn ensure_prompt_foreground_and_trusted(
     {
         anyhow::bail!("credential prompt PID/HWND/title identity changed before {action}");
     }
-    ensure_direct_set_value_target_is_trusted(
-        target_app_name,
-        &current_target,
-        &class_name,
-        prompt.target.window_handle,
-        prompt.trust,
-    )
+    ensure_live_prompt_binding(target_app_name, prompt, &current_target, &class_name)
 }
 
 fn ensure_direct_set_value_target_matches_expected(
@@ -1221,59 +1772,19 @@ fn ensure_direct_set_value_target_matches_expected(
     if current.process_id != expected.process_id {
         anyhow::bail!("credential prompt process changed before password insertion");
     }
+    if !current
+        .process_path
+        .trim()
+        .eq_ignore_ascii_case(expected.process_path.trim())
+        || normalized_identifier(&current.process_name)
+            != normalized_identifier(&expected.process_name)
+    {
+        anyhow::bail!("credential prompt process image changed before password insertion");
+    }
     if !window_title_matches(&current.window_title, &expected.window_title) {
         anyhow::bail!("credential prompt title changed before password insertion");
     }
     Ok(())
-}
-
-fn ensure_direct_set_value_target_is_trusted(
-    target_app_name: &str,
-    target: &WindowsTarget,
-    class_name: &str,
-    window_handle: isize,
-    trust: WindowsPromptTrust,
-) -> anyhow::Result<()> {
-    match trust {
-        WindowsPromptTrust::TrustedTargetProcess => {
-            if prompt_candidate_is_trusted_autofill_target(target_app_name, target, class_name) {
-                Ok(())
-            } else {
-                anyhow::bail!("credential prompt target is not trusted before password insertion")
-            }
-        }
-        WindowsPromptTrust::CredentialBrokerBoundToTarget => {
-            if system_credential_prompt_matches_target(
-                target_app_name,
-                target,
-                class_name,
-                window_handle,
-            ) {
-                Ok(())
-            } else {
-                anyhow::bail!("credential broker prompt is not trusted before password insertion")
-            }
-        }
-    }
-}
-
-fn ensure_password_cleanup_target_is_trusted(
-    target_app_name: &str,
-    target: &WindowsTarget,
-    class_name: &str,
-    trust: WindowsPromptTrust,
-) -> anyhow::Result<()> {
-    match trust {
-        WindowsPromptTrust::TrustedTargetProcess
-            if target_app_matches_with_class(target_app_name, target, class_name) =>
-        {
-            Ok(())
-        }
-        WindowsPromptTrust::CredentialBrokerBoundToTarget => {
-            anyhow::bail!("credential broker cleanup has no non-spoofable requester binding")
-        }
-        _ => anyhow::bail!("original filled prompt process is no longer trusted during cleanup"),
-    }
 }
 
 fn password_field_ready_for_direct_set_value(element: &UIElement) -> bool {
@@ -1387,8 +1898,15 @@ fn native_hwnd_is_within_prompt_window(
 
 fn ensure_prompt_sensitive_elements_bound(prompt: &WindowsPrompt) -> anyhow::Result<()> {
     let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+    ensure_prompt_sensitive_elements_bound_with_automation(&automation, prompt)
+}
+
+fn ensure_prompt_sensitive_elements_bound_with_automation(
+    automation: &UIAutomation,
+    prompt: &WindowsPrompt,
+) -> anyhow::Result<()> {
     if !uia_element_bound_to_prompt_window_checked(
-        &automation,
+        automation,
         &prompt.prompt_root,
         &prompt.prompt_root,
         &prompt.target,
@@ -1396,7 +1914,7 @@ fn ensure_prompt_sensitive_elements_bound(prompt: &WindowsPrompt) -> anyhow::Res
         anyhow::bail!("credential prompt root is no longer bound to the trusted process window");
     }
     if !uia_element_bound_to_prompt_window_checked(
-        &automation,
+        automation,
         &prompt.password_field,
         &prompt.prompt_root,
         &prompt.target,
@@ -1405,7 +1923,7 @@ fn ensure_prompt_sensitive_elements_bound(prompt: &WindowsPrompt) -> anyhow::Res
     }
     if let Some(button) = prompt.submit_button.as_ref() {
         if !uia_element_bound_to_prompt_window_checked(
-            &automation,
+            automation,
             button,
             &prompt.prompt_root,
             &prompt.target,
@@ -1415,7 +1933,7 @@ fn ensure_prompt_sensitive_elements_bound(prompt: &WindowsPrompt) -> anyhow::Res
     }
     for element in &prompt.identity_elements {
         if !uia_element_bound_to_prompt_window_checked(
-            &automation,
+            automation,
             element,
             &prompt.prompt_root,
             &prompt.target,
@@ -1446,18 +1964,21 @@ fn prompt_from_window(
     automation: &UIAutomation,
     target: WindowsTarget,
     trust: WindowsPromptTrust,
+    binding: WindowsPromptBinding,
     window: UIElement,
 ) -> anyhow::Result<Option<WindowsPrompt>> {
-    Ok(inspect_prompt_window(automation, target, trust, window)?.prompt)
+    Ok(inspect_prompt_window(automation, target, trust, binding, window)?.prompt)
 }
 
 fn inspect_prompt_window(
     automation: &UIAutomation,
     target: WindowsTarget,
     trust: WindowsPromptTrust,
+    binding: WindowsPromptBinding,
     window: UIElement,
 ) -> anyhow::Result<PromptWindowInspection> {
     if !is_usable_window_checked(&window)? {
+        tracing::debug!("Credential prompt UIA root is not usable");
         return Ok(PromptWindowInspection {
             prompt: None,
             password_like_plain_edit_rejected: false,
@@ -1479,6 +2000,11 @@ fn inspect_prompt_window(
     }
 
     let (selection, prompt_candidate) = select_prompt_candidate(&target.window_title, &elements)?;
+    tracing::debug!(
+        descendant_count = elements.len(),
+        ?selection,
+        "Credential prompt UIA descendant selection completed"
+    );
     if selection == PromptCandidateSelection::Ambiguous {
         anyhow::bail!("multiple secure credential prompt candidates are visible");
     }
@@ -1530,6 +2056,7 @@ fn inspect_prompt_window(
             password_field_description,
             password_field_role,
             trust,
+            binding,
             prompt_root: window,
             password_field: prompt_candidate.password_field,
             submit_button: prompt_candidate.submit_button,
@@ -1562,6 +2089,27 @@ fn target_window_should_be_scanned_for_prompt(
         || credential_specific_dialog_class_like(class_name)
 }
 
+fn trusted_windows_app_launcher_shell_is_known_non_prompt(
+    target_app_name: &str,
+    target: &WindowsTarget,
+    class_name: &str,
+) -> bool {
+    // Callers must already have matched this native HWND to the independently
+    // verified Microsoft target snapshot. Keep the tuple deliberately narrow:
+    // only the packaged Windows App launcher observed in production is a
+    // known non-prompt. Every other trusted window remains fail-closed.
+    is_builtin_target_name(target_app_name)
+        && normalized_identifier(&target.process_name) == "windows365"
+        && microsoft_rdp_target_kind(&target.process_name, &target.process_path)
+            == Some(WindowsMicrosoftTargetKind::WindowsAppsPackage)
+        && target
+            .window_title
+            .trim()
+            .eq_ignore_ascii_case("Windows App")
+        && class_name.trim().eq_ignore_ascii_case("MainWindow")
+}
+
+#[cfg(test)]
 fn prompt_candidate_is_trusted_autofill_target(
     target_app_name: &str,
     target: &WindowsTarget,
@@ -1571,18 +2119,147 @@ fn prompt_candidate_is_trusted_autofill_target(
         && target_window_should_be_scanned_for_prompt(target_app_name, target, class_name)
 }
 
-fn prompt_candidate_trust(
+fn prompt_candidate_binding(
     target_app_name: &str,
     target: &WindowsTarget,
     class_name: &str,
     window_handle: isize,
-) -> Option<WindowsPromptTrust> {
-    if prompt_candidate_is_trusted_autofill_target(target_app_name, target, class_name) {
-        return Some(WindowsPromptTrust::TrustedTargetProcess);
+    trusted_running_targets: &[WindowsTarget],
+) -> anyhow::Result<Option<(WindowsPromptTrust, WindowsPromptBinding)>> {
+    if target_window_should_be_scanned_for_prompt(target_app_name, target, class_name) {
+        if let Some(trusted) = matching_trusted_target_snapshot(target, trusted_running_targets) {
+            let creation_time = process_creation_time(target.process_id)
+                .context("trusted target process creation identity is unavailable")?;
+            return Ok(Some((
+                WindowsPromptTrust::TrustedTargetProcess,
+                WindowsPromptBinding {
+                    prompt_process_creation_time: creation_time,
+                    requester: WindowsRequesterBinding {
+                        process_id: trusted.process_id,
+                        process_path: trusted.process_path.clone(),
+                        process_creation_time: creation_time,
+                        window_handle,
+                    },
+                    root_requester: None,
+                },
+            )));
+        }
     }
 
-    system_credential_prompt_matches_target(target_app_name, target, class_name, window_handle)
-        .then_some(WindowsPromptTrust::CredentialBrokerBoundToTarget)
+    let Some(requesters) = system_credential_prompt_requester(
+        target_app_name,
+        target,
+        class_name,
+        window_handle,
+        trusted_running_targets,
+    )?
+    else {
+        return Ok(None);
+    };
+    let prompt_process_creation_time = process_creation_time(target.process_id)
+        .context("credential broker process creation identity is unavailable")?;
+    Ok(Some((
+        WindowsPromptTrust::CredentialBrokerBoundToTarget,
+        WindowsPromptBinding {
+            prompt_process_creation_time,
+            requester: requesters.direct,
+            root_requester: Some(requesters.root),
+        },
+    )))
+}
+
+fn matching_trusted_target_snapshot<'a>(
+    current: &WindowsTarget,
+    trusted_running_targets: &'a [WindowsTarget],
+) -> Option<&'a WindowsTarget> {
+    trusted_running_targets.iter().find(|trusted| {
+        trusted.process_id == current.process_id
+            && trusted
+                .process_path
+                .trim()
+                .eq_ignore_ascii_case(current.process_path.trim())
+            && normalized_identifier(&trusted.process_name)
+                == normalized_identifier(&current.process_name)
+    })
+}
+
+fn system_credential_prompt_requester(
+    target_app_name: &str,
+    target: &WindowsTarget,
+    class_name: &str,
+    window_handle: isize,
+    trusted_running_targets: &[WindowsTarget],
+) -> anyhow::Result<Option<WindowsRequesterChain>> {
+    if !is_builtin_target_name(target_app_name) {
+        return Ok(None);
+    }
+    if !credential_dialog_title_like(&target.window_title)
+        || !credential_dialog_class_like(class_name)
+    {
+        tracing::debug!("Non-target window did not match credential dialog title/class identity");
+        return Ok(None);
+    }
+    if !trusted_windows_credential_broker(target) {
+        tracing::debug!("Credential dialog broker process identity was not trusted");
+        return Ok(None);
+    }
+
+    let hwnd = hwnd_from_handle(window_handle);
+    let Some(owner) = (unsafe { GetWindow(hwnd, GW_OWNER).ok() }) else {
+        tracing::debug!("Credential broker direct owner window was unavailable");
+        return Ok(None);
+    };
+    let root_owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    if owner.0.addr() == 0
+        || root_owner.0.addr() == 0
+        || owner.0.addr() as isize == window_handle
+        || root_owner.0.addr() as isize == window_handle
+    {
+        tracing::debug!("Credential broker owner chain contained an invalid native window");
+        return Ok(None);
+    }
+
+    let Some(direct) = trusted_requester_binding_for_window(owner, trusted_running_targets)? else {
+        tracing::debug!("Credential broker direct owner was not a captured trusted target");
+        return Ok(None);
+    };
+    let root = if root_owner == owner {
+        direct.clone()
+    } else {
+        let Some(root) = trusted_requester_binding_for_window(root_owner, trusted_running_targets)?
+        else {
+            tracing::debug!("Credential broker root owner was not a captured trusted target");
+            return Ok(None);
+        };
+        root
+    };
+    tracing::debug!(
+        distinct_requester_processes = direct.process_id != root.process_id,
+        "Credential broker requester chain was bound"
+    );
+    Ok(Some(WindowsRequesterChain { direct, root }))
+}
+
+fn trusted_requester_binding_for_window(
+    requester_hwnd: HWND,
+    trusted_running_targets: &[WindowsTarget],
+) -> anyhow::Result<Option<WindowsRequesterBinding>> {
+    let Ok((requester_target, _)) = target_details_from_hwnd_checked(requester_hwnd) else {
+        return Ok(None);
+    };
+    let Some(trusted) =
+        matching_trusted_target_snapshot(&requester_target, trusted_running_targets)
+    else {
+        return Ok(None);
+    };
+    let process_creation_time = process_creation_time(trusted.process_id)
+        .context("credential requester process creation identity is unavailable")?;
+    Ok(Some(WindowsRequesterBinding {
+        process_id: trusted.process_id,
+        process_path: trusted.process_path.clone(),
+        process_creation_time,
+        window_handle: requester_hwnd.0.addr() as isize,
+    }))
 }
 
 struct NativePromptSnapshotCandidate {
@@ -1696,9 +2373,11 @@ unsafe extern "system" fn enum_native_visible_window(hwnd: HWND, lparam: LPARAM)
 
     let mut process_id = 0_u32;
     let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
-    if thread_id == 0 || process_id == 0 || !search.trusted_process_ids.contains(&process_id) {
+    if thread_id == 0 || process_id == 0 {
         return true.into();
     }
+
+    let trusted_target_window = search.trusted_process_ids.contains(&process_id);
 
     match native_window_is_visible_and_sized_checked(hwnd) {
         Ok(true) => {}
@@ -1706,6 +2385,22 @@ unsafe extern "system" fn enum_native_visible_window(hwnd: HWND, lparam: LPARAM)
         Err(_) => {
             search.scan_complete = false;
             return false.into();
+        }
+    }
+
+    if !trusted_target_window {
+        let Ok(class_name) = native_window_class_checked(hwnd) else {
+            return true.into();
+        };
+        if !credential_specific_dialog_class_like(&class_name) {
+            return true.into();
+        }
+        let Ok(title) = native_window_text_checked(hwnd) else {
+            search.scan_complete = false;
+            return false.into();
+        };
+        if !credential_dialog_title_like(&title) {
+            return true.into();
         }
     }
 
@@ -1848,22 +2543,6 @@ fn target_details_from_hwnd_checked(hwnd: HWND) -> anyhow::Result<(WindowsTarget
     Ok((target, class_name))
 }
 
-fn system_credential_prompt_matches_target(
-    target_app_name: &str,
-    target: &WindowsTarget,
-    class_name: &str,
-    window_handle: isize,
-) -> bool {
-    let _ = (target_app_name, target, class_name, window_handle);
-
-    // CredentialUIBroker is a trusted Windows binary, but its owner HWND does
-    // not cryptographically identify the process that requested CredUI. Any
-    // same-desktop process can create a broker dialog owned by a Windows App
-    // HWND and receive the entered credential. Until Windows exposes a
-    // non-spoofable requester correlation, automatic filling must fail closed.
-    false
-}
-
 fn native_window_text_checked(hwnd: HWND) -> anyhow::Result<String> {
     let mut buffer = [0_u16; 512];
     let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
@@ -1928,8 +2607,8 @@ fn wait_for_foreground_window(window_handle: isize, timeout: Duration) -> bool {
 }
 
 fn wait_for_submit_ready(
-    target_app_name: &str,
-    mut prompt: WindowsPrompt,
+    _target_app_name: &str,
+    prompt: WindowsPrompt,
     timeout: Duration,
 ) -> WindowsPrompt {
     let started = Instant::now();
@@ -1947,9 +2626,6 @@ fn wait_for_submit_ready(
         }
 
         thread::sleep(Duration::from_millis(75));
-        if let Ok(next_prompt) = revalidate_prompt(target_app_name, &prompt) {
-            prompt = next_prompt;
-        }
     }
 }
 
@@ -2414,6 +3090,24 @@ fn process_image_path(process_id: u32) -> Option<String> {
     }
 }
 
+fn process_creation_time(process_id: i32) -> Option<u64> {
+    if process_id <= 0 {
+        return None;
+    }
+    unsafe {
+        let handle =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id as u32).ok()?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let result = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(handle);
+        result.ok()?;
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
 fn process_package_full_name(process_id: i32) -> Option<String> {
     if process_id <= 0 {
         return None;
@@ -2862,12 +3556,10 @@ fn system_credential_dialog_matches(target: &WindowsTarget, class_name: &str) ->
         && credential_dialog_class_like(class_name)
 }
 
-#[cfg(test)]
 fn credential_dialog_title_like(title: &str) -> bool {
     contains_keyword(title, "Windows Security") || contains_keyword(title, "Enter your credentials")
 }
 
-#[cfg(test)]
 fn credential_dialog_class_like(class_name: &str) -> bool {
     let class_name = normalized_identifier(class_name);
     class_name.contains("credential")
@@ -2881,12 +3573,10 @@ fn credential_specific_dialog_class_like(class_name: &str) -> bool {
     class_name.contains("credential") || class_name.contains("windowssecurity")
 }
 
-#[cfg(test)]
 fn trusted_windows_credential_broker_path(path: &str) -> bool {
     trusted_windows_system_exe_path(path, "credentialuibroker.exe")
 }
 
-#[cfg(test)]
 fn trusted_windows_credential_broker(target: &WindowsTarget) -> bool {
     normalized_identifier(&target.process_name) == "credentialuibroker"
         && trusted_windows_credential_broker_path(&target.process_path)
@@ -2919,22 +3609,95 @@ fn windows_target_identity_trust(
     if target.process_id <= 0 || target.process_path.trim().is_empty() {
         return WindowsSignatureTrust::Indeterminate;
     }
+    let Some(process_creation_time) = process_creation_time(target.process_id) else {
+        return WindowsSignatureTrust::Indeterminate;
+    };
+    if let Some(trust) = cached_process_trust(target, kind, process_creation_time) {
+        return trust;
+    }
     let signature_trust = windows_executable_microsoft_signature_trust(&target.process_path);
     if signature_trust != WindowsSignatureTrust::Trusted {
+        cache_process_trust(target, kind, process_creation_time, signature_trust);
         return signature_trust;
     }
-    if kind == WindowsMicrosoftTargetKind::WindowsAppsPackage {
-        return if process_package_full_name(target.process_id)
+    let trust = if kind == WindowsMicrosoftTargetKind::WindowsAppsPackage {
+        if process_package_full_name(target.process_id)
             .as_deref()
             .is_some_and(trusted_windowsapps_microsoft_package_full_name)
         {
             WindowsSignatureTrust::Trusted
         } else {
             WindowsSignatureTrust::Indeterminate
-        };
-    }
+        }
+    } else {
+        WindowsSignatureTrust::Trusted
+    };
+    cache_process_trust(target, kind, process_creation_time, trust);
+    trust
+}
 
-    WindowsSignatureTrust::Trusted
+fn cached_process_trust(
+    target: &WindowsTarget,
+    kind: WindowsMicrosoftTargetKind,
+    process_creation_time: u64,
+) -> Option<WindowsSignatureTrust> {
+    let mut cache = PROCESS_TRUST_CACHE
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .ok()?;
+    cache.retain(|entry| {
+        entry.verified_at.elapsed() <= Duration::from_secs(PROCESS_TRUST_CACHE_TTL_SECS)
+    });
+    cache
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.process_id == target.process_id
+                && entry.process_creation_time == process_creation_time
+                && entry.kind == kind
+                && entry
+                    .process_path
+                    .trim()
+                    .eq_ignore_ascii_case(target.process_path.trim())
+        })
+        .map(|entry| entry.trust)
+}
+
+fn cache_process_trust(
+    target: &WindowsTarget,
+    kind: WindowsMicrosoftTargetKind,
+    process_creation_time: u64,
+    trust: WindowsSignatureTrust,
+) {
+    if trust == WindowsSignatureTrust::Indeterminate {
+        return;
+    }
+    let Ok(mut cache) = PROCESS_TRUST_CACHE
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+    else {
+        return;
+    };
+    cache.retain(|entry| {
+        !(entry.process_id == target.process_id
+            && entry.process_creation_time == process_creation_time
+            && entry.kind == kind
+            && entry
+                .process_path
+                .trim()
+                .eq_ignore_ascii_case(target.process_path.trim()))
+    });
+    cache.push_back(ProcessTrustCacheEntry {
+        process_id: target.process_id,
+        process_path: target.process_path.clone(),
+        process_creation_time,
+        kind,
+        trust,
+        verified_at: Instant::now(),
+    });
+    while cache.len() > PROCESS_TRUST_CACHE_CAPACITY {
+        cache.pop_front();
+    }
 }
 
 fn trusted_windowsapps_microsoft_package_full_name(package_full_name: &str) -> bool {
@@ -2966,6 +3729,18 @@ enum WindowsSignatureTrust {
     Rejected,
     Indeterminate,
 }
+
+#[derive(Debug, Clone)]
+struct ProcessTrustCacheEntry {
+    process_id: i32,
+    process_path: String,
+    process_creation_time: u64,
+    kind: WindowsMicrosoftTargetKind,
+    trust: WindowsSignatureTrust,
+    verified_at: Instant,
+}
+
+static PROCESS_TRUST_CACHE: OnceLock<Mutex<VecDeque<ProcessTrustCacheEntry>>> = OnceLock::new();
 
 fn windows_executable_microsoft_signature_trust(path: &str) -> WindowsSignatureTrust {
     unsafe {
@@ -3661,6 +4436,153 @@ mod tests {
     }
 
     #[test]
+    fn trusted_windows_app_launcher_shell_is_known_non_prompt() {
+        let target = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+
+        assert!(
+            super::trusted_windows_app_launcher_shell_is_known_non_prompt(
+                "Windows App",
+                &target,
+                "MainWindow",
+            )
+        );
+    }
+
+    #[test]
+    fn windows_app_launcher_non_prompt_exception_remains_fail_closed() {
+        let packaged_path = program_files_path(
+            r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+        );
+        let trusted_launcher = windows_target("Windows365", packaged_path.clone());
+
+        for (target_app_name, target, class_name) in [
+            (
+                "Windows App",
+                {
+                    let mut target = trusted_launcher.clone();
+                    target.window_title = "Windows Security - Sign in".to_string();
+                    target
+                },
+                "MainWindow",
+            ),
+            (
+                "Windows App",
+                trusted_launcher.clone(),
+                "Credential Dialog Xaml Host",
+            ),
+            (
+                "Windows App",
+                windows_target("WindowsApp", packaged_path),
+                "MainWindow",
+            ),
+            (
+                "Windows App",
+                windows_target("msrdc", program_files_path(r"Remote Desktop\msrdc.exe")),
+                "MainWindow",
+            ),
+            (
+                "Windows App",
+                windows_target(
+                    "Windows365",
+                    r"C:\Users\me\WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+                ),
+                "MainWindow",
+            ),
+            ("Custom App", trusted_launcher, "MainWindow"),
+        ] {
+            assert!(
+                !super::trusted_windows_app_launcher_shell_is_known_non_prompt(
+                    target_app_name,
+                    &target,
+                    class_name,
+                ),
+                "unexpectedly accepted {target_app_name:?}, {target:?}, {class_name:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn complete_windows_session_scan_is_definitive_no_prompt() {
+        let target = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+        let observation = super::monitor_observation_from_inspection(super::WindowsInspection {
+            target: Some(target),
+            has_session: true,
+            prompt_scan_complete: true,
+            target_process_scan_complete: true,
+            ..Default::default()
+        });
+
+        assert_eq!(observation.status, crate::monitor::MonitorStatus::Connected);
+        assert!(observation.definitive_no_prompt);
+    }
+
+    #[test]
+    fn incomplete_windows_session_scan_is_not_definitive_no_prompt() {
+        let target = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+        let observation = super::monitor_observation_from_inspection(super::WindowsInspection {
+            target: Some(target),
+            has_session: true,
+            prompt_scan_complete: false,
+            target_process_scan_complete: true,
+            ..Default::default()
+        });
+
+        assert_eq!(observation.status, crate::monitor::MonitorStatus::Connected);
+        assert!(!observation.definitive_no_prompt);
+    }
+
+    #[test]
+    fn complete_launcher_only_scan_is_definitive_no_prompt() {
+        let target = windows_target(
+            "Windows365",
+            program_files_path(
+                r"WindowsApps\MicrosoftCorporationII.Windows365_1.0.0.0_x64__8wekyb3d8bbwe\Windows365.exe",
+            ),
+        );
+        let observation = super::monitor_observation_from_inspection(super::WindowsInspection {
+            target: Some(target),
+            has_session: false,
+            prompt_scan_complete: true,
+            target_process_scan_complete: true,
+            ..Default::default()
+        });
+
+        assert_eq!(observation.status, crate::monitor::MonitorStatus::Unknown);
+        assert!(observation.definitive_no_prompt);
+    }
+
+    #[test]
+    fn incomplete_target_process_scan_is_not_definitive_no_prompt() {
+        let observation = super::monitor_observation_from_inspection(super::WindowsInspection {
+            target: None,
+            prompt_scan_complete: true,
+            target_process_scan_complete: false,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            observation.status,
+            crate::monitor::MonitorStatus::ProcessNotFound
+        );
+        assert!(!observation.definitive_no_prompt);
+    }
+
+    #[test]
     fn builtin_windows_target_rejects_application_frame_host_title_spoof() {
         let mut hosted_window = windows_target(
             "ApplicationFrameHost",
@@ -3818,30 +4740,74 @@ mod tests {
     }
 
     #[test]
+    fn submit_failure_only_carries_prompt_identity_for_ambiguous_invoke() {
+        let before_submit = super::WindowsSubmitFailure::before_submit(anyhow::anyhow!(
+            "simulated pre-submit failure"
+        ));
+        assert!(before_submit.submitted_prompt().is_none());
+        assert!(!before_submit.invoke_result_is_ambiguous());
+
+        let implementation = include_str!("windows_ui.rs");
+        let submit = source_between(
+            implementation,
+            "pub(crate) fn submit_prompt(",
+            "pub(crate) fn clear_filled_password(",
+        );
+        let final_guard = submit.rfind("guard()?;").expect("final cancellation guard");
+        let invoke = submit
+            .find("if let Err(error) = invoke.invoke()")
+            .expect("single Invoke side effect");
+        let ambiguous_failure = submit
+            .find("WindowsSubmitFailure::ambiguous_invoke(")
+            .expect("captured identity on ambiguous Invoke result");
+
+        assert!(submit.contains("Result<WindowsSubmitResult, WindowsSubmitFailure>"));
+        assert!(final_guard < invoke);
+        assert!(invoke < ambiguous_failure);
+        assert_eq!(
+            submit
+                .matches("WindowsSubmitFailure::ambiguous_invoke(")
+                .count(),
+            1
+        );
+        assert!(submit.contains("submitted_prompt,"));
+    }
+
+    #[test]
     fn post_submit_authentication_requires_a_new_session_after_the_submitted_prompt() {
         let existing = super::WindowsSessionWindow {
             process_id: 42,
             window_title: "Existing session".to_string(),
             window_handle: 100,
         };
-        let submitted = super::WindowsSubmittedPrompt {
-            process_id: 42,
-            prompt_window_handle: 7,
-            prompt_window_title: "Windows Security".to_string(),
-            email: "user@example.com".to_string(),
-            trust: super::WindowsPromptTrust::TrustedTargetProcess,
-            prompt_runtime_id: vec![42, 7],
-            pre_submit_session_windows: vec![existing.clone()],
+        let binding = super::WindowsPromptBinding {
+            prompt_process_creation_time: 1,
+            requester: super::WindowsRequesterBinding {
+                process_id: 42,
+                process_path: r"C:\Windows\System32\mstsc.exe".to_string(),
+                process_creation_time: 1,
+                window_handle: 7,
+            },
+            root_requester: None,
         };
+        let pre_submit = vec![existing.clone()];
 
-        assert!(!super::submitted_prompt_has_new_session(
-            Some(&submitted),
+        assert!(!super::submitted_prompt_identity_has_new_session(
+            &binding,
+            7,
+            "Windows Security",
+            "user@example.com",
+            &pre_submit,
             std::slice::from_ref(&existing),
             42,
             "user@example.com",
         ));
-        assert!(!super::submitted_prompt_has_new_session(
-            Some(&submitted),
+        assert!(!super::submitted_prompt_identity_has_new_session(
+            &binding,
+            7,
+            "Windows Security",
+            "user@example.com",
+            &pre_submit,
             &[
                 existing.clone(),
                 super::WindowsSessionWindow {
@@ -3853,8 +4819,12 @@ mod tests {
             42,
             "USER@example.com",
         ));
-        assert!(super::submitted_prompt_has_new_session(
-            Some(&submitted),
+        assert!(super::submitted_prompt_identity_has_new_session(
+            &binding,
+            7,
+            "Windows Security",
+            "user@example.com",
+            &pre_submit,
             &[
                 existing,
                 super::WindowsSessionWindow {
@@ -3866,8 +4836,34 @@ mod tests {
             42,
             "USER@example.com",
         ));
-        assert!(!super::submitted_prompt_has_new_session(
-            None,
+
+        let mut broker_binding = binding;
+        broker_binding.root_requester = Some(super::WindowsRequesterBinding {
+            process_id: 43,
+            process_path: r"C:\Program Files\WindowsApps\Windows365.exe".to_string(),
+            process_creation_time: 2,
+            window_handle: 8,
+        });
+        assert!(super::submitted_prompt_identity_has_new_session(
+            &broker_binding,
+            7,
+            "Windows Security",
+            "user@example.com",
+            &pre_submit,
+            &[super::WindowsSessionWindow {
+                process_id: 43,
+                window_title: "New root-owner session".to_string(),
+                window_handle: 102,
+            }],
+            42,
+            "USER@example.com",
+        ));
+        assert!(!super::submitted_prompt_identity_has_new_session(
+            &broker_binding,
+            0,
+            "",
+            "user@example.com",
+            &pre_submit,
             &[],
             42,
             "user@example.com",
@@ -3908,6 +4904,163 @@ mod tests {
             super::SubmittedPromptPresence::Absent,
         );
         assert_eq!(observations, 2);
+    }
+
+    #[test]
+    fn post_submit_timeout_distinguishes_confirmed_exact_prompt_absence() {
+        assert_eq!(
+            super::post_submit_timeout_state(super::SubmittedPromptPresence::Indeterminate, false),
+            "prompt_gone_unknown"
+        );
+        assert_eq!(
+            super::post_submit_timeout_state(super::SubmittedPromptPresence::Present, false),
+            "still_prompt"
+        );
+        assert_eq!(
+            super::post_submit_timeout_state(super::SubmittedPromptPresence::Absent, true),
+            "prompt_gone_confirmed"
+        );
+    }
+
+    #[test]
+    fn post_submit_runtime_identity_tracks_root_and_secure_field() {
+        let expected_root = [1, 2];
+        let expected_password = [3, 4];
+
+        assert_eq!(
+            super::classify_submitted_prompt_runtime_identity(
+                &expected_root,
+                &expected_password,
+                &expected_root,
+                &expected_password,
+            ),
+            super::SubmittedPromptPresence::Present
+        );
+        assert_eq!(
+            super::classify_submitted_prompt_runtime_identity(
+                &expected_root,
+                &expected_password,
+                &[9, 9],
+                &expected_password,
+            ),
+            super::SubmittedPromptPresence::Absent,
+            "a new root on the same HWND means the submitted prompt is gone"
+        );
+        assert_eq!(
+            super::classify_submitted_prompt_runtime_identity(
+                &expected_root,
+                &expected_password,
+                &expected_root,
+                &[8, 8],
+            ),
+            super::SubmittedPromptPresence::Absent,
+            "a replaced secure field under the same root is a new prompt state"
+        );
+        assert_eq!(
+            super::classify_submitted_prompt_runtime_identity(
+                &expected_root,
+                &expected_password,
+                &[],
+                &expected_password,
+            ),
+            super::SubmittedPromptPresence::Indeterminate
+        );
+    }
+
+    #[test]
+    fn authentication_still_requires_complete_global_prompt_scan() {
+        assert!(!super::submitted_prompt_authentication_is_confirmed(
+            true, true, false
+        ));
+        assert!(!super::submitted_prompt_authentication_is_confirmed(
+            true, false, true
+        ));
+        assert!(super::submitted_prompt_authentication_is_confirmed(
+            true, true, true
+        ));
+    }
+
+    #[test]
+    fn post_submit_exact_identity_probe_precedes_any_broad_inspection() {
+        let implementation = include_str!("windows_ui.rs");
+        let post_check = source_between(
+            implementation,
+            "pub(crate) fn post_check_state(",
+            "fn post_submit_timeout_state(",
+        );
+        let exact_probe = post_check
+            .find("submitted_prompt_presence(")
+            .expect("exact submitted prompt probe");
+        let present_fast_path = post_check
+            .find("if submitted_presence == SubmittedPromptPresence::Present")
+            .expect("exact-present fast path");
+        let broad_inspection = post_check
+            .find("match inspect(target_app_name)")
+            .expect("bounded broad post-submit inspection");
+
+        assert!(exact_probe < present_fast_path);
+        assert!(present_fast_path < broad_inspection);
+        assert!(post_check[present_fast_path..broad_inspection].contains("continue;"));
+        assert!(post_check.contains("post_submit_broad_inspection_due("));
+        assert!(!post_check.contains("confirmed_absent_seen"));
+    }
+
+    #[test]
+    fn post_submit_broad_inspection_frequency_is_bounded() {
+        assert!(super::post_submit_broad_inspection_due(None));
+        assert!(!super::post_submit_broad_inspection_due(Some(
+            super::POST_SUBMIT_BROAD_INSPECTION_INTERVAL - std::time::Duration::from_millis(1)
+        )));
+        assert!(super::post_submit_broad_inspection_due(Some(
+            super::POST_SUBMIT_BROAD_INSPECTION_INTERVAL
+        )));
+        assert!(
+            super::POST_SUBMIT_BROAD_INSPECTION_INTERVAL >= super::POST_SUBMIT_POLL_INTERVAL * 3
+        );
+    }
+
+    #[test]
+    fn replacement_prompt_is_reported_only_after_exact_prompt_absence_is_confirmed() {
+        assert_eq!(
+            super::classify_visible_post_submit_prompt(
+                Some("user@example.com"),
+                true,
+                super::SubmittedPromptPresence::Absent,
+                false,
+                "user@example.com",
+            ),
+            None
+        );
+        assert_eq!(
+            super::classify_visible_post_submit_prompt(
+                Some("user@example.com"),
+                true,
+                super::SubmittedPromptPresence::Absent,
+                true,
+                "user@example.com",
+            ),
+            Some("prompt_replaced")
+        );
+        assert_eq!(
+            super::classify_visible_post_submit_prompt(
+                Some("user@example.com"),
+                true,
+                super::SubmittedPromptPresence::Present,
+                false,
+                "USER@example.com",
+            ),
+            Some("still_prompt")
+        );
+        assert_eq!(
+            super::classify_visible_post_submit_prompt(
+                Some("other@example.com"),
+                false,
+                super::SubmittedPromptPresence::Indeterminate,
+                false,
+                "user@example.com",
+            ),
+            Some("prompt_mismatch")
+        );
     }
 
     #[test]
@@ -4166,6 +5319,56 @@ mod tests {
     }
 
     #[test]
+    fn production_binary_has_a_bin_scoped_uiaccess_manifest() {
+        let build_script = include_str!("../build.rs");
+        let resources = source_between(
+            build_script,
+            "fn embed_windows_resources(",
+            "fn write_windows_icon(",
+        );
+        let icon_resources =
+            source_between(resources, "let icon_rc =", "if include_uiaccess_manifest {");
+        let uiaccess_resources =
+            source_between(resources, "if include_uiaccess_manifest {", "    Ok(())");
+        let manifest = source_between(
+            build_script,
+            "fn windows_application_manifest(",
+            "fn write_windows_icon(",
+        );
+        let uiaccess_gate = source_between(
+            build_script,
+            "fn windows_uiaccess_manifest_requested(",
+            "fn windows_application_manifest(",
+        );
+
+        assert!(build_script
+            .contains("const PRODUCTION_WINDOWS_BINARY: &str = \"windows-app-autologin\";"));
+        assert!(build_script
+            .contains("const FULL_UI_WINDOWS_BINARY: &str = \"windows-app-autologin-ui\";"));
+        assert_eq!(resources.matches("embed_resource::compile_for(").count(), 2);
+        assert!(!resources.contains("embed_resource::compile("));
+        assert!(icon_resources.contains("&icon_rc_path"));
+        assert!(icon_resources.contains("[PRODUCTION_WINDOWS_BINARY, FULL_UI_WINDOWS_BINARY]"));
+        assert!(icon_resources.contains(".manifest_optional()"));
+        assert!(!icon_resources.contains("windows_application_manifest()"));
+        assert!(!icon_resources.contains("1 24"));
+        assert!(uiaccess_resources.contains("&uiaccess_rc_path"));
+        assert!(uiaccess_resources.contains("[PRODUCTION_WINDOWS_BINARY]"));
+        assert!(uiaccess_resources.contains(".manifest_required()"));
+        assert!(uiaccess_resources.contains("windows_application_manifest()"));
+        assert!(uiaccess_resources.contains("1 24"));
+        assert!(!uiaccess_resources.contains("FULL_UI_WINDOWS_BINARY"));
+        assert!(resources.contains("windows_uiaccess_manifest_requested()"));
+        assert!(resources.contains("if include_uiaccess_manifest"));
+        assert!(build_script.contains("WAAL_WINDOWS_UIACCESS_MANIFEST"));
+        assert!(uiaccess_gate.contains("CARGO_CFG_TARGET_OS"));
+        assert!(uiaccess_gate.contains("Ok(\"windows\")"));
+        assert!(uiaccess_gate.contains("PROFILE"));
+        assert!(uiaccess_gate.contains("Ok(\"release\")"));
+        assert!(manifest.contains("requestedExecutionLevel level=\"asInvoker\" uiAccess=\"true\""));
+    }
+
+    #[test]
     fn equally_ranked_submit_candidates_are_rejected_as_ambiguous() {
         assert_eq!(
             super::unique_matching_index(&[1, 2, 3], |item| *item == 2).unwrap(),
@@ -4207,14 +5410,9 @@ mod tests {
             &target,
             "Credential Dialog Xaml Host"
         ));
-        assert!(super::ensure_direct_set_value_target_is_trusted(
-            "Windows App",
-            &target,
-            "Credential Dialog Xaml Host",
-            target.window_handle,
-            super::WindowsPromptTrust::TrustedTargetProcess
-        )
-        .is_ok());
+        assert!(
+            super::microsoft_rdp_target_kind(&target.process_name, &target.process_path).is_some()
+        );
     }
 
     #[test]
@@ -4265,26 +5463,30 @@ mod tests {
             &target,
             "Credential Dialog Xaml Host"
         ));
-        assert!(!super::system_credential_prompt_matches_target(
+        assert!(super::system_credential_prompt_requester(
             "Windows App",
             &target,
             "Credential Dialog Xaml Host",
             target.window_handle,
-        ));
+            &[],
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
     fn credential_broker_prompt_requires_owner_binding_before_direct_setvalue() {
         let target = trusted_windows_security_target();
 
-        assert!(super::ensure_direct_set_value_target_is_trusted(
+        assert!(super::system_credential_prompt_requester(
             "Windows App",
             &target,
             "Credential Dialog Xaml Host",
             target.window_handle,
-            super::WindowsPromptTrust::CredentialBrokerBoundToTarget
+            &[],
         )
-        .is_err());
+        .unwrap()
+        .is_none());
     }
 
     #[test]
