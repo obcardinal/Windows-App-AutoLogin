@@ -87,7 +87,8 @@ pub(crate) fn trusted_process_info_for_pid(
     else {
         return Ok(None);
     };
-    let Some(bundle_path) = containing_app_bundle(&executable_path) else {
+    let Some(bundle_path) = containing_app_bundle_for_direct_main_executable(&executable_path)
+    else {
         return Ok(None);
     };
     let Some(identity) = trusted_identity(app_name) else {
@@ -207,7 +208,8 @@ fn process_identities_from_pids(
             // the snapshot. Only that definitive race is safe to omit.
             continue;
         };
-        let Some(bundle_path) = containing_app_bundle(&executable_path) else {
+        let Some(bundle_path) = containing_app_bundle_for_direct_main_executable(&executable_path)
+        else {
             continue;
         };
         if trusted_candidates.contains(&bundle_path) {
@@ -367,6 +369,18 @@ fn containing_app_bundle(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|candidate| candidate.extension().is_some_and(|ext| ext == "app"))
         .map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn containing_app_bundle_for_direct_main_executable(path: &Path) -> Option<PathBuf> {
+    let bundle_path = containing_app_bundle(path)?;
+    let executable_name = bundle_path.file_stem()?;
+    let expected_executable = bundle_path
+        .join("Contents")
+        .join("MacOS")
+        .join(executable_name);
+
+    (path == expected_executable).then_some(bundle_path)
 }
 
 #[cfg(target_os = "macos")]
@@ -890,6 +904,54 @@ mod tests {
                 team_id: "UBF8T346G9",
             },
             |_pid| Ok(None),
+        )
+        .unwrap();
+
+        assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn direct_main_executable_is_discovered_as_the_trusted_app_identity() {
+        let processes = process_identities_from_pids(
+            vec![49_806],
+            &[PathBuf::from("/Applications/Windows App.app")],
+            TrustedIdentity {
+                bundle_id: "com.microsoft.rdc.macos",
+                team_id: "UBF8T346G9",
+            },
+            |pid| {
+                assert_eq!(pid, 49_806);
+                Ok(Some(PathBuf::from(
+                    "/Applications/Windows App.app/Contents/MacOS/Windows App",
+                )))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 49_806);
+        assert_eq!(processes[0].bundle_id, "com.microsoft.rdc.macos");
+        assert_eq!(
+            processes[0].bundle_path,
+            PathBuf::from("/Applications/Windows App.app")
+        );
+    }
+
+    #[test]
+    fn nested_pasteboard_xpc_executable_is_not_discovered_as_the_main_app() {
+        let processes = process_identities_from_pids(
+            vec![68_662],
+            &[PathBuf::from("/Applications/Windows App.app")],
+            TrustedIdentity {
+                bundle_id: "com.microsoft.rdc.macos",
+                team_id: "UBF8T346G9",
+            },
+            |pid| {
+                assert_eq!(pid, 68_662);
+                Ok(Some(PathBuf::from(
+                    "/Applications/Windows App.app/Contents/Frameworks/ClientShared.framework/Versions/A/XPCServices/pasteboard.xpc.xpc/Contents/MacOS/pasteboard.xpc",
+                )))
+            },
         )
         .unwrap();
 

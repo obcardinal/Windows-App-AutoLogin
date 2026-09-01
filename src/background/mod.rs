@@ -203,6 +203,10 @@ const AUTOMATION_SLEEP: Duration = Duration::from_millis(250);
 const PROMPT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_FALLBACK_PROMPT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACOS_TRANSIENT_FILL_RETRY_DELAY: Duration = Duration::from_millis(250);
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACOS_TRANSIENT_FILL_MAX_RETRIES: usize = 2;
 const MACOS_RETRY_REARM_NO_PROMPT_OBSERVATIONS: u8 = 3;
 const MACOS_RETRY_REARM_PROCESS_EXIT_OBSERVATIONS: u8 = 2;
 const MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS: u8 = 3;
@@ -512,6 +516,24 @@ fn reserve_prompt_retry_suppression(suppression: Option<&PromptRetrySuppression>
     };
     prompts.insert(suppression.prompt_key.clone(), now);
     true
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn should_retry_macos_transient_fill(
+    report: &FillAttemptReport,
+    retries_started: usize,
+    attempt_is_current: bool,
+) -> bool {
+    attempt_is_current
+        && retries_started < MACOS_TRANSIENT_FILL_MAX_RETRIES
+        && !report.success
+        && report.field("prompt_detected") == Some("true")
+        && report.field("password_write_state") == Some("not_attempted")
+        && report.field("submit_attempted") == Some("false")
+        && matches!(
+            report.failure_reason.as_deref(),
+            Some("pre_password_revalidation_failed" | "fill_failed")
+        )
 }
 
 fn release_prompt_retry_suppression_after_authenticated_success(
@@ -1085,6 +1107,10 @@ impl PrePasswordReportPersistence {
         self.observed_this_tick = false;
         self.persisted_this_tick = false;
     }
+
+    fn observe_non_actionable_skip(&mut self) {
+        self.observed_this_tick = true;
+    }
 }
 
 fn emit_pre_password_skip_report(
@@ -1094,14 +1120,29 @@ fn emit_pre_password_skip_report(
     fields: &[(&'static str, String)],
 ) {
     let reason = reason.into();
-    let should_persist = persistence.should_persist(&reason, fields, Instant::now());
+    let is_actionable_attempt_report = pre_password_skip_is_actionable(&reason);
+    let should_persist = if is_actionable_attempt_report {
+        persistence.should_persist(&reason, fields, Instant::now())
+    } else {
+        persistence.observe_non_actionable_skip();
+        false
+    };
     let report = debug_fill::pre_password_skip_report(reason, fields);
-    if should_persist {
+    // Suppression is a consequence of an earlier attempted fill, not a new
+    // attempt. Keep the first actionable failure visible in both the persisted
+    // report and the UI instead of replacing it on the next monitor poll.
+    if should_persist && is_actionable_attempt_report {
         if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
             warn!("Could not persist pre-password skip report: {e}");
         }
     }
-    let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
+    if is_actionable_attempt_report {
+        let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
+    }
+}
+
+fn pre_password_skip_is_actionable(reason: &str) -> bool {
+    reason != "prompt_retry_suppressed"
 }
 
 fn monitor_prompt_fields(
@@ -1422,16 +1463,61 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                 ..
             } = job;
             let _automation_guard = automation_guard;
-            let report = debug_fill::fill_current_prompt_once_guarded_with_context(
-                &settings,
-                &accounts,
-                FillMethod::Keyboard,
-                prompt_context,
-                || {
-                    pause_latch
-                        .ensure_attempt_current(expected_generation, "accounts/settings changed")
-                },
-            );
+            let run_attempt = |prompt_context| {
+                debug_fill::fill_current_prompt_once_guarded_with_context(
+                    &settings,
+                    &accounts,
+                    FillMethod::Keyboard,
+                    prompt_context,
+                    || {
+                        pause_latch.ensure_attempt_current(
+                            expected_generation,
+                            "accounts/settings changed",
+                        )
+                    },
+                )
+            };
+            let report = {
+                #[cfg(target_os = "macos")]
+                {
+                    let mut retries_started = 0;
+                    let mut report = run_attempt(prompt_context.clone());
+                    while should_retry_macos_transient_fill(
+                        &report,
+                        retries_started,
+                        pause_latch
+                            .ensure_attempt_current(
+                                expected_generation,
+                                "accounts/settings changed",
+                            )
+                            .is_ok(),
+                    ) {
+                        retries_started += 1;
+                        debug!(
+                            "Retrying macOS credential fill after transient pre-write failure ({retries_started}/{MACOS_TRANSIENT_FILL_MAX_RETRIES})"
+                        );
+                        std::thread::sleep(MACOS_TRANSIENT_FILL_RETRY_DELAY);
+                        if pause_latch
+                            .ensure_attempt_current(
+                                expected_generation,
+                                "accounts/settings changed",
+                            )
+                            .is_err()
+                        {
+                            debug!(
+                                "Skipping macOS transient fill retry because the attempt is no longer current"
+                            );
+                            break;
+                        }
+                        report = run_attempt(prompt_context.clone());
+                    }
+                    report
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    run_attempt(prompt_context)
+                }
+            };
             if !release_prompt_retry_suppression_after_authenticated_success(
                 prompt_retry_suppression.as_ref(),
                 &report,
@@ -2051,6 +2137,27 @@ mod tests {
         .pause_latch()
     }
 
+    fn macos_transient_fill_report(
+        failure_reason: &str,
+        password_write_state: &str,
+        submit_attempted: &str,
+        post_check_state: &str,
+    ) -> debug_fill::FillAttemptReport {
+        debug_fill::FillAttemptReport {
+            fields: vec![
+                ("prompt_detected".to_string(), "true".to_string()),
+                (
+                    "password_write_state".to_string(),
+                    password_write_state.to_string(),
+                ),
+                ("submit_attempted".to_string(), submit_attempted.to_string()),
+                ("post_check_state".to_string(), post_check_state.to_string()),
+            ],
+            success: false,
+            failure_reason: Some(failure_reason.to_string()),
+        }
+    }
+
     #[test]
     fn poll_cadence_backs_off_for_stable_statuses_but_keeps_prompts_fast() {
         let settings = AppSettings {
@@ -2209,6 +2316,40 @@ mod tests {
             "second_reason",
             &second_fields,
             now + PRE_PASSWORD_REPORT_PERSIST_INTERVAL + Duration::from_millis(2),
+        ));
+    }
+
+    #[test]
+    fn retry_suppression_does_not_replace_the_actionable_fill_failure() {
+        assert!(!super::pre_password_skip_is_actionable(
+            "prompt_retry_suppressed"
+        ));
+        assert!(super::pre_password_skip_is_actionable(
+            "visible_prompt_email_missing"
+        ));
+        assert!(super::pre_password_skip_is_actionable(
+            "prompt_detection_failed"
+        ));
+    }
+
+    #[test]
+    fn retry_suppression_observation_does_not_consume_the_persistence_slot() {
+        let mut persistence = PrePasswordReportPersistence::default();
+        let now = Instant::now();
+        let fields = [("prompt_context_source", "fallback".to_string())];
+
+        persistence.begin_poll_tick();
+        persistence.observe_non_actionable_skip();
+        assert!(persistence.should_persist("actionable_reason", &fields, now));
+
+        persistence.begin_poll_tick();
+        persistence.observe_non_actionable_skip();
+        persistence.observe_no_prompt();
+        persistence.begin_poll_tick();
+        assert!(!persistence.should_persist(
+            "actionable_reason",
+            &fields,
+            now + Duration::from_secs(1)
         ));
     }
 
@@ -2784,6 +2925,139 @@ mod tests {
 
         assert!(reserve_prompt_retry_suppression(Some(&suppression)));
         assert!(attempts.lock().unwrap().contains_key(&prompt_key));
+    }
+
+    #[test]
+    fn macos_transient_fill_retry_requires_complete_safe_prewrite_evidence() {
+        for failure_reason in ["pre_password_revalidation_failed", "fill_failed"] {
+            let report =
+                macos_transient_fill_report(failure_reason, "not_attempted", "false", "unknown");
+            assert!(super::should_retry_macos_transient_fill(&report, 0, true));
+            assert!(
+                !super::should_retry_macos_transient_fill(&report, 0, false),
+                "a cancelled generation must not enter the retry delay"
+            );
+
+            for missing_field in [
+                "prompt_detected",
+                "password_write_state",
+                "submit_attempted",
+            ] {
+                let mut incomplete = report.clone();
+                incomplete
+                    .fields
+                    .retain(|(field, _)| field != missing_field);
+                assert!(
+                    !super::should_retry_macos_transient_fill(&incomplete, 0, true),
+                    "missing {missing_field} must fail closed"
+                );
+            }
+        }
+
+        let mut successful =
+            macos_transient_fill_report("fill_failed", "not_attempted", "false", "unknown");
+        successful.success = true;
+        assert!(!super::should_retry_macos_transient_fill(
+            &successful,
+            0,
+            true
+        ));
+
+        let mut missing_failure =
+            macos_transient_fill_report("fill_failed", "not_attempted", "false", "unknown");
+        missing_failure.failure_reason = None;
+        assert!(!super::should_retry_macos_transient_fill(
+            &missing_failure,
+            0,
+            true
+        ));
+
+        let non_exact_failure = macos_transient_fill_report(
+            "fill_failed_focus_timeout",
+            "not_attempted",
+            "false",
+            "unknown",
+        );
+        assert!(!super::should_retry_macos_transient_fill(
+            &non_exact_failure,
+            0,
+            true
+        ));
+    }
+
+    #[test]
+    fn macos_transient_fill_retry_budget_is_two_with_bounded_backoff() {
+        let report =
+            macos_transient_fill_report("fill_failed", "not_attempted", "false", "unknown");
+
+        assert_eq!(super::MACOS_TRANSIENT_FILL_MAX_RETRIES, 2);
+        assert_eq!(
+            super::MACOS_TRANSIENT_FILL_RETRY_DELAY,
+            Duration::from_millis(250)
+        );
+        assert!(super::should_retry_macos_transient_fill(&report, 0, true));
+        assert!(super::should_retry_macos_transient_fill(&report, 1, true));
+        assert!(!super::should_retry_macos_transient_fill(&report, 2, true));
+    }
+
+    #[test]
+    fn macos_transient_fill_retry_rejects_unsafe_failure_classes() {
+        let reports = [
+            macos_transient_fill_report("fill_failed", "ambiguous", "false", "unknown"),
+            macos_transient_fill_report("fill_failed", "completed", "false", "unknown"),
+            macos_transient_fill_report(
+                "password_storage_recovery_pending",
+                "not_attempted",
+                "false",
+                "unknown",
+            ),
+            macos_transient_fill_report("attempt_cancelled", "not_attempted", "false", "unknown"),
+            macos_transient_fill_report("fill_failed", "not_attempted", "true", "unknown"),
+            macos_transient_fill_report(
+                "credential_prompt_still_visible_after_submit",
+                "completed",
+                "true",
+                "still_prompt",
+            ),
+        ];
+
+        for report in reports {
+            assert!(!super::should_retry_macos_transient_fill(&report, 0, true));
+        }
+
+        let mut prompt_not_detected =
+            macos_transient_fill_report("fill_failed", "not_attempted", "false", "unknown");
+        prompt_not_detected.fields[0].1 = "false".to_string();
+        assert!(!super::should_retry_macos_transient_fill(
+            &prompt_not_detected,
+            0,
+            true
+        ));
+    }
+
+    #[test]
+    fn eligible_local_retry_keeps_episode_suppression_sticky() {
+        let prompt_key = make_prompt_key("account-1", 42, "Sign in", "user@example.com");
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let suppression = PromptRetrySuppression {
+            recent_prompt_attempts: attempts.clone(),
+            prompt_key: prompt_key.clone(),
+        };
+        let report =
+            macos_transient_fill_report("fill_failed", "not_attempted", "false", "unknown");
+
+        assert!(reserve_prompt_retry_suppression(Some(&suppression)));
+        assert!(super::should_retry_macos_transient_fill(&report, 0, true));
+        assert!(
+            release_prompt_retry_suppression_after_authenticated_success(
+                Some(&suppression),
+                &report,
+            )
+        );
+        assert!(prompt_retry_is_suppressed(
+            &attempts.lock().unwrap(),
+            &prompt_key,
+        ));
     }
 
     #[test]

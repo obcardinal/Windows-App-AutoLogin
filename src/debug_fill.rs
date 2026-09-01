@@ -143,7 +143,7 @@ impl FillAttemptReport {
         let result = if self.success { "success" } else { "failed" };
         let failure = self.failure_reason.as_deref().unwrap_or("");
         format!(
-            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_loaded={} password_load_skip_reason={} password_load_ms={} fill_method={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} password_cleanup_attempted={} password_cleanup_status={} failure_reason={}",
+            "fill_current_prompt_once result={} prompt_context_source={} prompt_context_age_ms={} prompt_context_revalidation_result={} prompt_detected={} account_enabled_email_match_count={} account_saved_email_match_count={} account_match_count={} selected_account_id={} password_load_attempted={} password_loaded={} password_load_skip_reason={} password_load_ms={} fill_method={} password_write_state={} submit_method={} axpress_result={} enter_fallback_result={} post_check_state={} password_cleanup_attempted={} password_cleanup_status={} failure_reason={}",
             result,
             self.field("prompt_context_source").unwrap_or("live_scan"),
             self.field("prompt_context_age_ms").unwrap_or("0"),
@@ -159,6 +159,8 @@ impl FillAttemptReport {
             self.field("password_load_skip_reason").unwrap_or(""),
             self.field("password_load_ms").unwrap_or("0"),
             self.field("fill_method").unwrap_or("none"),
+            self.field("password_write_state")
+                .unwrap_or("not_attempted"),
             self.field("submit_method").unwrap_or("none"),
             self.field("axpress_result").unwrap_or("not_found"),
             self.field("enter_fallback_result").unwrap_or("not_needed"),
@@ -501,6 +503,7 @@ impl DebugLog {
             ("fill_method", "none".to_string()),
             ("fill_attempted", "false".to_string()),
             ("fill_status", "not_attempted".to_string()),
+            ("password_write_state", "not_attempted".to_string()),
             ("fill_duration_ms", "0".to_string()),
             ("submit_method", "none".to_string()),
             ("submit_attempted", "false".to_string()),
@@ -569,6 +572,16 @@ fn log_value(log: &DebugLog, key: &str) -> Option<String> {
         .iter()
         .find(|(field, _)| *field == key)
         .map(|(_, value)| value.clone())
+}
+
+fn record_password_write_failure(log: &mut DebugLog, write_is_ambiguous: bool) {
+    if write_is_ambiguous {
+        log.set("password_write_state", "ambiguous");
+    }
+}
+
+fn record_password_write_completed(log: &mut DebugLog) {
+    log.set("password_write_state", "completed");
 }
 
 fn record_password_cleanup_result(
@@ -983,7 +996,9 @@ fn fill_current_prompt_once_macos(
                 "fill_duration_ms",
                 fill_start.elapsed().as_millis().to_string(),
             );
-            let cleanup_confirmed = if e.cleanup_prompt().is_some() {
+            let write_is_ambiguous = e.cleanup_prompt().is_some();
+            record_password_write_failure(&mut log, write_is_ambiguous);
+            let cleanup_confirmed = if write_is_ambiguous {
                 record_password_cleanup_result(
                     &mut log,
                     e.cleanup_prompt().map(|filled_prompt| {
@@ -1000,6 +1015,7 @@ fn fill_current_prompt_once_macos(
             };
         }
     };
+    record_password_write_completed(&mut log);
     log.set(
         "fill_duration_ms",
         fill_start.elapsed().as_millis().to_string(),
@@ -1619,7 +1635,9 @@ fn fill_current_prompt_once_windows(
                 "fill_duration_ms",
                 fill_start.elapsed().as_millis().to_string(),
             );
-            let cleanup_confirmed = if e.cleanup_prompt().is_some() {
+            let write_is_ambiguous = e.cleanup_prompt().is_some();
+            record_password_write_failure(&mut log, write_is_ambiguous);
+            let cleanup_confirmed = if write_is_ambiguous {
                 record_password_cleanup_result(
                     &mut log,
                     e.cleanup_prompt().map(|filled_prompt| {
@@ -1636,6 +1654,7 @@ fn fill_current_prompt_once_windows(
             };
         }
     };
+    record_password_write_completed(&mut log);
     log.set(
         "fill_duration_ms",
         fill_start.elapsed().as_millis().to_string(),
@@ -3011,6 +3030,43 @@ mod tests {
     }
 
     #[test]
+    fn pre_write_fill_failure_keeps_password_write_not_attempted() {
+        let mut log = super::DebugLog::new("test".to_string());
+
+        super::record_password_write_failure(&mut log, false);
+        let report = log.fail("fill_failed_before_write");
+
+        assert_eq!(report.field("password_write_state"), Some("not_attempted"));
+        assert!(report
+            .summary_line()
+            .contains("password_write_state=not_attempted"));
+    }
+
+    #[test]
+    fn ambiguous_fill_marks_password_write_before_cleanup() {
+        let mut log = super::DebugLog::new("test".to_string());
+
+        super::record_password_write_failure(&mut log, true);
+        let cleanup_confirmed = super::record_password_cleanup_result(&mut log, Some(Ok(())));
+        let report = log.fail("fill_failed_after_ambiguous_write");
+
+        assert!(cleanup_confirmed);
+        assert_eq!(report.field("password_write_state"), Some("ambiguous"));
+        assert_eq!(report.field("password_cleanup_status"), Some("ok"));
+    }
+
+    #[test]
+    fn successful_fill_marks_password_write_completed() {
+        let mut log = super::DebugLog::new("test".to_string());
+
+        super::record_password_write_completed(&mut log);
+        let report = log.finish(None);
+
+        assert!(report.success);
+        assert_eq!(report.field("password_write_state"), Some("completed"));
+    }
+
+    #[test]
     fn loaded_password_is_dropped_before_submit_on_macos_and_windows() {
         let implementation = include_str!("debug_fill.rs");
         let macos_fill = source_between(
@@ -3113,8 +3169,18 @@ mod tests {
         ] {
             let write = fill.find("let fill_result =").unwrap();
             let drop_secret = fill[write..].find("drop(password);").unwrap() + write;
-            let ambiguous_cleanup =
-                fill[drop_secret..].find("e.cleanup_prompt()").unwrap() + drop_secret;
+            let ambiguity_detected = fill[drop_secret..]
+                .find("let write_is_ambiguous = e.cleanup_prompt().is_some()")
+                .unwrap()
+                + drop_secret;
+            let write_state = fill[drop_secret..]
+                .find("record_password_write_failure(&mut log, write_is_ambiguous)")
+                .unwrap()
+                + drop_secret;
+            let ambiguous_cleanup = fill[write_state..]
+                .find("record_password_cleanup_result(")
+                .unwrap()
+                + write_state;
             let clear_field =
                 fill[ambiguous_cleanup..].find(cleanup_call).unwrap() + ambiguous_cleanup;
             let hard_failure = fill[clear_field..]
@@ -3123,7 +3189,9 @@ mod tests {
                 + clear_field;
 
             assert!(write < drop_secret);
-            assert!(drop_secret < ambiguous_cleanup);
+            assert!(drop_secret < ambiguity_detected);
+            assert!(ambiguity_detected < write_state);
+            assert!(write_state < ambiguous_cleanup);
             assert!(ambiguous_cleanup < clear_field);
             assert!(clear_field < hard_failure);
         }
@@ -3429,6 +3497,15 @@ mod tests {
         assert!(fill_index < drop_index);
         assert!(drop_index < fill_result_index);
         assert!(fill_result_index < submit_index);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fill_method_uses_pid_targeted_keyboard() {
+        assert!(matches!(
+            super::macos_fill_method(super::FillMethod::Keyboard),
+            crate::macos_ax::MacosFillMethod::Keyboard
+        ));
     }
 
     #[cfg(target_os = "macos")]

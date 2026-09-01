@@ -23,7 +23,7 @@ const FOCUS_POLL_INTERVAL_MS: u64 = 10;
 const KEY_EVENT_SETTLE_MS: u64 = 30;
 const POST_FILL_SETTLE_MS: u64 = 40;
 #[cfg_attr(not(test), allow(dead_code))]
-const DIRECT_AXVALUE_READY_MS: u64 = 40;
+const PASSWORD_FILL_READY_MS: u64 = 40;
 const FAST_SUBMIT_READY_TIMEOUT_MS: u64 = 60;
 const POST_SUBMIT_REQUIRED_ABSENCE_DWELL_MS: u64 = 1_500;
 const PASSWORD_CLEANUP_ATTEMPTS: usize = 3;
@@ -1240,7 +1240,7 @@ pub(crate) fn fill_verified_password(
             }
             let submit_button_ready_after_fill = wait_for_prompt_submit_button_enabled(
                 &prompt,
-                Duration::from_millis(DIRECT_AXVALUE_READY_MS),
+                Duration::from_millis(PASSWORD_FILL_READY_MS),
             );
             ("keyboard", true, submit_button_ready_after_fill)
         }
@@ -3591,8 +3591,9 @@ mod tests {
         collect_descendants_bounded, credential_prompt_text_like, extract_email_like,
         normalized_submit_label, prompt_identity_verified, prompt_text_element_should_contribute,
         prompt_window_title_matches, select_submit_label_for_test, submit_label_rank,
-        text_contains_password_cue, AxTraversalCompleteness, PromptOrigin, DIRECT_AXVALUE_READY_MS,
+        text_contains_password_cue, AxTraversalCompleteness, PromptOrigin,
         FOCUS_ACQUIRE_TIMEOUT_MS, FOCUS_POLL_INTERVAL_MS, FOCUS_STABLE_SETTLE_MS,
+        PASSWORD_FILL_READY_MS,
     };
     use std::time::{Duration, Instant};
 
@@ -3772,7 +3773,7 @@ mod tests {
     }
 
     #[test]
-    fn password_insertion_restores_verified_focus_keyboard_events() {
+    fn password_insertion_uses_verified_pid_targeted_keyboard_events() {
         let implementation = include_str!("macos_ax.rs")
             .split("#[cfg(test)]")
             .next()
@@ -3795,6 +3796,10 @@ mod tests {
         assert!(fill_verified_password.contains("KEYCODE_DELETE"));
         assert!(!fill_verified_password.contains("set_password_value("));
         assert!(sender.contains("CGEventPostToPid(target_process_id"));
+        assert_eq!(
+            sender.matches("CGEventPostToPid(target_process_id").count(),
+            4
+        );
         assert!(!sender.contains("CGEventPost(CG_HID_EVENT_TAP"));
         assert!(sender.contains("zeroizing_utf16_buffer(text)"));
     }
@@ -3937,13 +3942,19 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn submit_filled_prompt").next())
             .unwrap();
+        let fill_revalidation = implementation
+            .split("fn revalidate_prepared_prompt_for_fill")
+            .nth(1)
+            .and_then(|tail| tail.split("fn ensure_trusted_process_matches").next())
+            .unwrap();
         let fast_submit = implementation
             .split("fn revalidate_filled_prompt")
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn post_check_state").next())
             .unwrap();
 
-        assert!(fill.contains("ensure_live_prompt_window_title"));
+        assert!(fill.contains("revalidate_prepared_prompt_for_fill"));
+        assert!(fill_revalidation.contains("ensure_live_prompt_window_title"));
         assert!(fast_submit.contains("ensure_live_prompt_window_title"));
     }
 
@@ -4099,15 +4110,15 @@ mod tests {
 
     #[test]
     fn automation_timing_constants_stay_bounded() {
-        let direct_ready_ms = std::hint::black_box(DIRECT_AXVALUE_READY_MS);
+        let fill_ready_ms = std::hint::black_box(PASSWORD_FILL_READY_MS);
         let focus_poll_interval_ms = std::hint::black_box(FOCUS_POLL_INTERVAL_MS);
         let focus_stable_settle_ms = std::hint::black_box(FOCUS_STABLE_SETTLE_MS);
         let focus_acquire_timeout_ms = std::hint::black_box(FOCUS_ACQUIRE_TIMEOUT_MS);
         let post_submit_absence_dwell_ms =
             std::hint::black_box(super::POST_SUBMIT_REQUIRED_ABSENCE_DWELL_MS);
 
-        assert!(direct_ready_ms >= focus_poll_interval_ms);
-        assert!(Duration::from_millis(direct_ready_ms) < Duration::from_millis(450));
+        assert!(fill_ready_ms >= focus_poll_interval_ms);
+        assert!(Duration::from_millis(fill_ready_ms) < Duration::from_millis(450));
         assert!(focus_stable_settle_ms >= 80);
         assert!(focus_acquire_timeout_ms >= focus_stable_settle_ms);
         assert!(focus_stable_settle_ms >= focus_poll_interval_ms);
