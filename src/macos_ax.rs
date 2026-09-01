@@ -17,6 +17,8 @@ const MAX_ELEMENT_COUNT: usize = 900;
 const AX_SEARCH_DEPTH: usize = 12;
 const MAX_DIRECT_SHEET_COUNT: usize = 8;
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 0.15;
+const PROMPT_DETECTION_RETRY_DELAY: Duration = Duration::from_millis(100);
+const PROMPT_DETECTION_MAX_RETRIES: usize = 2;
 const FOCUS_STABLE_SETTLE_MS: u64 = 150;
 const FOCUS_ACQUIRE_TIMEOUT_MS: u64 = 500;
 const FOCUS_POLL_INTERVAL_MS: u64 = 10;
@@ -884,6 +886,61 @@ fn trusted_process_infos_for_inspection(
 }
 
 pub(crate) fn detect_visible_prompt(
+    app_name: &str,
+    expected_process_id: Option<i32>,
+    expected_window_title: Option<&str>,
+    expected_email: Option<&str>,
+) -> anyhow::Result<Option<MacosPrompt>> {
+    let retry_missing_scoped_prompt =
+        scoped_prompt_retry_enabled(expected_process_id, expected_window_title, expected_email);
+    retry_complete_prompt_detection(
+        || {
+            detect_visible_prompt_once(
+                app_name,
+                expected_process_id,
+                expected_window_title,
+                expected_email,
+            )
+        },
+        retry_missing_scoped_prompt,
+        thread::sleep,
+    )
+}
+
+fn scoped_prompt_retry_enabled(
+    expected_process_id: Option<i32>,
+    expected_window_title: Option<&str>,
+    expected_email: Option<&str>,
+) -> bool {
+    expected_process_id.is_some() && expected_window_title.is_some() && expected_email.is_some()
+}
+
+fn retry_complete_prompt_detection<T>(
+    mut detect: impl FnMut() -> anyhow::Result<Option<T>>,
+    retry_missing_prompt: bool,
+    mut wait: impl FnMut(Duration),
+) -> anyhow::Result<Option<T>> {
+    let mut retries_started = 0;
+    loop {
+        match detect() {
+            Ok(Some(snapshot)) => return Ok(Some(snapshot)),
+            Ok(None) if retry_missing_prompt && retries_started < PROMPT_DETECTION_MAX_RETRIES => {
+                retries_started += 1;
+                wait(PROMPT_DETECTION_RETRY_DELAY);
+            }
+            Ok(None) => return Ok(None),
+            Err(error) if retries_started < PROMPT_DETECTION_MAX_RETRIES => {
+                retries_started += 1;
+                wait(PROMPT_DETECTION_RETRY_DELAY);
+                debug_assert!(retries_started <= PROMPT_DETECTION_MAX_RETRIES);
+                drop(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn detect_visible_prompt_once(
     app_name: &str,
     expected_process_id: Option<i32>,
     expected_window_title: Option<&str>,
@@ -3734,6 +3791,149 @@ mod tests {
         assert!(scope_selection.contains("into_complete_elements()"));
         assert!(!implementation.contains("fn array_attr("));
         assert!(!implementation.contains("array_attr(AX_CHILDREN)"));
+    }
+
+    #[test]
+    fn transient_prompt_detection_error_retries_until_a_complete_snapshot() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let snapshot = super::retry_complete_prompt_detection(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    anyhow::bail!("transient prompt snapshot failure");
+                }
+                Ok(Some("complete"))
+            },
+            false,
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, Some("complete"));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            waits,
+            vec![
+                super::PROMPT_DETECTION_RETRY_DELAY,
+                super::PROMPT_DETECTION_RETRY_DELAY
+            ]
+        );
+    }
+
+    #[test]
+    fn exhausted_prompt_detection_retry_returns_the_last_error() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let error = super::retry_complete_prompt_detection::<()>(
+            || {
+                attempts += 1;
+                Err(anyhow::anyhow!("prompt snapshot failure {attempts}"))
+            },
+            false,
+            |delay| waits.push(delay),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            attempts,
+            super::PROMPT_DETECTION_MAX_RETRIES.saturating_add(1)
+        );
+        assert_eq!(waits.len(), super::PROMPT_DETECTION_MAX_RETRIES);
+        assert_eq!(error.to_string(), "prompt snapshot failure 3");
+    }
+
+    #[test]
+    fn complete_no_prompt_snapshot_returns_without_retrying() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let snapshot = super::retry_complete_prompt_detection(
+            || {
+                attempts += 1;
+                Ok::<_, anyhow::Error>(None::<u8>)
+            },
+            false,
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, None);
+        assert_eq!(attempts, 1);
+        assert!(waits.is_empty());
+    }
+
+    #[test]
+    fn missing_prompt_retry_requires_a_fully_scoped_identity() {
+        assert!(super::scoped_prompt_retry_enabled(
+            Some(42),
+            Some("Sign in"),
+            Some("user@example.com")
+        ));
+        assert!(!super::scoped_prompt_retry_enabled(
+            None,
+            Some("Sign in"),
+            Some("user@example.com")
+        ));
+        assert!(!super::scoped_prompt_retry_enabled(
+            Some(42),
+            None,
+            Some("user@example.com")
+        ));
+        assert!(!super::scoped_prompt_retry_enabled(
+            Some(42),
+            Some("Sign in"),
+            None
+        ));
+    }
+
+    #[test]
+    fn scoped_missing_prompt_retries_until_hydrated() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let snapshot = super::retry_complete_prompt_detection(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Ok(None)
+                } else {
+                    Ok(Some("hydrated"))
+                }
+            },
+            true,
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, Some("hydrated"));
+        assert_eq!(attempts, 3);
+        assert_eq!(waits.len(), super::PROMPT_DETECTION_MAX_RETRIES);
+    }
+
+    #[test]
+    fn scoped_missing_prompt_retry_stays_bounded() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let snapshot = super::retry_complete_prompt_detection(
+            || {
+                attempts += 1;
+                Ok::<_, anyhow::Error>(None::<u8>)
+            },
+            true,
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, None);
+        assert_eq!(
+            attempts,
+            super::PROMPT_DETECTION_MAX_RETRIES.saturating_add(1)
+        );
+        assert_eq!(waits.len(), super::PROMPT_DETECTION_MAX_RETRIES);
     }
 
     #[test]
