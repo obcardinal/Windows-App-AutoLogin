@@ -1,3 +1,9 @@
+#[cfg(target_os = "macos")]
+#[path = "remote_pc_import.rs"]
+mod remote_pc_import;
+#[cfg(target_os = "macos")]
+use remote_pc_import::RemotePcLookup;
+
 use crate::app::{
     AutoLoginApp, BackgroundMutationExecutor, SettingsMutationGuard,
     CONFIG_MUTATION_RECOVERY_REASON,
@@ -2458,13 +2464,17 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         .show(ui.ctx(), |ui| {
             ui.set_width(ACCOUNT_EDITOR_WIDTH);
             if let Some(ref mut account) = editing {
+                #[cfg(target_os = "macos")]
+                if remote_pc_import::show_if_open(ui, account) {
+                    return;
+                }
                 account_editor_input_scope(ui, |ui| {
                     egui::Grid::new("account_editor_grid")
                         .num_columns(2)
                         .spacing([16.0, 10.0])
                         .show(ui, |ui| {
                             account_editor_field_label(ui, "Email");
-                            let email = ui.add_sized(
+                            ui.add_sized(
                                 [ACCOUNT_EDITOR_FIELD_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT],
                                 egui::TextEdit::singleline(&mut account.username)
                                     .hint_text("user@domain.com"),
@@ -2500,26 +2510,24 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                             ui.end_row();
 
                             let label = account_editor_field_label(ui, "Remote PC");
-                            let remote_pc = ui.add_sized(
+                            ui.add_sized(
                                 [ACCOUNT_EDITOR_FIELD_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT],
                                 egui::TextEdit::singleline(&mut account.remote_pc)
-                                    .hint_text("pc.example.com (optional)"),
+                                    .hint_text("Hostname or IP address"),
                             )
                             .labelled_by(label.id);
                             ui.end_row();
                             #[cfg(target_os = "macos")]
                             {
                                 ui.label("");
-                                show_remote_pc_lookup(ui, account, email.changed() || remote_pc.changed());
+                                remote_pc_import::import_button(ui, account);
                                 ui.end_row();
                             }
-                            #[cfg(not(target_os = "macos"))]
-                            let _ = (email, remote_pc);
                         });
                 });
                 ui.add(
                     egui::Label::new(theme::muted(
-                        "Use Connection Information → Remote PC to match this account for automatic remote desktop sign-in. With one account, you can leave it blank.",
+                        "Remote PC matches this account to its desktop for automatic sign-in. Leave it blank if this is your only account.",
                     ))
                     .wrap(),
                 );
@@ -2592,55 +2600,6 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         // created while the user explicitly revealed the password.
         ui.ctx().request_repaint();
     }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Default)]
-struct RemotePcLookup(std::sync::Arc<std::sync::OnceLock<Option<String>>>);
-
-#[cfg(target_os = "macos")]
-fn show_remote_pc_lookup(ui: &mut egui::Ui, account: &mut Account, user_edited: bool) {
-    let id = egui::Id::new(("lookup_remote_pc", &account.id));
-    let lookup = ui.ctx().data_mut(|data| {
-        if user_edited {
-            data.remove::<RemotePcLookup>(id);
-        }
-        data.get_temp::<RemotePcLookup>(id)
-    });
-    let result = lookup.as_ref().and_then(|lookup| lookup.0.get());
-    let pending = lookup.is_some() && result.is_none();
-    ui.vertical(|ui| {
-        ui.set_width(ACCOUNT_EDITOR_FIELD_WIDTH);
-        let label = if pending { "Reading…" } else { "Use from Windows App" };
-        if ui.add_enabled(!pending, egui::Button::new(label).small()).clicked() {
-            let task = RemotePcLookup::default();
-            ui.ctx().data_mut(|data| data.insert_temp(id, task.clone()));
-            let ctx = ui.ctx().clone();
-            let completion = task.clone();
-            if std::thread::Builder::new()
-                .name("remote-pc-lookup".into())
-                .spawn(move || {
-                    let remote_pc = crate::macos_ax::remote_pc_info::open_connection_remote_pc().ok();
-                    let _ = completion.0.set(remote_pc);
-                    ctx.request_repaint();
-                })
-                .is_err()
-            {
-                let _ = task.0.set(None);
-                ui.ctx().request_repaint();
-            }
-        } else if let Some(address) = result {
-            if let Some(host) = address {
-                account.remote_pc.clone_from(host);
-                ui.ctx().data_mut(|data| data.remove::<RemotePcLookup>(id));
-                ui.ctx().request_repaint();
-            } else {
-                ui.add(egui::Label::new(theme::muted(
-                    "Open Connection Information for just one desktop in Windows App, then try again.",
-                )).wrap());
-            }
-        }
-    });
 }
 
 fn account_editor_field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -5269,36 +5228,6 @@ mod tests {
         assert!(!rebased.enabled);
         assert!(rebased.has_saved_password);
         assert!(rebased.iphone_authenticator_enabled);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn remote_pc_lookup_only_applies_to_the_unedited_account_that_requested_it() {
-        let ctx = egui::Context::default();
-        let mut account = Account::new("first@example.com");
-        let mut other = Account::new("second@example.com");
-        let lookup_id = egui::Id::new(("lookup_remote_pc", &account.id));
-        let lookup = super::RemotePcLookup::default();
-        lookup.0.set(Some("pc.example.com".into())).unwrap();
-        ctx.data_mut(|data| data.insert_temp(lookup_id, lookup.clone()));
-        let _ = ctx.run_ui(Default::default(), |ui| {
-            super::show_remote_pc_lookup(ui, &mut other, false);
-        });
-        assert!(other.remote_pc.is_empty());
-        account.remote_pc = "manually-edited.example.com".into();
-        let _ = ctx.run_ui(Default::default(), |ui| {
-            super::show_remote_pc_lookup(ui, &mut account, true);
-        });
-        assert_eq!(account.remote_pc, "manually-edited.example.com");
-        assert!(ctx
-            .data_mut(|data| data.get_temp::<super::RemotePcLookup>(lookup_id))
-            .is_none());
-
-        ctx.data_mut(|data| data.insert_temp(lookup_id, lookup));
-        let _ = ctx.run_ui(Default::default(), |ui| {
-            super::show_remote_pc_lookup(ui, &mut account, false);
-        });
-        assert_eq!(account.remote_pc, "pc.example.com");
     }
 
     #[test]

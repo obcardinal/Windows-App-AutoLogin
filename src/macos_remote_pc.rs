@@ -6,8 +6,16 @@ use super::{
 use crate::remote_pc::{prompt_destination, PromptDestination};
 use anyhow::{ensure, Context};
 
-/// Import an explicitly opened native information dialog into an account draft.
-pub(crate) fn open_connection_remote_pc() -> anyhow::Result<String> {
+#[derive(Clone)]
+pub(crate) enum ConnectionInfo {
+    NoWindow,
+    SeveralWindows,
+    Unreadable,
+    Host(String),
+}
+
+/// Read the address for a preview. The user chooses whether to apply it.
+pub(crate) fn open_connection_remote_pc() -> anyhow::Result<ConnectionInfo> {
     let mut selected = None;
     for process in macos_identity::trusted_process_infos(crate::config::TARGET_APP_NAME)? {
         let app = AxElement::application(process.pid).context("Windows App is unavailable.")?;
@@ -28,16 +36,16 @@ pub(crate) fn open_connection_remote_pc() -> anyhow::Result<String> {
             if identity[0].as_deref() == Some(AX_WINDOW_ROLE)
                 && identity[1].as_deref() == Some(AX_DIALOG_SUBROLE)
             {
-                ensure!(
-                    selected.is_none(),
-                    "Leave only one Connection Information window open."
-                );
+                if selected.is_some() {
+                    return Ok(ConnectionInfo::SeveralWindows);
+                }
                 selected = Some((window, process.pid));
             }
         }
     }
-    let (window, pid) =
-        selected.context("Open Connection Information for the desktop in Windows App first.")?;
+    let Some((window, pid)) = selected else {
+        return Ok(ConnectionInfo::NoWindow);
+    };
     let mut sections = Vec::new();
     for content in children(&window, pid)? {
         if !role_matches(&content, "AXGroup")
@@ -70,7 +78,9 @@ pub(crate) fn open_connection_remote_pc() -> anyhow::Result<String> {
         .filter(|item| role_matches(item, AX_STATIC_TEXT_ROLE))
         .map(|item| native_text(item).context("An entry in Connection Information is unreadable."))
         .collect::<anyhow::Result<_>>()?;
-    host_from_connection_rows(&values).context("Windows App did not report a unique Remote PC.")
+    host_from_connection_rows(&values)
+        .map(ConnectionInfo::Host)
+        .context("Windows App did not report a unique Remote PC.")
 }
 
 fn children(parent: &AxElement, pid: i32) -> anyhow::Result<Vec<AxElement>> {
