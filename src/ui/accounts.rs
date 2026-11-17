@@ -2535,17 +2535,23 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                 #[cfg(target_os = "macos")]
                 {
                     ui.add_space(6.0);
-                    ui.checkbox(
-                        &mut account.iphone_authenticator_enabled,
-                        crate::ui::iphone_sign_in::TITLE,
-                    )
-                    .on_hover_text(crate::ui::iphone_sign_in::TRIGGER);
-                    if account.iphone_authenticator_enabled {
-                        crate::ui::iphone_sign_in::provider_picker(
-                            ui,
-                            &mut account.authenticator_provider,
-                        );
-                    }
+                    ui.label(egui::RichText::new("2FA").strong());
+                    account_editor_input_scope(ui, |ui| {
+                        egui::Grid::new("account_2fa_fields")
+                            .num_columns(2)
+                            .spacing([16.0, 10.0])
+                            .show(ui, |ui| {
+                                let label = account_editor_field_label(ui, "iPhone app");
+                                crate::ui::iphone_sign_in::provider_picker(
+                                    ui, account, ACCOUNT_EDITOR_FIELD_WIDTH,
+                                )
+                                .labelled_by(label.id);
+                                ui.end_row();
+                            });
+                    });
+                    ui.add(
+                        egui::Label::new(theme::muted(crate::ui::iphone_sign_in::ACCOUNT_HELP)).wrap(),
+                    );
                 }
 
                 ui.separator();
@@ -2601,6 +2607,33 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         // created while the user explicitly revealed the password.
         ui.ctx().request_repaint();
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn account_picker_button(
+    ui: &mut egui::Ui,
+    popup_id: egui::Id,
+    selection: &str,
+    field_width: f32,
+) -> egui::Response {
+    let mut button = egui::Button::new(selection)
+        .right_text(
+            egui::Image::new(egui::include_image!("../../assets/icons/caret-down.svg"))
+                .fit_to_exact_size(egui::Vec2::splat(14.0)),
+        )
+        .image_tint_follows_text_color(true)
+        .truncate();
+    if egui::Popup::is_id_open(ui.ctx(), popup_id) {
+        button = button.stroke(ui.visuals().selection.stroke);
+    }
+    let response = ui.add_sized([field_width, ACCOUNT_EDITOR_CONTROL_HEIGHT], button);
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::new(egui::WidgetType::ComboBox);
+        info.enabled = response.enabled();
+        info.current_text_value = Some(selection.to_owned());
+        info
+    });
+    response
 }
 
 fn account_editor_field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
