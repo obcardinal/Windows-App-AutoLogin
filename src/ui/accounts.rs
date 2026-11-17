@@ -1878,9 +1878,12 @@ fn show_accounts_page_header(
                 ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
                 ui.add_enabled(
                     controls_enabled,
-                    theme::primary_button("+ Add Account")
-                        .wrap_mode(egui::TextWrapMode::Extend)
-                        .min_size(egui::vec2(144.0, 32.0)),
+                    theme::primary_button_with_icon(
+                        "Add Account",
+                        theme::toolbar_icon(egui::include_image!("../../assets/icons/plus.svg")),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend)
+                    .min_size(egui::vec2(144.0, 32.0)),
                 )
             })
             .inner
