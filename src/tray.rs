@@ -5,6 +5,9 @@ use tray_icon::{
     TrayIconBuilder,
 };
 
+#[cfg(target_os = "windows")]
+mod windows_visibility;
+
 #[derive(Debug, Clone)]
 pub(crate) enum TrayCommand {
     OpenAccounts,
@@ -19,6 +22,8 @@ pub(crate) enum TrayCommand {
 
 pub(crate) struct AppTray {
     _tray: tray_icon::TrayIcon,
+    #[cfg(target_os = "windows")]
+    windows_visibility: windows_visibility::WindowsTrayVisibility,
     monitor_i: MenuItem,
     #[cfg(not(target_os = "windows"))]
     accessibility_i: Option<MenuItem>,
@@ -27,6 +32,17 @@ pub(crate) struct AppTray {
 }
 
 impl AppTray {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_icon_hidden(&self, hidden: bool) -> anyhow::Result<()> {
+        self._tray.set_visible(!hidden)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_icon_hidden(&self, hidden: bool) -> anyhow::Result<()> {
+        self.windows_visibility.set_hidden(hidden)
+    }
+
     pub(crate) fn set_monitor_control_state(&self, state: MonitorControlState) {
         self.monitor_i.set_text(state.toggle_label());
     }
@@ -92,6 +108,8 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         .with_icon(icon)
         .with_icon_as_template(tray_icon_uses_template_rendering())
         .build()?;
+    #[cfg(target_os = "windows")]
+    let windows_visibility = windows_visibility::WindowsTrayVisibility::new(tray.clone());
 
     let accounts_id = accounts_i.id().clone();
     let settings_id = settings_i.id().clone();
@@ -149,6 +167,8 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 
     Ok(AppTray {
         _tray: tray,
+        #[cfg(target_os = "windows")]
+        windows_visibility,
         monitor_i: toggle_i,
         #[cfg(not(target_os = "windows"))]
         accessibility_i,

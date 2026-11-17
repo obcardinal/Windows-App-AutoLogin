@@ -3,6 +3,7 @@
   "settings": {
     "auto_start": false,
     "start_minimized": false,
+    "hide_menu_bar_icon": false,
     "use_keyring": true
   }
 }

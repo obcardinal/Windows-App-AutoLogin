@@ -29,6 +29,7 @@ const SETTINGS_JOB_DISCONNECTED_REASON: &str =
 struct QueuedSettingsIntent {
     auto_start: Option<bool>,
     start_minimized: Option<bool>,
+    hide_menu_bar_icon: Option<bool>,
     use_keyring: Option<bool>,
 }
 
@@ -39,6 +40,9 @@ impl QueuedSettingsIntent {
         }
         if before.start_minimized != after.start_minimized {
             self.start_minimized = Some(after.start_minimized);
+        }
+        if before.hide_menu_bar_icon != after.hide_menu_bar_icon {
+            self.hide_menu_bar_icon = Some(after.hide_menu_bar_icon);
         }
         if before.use_keyring != after.use_keyring {
             self.use_keyring = Some(after.use_keyring);
@@ -52,6 +56,11 @@ impl QueuedSettingsIntent {
         if self.start_minimized.is_none() && requested.start_minimized != latest.start_minimized {
             self.start_minimized = Some(latest.start_minimized);
         }
+        if self.hide_menu_bar_icon.is_none()
+            && requested.hide_menu_bar_icon != latest.hide_menu_bar_icon
+        {
+            self.hide_menu_bar_icon = Some(latest.hide_menu_bar_icon);
+        }
         if self.use_keyring.is_none() && requested.use_keyring != latest.use_keyring {
             self.use_keyring = Some(latest.use_keyring);
         }
@@ -64,6 +73,9 @@ impl QueuedSettingsIntent {
         }
         if let Some(value) = self.start_minimized {
             rebased.start_minimized = value;
+        }
+        if let Some(value) = self.hide_menu_bar_icon {
+            rebased.hide_menu_bar_icon = value;
         }
         if let Some(value) = self.use_keyring {
             rebased.use_keyring = value;
@@ -147,9 +159,33 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                 settings_changed |= add_setting_description(
                     start_minimized,
                     settings_ready,
-                    "The app keeps running from the menu bar or system tray.",
+                    "The app keeps running in the background.",
                     disabled_reason.as_deref(),
                 );
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    let icon_visibility_label = if cfg!(target_os = "windows") {
+                        "Hide system tray icon"
+                    } else {
+                        "Hide menu bar icon"
+                    };
+                    let hide_menu_bar_icon = ui.add_enabled(
+                        settings_ready,
+                        egui::Checkbox::new(
+                            &mut app.settings_draft.hide_menu_bar_icon,
+                            icon_visibility_label,
+                        ),
+                    );
+                    settings_changed |= add_setting_description(
+                        hide_menu_bar_icon,
+                        settings_ready,
+                        "Hide the icon while the app keeps running in the background.",
+                        disabled_reason.as_deref(),
+                    );
+                    ui.label(theme::muted(
+                        "Open Windows App AutoLogin again, then choose Settings to restore the icon.",
+                    ));
+                }
                 if let Some(reason) = disabled_reason.as_deref() {
                     ui.add_space(4.0);
                     ui.label(theme::muted(reason));
@@ -1435,6 +1471,7 @@ mod tests {
         requested.start_minimized = true;
         let mut latest = requested.clone();
         latest.auto_start = true;
+        latest.hide_menu_bar_icon = true;
         app.settings_draft = latest.clone();
 
         let (sender, receiver) = sync_channel(1);
@@ -1527,6 +1564,7 @@ mod tests {
 
         let mut latest = requested.clone();
         latest.auto_start = false;
+        latest.hide_menu_bar_icon = true;
         latest.use_keyring = true;
 
         let mut authoritative = requested.clone();
@@ -1541,6 +1579,7 @@ mod tests {
 
         assert!(!rebased.auto_start);
         assert!(rebased.start_minimized);
+        assert!(rebased.hide_menu_bar_icon);
         assert!(rebased.use_keyring);
         assert_eq!(rebased.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
     }
@@ -1549,15 +1588,18 @@ mod tests {
     fn explicit_toggle_away_and_back_survives_partial_active_result() {
         let requested = AppSettings {
             auto_start: true,
+            hide_menu_bar_icon: true,
             ..AppSettings::default()
         };
         let latest = requested.clone();
         let mut authoritative = requested.clone();
         authoritative.auto_start = false;
+        authoritative.hide_menu_bar_icon = false;
         let mut queued_intent = QueuedSettingsIntent::default();
 
         let mut away = requested.clone();
         away.auto_start = false;
+        away.hide_menu_bar_icon = false;
         queued_intent.record_changes(&requested, &away);
         queued_intent.record_changes(&away, &latest);
 
@@ -1565,6 +1607,7 @@ mod tests {
             rebase_latest_settings_intent(&requested, &latest, &queued_intent, &authoritative);
 
         assert!(rebased.auto_start);
+        assert!(rebased.hide_menu_bar_icon);
         assert_ne!(rebased, authoritative);
     }
 

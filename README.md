@@ -190,7 +190,11 @@ When the matching Windows App credential prompt is visible and Windows App is fr
 
 ## Menu-Bar App
 
-The app always keeps a lightweight supervisor in the menu bar. On a fresh launch it opens the Accounts window unless **Hide main window at launch** is enabled; when that setting is enabled, startup remains menu-bar only. The menu contains:
+The app keeps a lightweight supervisor running in the background. On a fresh launch it opens the Accounts window unless **Hide main window at launch** is enabled.
+
+Under **Settings → System**, **Hide menu bar icon** (macOS) or **Hide system tray icon** (Windows) hides the icon without stopping the app. This option is off by default, is saved automatically, and takes effect without restarting. Open Windows App AutoLogin again from Finder or Spotlight on macOS, or launch its shortcut or main executable again on Windows, to return to the window and restore the icon in Settings. Both platforms store this preference as `hide_menu_bar_icon` in the configuration.
+
+The menu contains:
 
 - **Open Accounts**
 - **Open Settings**
@@ -209,7 +213,7 @@ The heavier settings UI is launched only when needed. Closing the settings windo
 The settings window includes:
 
 - **Accounts**: add, edit, pause, enable, or delete saved accounts.
-- **Settings**: adjust Open at Login and storage mode.
+- **Settings**: adjust Open at Login, launch window visibility, menu-bar or system-tray icon visibility, and storage mode.
 - **Diagnose**: only when built with development diagnostics features.
 
 Existing accounts can be edited without re-entering a password. Leave the password field blank to keep the saved password.
@@ -238,6 +242,7 @@ Example:
   "settings": {
     "auto_start": false,
     "start_minimized": false,
+    "hide_menu_bar_icon": false,
     "use_keyring": true
   }
 }

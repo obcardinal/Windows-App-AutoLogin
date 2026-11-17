@@ -41,6 +41,8 @@ pub struct AppSettings {
     pub poll_interval_secs: u64,
     pub auto_start: bool,
     pub start_minimized: bool,
+    /// Hide the macOS menu-bar icon or Windows system-tray icon.
+    pub hide_menu_bar_icon: bool,
     pub use_keyring: bool,
 }
 
@@ -50,6 +52,7 @@ impl Default for AppSettings {
             poll_interval_secs: FIXED_POLL_INTERVAL_SECS,
             auto_start: false,
             start_minimized: false,
+            hide_menu_bar_icon: false,
             use_keyring: true,
         }
     }

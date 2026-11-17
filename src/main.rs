@@ -25,6 +25,8 @@ pub(crate) mod debug_fill;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_ax;
 pub(crate) mod macos_identity;
+#[cfg(target_os = "macos")]
+mod macos_reopen;
 pub(crate) mod models;
 pub(crate) mod monitor;
 pub(crate) mod private_permissions;
@@ -803,6 +805,8 @@ struct LightweightSupervisor {
     worker_invalidator: background::WorkerInvalidator,
     worker_pause_latch: background::WorkerPauseLatch,
     tray: Option<tray::AppTray>,
+    #[cfg(target_os = "macos")]
+    reopen_registration: Option<macos_reopen::ReopenRegistration>,
     config: models::AppConfig,
     storage_recovery_ready: bool,
     storage_recovery_sticky_blocked: bool,
@@ -859,6 +863,8 @@ impl LightweightSupervisor {
             worker_invalidator,
             worker_pause_latch,
             tray: None,
+            #[cfg(target_os = "macos")]
+            reopen_registration: None,
             config,
             storage_recovery_ready: true,
             storage_recovery_sticky_blocked: false,
@@ -2565,6 +2571,10 @@ impl LightweightSupervisor {
         let Some(tray) = &self.tray else {
             return;
         };
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Err(error) = tray.set_icon_hidden(self.config.settings.hide_menu_bar_icon) {
+            tracing::warn!(%error, "Could not update tray icon visibility");
+        }
         tray.set_accessibility_trusted(self.accessibility_trusted);
         tray.set_keychain_enabled(self.config.settings.use_keyring);
         tray.set_monitor_control_state(control_state);
@@ -2588,7 +2598,15 @@ impl ApplicationHandler for LightweightSupervisor {
         }
     }
 
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if self.reopen_registration.is_none() {
+            match macos_reopen::install(self.tray_tx.clone()) {
+                Ok(registration) => self.reopen_registration = Some(registration),
+                Err(error) => tracing::error!(%error, "Could not register macOS app reopening"),
+            }
+        }
+    }
 
     fn window_event(
         &mut self,
@@ -2872,6 +2890,7 @@ mod tests {
         supervisor.settings_mutation_active = true;
         let mut next_config = AppConfig::default();
         next_config.settings.start_minimized = true;
+        next_config.settings.hide_menu_bar_icon = true;
         let expected = next_config.clone();
         let ack_saw_no_released_command = std::cell::Cell::new(false);
 
@@ -4229,7 +4248,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
-    fn activate_ipc_pauses_running_monitor_before_opening_accounts() {
+    fn activate_ipc_opens_accounts_safely_with_icon_and_launch_window_hidden() {
         use super::single_instance::LocalIpcCommand;
 
         let (worker_tx, mut worker_rx) = tokio_channel(8);
@@ -4248,6 +4267,8 @@ mod tests {
         supervisor.desired_monitor_running = true;
         supervisor.accessibility_trusted = true;
         supervisor.resume_monitor_after_settings = false;
+        supervisor.config.settings.start_minimized = true;
+        supervisor.config.settings.hide_menu_bar_icon = true;
 
         assert!(supervisor.handle_authorized_local_ipc_command(LocalIpcCommand::Activate));
 
