@@ -4689,7 +4689,7 @@ dependencies = [
 
 [[package]]
 name = "windows-app-autologin"
-version = "0.4.1"
+version = "1.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
