@@ -30,6 +30,7 @@ struct QueuedSettingsIntent {
     auto_start: Option<bool>,
     start_minimized: Option<bool>,
     hide_menu_bar_icon: Option<bool>,
+    show_menu_diagnostics: Option<bool>,
     use_keyring: Option<bool>,
 }
 
@@ -43,6 +44,9 @@ impl QueuedSettingsIntent {
         }
         if before.hide_menu_bar_icon != after.hide_menu_bar_icon {
             self.hide_menu_bar_icon = Some(after.hide_menu_bar_icon);
+        }
+        if before.show_menu_diagnostics != after.show_menu_diagnostics {
+            self.show_menu_diagnostics = Some(after.show_menu_diagnostics);
         }
         if before.use_keyring != after.use_keyring {
             self.use_keyring = Some(after.use_keyring);
@@ -61,6 +65,11 @@ impl QueuedSettingsIntent {
         {
             self.hide_menu_bar_icon = Some(latest.hide_menu_bar_icon);
         }
+        if self.show_menu_diagnostics.is_none()
+            && requested.show_menu_diagnostics != latest.show_menu_diagnostics
+        {
+            self.show_menu_diagnostics = Some(latest.show_menu_diagnostics);
+        }
         if self.use_keyring.is_none() && requested.use_keyring != latest.use_keyring {
             self.use_keyring = Some(latest.use_keyring);
         }
@@ -76,6 +85,9 @@ impl QueuedSettingsIntent {
         }
         if let Some(value) = self.hide_menu_bar_icon {
             rebased.hide_menu_bar_icon = value;
+        }
+        if let Some(value) = self.show_menu_diagnostics {
+            rebased.show_menu_diagnostics = value;
         }
         if let Some(value) = self.use_keyring {
             rebased.use_keyring = value;
@@ -186,6 +198,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                         "Open Windows App AutoLogin again, then choose Settings to restore the icon.",
                     ));
                 }
+                let menu_diagnostics = ui.add_enabled(
+                    settings_ready,
+                    egui::Checkbox::new(
+                        &mut app.settings_draft.show_menu_diagnostics,
+                        "Show diagnostic info in menu",
+                    ),
+                );
+                settings_changed |= add_setting_description(
+                    menu_diagnostics,
+                    settings_ready,
+                    "Show status information in the app menu, including password storage and the last fill result.",
+                    disabled_reason.as_deref(),
+                );
                 if let Some(reason) = disabled_reason.as_deref() {
                     ui.add_space(4.0);
                     ui.label(theme::muted(reason));
@@ -1472,6 +1497,7 @@ mod tests {
         let mut latest = requested.clone();
         latest.auto_start = true;
         latest.hide_menu_bar_icon = true;
+        latest.show_menu_diagnostics = false;
         app.settings_draft = latest.clone();
 
         let (sender, receiver) = sync_channel(1);
@@ -1565,6 +1591,7 @@ mod tests {
         let mut latest = requested.clone();
         latest.auto_start = false;
         latest.hide_menu_bar_icon = true;
+        latest.show_menu_diagnostics = false;
         latest.use_keyring = true;
 
         let mut authoritative = requested.clone();
@@ -1580,6 +1607,7 @@ mod tests {
         assert!(!rebased.auto_start);
         assert!(rebased.start_minimized);
         assert!(rebased.hide_menu_bar_icon);
+        assert!(!rebased.show_menu_diagnostics);
         assert!(rebased.use_keyring);
         assert_eq!(rebased.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
     }
@@ -1595,11 +1623,13 @@ mod tests {
         let mut authoritative = requested.clone();
         authoritative.auto_start = false;
         authoritative.hide_menu_bar_icon = false;
+        authoritative.show_menu_diagnostics = false;
         let mut queued_intent = QueuedSettingsIntent::default();
 
         let mut away = requested.clone();
         away.auto_start = false;
         away.hide_menu_bar_icon = false;
+        away.show_menu_diagnostics = false;
         queued_intent.record_changes(&requested, &away);
         queued_intent.record_changes(&away, &latest);
 
@@ -1608,6 +1638,7 @@ mod tests {
 
         assert!(rebased.auto_start);
         assert!(rebased.hide_menu_bar_icon);
+        assert!(rebased.show_menu_diagnostics);
         assert_ne!(rebased, authoritative);
     }
 

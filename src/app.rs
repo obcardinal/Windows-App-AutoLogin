@@ -1761,6 +1761,11 @@ impl AutoLoginApp {
             match cmd {
                 TrayCommand::OpenAccounts => self.present_tab(ctx, Tab::Accounts, || {}),
                 TrayCommand::OpenSettings => self.present_tab(ctx, Tab::Settings, || {}),
+                TrayCommand::OpenAbout => {
+                    if let Err(error) = crate::about::show() {
+                        tracing::warn!(%error, "Could not open About window");
+                    }
+                }
                 TrayCommand::PresentAccounts(acknowledgement) => {
                     self.present_tab(ctx, Tab::Accounts, move || {
                         let _ = acknowledgement.send(());

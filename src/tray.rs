@@ -1,4 +1,5 @@
 use crate::models::MonitorControlState;
+use std::cell::Cell;
 use std::sync::mpsc::Sender;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -12,6 +13,7 @@ mod windows_visibility;
 pub(crate) enum TrayCommand {
     OpenAccounts,
     OpenSettings,
+    OpenAbout,
     PresentAccounts(Sender<()>),
     PresentSettings(Sender<()>),
     ToggleMonitor,
@@ -22,6 +24,9 @@ pub(crate) enum TrayCommand {
 
 pub(crate) struct AppTray {
     _tray: tray_icon::TrayIcon,
+    diagnostic_menu: Menu,
+    compact_menu: Menu,
+    diagnostics_visible: Cell<bool>,
     #[cfg(target_os = "windows")]
     windows_visibility: windows_visibility::WindowsTrayVisibility,
     monitor_i: MenuItem,
@@ -32,6 +37,19 @@ pub(crate) struct AppTray {
 }
 
 impl AppTray {
+    pub(crate) fn set_diagnostics_visible(&self, visible: bool) {
+        if self.diagnostics_visible.get() == visible {
+            return;
+        }
+        let menu = if visible {
+            &self.diagnostic_menu
+        } else {
+            &self.compact_menu
+        };
+        self._tray.set_menu(Some(Box::new(menu.clone())));
+        self.diagnostics_visible.set(visible);
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn set_icon_hidden(&self, hidden: bool) -> anyhow::Result<()> {
         self._tray.set_visible(!hidden)?;
@@ -70,6 +88,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let menu = Menu::new();
     let accounts_i = MenuItem::new("Accounts", true, None);
     let settings_i = MenuItem::new("Settings", true, None);
+    let about_i = MenuItem::new("About", true, None);
     let toggle_i = MenuItem::new("Start Monitor", true, None);
     let request_accessibility_i = automation_request_item();
     let open_accessibility_i = automation_settings_item();
@@ -81,29 +100,37 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let quit_separator = PredefinedMenuItem::separator();
     let quit_i = MenuItem::new("Quit", true, None);
 
-    menu.append(&accounts_i)?;
-    menu.append(&settings_i)?;
-    menu.append(&toggle_i)?;
-    if let Some(request_accessibility_i) = &request_accessibility_i {
-        menu.append(&permission_separator)?;
-        menu.append(request_accessibility_i)?;
+    // Both menus share item handles, so commands keep their IDs and status updates
+    // made while diagnostics are hidden are visible immediately when restored.
+    let compact_menu = Menu::new();
+    for (menu, diagnostics_visible) in [(&menu, true), (&compact_menu, false)] {
+        menu.append(&accounts_i)?;
+        menu.append(&settings_i)?;
+        menu.append(&toggle_i)?;
+        if let Some(request_accessibility_i) = &request_accessibility_i {
+            menu.append(&permission_separator)?;
+            menu.append(request_accessibility_i)?;
+        }
+        if let Some(open_accessibility_i) = &open_accessibility_i {
+            menu.append(open_accessibility_i)?;
+        }
+        if diagnostics_visible {
+            menu.append(&status_separator)?;
+            if let Some(accessibility_i) = &accessibility_i {
+                menu.append(accessibility_i)?;
+            }
+            menu.append(&keychain_i)?;
+            menu.append(&last_result_i)?;
+        }
+        menu.append(&quit_separator)?;
+        menu.append(&about_i)?;
+        menu.append(&quit_i)?;
     }
-    if let Some(open_accessibility_i) = &open_accessibility_i {
-        menu.append(open_accessibility_i)?;
-    }
-    menu.append(&status_separator)?;
-    if let Some(accessibility_i) = &accessibility_i {
-        menu.append(accessibility_i)?;
-    }
-    menu.append(&keychain_i)?;
-    menu.append(&last_result_i)?;
-    menu.append(&quit_separator)?;
-    menu.append(&quit_i)?;
 
     let icon = load_icon()?;
 
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_tooltip("Windows App AutoLogin")
         .with_icon(icon)
         .with_icon_as_template(tray_icon_uses_template_rendering())
@@ -113,6 +140,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 
     let accounts_id = accounts_i.id().clone();
     let settings_id = settings_i.id().clone();
+    let about_id = about_i.id().clone();
     let toggle_id = toggle_i.id().clone();
     let request_accessibility_id = request_accessibility_i
         .as_ref()
@@ -122,6 +150,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 
     let tx_accounts = tx.clone();
     let tx_settings = tx.clone();
+    let tx_about = tx.clone();
     let tx_toggle = tx.clone();
     let tx_request_accessibility = tx.clone();
     let tx_open_accessibility = tx.clone();
@@ -137,6 +166,10 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
                 }
                 if event.id == settings_id {
                     let _ = tx_settings.send(TrayCommand::OpenSettings);
+                    continue;
+                }
+                if event.id == about_id {
+                    let _ = tx_about.send(TrayCommand::OpenAbout);
                     continue;
                 }
                 if event.id == toggle_id {
@@ -167,6 +200,9 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 
     Ok(AppTray {
         _tray: tray,
+        diagnostic_menu: menu,
+        compact_menu,
+        diagnostics_visible: Cell::new(true),
         #[cfg(target_os = "windows")]
         windows_visibility,
         monitor_i: toggle_i,

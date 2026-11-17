@@ -43,6 +43,7 @@ pub struct AppSettings {
     pub start_minimized: bool,
     /// Hide the macOS menu-bar icon or Windows system-tray icon.
     pub hide_menu_bar_icon: bool,
+    pub show_menu_diagnostics: bool,
     pub use_keyring: bool,
 }
 
@@ -53,6 +54,7 @@ impl Default for AppSettings {
             auto_start: false,
             start_minimized: false,
             hide_menu_bar_icon: false,
+            show_menu_diagnostics: true,
             use_keyring: true,
         }
     }

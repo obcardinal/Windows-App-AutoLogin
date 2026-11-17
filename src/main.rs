@@ -15,6 +15,7 @@ compile_error!(
     "diagnostics-ui is development-only in release builds; enable release-diagnostics only for intentional support artifacts"
 );
 
+pub(crate) mod about;
 pub(crate) mod app;
 pub(crate) mod app_identity;
 pub(crate) mod autologin;
@@ -1006,6 +1007,11 @@ impl LightweightSupervisor {
             match command {
                 tray::TrayCommand::OpenAccounts => self.open_accounts_window(),
                 tray::TrayCommand::OpenSettings => self.open_settings_window(),
+                tray::TrayCommand::OpenAbout => {
+                    if let Err(error) = about::show() {
+                        tracing::warn!(%error, "Could not open About window");
+                    }
+                }
                 tray::TrayCommand::PresentAccounts(_) | tray::TrayCommand::PresentSettings(_) => {
                     tracing::warn!("Rejected a child-only presentation command in the supervisor");
                 }
@@ -2578,6 +2584,7 @@ impl LightweightSupervisor {
         tray.set_accessibility_trusted(self.accessibility_trusted);
         tray.set_keychain_enabled(self.config.settings.use_keyring);
         tray.set_monitor_control_state(control_state);
+        tray.set_diagnostics_visible(self.config.settings.show_menu_diagnostics);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2891,6 +2898,7 @@ mod tests {
         let mut next_config = AppConfig::default();
         next_config.settings.start_minimized = true;
         next_config.settings.hide_menu_bar_icon = true;
+        next_config.settings.show_menu_diagnostics = false;
         let expected = next_config.clone();
         let ack_saw_no_released_command = std::cell::Cell::new(false);
 

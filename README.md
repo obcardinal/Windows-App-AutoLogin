@@ -194,6 +194,8 @@ The app keeps a lightweight supervisor running in the background. On a fresh lau
 
 Under **Settings → System**, **Hide menu bar icon** (macOS) or **Hide system tray icon** (Windows) hides the icon without stopping the app. This option is off by default, is saved automatically, and takes effect without restarting. Open Windows App AutoLogin again from Finder or Spotlight on macOS, or launch its shortcut or main executable again on Windows, to return to the window and restore the icon in Settings. Both platforms store this preference as `hide_menu_bar_icon` in the configuration.
 
+**Show diagnostic info in menu** controls the gray status lines: Accessibility (macOS), password storage, and the last fill result. It is on by default on both platforms, saves automatically, and applies without restarting. Turning it off hides only those lines and their separator; menu actions remain available.
+
 The menu contains:
 
 - **Open Accounts**
@@ -204,16 +206,19 @@ The menu contains:
 - Accessibility status
 - Password storage status
 - Last fill result
+- **About**: application icon, version, release date, author, and contact links
 - **Quit**
 
 The heavier settings UI is launched only when needed. Closing the settings window returns the app to the lightweight menu-bar process.
+
+**About** opens a separate native window and remains available when diagnostic info is hidden. On macOS it uses the same standard About panel and spacing as Instance Control: bundle icon, version, localized release date, author link, and contact icons. Windows uses a native modeless About window with the same information. The release date is tied to the published version; an unknown version does not inherit an older release's date. Opening or closing About does not stop the monitor or open the Accounts/Settings window.
 
 ## Settings Window
 
 The settings window includes:
 
 - **Accounts**: add, edit, pause, enable, or delete saved accounts.
-- **Settings**: adjust Open at Login, launch window visibility, menu-bar or system-tray icon visibility, and storage mode.
+- **Settings**: adjust Open at Login, launch window visibility, menu-bar or system-tray icon visibility, diagnostic info in the menu, and storage mode.
 - **Diagnose**: only when built with development diagnostics features.
 
 Existing accounts can be edited without re-entering a password. Leave the password field blank to keep the saved password.
@@ -243,6 +248,7 @@ Example:
     "auto_start": false,
     "start_minimized": false,
     "hide_menu_bar_icon": false,
+    "show_menu_diagnostics": true,
     "use_keyring": true
   }
 }
