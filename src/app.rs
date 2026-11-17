@@ -22,7 +22,6 @@ use tokio::sync::mpsc::Sender as TokioSender;
 use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
-const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const ACCESSIBILITY_REQUEST_BUTTON_SIZE: [f32; 2] = [278.0, 34.0];
 const ACCESSIBILITY_SETTINGS_BUTTON_SIZE: [f32; 2] = [248.0, 34.0];
 const ACCESSIBILITY_SETTINGS_INSTRUCTIONS: &str =
@@ -2263,21 +2262,33 @@ impl eframe::App for AutoLoginApp {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let previous_button_padding = ui.spacing().button_padding;
                         ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-                        for (tab, label) in [
-                            (Tab::Accounts, "Accounts"),
-                            (Tab::Settings, "Settings"),
+                        for (tab, label, icon) in [
+                            (
+                                Tab::Accounts,
+                                "Accounts",
+                                Some(egui::include_image!("../assets/icons/users.svg")),
+                            ),
+                            (
+                                Tab::Settings,
+                                "Settings",
+                                Some(egui::include_image!("../assets/icons/settings.svg")),
+                            ),
                             #[cfg(feature = "diagnostics-ui")]
-                            (Tab::Diagnose, "Diagnose"),
+                            (Tab::Diagnose, "Diagnose", None),
                         ] {
                             let selected = self.selected_tab == tab;
+                            let mut contents =
+                                egui::Atoms::new(egui::RichText::new(label).strong());
+                            if let Some(icon) = icon {
+                                contents.push_left(theme::toolbar_icon(icon));
+                            }
                             if ui
                                 .add(
-                                    egui::Button::selectable(
-                                        selected,
-                                        egui::RichText::new(label).strong(),
-                                    )
-                                    .corner_radius(egui::CornerRadius::same(8))
-                                    .min_size(egui::vec2(0.0, 30.0)),
+                                    egui::Button::selectable(selected, contents)
+                                        .image_tint_follows_text_color(true)
+                                        .wrap_mode(egui::TextWrapMode::Extend)
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .min_size(egui::vec2(0.0, 30.0)),
                                 )
                                 .clicked()
                             {
@@ -2288,14 +2299,6 @@ impl eframe::App for AutoLoginApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(68.0, 30.0),
-                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                            |ui| {
-                                ui.label(theme::version_label(APP_VERSION_LABEL));
-                            },
-                        );
-
                         // Keep Start/Stop available while onboarding so a
                         // pending permission-gated Start can also be cancelled.
                         show_monitor_control(ui, self);
@@ -2343,11 +2346,20 @@ fn push_bounded_log(logs: &mut VecDeque<LogEntry>, mut entry: LogEntry) {
 fn show_monitor_control(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let state = app.monitor_control_state();
     let button = if state.toggle_requests_stop() {
-        theme::secondary_button(state.toggle_label())
+        theme::secondary_button_with_icon(
+            state.toggle_label(),
+            theme::toolbar_icon(egui::include_image!("../assets/icons/stop.svg")),
+        )
     } else {
-        theme::primary_button(state.toggle_label())
+        theme::primary_button_with_icon(
+            state.toggle_label(),
+            theme::toolbar_icon(egui::include_image!("../assets/icons/play.svg")),
+        )
     };
-    if ui.add_sized([140.0, 30.0], button).clicked() {
+    if ui
+        .add_sized([168.0, 30.0], button.wrap_mode(egui::TextWrapMode::Extend))
+        .clicked()
+    {
         app.toggle_monitor_from_ui(ui.ctx());
     }
 }

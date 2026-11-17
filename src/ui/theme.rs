@@ -185,11 +185,8 @@ pub fn muted(text: impl Into<String>) -> egui::RichText {
         .line_height(Some(22.0))
 }
 
-pub fn version_label(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text)
-        .color(MUTED)
-        .size(13.5)
-        .line_height(Some(18.0))
+pub fn toolbar_icon(source: egui::ImageSource<'static>) -> egui::Image<'static> {
+    egui::Image::new(source).fit_to_exact_size(egui::vec2(18.0, 18.0))
 }
 
 pub fn status_text(text: impl Into<String>) -> egui::RichText {
@@ -201,22 +198,54 @@ pub fn status_text(text: impl Into<String>) -> egui::RichText {
 }
 
 pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(
+    style_primary_button(egui::Button::new(
         egui::RichText::new(text.into())
             .strong()
             .color(egui::Color32::WHITE),
-    )
-    .fill(ACCENT)
-    .stroke(egui::Stroke::new(
-        1.0,
-        egui::Color32::from_rgb(43, 109, 166),
     ))
-    .corner_radius(egui::CornerRadius::same(7))
-    .min_size(egui::vec2(0.0, 28.0))
+}
+
+pub fn primary_button_with_icon(
+    text: impl Into<String>,
+    icon: egui::Image<'static>,
+) -> egui::Button<'static> {
+    style_primary_button(egui::Button::new((
+        icon.tint(egui::Color32::WHITE),
+        egui::RichText::new(text.into())
+            .strong()
+            .color(egui::Color32::WHITE),
+    )))
+}
+
+fn style_primary_button(button: egui::Button<'static>) -> egui::Button<'static> {
+    button
+        .fill(ACCENT)
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(43, 109, 166),
+        ))
+        .corner_radius(egui::CornerRadius::same(7))
+        .min_size(egui::vec2(0.0, 28.0))
 }
 
 pub fn secondary_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.into()).color(TEXT))
+    style_secondary_button(egui::Button::new(
+        egui::RichText::new(text.into()).color(TEXT),
+    ))
+}
+
+pub fn secondary_button_with_icon(
+    text: impl Into<String>,
+    icon: egui::Image<'static>,
+) -> egui::Button<'static> {
+    style_secondary_button(egui::Button::new((
+        icon.tint(TEXT),
+        egui::RichText::new(text.into()).color(TEXT),
+    )))
+}
+
+fn style_secondary_button(button: egui::Button<'static>) -> egui::Button<'static> {
+    button
         .fill(egui::Color32::from_rgb(246, 249, 252))
         .stroke(egui::Stroke::new(1.0, STROKE))
         .corner_radius(egui::CornerRadius::same(7))
