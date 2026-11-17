@@ -14,6 +14,8 @@ pub(crate) enum TrayCommand {
     OpenAccounts,
     OpenSettings,
     OpenAbout,
+    #[cfg(target_os = "macos")]
+    CheckForUpdates,
     PresentAccounts(Sender<()>),
     PresentSettings(Sender<()>),
     #[cfg(target_os = "macos")]
@@ -30,6 +32,8 @@ pub(crate) struct AppTray {
     #[cfg(target_os = "windows")]
     windows_visibility: windows_visibility::WindowsTrayVisibility,
     monitor_i: MenuItem,
+    #[cfg(target_os = "macos")]
+    updates_i: MenuItem,
     #[cfg(not(target_os = "windows"))]
     accessibility_i: Option<MenuItem>,
     keychain_i: MenuItem,
@@ -37,6 +41,11 @@ pub(crate) struct AppTray {
 }
 
 impl AppTray {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_updates_enabled(&self, enabled: bool) {
+        self.updates_i.set_enabled(enabled);
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn take_panel_click(&self) -> bool {
         // Drain the queue even after finding a click: move/enter/leave events
@@ -55,7 +64,7 @@ impl AppTray {
 
     #[cfg(target_os = "macos")]
     fn show_context_menu(&self) {
-        use objc2::rc::Retained;
+        use objc2_app_kit::NSMenu;
         use objc2_foundation::MainThreadMarker;
         use tray_icon::menu::ContextMenu;
 
@@ -72,16 +81,17 @@ impl AppTray {
             return;
         }
         let menu = self.current_menu();
-        let position = tray_icon::dpi::LogicalPosition::new(0.0, button.bounds().size.height);
-        // SAFETY: the retained AppKit button remains alive and attached to a
-        // window for the synchronous popup, which runs on the main thread.
+        // Let NSStatusItem position its menu beneath the menu-bar icon. A
+        // generic NSView popup can align around the pointer and jump above the
+        // menu bar. Attach only for this synchronous right-click tracking;
+        // keeping the menu attached would consume the next left click.
+        // SAFETY: Menu owns this NSMenu for the complete synchronous call and
+        // all AppKit access occurs on its main thread.
         unsafe {
-            button.highlight(true);
-            menu.show_context_menu_for_nsview(
-                Retained::as_ptr(&button).cast(),
-                Some(position.into()),
-            );
-            button.highlight(false);
+            let native_menu = &*menu.ns_menu().cast::<NSMenu>();
+            status_item.setMenu(Some(native_menu));
+            button.performClick(None);
+            status_item.setMenu(None);
         }
     }
 
@@ -149,6 +159,8 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let menu = Menu::new();
     let accounts_i = MenuItem::new("Accounts", true, None);
     let settings_i = MenuItem::new("Settings…", true, None);
+    #[cfg(target_os = "macos")]
+    let updates_i = MenuItem::new("Check for Updates…", true, None);
     let about_i = MenuItem::new("About Windows App AutoLogin", true, None);
     let toggle_i = MenuItem::new("Start Monitor", true, None);
     let accessibility_i = automation_status_item();
@@ -191,6 +203,8 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         menu.append(&about_i)?;
         menu.append(&settings_separator)?;
         menu.append(&settings_i)?;
+        #[cfg(target_os = "macos")]
+        menu.append(&updates_i)?;
         menu.append(&quit_separator)?;
         menu.append(&quit_i)?;
     }
@@ -213,6 +227,8 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 
     let accounts_id = accounts_i.id().clone();
     let settings_id = settings_i.id().clone();
+    #[cfg(target_os = "macos")]
+    let updates_id = updates_i.id().clone();
     let about_id = about_i.id().clone();
     let toggle_id = toggle_i.id().clone();
     let quit_id = quit_i.id().clone();
@@ -233,6 +249,11 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
                 }
                 if event.id == settings_id {
                     let _ = tx_settings.send(TrayCommand::OpenSettings);
+                    continue;
+                }
+                #[cfg(target_os = "macos")]
+                if event.id == updates_id {
+                    let _ = tx.send(TrayCommand::CheckForUpdates);
                     continue;
                 }
                 if event.id == about_id {
@@ -259,6 +280,8 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         #[cfg(target_os = "windows")]
         windows_visibility,
         monitor_i: toggle_i,
+        #[cfg(target_os = "macos")]
+        updates_i,
         #[cfg(not(target_os = "windows"))]
         accessibility_i,
         keychain_i,

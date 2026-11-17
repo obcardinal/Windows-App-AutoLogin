@@ -202,12 +202,27 @@ The menu follows these groups, separated by native menu dividers:
 
 - **Accounts** and **Start Monitor** / **Stop Monitor**, followed by the optional diagnostic block: Accessibility (macOS), password storage, and last fill result.
 - **About Windows App AutoLogin**: application icon, version, release date, author, and contact links.
-- **Settings…** (`⌘,` on macOS).
+- **Settings…** (`⌘,` on macOS), followed by **Check for Updates…** on macOS.
 - **Quit Windows App AutoLogin** (`⌘Q` on macOS).
 
 The heavier settings UI is launched only when needed. Closing a normal settings window returns the app to the lightweight menu-bar process. Dismissing the macOS panel keeps its UI process available so reopening it restores unfinished edits; monitoring continues according to the selected Start/Stop state.
 
 **About** opens a separate native window and remains available when diagnostic info is hidden. On macOS it uses the same standard About panel and spacing as Instance Control: bundle icon, version, localized release date, author link, and contact icons. Windows uses a native modeless About window with the same information. The release date is tied to the published version; an unknown version does not inherit an older release's date. Opening or closing About does not stop the monitor or open the Accounts/Settings window.
+
+### macOS software updates
+
+The packaged macOS app uses Sparkle 2.9.4 with its standard update windows, like Instance Control. **Check for Updates…** is available immediately after **Settings…** in both compact and diagnostic menus. Checking does not pause monitoring or open Accounts. Installing an update stops automation and lets the settings process finish pending saves before Sparkle replaces and relaunches the app. Cancelling installation restores normal operation.
+
+Production builds check every six hours and ask before installing. Local development bundles use a separate feed and manual checks by default. The two bundle identities cannot receive each other's releases:
+
+| Build | Bundle identifier | Feed |
+| --- | --- | --- |
+| Production | `com.obcardinal.WindowsAppAutoLogin` | `https://obcardinal.com/assets/downloads/windows-app-autologin/macos/appcast.xml` |
+| Development | `obcardinal.windows-app-autologin` | `https://obcardinal.com/assets/downloads/windows-app-autologin/macos/development/appcast.xml` |
+
+The feeds are served by the existing HTTPS website on Mac mini. Updates require a signature matching `macos/SparklePublicKey.txt`; the dedicated signing key stays in the login Keychain under account `windows-app-autologin`. Framework downloads are pinned by SHA-256, and the complete framework and its helpers are signed with the application before launch. `script/build_and_run.sh` includes this setup. A raw `cargo run` without a configured bundle shows an explanatory message when an update check is requested. The existing local-only release packager remains non-publishable; see [macos/UPDATES.md](macos/UPDATES.md) for producing update archives with an isolated builder and preparing a signed appcast.
+
+Companion applications can invoke `windows-app-autologin://check-for-updates` when the installed bundle advertises boolean `WAALSupportsCheckForUpdatesURL=true` in `Info.plist`. Use `NSWorkspace.open(_:withApplicationAt:configuration:completionHandler:)` with the exact installed application URL, so another development copy is not selected. Only that fixed URL is accepted; paths, query parameters, fragments, credentials and alternate feeds are rejected. Both a cold launch and an already-running UI child forward the action to the supervisor's updater.
 
 ## Settings Window
 

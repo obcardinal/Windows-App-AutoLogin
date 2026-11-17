@@ -1818,6 +1818,16 @@ impl AutoLoginApp {
                         tracing::warn!(%error, "Could not open About window");
                     }
                 }
+                #[cfg(target_os = "macos")]
+                TrayCommand::CheckForUpdates => {
+                    // Only the supervisor owns Sparkle; UI instances never
+                    // load a second updater or compete to replace the bundle.
+                    std::thread::spawn(|| {
+                        if let Err(error) = crate::single_instance::request_check_for_updates() {
+                            tracing::warn!(%error, "Could not request an update check");
+                        }
+                    });
+                }
                 TrayCommand::PresentAccounts(acknowledgement) => {
                     self.present_tab(ctx, Tab::Accounts, move || {
                         let _ = acknowledgement.send(());

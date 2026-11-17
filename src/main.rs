@@ -30,6 +30,8 @@ pub(crate) mod macos_identity;
 pub(crate) mod macos_panel;
 #[cfg(target_os = "macos")]
 mod macos_reopen;
+#[cfg(target_os = "macos")]
+mod macos_updates;
 pub(crate) mod models;
 pub(crate) mod monitor;
 pub(crate) mod private_permissions;
@@ -129,6 +131,17 @@ fn windows_full_ui_initial_tab_arg_is_valid(arg: &str) -> bool {
 }
 
 fn run_lightweight_supervisor() -> anyhow::Result<()> {
+    // Initialize AppKit before native storage/security work can service the
+    // initial LaunchServices event, then install our activation handlers.
+    #[cfg(target_os = "macos")]
+    let event_loop = EventLoop::new()?;
+    #[cfg(target_os = "macos")]
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
+    #[cfg(target_os = "macos")]
+    let reopen_registration = macos_reopen::install(tray_tx.clone())
+        .map_err(|error| tracing::error!(%error, "Could not register macOS activation"))
+        .ok();
     let single_instance = match single_instance::SingleInstanceGuard::acquire() {
         Ok(guard) => guard,
         Err(e) => {
@@ -159,7 +172,6 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
 
     let (worker_tx, worker_rx) = tokio_channel::<background::WorkerCommand>(32);
     let (worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
-    let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
     let worker_invalidator = background::WorkerInvalidator::new();
     let worker_pause_latch = worker_invalidator.pause_latch();
     let settings_session_token = single_instance::SettingsSessionToken::generate();
@@ -208,7 +220,9 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     );
     publish_initial_monitor_status(single_instance::write_monitor_status);
 
+    #[cfg(not(target_os = "macos"))]
     let event_loop = EventLoop::new()?;
+    #[cfg(not(target_os = "macos"))]
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut supervisor = LightweightSupervisor::new(
         worker_tx,
@@ -224,6 +238,16 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     .with_settings_session_token(settings_session_token)
     .with_storage_recovery_state(storage_recovery_ready)
     .with_storage_recovery_sticky_blocked(storage_recovery_sticky_blocked);
+    #[cfg(target_os = "macos")]
+    {
+        // Native startup/keychain work can already service Apple events.
+        // Retain the handler registered before that work, and refresh after
+        // native startup as well as after finishLaunching.
+        supervisor.reopen_registration = reopen_registration;
+        if let Some(registration) = &supervisor.reopen_registration {
+            registration.refresh();
+        }
+    }
     if !storage_recovery_ready
         && !storage_recovery_sticky_blocked
         && supervisor.accessibility_trusted
@@ -893,6 +917,12 @@ struct LightweightSupervisor {
     tray: Option<tray::AppTray>,
     #[cfg(target_os = "macos")]
     reopen_registration: Option<macos_reopen::ReopenRegistration>,
+    #[cfg(target_os = "macos")]
+    updater: Option<macos_updates::Updater>,
+    #[cfg(target_os = "macos")]
+    pending_update_check: bool,
+    #[cfg(target_os = "macos")]
+    update_resume_monitor: Option<bool>,
     config: models::AppConfig,
     storage_recovery_ready: bool,
     storage_recovery_sticky_blocked: bool,
@@ -952,6 +982,12 @@ impl LightweightSupervisor {
             tray: None,
             #[cfg(target_os = "macos")]
             reopen_registration: None,
+            #[cfg(target_os = "macos")]
+            updater: None,
+            #[cfg(target_os = "macos")]
+            pending_update_check: false,
+            #[cfg(target_os = "macos")]
+            update_resume_monitor: None,
             config,
             storage_recovery_ready: true,
             storage_recovery_sticky_blocked: false,
@@ -1109,6 +1145,8 @@ impl LightweightSupervisor {
                         tracing::warn!(%error, "Could not open About window");
                     }
                 }
+                #[cfg(target_os = "macos")]
+                tray::TrayCommand::CheckForUpdates => self.check_for_updates(),
                 tray::TrayCommand::PresentAccounts(_) | tray::TrayCommand::PresentSettings(_) => {
                     tracing::warn!("Rejected a child-only presentation command in the supervisor");
                 }
@@ -1119,13 +1157,95 @@ impl LightweightSupervisor {
                 tray::TrayCommand::ToggleMonitor => self.toggle_monitor(),
                 tray::TrayCommand::Exit => {
                     if self.handle_exit_request() {
-                        event_loop.exit();
-                        return true;
+                        return self.finish_exit(event_loop);
                     }
                 }
             }
         }
         false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_for_updates(&mut self) {
+        if !self.exit_requested {
+            tracing::debug!(target: "waal::updates", "Manual update check queued");
+            self.pending_update_check = true;
+            self.dispatch_pending_update_check();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dispatch_pending_update_check(&mut self) {
+        if self.pending_update_check && !self.exit_requested {
+            if let Some(updater) = &self.updater {
+                if updater.can_check_for_updates() {
+                    tracing::debug!(target: "waal::updates", "Presenting manual update check");
+                    self.pending_update_check = false;
+                    updater.check_for_updates();
+                } else {
+                    tracing::trace!(target: "waal::updates", "Waiting for Sparkle readiness");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_updater(&mut self) {
+        // A cold-launch URL can arrive before Sparkle completes its deferred
+        // startup (or while its background check is busy). Coalesce the request
+        // and retain it until a user-initiated check can actually be presented.
+        self.dispatch_pending_update_check();
+        let Some(updater) = &self.updater else {
+            return;
+        };
+        let failed = updater.take_installation_error();
+        let pending = updater.installation_pending();
+        let installing = updater.installation_started();
+        if let Some(tray) = &self.tray {
+            tray.set_updates_enabled(!self.exit_requested && updater.can_check_for_updates());
+        }
+        if failed {
+            if let Some(resume_monitor) = self.update_resume_monitor.take() {
+                // An authorization cancellation or installation failure must
+                // leave the still-running application usable.
+                self.exit_requested = false;
+                self.exit_shutdown_finalized = false;
+                self.settings_child_exit_deadline = None;
+                self.desired_monitor_running = resume_monitor;
+                self.resume_monitor_after_settings = resume_monitor;
+                if resume_monitor
+                    && self.settings_child.is_none()
+                    && self.storage_recovery_ready
+                    && self.accessibility_trusted
+                {
+                    self.queue_fresh_config_and_start();
+                }
+                self.update_tray_status();
+            }
+        } else if (pending || installing) && !self.exit_requested {
+            self.update_resume_monitor = Some(self.desired_monitor_running);
+            // Use the normal asynchronous quit path: stop autofill first, then
+            // let the authorized UI finish pending saves before Sparkle replaces
+            // or relaunches the application bundle.
+            self.handle_exit_request();
+        }
+    }
+
+    fn finish_exit(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.update_resume_monitor.is_some() {
+            if let Some(updater) = &self.updater {
+                if updater.installation_pending() {
+                    updater.resume_installation();
+                }
+            }
+            // Sparkle owns termination/relaunch. Keep the AppKit loop alive
+            // even if a nested menu loop just delivered a cancellation: the
+            // next poll_updater must restore normal operation in that case.
+            return false;
+        }
+        event_loop.exit();
+        true
     }
 
     fn handle_exit_request(&mut self) -> bool {
@@ -1142,6 +1262,10 @@ impl LightweightSupervisor {
     ) -> bool {
         if !self.exit_requested {
             self.exit_requested = true;
+            #[cfg(target_os = "macos")]
+            {
+                self.pending_update_check = false;
+            }
             self.worker_pause_latch.pause();
             self.worker_invalidator.invalidate();
             self.desired_monitor_running = false;
@@ -1328,6 +1452,14 @@ impl LightweightSupervisor {
         }
         match command {
             single_instance::LocalIpcCommand::Activate => self.handle_activation_request(),
+            #[cfg(target_os = "macos")]
+            single_instance::LocalIpcCommand::CheckForUpdates => {
+                !self.exit_requested
+                    && self
+                        .tray_tx
+                        .send(tray::TrayCommand::CheckForUpdates)
+                        .is_ok()
+            }
             single_instance::LocalIpcCommand::SettingsBootstrap => false,
             single_instance::LocalIpcCommand::SettingsMutationBegin => {
                 self.begin_settings_mutation()
@@ -1403,6 +1535,10 @@ impl LightweightSupervisor {
         peer_pid: u32,
     ) -> bool {
         if command == single_instance::LocalIpcCommand::Activate {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if command == single_instance::LocalIpcCommand::CheckForUpdates {
             return true;
         }
         let settings_child_pid = self.live_settings_child_pid();
@@ -2810,10 +2946,20 @@ impl ApplicationHandler for LightweightSupervisor {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         self.request_startup_accessibility_once();
         #[cfg(target_os = "macos")]
-        if self.reopen_registration.is_none() {
-            match macos_reopen::install(self.tray_tx.clone()) {
-                Ok(registration) => self.reopen_registration = Some(registration),
-                Err(error) => tracing::error!(%error, "Could not register macOS app reopening"),
+        {
+            if let Some(registration) = &self.reopen_registration {
+                registration.refresh();
+            } else {
+                match macos_reopen::install(self.tray_tx.clone()) {
+                    Ok(registration) => self.reopen_registration = Some(registration),
+                    Err(error) => tracing::error!(%error, "Could not register macOS app reopening"),
+                }
+            }
+            if self.updater.is_none() {
+                match macos_updates::Updater::new() {
+                    Ok(updater) => self.updater = Some(updater),
+                    Err(error) => tracing::error!(%error, "Could not initialize macOS updates"),
+                }
             }
         }
     }
@@ -2828,6 +2974,8 @@ impl ApplicationHandler for LightweightSupervisor {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_tray();
+        #[cfg(target_os = "macos")]
+        self.poll_updater();
         if self.process_tray_commands(event_loop) {
             return;
         }
@@ -2844,8 +2992,7 @@ impl ApplicationHandler for LightweightSupervisor {
         }
         self.poll_settings_window();
         if self.exit_requested {
-            if self.poll_exit_request(Instant::now()) {
-                event_loop.exit();
+            if self.poll_exit_request(Instant::now()) && self.finish_exit(event_loop) {
                 return;
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + SUPERVISOR_TICK));
@@ -2885,6 +3032,8 @@ fn local_ipc_command_authorized(
 ) -> bool {
     match command {
         single_instance::LocalIpcCommand::Activate => true,
+        #[cfg(target_os = "macos")]
+        single_instance::LocalIpcCommand::CheckForUpdates => true,
         single_instance::LocalIpcCommand::SettingsBootstrap => Some(peer_pid) == settings_child_pid,
         single_instance::LocalIpcCommand::SettingsMutationBegin
         | single_instance::LocalIpcCommand::SettingsMutationCancel
@@ -4350,6 +4499,129 @@ mod tests {
         assert!(supervisor.authorize_local_ipc_command(LocalIpcCommand::Activate, 4242));
         assert!(!supervisor.settings_child_bootstrapped);
         assert!(!supervisor.acknowledge_settings_bootstrap_with(4242, || Ok(())));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn authenticated_update_activation_never_grants_settings_access() {
+        use super::single_instance::LocalIpcCommand;
+
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+
+        // Peer identity is checked at the socket boundary. Update activation,
+        // like reopening, does not require a privileged settings session.
+        assert!(super::local_ipc_command_authorized(
+            LocalIpcCommand::CheckForUpdates,
+            4242,
+            None,
+            false,
+        ));
+        assert!(supervisor.authorize_local_ipc_command(LocalIpcCommand::CheckForUpdates, 4242));
+        assert!(!supervisor.settings_child_bootstrapped);
+        assert!(!supervisor.authorize_local_ipc_command(LocalIpcCommand::ReloadConfig, 4242));
+        assert!(!supervisor.acknowledge_settings_bootstrap_with(4242, || Ok(())));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_activation_queues_before_updater_start_without_opening_settings_or_pausing_monitor() {
+        use super::single_instance::LocalIpcCommand;
+
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.config.settings.hide_menu_bar_icon = true;
+        supervisor.config.settings.start_minimized = true;
+        supervisor.worker_status = crate::models::WorkerStatus::Running;
+        let paused_before = supervisor.worker_pause_latch.is_paused();
+        assert!(supervisor.updater.is_none());
+
+        assert!(supervisor.handle_authorized_local_ipc_command(LocalIpcCommand::CheckForUpdates));
+
+        assert!(matches!(
+            supervisor.tray_rx.try_recv(),
+            Ok(crate::tray::TrayCommand::CheckForUpdates)
+        ));
+        assert!(supervisor.tray_rx.try_recv().is_err());
+        assert!(supervisor.pending_settings_launch.is_none());
+        assert!(supervisor.settings_child.is_none());
+        assert_eq!(supervisor.worker_pause_latch.is_paused(), paused_before);
+        assert_eq!(
+            supervisor.worker_status,
+            crate::models::WorkerStatus::Running
+        );
+        assert!(supervisor.desired_monitor_running);
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_check_waits_for_updater_start_and_is_cancelled_on_quit() {
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.check_for_updates();
+        supervisor.poll_updater();
+        assert!(supervisor.pending_update_check);
+        assert!(supervisor.desired_monitor_running);
+        assert!(supervisor.handle_exit_request());
+        assert!(!supervisor.pending_update_check);
+        supervisor.check_for_updates();
+        assert!(!supervisor.pending_update_check);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_activation_is_rejected_after_shutdown_starts() {
+        use super::single_instance::LocalIpcCommand;
+
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            None,
+        );
+        supervisor.exit_requested = true;
+
+        assert!(!supervisor.handle_authorized_local_ipc_command(LocalIpcCommand::CheckForUpdates));
+        assert!(supervisor.tray_rx.try_recv().is_err());
+        assert!(worker_rx.try_recv().is_err());
+        assert!(supervisor.exit_requested);
     }
 
     #[test]

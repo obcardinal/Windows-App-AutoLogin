@@ -5,6 +5,8 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${HOME:-}/.cargo/bin"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=script/macos_bundle.sh
 source "$ROOT_DIR/script/macos_bundle.sh"
+# shellcheck source=script/macos_sparkle.sh
+source "$ROOT_DIR/script/macos_sparkle.sh"
 APP_NAME="WindowsAppAutoLogin"
 APP_DISPLAY_NAME="Windows App AutoLogin"
 BUNDLE_ID="obcardinal.windows-app-autologin"
@@ -156,11 +158,14 @@ waal_assemble_app_bundle \
   "$CARGO_VERSION" \
   "$BUILD_VERSION"
 
+waal_stage_sparkle "$ROOT_DIR" "$BUNDLE_DIR"
+
 if command -v codesign >/dev/null 2>&1; then
   DEVELOPMENT_CODESIGN_IDENTITY="-"
   if detected_identity="$(waal_development_codesign_identity)"; then
     DEVELOPMENT_CODESIGN_IDENTITY="$detected_identity"
   fi
+  waal_sign_sparkle "$BUNDLE_DIR" "$DEVELOPMENT_CODESIGN_IDENTITY"
   waal_codesign_development_bundle \
     "$BUNDLE_DIR" \
     "$BUNDLE_ID" \

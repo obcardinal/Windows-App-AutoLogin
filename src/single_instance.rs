@@ -91,6 +91,8 @@ const MACOS_LOCAL_IPC_MAX_BYTES: usize = 128;
 const MAX_IPC_COMMANDS_PER_TICK: usize = 16;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_ACTIVATE: &str = "activate";
+#[cfg(target_os = "macos")]
+const IPC_COMMAND_CHECK_FOR_UPDATES: &str = "updates:check";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_SETTINGS_BOOTSTRAP: &str = "settings:bootstrap";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -171,6 +173,8 @@ pub(crate) struct LocalIpcServer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalIpcCommand {
     Activate,
+    #[cfg(target_os = "macos")]
+    CheckForUpdates,
     SettingsBootstrap,
     SettingsMutationBegin,
     SettingsMutationCancel,
@@ -788,6 +792,13 @@ pub(crate) fn request_activation() -> anyhow::Result<()> {
             &format!("{}:{nonce}:{current_exe}\n", std::process::id()),
         )
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_check_for_updates() -> anyhow::Result<()> {
+    // This uses the same endpoint ownership, peer identity and fresh nonce
+    // validation as app activation. There is no feed URL or command payload.
+    send_local_ipc_command(IPC_COMMAND_CHECK_FOR_UPDATES)
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1772,6 +1783,11 @@ fn parse_local_ipc_command(message: &str) -> Option<LocalIpcCommand> {
     let message = message.trim();
     if message == IPC_COMMAND_ACTIVATE {
         return Some(LocalIpcCommand::Activate);
+    }
+
+    #[cfg(target_os = "macos")]
+    if message == IPC_COMMAND_CHECK_FOR_UPDATES {
+        return Some(LocalIpcCommand::CheckForUpdates);
     }
 
     if message == IPC_COMMAND_SETTINGS_BOOTSTRAP {
@@ -4175,32 +4191,67 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn update_check_ipc_has_no_arguments_and_requires_the_fresh_challenge() {
+        let challenge = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_local_ipc_challenge_response(
+                "0123456789abcdef0123456789abcdef:updates:check\n",
+                challenge,
+            ),
+            Some(LocalIpcCommand::CheckForUpdates)
+        );
+        for message in [
+            "updates:check",
+            "fedcba9876543210fedcba9876543210:updates:check",
+            "0123456789abcdef0123456789abcdef:updates:check:quit",
+            "0123456789abcdef0123456789abcdef:updates:check?feed=https://example.com",
+            "0123456789abcdef0123456789abcdef:updates:check\nactivate",
+            "0123456789abcdef0123456789abcdef:updates:check\0",
+        ] {
+            assert_eq!(
+                parse_local_ipc_challenge_response(message, challenge),
+                None,
+                "accepted {message:?}",
+            );
+        }
+    }
+
     #[cfg(all(target_os = "macos", unix))]
     #[test]
     fn local_ipc_accepts_challenge_response_command() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
-        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || {
-            local_ipc_command_from_validated_stream(server_stream, std::process::id())
-        });
-        let mut challenge = String::new();
-        let mut byte = [0_u8; 1];
-        while client_stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
-            challenge.push(byte[0] as char);
-        }
-        client_stream
-            .write_all(format!("{challenge}:activate\n").as_bytes())
-            .unwrap();
+        for (wire_command, expected) in [
+            (IPC_COMMAND_ACTIVATE, LocalIpcCommand::Activate),
+            (
+                IPC_COMMAND_CHECK_FOR_UPDATES,
+                LocalIpcCommand::CheckForUpdates,
+            ),
+        ] {
+            let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let server = std::thread::spawn(move || {
+                local_ipc_command_from_validated_stream(server_stream, std::process::id())
+            });
+            let mut challenge = String::new();
+            let mut byte = [0_u8; 1];
+            while client_stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+                challenge.push(byte[0] as char);
+            }
+            client_stream
+                .write_all(format!("{challenge}:{wire_command}\n").as_bytes())
+                .unwrap();
 
-        let peer_command = server
-            .join()
-            .unwrap()
-            .unwrap()
-            .expect("validated local IPC command");
-        assert_eq!(peer_command.peer_pid, std::process::id());
-        assert_eq!(peer_command.command, LocalIpcCommand::Activate);
+            let peer_command = server
+                .join()
+                .unwrap()
+                .unwrap()
+                .expect("validated local IPC command");
+            assert_eq!(peer_command.peer_pid, std::process::id());
+            assert_eq!(peer_command.command, expected);
+        }
     }
 
     #[cfg(all(target_os = "macos", unix))]
