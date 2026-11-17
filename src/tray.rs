@@ -16,6 +16,8 @@ pub(crate) enum TrayCommand {
     OpenAbout,
     PresentAccounts(Sender<()>),
     PresentSettings(Sender<()>),
+    #[cfg(target_os = "macos")]
+    SetMacosPresentation(crate::macos_panel::Presentation),
     ToggleMonitor,
     Exit,
 }
@@ -35,6 +37,22 @@ pub(crate) struct AppTray {
 }
 
 impl AppTray {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_panel_click(&self) -> bool {
+        // Drain the queue even after finding a click: move/enter/leave events
+        // must not accumulate while the supervisor is running.
+        let mut clicked = false;
+        for event in tray_icon::TrayIconEvent::receiver().try_iter() {
+            clicked |= is_panel_click(&event, self._tray.id());
+        }
+        clicked
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn status_item(&self) -> Option<objc2::rc::Retained<objc2_app_kit::NSStatusItem>> {
+        self._tray.ns_status_item()
+    }
+
     pub(crate) fn set_diagnostics_visible(&self, visible: bool) {
         if self.diagnostics_visible.get() == visible {
             return;
@@ -134,12 +152,14 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 
     let icon = load_icon()?;
 
-    let tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new()
         .with_menu(Box::new(compact_menu.clone()))
         .with_tooltip("Windows App AutoLogin")
         .with_icon(icon)
-        .with_icon_as_template(tray_icon_uses_template_rendering())
-        .build()?;
+        .with_icon_as_template(tray_icon_uses_template_rendering());
+    #[cfg(target_os = "macos")]
+    let tray_builder = tray_builder.with_menu_on_left_click(false);
+    let tray = tray_builder.build()?;
     #[cfg(target_os = "windows")]
     let windows_visibility = windows_visibility::WindowsTrayVisibility::new(tray.clone());
 
@@ -254,4 +274,81 @@ fn load_icon() -> anyhow::Result<tray_icon::Icon> {
 
 fn tray_icon_uses_template_rendering() -> bool {
     cfg!(target_os = "macos")
+}
+
+#[cfg(target_os = "macos")]
+fn is_panel_click(event: &tray_icon::TrayIconEvent, tray_id: &tray_icon::TrayIconId) -> bool {
+    matches!(
+        event,
+        tray_icon::TrayIconEvent::Click {
+            id,
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } if id == tray_id
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::is_panel_click;
+    use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
+
+    #[test]
+    fn only_own_left_release_opens_the_panel() {
+        let own_id = TrayIconId::new("autologin");
+        for (id, button, button_state, expected) in [
+            (
+                own_id.clone(),
+                MouseButton::Left,
+                MouseButtonState::Up,
+                true,
+            ),
+            (
+                own_id.clone(),
+                MouseButton::Left,
+                MouseButtonState::Down,
+                false,
+            ),
+            (
+                own_id.clone(),
+                MouseButton::Right,
+                MouseButtonState::Up,
+                false,
+            ),
+            (
+                own_id.clone(),
+                MouseButton::Right,
+                MouseButtonState::Down,
+                false,
+            ),
+            (
+                own_id.clone(),
+                MouseButton::Middle,
+                MouseButtonState::Up,
+                false,
+            ),
+            (
+                TrayIconId::new("another-app"),
+                MouseButton::Left,
+                MouseButtonState::Up,
+                false,
+            ),
+        ] {
+            let event = TrayIconEvent::Click {
+                id,
+                position: Default::default(),
+                rect: Rect::default(),
+                button,
+                button_state,
+            };
+            assert_eq!(is_panel_click(&event, &own_id), expected);
+        }
+        let movement = TrayIconEvent::Move {
+            id: own_id.clone(),
+            position: Default::default(),
+            rect: Rect::default(),
+        };
+        assert!(!is_panel_click(&movement, &own_id));
+    }
 }

@@ -95,7 +95,7 @@ core-foundation = "0.10"
 security-framework = "3.7"
 objc2 = "0.6.4"
 block2 = "0.6.2"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSAttributedString", "NSColor", "NSFont", "NSGraphics", "NSImage", "NSParagraphStyle", "NSResponder", "NSText", "NSTextAttachment", "block2", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSAttributedString", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSImage", "NSParagraphStyle", "NSResponder", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSText", "NSTextAttachment", "NSView", "NSWindow", "block2", "objc2-core-foundation"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSAttributedString", "NSBundle", "NSCalendar", "NSData", "NSDate", "NSDateFormatter", "NSDictionary", "NSGeometry", "NSLocale", "NSTimeZone", "NSValue", "NSRange", "NSString", "NSURL", "objc2-core-services"] }
 
 [build-dependencies]

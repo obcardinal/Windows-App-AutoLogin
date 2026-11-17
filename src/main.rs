@@ -27,6 +27,8 @@ pub(crate) mod debug_fill;
 pub(crate) mod macos_ax;
 pub(crate) mod macos_identity;
 #[cfg(target_os = "macos")]
+pub(crate) mod macos_panel;
+#[cfg(target_os = "macos")]
 mod macos_reopen;
 pub(crate) mod models;
 pub(crate) mod monitor;
@@ -63,7 +65,9 @@ const SUPERVISOR_TICK: Duration = Duration::from_millis(250);
 const STORAGE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SETTINGS_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const SETTINGS_SESSION_TOKEN_ENV: &str = "WAAL_SETTINGS_SESSION_TOKEN";
-const FULL_UI_CONTROL_MAX_LINE_BYTES: usize = 32;
+const FULL_UI_CONTROL_MAX_LINE_BYTES: usize = if cfg!(target_os = "macos") { 256 } else { 32 };
+#[cfg(target_os = "macos")]
+const MACOS_UI_PRESENTATION_ENV: &str = "WAAL_MACOS_UI_PRESENTATION";
 const FULL_UI_CONTROL_SHOW_ACCOUNTS: &[u8] = b"show:accounts\n";
 const FULL_UI_CONTROL_SHOW_SETTINGS: &[u8] = b"show:settings\n";
 const FULL_UI_CONTROL_EXIT: &[u8] = b"exit\n";
@@ -262,6 +266,15 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
 
     let startup = load_full_ui_config();
     let config = startup.config;
+    #[cfg(target_os = "macos")]
+    let presentation = if config.settings.hide_menu_bar_icon {
+        macos_panel::Presentation::Window
+    } else {
+        std::env::var(MACOS_UI_PRESENTATION_ENV)
+            .ok()
+            .and_then(|value| macos_panel::Presentation::decode(&value))
+            .unwrap_or(macos_panel::Presentation::Window)
+    };
     let storage_recovery_ready = startup.storage_recovery_ready;
     let (worker_tx, _worker_rx) = tokio_channel::<background::WorkerCommand>(32);
     let ui_worker_invalidator = background::WorkerInvalidator::new();
@@ -269,13 +282,17 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let (_worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
     let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([640.0, 420.0])
+        .with_min_inner_size([560.0, 360.0])
+        .with_icon(load_icon()?)
+        .with_visible(true)
+        .with_active(true);
+    #[cfg(target_os = "macos")]
+    let viewport = macos_panel::configure_viewport(viewport, presentation)
+        .with_visible(matches!(presentation, macos_panel::Presentation::Window));
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 420.0])
-            .with_min_inner_size([560.0, 360.0])
-            .with_icon(load_icon()?)
-            .with_visible(true)
-            .with_active(true),
+        viewport,
         renderer: full_ui_renderer(),
         ..Default::default()
     };
@@ -285,6 +302,21 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| {
             ui::theme::apply(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            let presentation = {
+                let presentation = match macos_panel::apply(cc, presentation) {
+                    Ok(()) => presentation,
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not attach the menu bar panel; opening a regular window");
+                        macos_panel::apply(cc, macos_panel::Presentation::Window)?;
+                        macos_panel::Presentation::Window
+                    }
+                };
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                presentation
+            };
             spawn_full_ui_control_reader(tray_tx, cc.egui_ctx.clone())?;
             let app = app::AutoLoginApp::new(
                 worker_tx,
@@ -296,6 +328,8 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
                 initial_tab,
             )
             .with_storage_recovery_state(storage_recovery_ready);
+            #[cfg(target_os = "macos")]
+            let app = app.with_macos_presentation(presentation);
             Ok(Box::new(app))
         }),
     );
@@ -318,12 +352,14 @@ fn full_ui_renderer() -> eframe::Renderer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum FullUiControlRead {
     EndOfStream,
     Invalid,
     Exit,
     Show(models::Tab),
+    #[cfg(target_os = "macos")]
+    MacosPresentation(macos_panel::Presentation),
 }
 
 fn full_ui_control_message(initial_tab: models::Tab) -> anyhow::Result<&'static [u8]> {
@@ -346,7 +382,17 @@ fn parse_full_ui_control_line(line: &[u8]) -> FullUiControlRead {
         b"exit" => FullUiControlRead::Exit,
         b"show:accounts" => FullUiControlRead::Show(models::Tab::Accounts),
         b"show:settings" => FullUiControlRead::Show(models::Tab::Settings),
-        _ => FullUiControlRead::Invalid,
+        _ => {
+            #[cfg(target_os = "macos")]
+            if let Some(presentation) = line
+                .strip_prefix(b"mode:")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(macos_panel::Presentation::decode)
+            {
+                return FullUiControlRead::MacosPresentation(presentation);
+            }
+            FullUiControlRead::Invalid
+        }
     }
 }
 
@@ -402,6 +448,16 @@ fn spawn_full_ui_control_reader(
             let mut writer = std::io::stdout();
             loop {
                 match read_full_ui_control_command(&mut reader) {
+                    #[cfg(target_os = "macos")]
+                    Ok(FullUiControlRead::MacosPresentation(presentation)) => {
+                        if tray_tx
+                            .send(tray::TrayCommand::SetMacosPresentation(presentation))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        egui_ctx.request_repaint();
+                    }
                     Ok(FullUiControlRead::Show(models::Tab::Accounts)) => {
                         if !dispatch_full_ui_presentation(
                             &tray_tx,
@@ -498,6 +554,25 @@ fn send_full_ui_presentation(child: &mut Child, tab: models::Tab) -> anyhow::Res
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("full UI control channel is unavailable"))?;
     stdin.write_all(message)?;
+    stdin.flush()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_ui_presentation(
+    child: &mut Child,
+    presentation: macos_panel::Presentation,
+) -> anyhow::Result<()> {
+    let message = format!("mode:{}\n", presentation.encode());
+    anyhow::ensure!(
+        message.len() <= FULL_UI_CONTROL_MAX_LINE_BYTES,
+        "presentation exceeds control channel limit"
+    );
+    let stdin = child
+        .stdin
+        .as_mut()
+        .context("full UI control channel is unavailable")?;
+    stdin.write_all(message.as_bytes())?;
     stdin.flush()?;
     Ok(())
 }
@@ -1002,6 +1077,16 @@ impl LightweightSupervisor {
     }
 
     fn process_tray_commands(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        #[cfg(target_os = "macos")]
+        if self
+            .tray
+            .as_ref()
+            .is_some_and(|tray| tray.take_panel_click())
+            && !self.exit_requested
+            && !self.config.settings.hide_menu_bar_icon
+        {
+            self.open_accounts_window();
+        }
         while let Ok(command) = self.tray_rx.try_recv() {
             if self.exit_requested && !matches!(&command, tray::TrayCommand::Exit) {
                 continue;
@@ -1016,6 +1101,10 @@ impl LightweightSupervisor {
                 }
                 tray::TrayCommand::PresentAccounts(_) | tray::TrayCommand::PresentSettings(_) => {
                     tracing::warn!("Rejected a child-only presentation command in the supervisor");
+                }
+                #[cfg(target_os = "macos")]
+                tray::TrayCommand::SetMacosPresentation(_) => {
+                    tracing::warn!("Rejected a child-only window mode command in the supervisor");
                 }
                 tray::TrayCommand::ToggleMonitor => self.toggle_monitor(),
                 tray::TrayCommand::Exit => {
@@ -1842,6 +1931,27 @@ impl LightweightSupervisor {
         self.open_full_ui_window(models::Tab::Accounts);
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_ui_presentation(&self) -> macos_panel::Presentation {
+        if self.config.settings.hide_menu_bar_icon {
+            return macos_panel::Presentation::Window;
+        }
+        self.tray
+            .as_ref()
+            .and_then(|tray| tray.status_item())
+            .and_then(|item| macos_panel::Presentation::from_status_item(&item))
+            .unwrap_or(macos_panel::Presentation::Window)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_macos_ui_presentation(&mut self) -> anyhow::Result<()> {
+        let presentation = self.macos_ui_presentation();
+        if let Some(child) = self.settings_child.as_mut() {
+            send_macos_ui_presentation(child, presentation)?;
+        }
+        Ok(())
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn open_accounts_window_for_activation(&mut self) -> bool {
         self.open_full_ui_window_with_monitor_policy(models::Tab::Accounts, true)
@@ -1970,6 +2080,12 @@ impl LightweightSupervisor {
             requested_tab: tab,
             phase: SettingsPresentationPhase::AwaitingAcknowledgement,
         });
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self.sync_macos_ui_presentation() {
+            tracing::warn!(%error, "Could not update the requested window presentation");
+            self.mark_settings_child_control_broken();
+            return false;
+        }
         let send_result = self
             .settings_child
             .as_mut()
@@ -2052,6 +2168,14 @@ impl LightweightSupervisor {
                     self.mark_settings_child_control_broken();
                     return;
                 }
+                #[cfg(target_os = "macos")]
+                Ok(Ok(FullUiControlRead::MacosPresentation(_))) => {
+                    tracing::warn!(
+                        "Settings presentation protocol returned an unsolicited window mode"
+                    );
+                    self.mark_settings_child_control_broken();
+                    return;
+                }
                 Ok(Ok(FullUiControlRead::EndOfStream)) => {
                     self.mark_settings_child_control_broken();
                     return;
@@ -2082,8 +2206,16 @@ impl LightweightSupervisor {
 
     fn poll_pending_settings_launch(&mut self) {
         let privileged_ipc_available = self.privileged_ipc_available();
+        #[cfg(target_os = "macos")]
+        let presentation = self.macos_ui_presentation();
         self.poll_pending_settings_launch_with(Instant::now(), |initial_tab, token| {
-            spawn_full_ui_window(initial_tab, privileged_ipc_available, token)
+            spawn_full_ui_window(
+                initial_tab,
+                privileged_ipc_available,
+                token,
+                #[cfg(target_os = "macos")]
+                presentation,
+            )
         });
     }
 
@@ -2568,9 +2700,18 @@ impl LightweightSupervisor {
     }
 
     fn finish_reloaded_config(&mut self, next_config: models::AppConfig) {
+        #[cfg(target_os = "macos")]
+        let presentation_changed =
+            self.config.settings.hide_menu_bar_icon != next_config.settings.hide_menu_bar_icon;
         self.config = next_config;
         self.storage_recovery_ready = true;
         self.update_tray_status();
+        #[cfg(target_os = "macos")]
+        if presentation_changed {
+            if let Err(error) = self.sync_macos_ui_presentation() {
+                tracing::warn!(%error, "Could not switch the saved menu bar presentation");
+            }
+        }
     }
 
     fn retry_blocked_storage_recovery(&mut self) {
@@ -2771,19 +2912,22 @@ fn spawn_full_ui_window(
     initial_tab: models::Tab,
     privileged_ipc_available: bool,
     settings_session_token: &single_instance::SettingsSessionToken,
+    #[cfg(target_os = "macos")] presentation: macos_panel::Presentation,
 ) -> anyhow::Result<Child> {
     #[cfg(target_os = "windows")]
     let executable = app_identity::windows_full_ui_executable_path()?;
     #[cfg(not(target_os = "windows"))]
     let executable = std::env::current_exe()?;
 
-    Ok(full_ui_command(
+    let mut command = full_ui_command(
         executable,
         initial_tab,
         privileged_ipc_available,
         Some(settings_session_token),
-    )
-    .spawn()?)
+    );
+    #[cfg(target_os = "macos")]
+    command.env(MACOS_UI_PRESENTATION_ENV, presentation.encode());
+    Ok(command.spawn()?)
 }
 
 fn full_ui_command(
@@ -2816,6 +2960,7 @@ fn full_ui_command(
     {
         let _ = privileged_ipc_available;
         command.env_remove(LEGACY_IPC_TOKEN_ENV);
+        command.env_remove(MACOS_UI_PRESENTATION_ENV);
     }
     command
 }
@@ -3474,6 +3619,46 @@ mod tests {
 
         assert!(dispatch_full_ui_exit(&tray_tx, &ctx));
         assert!(matches!(tray_rx.try_recv(), Ok(TrayCommand::Exit)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mode_control_is_bounded_and_preserves_show_order() {
+        use crate::macos_panel::Presentation;
+        let presentation = Presentation::decode("panel:1200,876,28,24,0,0,1440,876").unwrap();
+        let input = format!(
+            "mode:{}\nshow:accounts\nmode:window\nshow:settings\n",
+            presentation.encode()
+        );
+        let mut reader = BufReader::with_capacity(3, Cursor::new(input.into_bytes()));
+        for expected in [
+            FullUiControlRead::MacosPresentation(presentation),
+            FullUiControlRead::Show(crate::models::Tab::Accounts),
+            FullUiControlRead::MacosPresentation(Presentation::Window),
+            FullUiControlRead::Show(crate::models::Tab::Settings),
+            FullUiControlRead::EndOfStream,
+        ] {
+            assert_eq!(read_full_ui_control_command(&mut reader).unwrap(), expected);
+        }
+        for invalid in [
+            b"mode:panel:NaN,0,28,24,0,0,1440,876".as_slice(),
+            b"mode:panel:0,0,28,24,0,0,1440,876,extra",
+            b"mode:window unexpected",
+        ] {
+            assert_eq!(
+                super::parse_full_ui_control_line(invalid),
+                FullUiControlRead::Invalid
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_launch_command_drops_inherited_panel_geometry() {
+        let command = full_ui_command("/test/app", crate::models::Tab::Accounts, true, None);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == super::MACOS_UI_PRESENTATION_ENV && value.is_none()));
     }
 
     #[test]
@@ -5624,7 +5809,7 @@ mod tests {
     fn spawn_test_control_child() -> std::process::Child {
         std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("while IFS= read -r line; do printf '%s\\n' \"$line\"; done")
+            .arg("while IFS= read -r line; do case \"$line\" in mode:*) continue;; esac; printf '%s\\n' \"$line\"; done")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()

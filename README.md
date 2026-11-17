@@ -190,7 +190,9 @@ When the matching Windows App credential prompt is visible and Windows App is fr
 
 ## Menu-Bar App
 
-The app keeps a lightweight supervisor running in the background. On a fresh launch it opens the Accounts window unless **Hide main window at launch** is enabled.
+The app keeps a lightweight supervisor running in the background. On a fresh launch it opens Accounts unless **Hide main window at launch** is enabled.
+
+On macOS, left-clicking the visible menu-bar icon opens Accounts in a fixed panel anchored below the icon. The panel hides when it loses focus and preserves unfinished edits and pending saves. Right-click the icon for the native menu described below. With **Hide menu bar icon** enabled, opening the app from Finder or Spotlight instead shows a normal movable, resizable window. Changing icon visibility switches the existing UI between these two modes without restarting it. Windows continues to use the normal application window and tray menu.
 
 Under **Settings → System**, **Hide menu bar icon** (macOS) or **Hide system tray icon** (Windows) hides the icon without stopping the app. This option is off by default, is saved automatically, and takes effect without restarting. Open Windows App AutoLogin again from Finder or Spotlight on macOS, or launch its shortcut or main executable again on Windows, to return to the window and restore the icon in Settings. Both platforms store this preference as `hide_menu_bar_icon` in the configuration.
 
@@ -203,7 +205,7 @@ The menu follows these groups, separated by native menu dividers:
 - **Settings…** (`⌘,` on macOS).
 - **Quit Windows App AutoLogin** (`⌘Q` on macOS).
 
-The heavier settings UI is launched only when needed. Closing the settings window returns the app to the lightweight menu-bar process.
+The heavier settings UI is launched only when needed. Closing a normal settings window returns the app to the lightweight menu-bar process. Dismissing the macOS panel keeps its UI process available so reopening it restores unfinished edits; monitoring continues according to the selected Start/Stop state.
 
 **About** opens a separate native window and remains available when diagnostic info is hidden. On macOS it uses the same standard About panel and spacing as Instance Control: bundle icon, version, localized release date, author link, and contact icons. Windows uses a native modeless About window with the same information. The release date is tied to the published version; an unknown version does not inherit an older release's date. Opening or closing About does not stop the monitor or open the Accounts/Settings window.
 

@@ -497,6 +497,18 @@ pub(crate) struct AutoLoginApp {
     #[cfg(feature = "diagnostics-ui")]
     pub(crate) runtime_status_rx: Option<std::sync::mpsc::Receiver<FillAttemptReport>>,
     settings_window_mode: bool,
+    #[cfg(target_os = "macos")]
+    macos_presentation: crate::macos_panel::Presentation,
+    #[cfg(target_os = "macos")]
+    pending_macos_presentation: Option<crate::macos_panel::Presentation>,
+    #[cfg(target_os = "macos")]
+    macos_fullscreen_exit_requested: bool,
+    #[cfg(target_os = "macos")]
+    macos_window_visible: bool,
+    #[cfg(target_os = "macos")]
+    macos_panel_acquired_focus: bool,
+    #[cfg(target_os = "macos")]
+    macos_presentation_requested_this_pass: bool,
     active_settings_mutation: Option<Weak<AtomicU8>>,
     active_local_config_mutation_pause_epoch: Option<u64>,
     active_local_config_mutation_start_monitor: Option<bool>,
@@ -604,6 +616,18 @@ impl AutoLoginApp {
             #[cfg(feature = "diagnostics-ui")]
             runtime_status_rx: None,
             settings_window_mode,
+            #[cfg(target_os = "macos")]
+            macos_presentation: crate::macos_panel::Presentation::Window,
+            #[cfg(target_os = "macos")]
+            pending_macos_presentation: None,
+            #[cfg(target_os = "macos")]
+            macos_fullscreen_exit_requested: false,
+            #[cfg(target_os = "macos")]
+            macos_window_visible: true,
+            #[cfg(target_os = "macos")]
+            macos_panel_acquired_focus: false,
+            #[cfg(target_os = "macos")]
+            macos_presentation_requested_this_pass: false,
             active_settings_mutation: None,
             active_local_config_mutation_pause_epoch: None,
             active_local_config_mutation_start_monitor: None,
@@ -645,6 +669,18 @@ impl AutoLoginApp {
             ));
         }
         app
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_macos_presentation(
+        mut self,
+        presentation: crate::macos_panel::Presentation,
+    ) -> Self {
+        // CreationContext already applied the native appearance before showing
+        // the first frame. Do not apply it twice or arm blur before native focus.
+        self.macos_presentation = presentation;
+        self.macos_panel_acquired_focus = false;
+        self
     }
 
     pub(crate) fn with_storage_recovery_state(mut self, recovery_ready: bool) -> Self {
@@ -796,6 +832,12 @@ impl AutoLoginApp {
     }
 
     pub(crate) fn keep_window_open_for_pending_settings_save(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        if self.is_macos_panel() && !self.quit_requested {
+            // Panel dismissal only hides the window; logic continues draining
+            // every accepted save while retaining the editor and its draft.
+            return;
+        }
         if self.settings_save_in_progress() && ctx.input(|input| input.viewport().close_requested())
         {
             // `present_tab` already cancelled this delivered Close and made
@@ -1773,6 +1815,10 @@ impl AutoLoginApp {
                         let _ = acknowledgement.send(());
                     });
                 }
+                #[cfg(target_os = "macos")]
+                TrayCommand::SetMacosPresentation(presentation) => {
+                    self.set_macos_presentation(ctx, presentation);
+                }
                 TrayCommand::ToggleMonitor => self.toggle_monitor_from_ui(ctx),
                 TrayCommand::Exit => {
                     self.quit_requested = true;
@@ -1791,6 +1837,12 @@ impl AutoLoginApp {
         self.close_settings_window_after_pending_save = false;
         self.keep_settings_window_open_through_ui_pass = true;
         self.selected_tab = tab;
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_window_visible = true;
+            self.macos_panel_acquired_focus = false;
+            self.macos_presentation_requested_this_pass = true;
+        }
         // `Close` is delivered as raw input on a later frame. Clearing the
         // deferred flag alone cannot cancel that already-delivered request;
         // eframe exits after the frame unless it sees `CancelClose`.
@@ -1801,6 +1853,141 @@ impl AutoLoginApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         acknowledge();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_macos_panel(&self) -> bool {
+        matches!(
+            self.macos_presentation,
+            crate::macos_panel::Presentation::Panel(_)
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_macos_presentation(
+        &mut self,
+        ctx: &egui::Context,
+        presentation: crate::macos_panel::Presentation,
+    ) {
+        if self.quit_requested {
+            return;
+        }
+        let was_panel = self.is_macos_panel();
+        self.macos_presentation = presentation;
+        self.pending_macos_presentation = Some(presentation);
+        self.macos_panel_acquired_focus = false;
+        self.macos_presentation_requested_this_pass = true;
+        self.close_settings_window_after_sync = false;
+        self.close_settings_window_after_pending_save = false;
+        self.keep_settings_window_open_through_ui_pass = true;
+        if was_panel && !self.is_macos_panel() {
+            // A hide-icon save can finish after the panel lost focus. Restore
+            // its normal window so committing that preference never strands it.
+            self.present_tab(ctx, self.selected_tab, || {});
+        } else if ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if !was_panel && self.is_macos_panel() {
+            // Unhiding the icon can commit after the user switched apps. That
+            // conversion must not leave an unfocused floating panel on screen.
+            // A later Present command in this batch still restores it normally.
+            let focused = ctx.input(|input| input.viewport().focused.unwrap_or(input.focused));
+            if focused {
+                self.macos_panel_acquired_focus = true;
+            } else {
+                self.hide_macos_panel(ctx);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_pending_macos_presentation(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(presentation) = self.pending_macos_presentation else {
+            return;
+        };
+        if self.defer_panel_until_fullscreen_exit(
+            ctx,
+            presentation,
+            crate::macos_panel::is_fullscreen(frame).unwrap_or(false),
+        ) {
+            return;
+        }
+        self.pending_macos_presentation = None;
+        if let Err(error) = crate::macos_panel::apply(frame, presentation) {
+            tracing::warn!(%error, "Could not apply macOS window presentation");
+            // Keep the UI reachable if the native panel could not be configured.
+            if !self.quit_requested
+                && self.is_macos_panel()
+                && crate::macos_panel::apply(frame, crate::macos_panel::Presentation::Window)
+                    .is_ok()
+            {
+                self.macos_presentation = crate::macos_panel::Presentation::Window;
+                self.present_tab(ctx, self.selected_tab, || {});
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn defer_panel_until_fullscreen_exit(
+        &mut self,
+        ctx: &egui::Context,
+        presentation: crate::macos_panel::Presentation,
+        fullscreen: bool,
+    ) -> bool {
+        if matches!(presentation, crate::macos_panel::Presentation::Panel(_)) && fullscreen {
+            // AppKit must finish its Space transition before the window can
+            // safely become borderless. Send the exit request only once.
+            if !self.macos_fullscreen_exit_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.macos_fullscreen_exit_requested = true;
+            }
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return true;
+        }
+        self.macos_fullscreen_exit_requested = false;
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn hide_macos_panel(&mut self, ctx: &egui::Context) {
+        self.macos_window_visible = false;
+        self.macos_panel_acquired_focus = false;
+        self.close_settings_window_after_sync = false;
+        self.close_settings_window_after_pending_save = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_macos_panel_focus(&mut self, ctx: &egui::Context) {
+        if !self.is_macos_panel() || self.quit_requested {
+            return;
+        }
+        if self.macos_presentation_requested_this_pass {
+            return;
+        }
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested {
+            // Cmd-W dismisses a panel without discarding an unfinished editor.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if !self.macos_window_visible {
+            return;
+        }
+        if close_requested {
+            self.hide_macos_panel(ctx);
+            return;
+        }
+        if self.pending_macos_presentation.is_some() {
+            // The fullscreen exit animation can temporarily remove focus.
+            // Dismissal resumes only after the native presentation is ready.
+            return;
+        }
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(input.focused));
+        if focused {
+            self.macos_panel_acquired_focus = true;
+        } else if self.macos_panel_acquired_focus {
+            self.hide_macos_panel(ctx);
+        }
     }
 
     fn process_worker_events(&mut self) {
@@ -1898,6 +2085,12 @@ impl AutoLoginApp {
     }
 
     fn close_settings_window_after_successful_sync(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        if self.is_macos_panel() && !self.quit_requested {
+            self.close_settings_window_after_sync = false;
+            self.close_settings_window_after_pending_save = false;
+            return;
+        }
         if self.settings_save_in_progress() {
             return;
         }
@@ -2215,8 +2408,19 @@ fn monitor_control_command(state: MonitorControlState) -> MonitorControlCommand 
 }
 
 impl eframe::App for AutoLoginApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
+        // Invisible roots still receive logic passes, but eframe skips ui().
+        // Presentation guards must therefore expire here as well as after ui.
+        self.keep_settings_window_open_through_ui_pass = false;
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_presentation_requested_this_pass = false;
+        }
         self.process_tray_commands(ctx);
+        #[cfg(target_os = "macos")]
+        self.apply_pending_macos_presentation(ctx, frame);
         self.process_worker_events();
         self.poll_background_monitor_control(ctx);
         self.poll_bridged_ui_status(ctx);
@@ -2230,6 +2434,8 @@ impl eframe::App for AutoLoginApp {
         #[cfg(feature = "diagnostics-ui")]
         crate::ui::diagnose::poll_runtime_status(self);
         self.close_after_quit_when_settings_saves_are_drained(ctx);
+        #[cfg(target_os = "macos")]
+        self.poll_macos_panel_focus(ctx);
         self.keep_window_open_for_pending_settings_save(ctx);
         if !self.settings_window_mode
             && !self.quit_requested
@@ -2459,6 +2665,325 @@ mod tests {
             settings_window_mode,
             Tab::Accounts,
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_panel_presentation() -> crate::macos_panel::Presentation {
+        crate::macos_panel::Presentation::Panel(crate::macos_panel::PanelAnchor {
+            icon_x: 900.0,
+            icon_y: 876.0,
+            icon_width: 24.0,
+            icon_height: 24.0,
+            screen_x: 0.0,
+            screen_y: 0.0,
+            screen_width: 1440.0,
+            screen_height: 876.0,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn panel_focus_input(focused: bool, close_requested: bool) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            focused,
+            ..Default::default()
+        };
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.focused = Some(focused);
+        if close_requested {
+            viewport.events.push(egui::ViewportEvent::Close);
+        }
+        input
+    }
+
+    #[cfg(target_os = "macos")]
+    fn panel_focus_pass(
+        app: &mut AutoLoginApp,
+        ctx: &egui::Context,
+        focused: bool,
+        close_requested: bool,
+    ) -> Vec<egui::ViewportCommand> {
+        app.macos_presentation_requested_this_pass = false;
+        app.keep_settings_window_open_through_ui_pass = false;
+        ctx.begin_pass(panel_focus_input(focused, close_requested));
+        app.poll_macos_panel_focus(ctx);
+        ctx.end_pass().viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_blur_waits_for_real_focus_then_hides_once() {
+        let mut app = mutation_test_app(true).with_macos_presentation(test_panel_presentation());
+        let ctx = egui::Context::default();
+        assert!(panel_focus_pass(&mut app, &ctx, false, false).is_empty());
+        assert!(app.macos_window_visible);
+        assert!(panel_focus_pass(&mut app, &ctx, true, false).is_empty());
+        assert_eq!(
+            panel_focus_pass(&mut app, &ctx, false, false),
+            vec![egui::ViewportCommand::Visible(false)]
+        );
+        assert!(!app.macos_window_visible);
+        assert!(panel_focus_pass(&mut app, &ctx, false, false).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_dismissal_preserves_draft_and_pending_save_without_monitor_commands() {
+        let (worker_tx, mut worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (_tray_tx, tray_rx) = std_channel();
+        let mut app = AutoLoginApp::new(
+            worker_tx,
+            test_pause_latch(),
+            tray_rx,
+            worker_event_rx,
+            AppConfig::default(),
+            true,
+            Tab::Accounts,
+        )
+        .with_macos_presentation(test_panel_presentation());
+        app.editing_account = Some(crate::models::Account::new("draft@example.invalid"));
+        app.temp_password = zeroize::Zeroizing::new("test-only-unsaved-secret".to_string());
+        app.settings_draft.auto_start = !app.config.settings.auto_start;
+        app.pending_settings_save =
+            Some(crate::ui::settings::PendingSettingsSave::inert_for_test());
+        let original_config = app.config.clone();
+        let original_draft = app.settings_draft.clone();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(panel_focus_input(true, true));
+        app.poll_macos_panel_focus(&ctx);
+        app.keep_window_open_for_pending_settings_save(&ctx);
+        app.close_settings_window_after_successful_sync(&ctx);
+        let output = ctx.end_pass();
+        assert_eq!(
+            output.viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Visible(false)
+            ]
+        );
+        assert!(app.pending_settings_save.is_some());
+        assert_eq!(app.config, original_config);
+        assert_eq!(app.settings_draft, original_draft);
+        assert_eq!(
+            app.editing_account.as_ref().unwrap().username,
+            "draft@example.invalid"
+        );
+        assert_eq!(app.temp_password.as_str(), "test-only-unsaved-secret");
+        assert!(!app.close_settings_window_after_pending_save);
+        assert!(worker_rx.try_recv().is_err());
+
+        app.pending_settings_save = None;
+        ctx.begin_pass(panel_focus_input(false, false));
+        app.close_settings_window_after_successful_sync(&ctx);
+        assert!(ctx.end_pass().viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_reopen_wins_over_stale_blur_and_close_and_rearms_focus() {
+        let mut app = mutation_test_app(true).with_macos_presentation(test_panel_presentation());
+        let ctx = egui::Context::default();
+        app.macos_panel_acquired_focus = true;
+        app.close_settings_window_after_pending_save = true;
+        ctx.begin_pass(panel_focus_input(false, true));
+        app.present_tab(&ctx, Tab::Settings, || {});
+        app.poll_macos_panel_focus(&ctx);
+        let output = ctx.end_pass();
+        assert_eq!(
+            output.viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus,
+            ]
+        );
+        assert!(app.macos_window_visible);
+        assert!(!app.macos_panel_acquired_focus);
+        assert!(!app.close_settings_window_after_pending_save);
+        assert!(panel_focus_pass(&mut app, &ctx, false, false).is_empty());
+        assert!(panel_focus_pass(&mut app, &ctx, true, false).is_empty());
+        assert_eq!(
+            panel_focus_pass(&mut app, &ctx, false, false),
+            vec![egui::ViewportCommand::Visible(false)]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normal_window_ignores_blur_and_retains_manual_close_policy() {
+        let mut app = mutation_test_app(true);
+        let ctx = egui::Context::default();
+        assert!(panel_focus_pass(&mut app, &ctx, true, false).is_empty());
+        assert!(panel_focus_pass(&mut app, &ctx, false, true).is_empty());
+        app.close_settings_window_after_pending_save = true;
+        ctx.begin_pass(Default::default());
+        app.close_settings_window_after_successful_sync(&ctx);
+        assert_eq!(
+            ctx.end_pass().viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![egui::ViewportCommand::Close]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn committed_window_mode_restores_hidden_panel_without_stale_save_close() {
+        let mut app = mutation_test_app(true).with_macos_presentation(test_panel_presentation());
+        app.macos_window_visible = false;
+        app.selected_tab = Tab::Settings;
+        app.close_settings_window_after_sync = true;
+        app.close_settings_window_after_pending_save = true;
+        // Local configuration may lag the supervisor's committed command.
+        assert!(!app.config.settings.hide_menu_bar_icon);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(panel_focus_input(false, true));
+        app.set_macos_presentation(&ctx, crate::macos_panel::Presentation::Window);
+        app.close_settings_window_after_successful_sync(&ctx);
+        app.poll_macos_panel_focus(&ctx);
+        assert_eq!(
+            ctx.end_pass().viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus,
+            ]
+        );
+        assert!(!app.is_macos_panel());
+        assert!(app.macos_window_visible);
+        assert_eq!(app.selected_tab, Tab::Settings);
+        assert_eq!(
+            app.pending_macos_presentation,
+            Some(crate::macos_panel::Presentation::Window)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn committed_panel_mode_hides_if_unhide_save_finishes_after_focus_loss() {
+        let mut app = mutation_test_app(true);
+        app.config.settings.hide_menu_bar_icon = true;
+        let ctx = egui::Context::default();
+        ctx.begin_pass(panel_focus_input(false, false));
+        app.set_macos_presentation(&ctx, test_panel_presentation());
+        app.poll_macos_panel_focus(&ctx);
+        assert_eq!(
+            ctx.end_pass().viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![egui::ViewportCommand::Visible(false)]
+        );
+        assert!(app.is_macos_panel());
+        assert!(!app.macos_window_visible);
+        assert!(panel_focus_pass(&mut app, &ctx, false, false).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_present_wins_over_unfocused_panel_conversion_in_same_batch() {
+        let mut app = mutation_test_app(true);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(panel_focus_input(false, false));
+        app.set_macos_presentation(&ctx, test_panel_presentation());
+        app.present_tab(&ctx, Tab::Accounts, || {});
+        app.poll_macos_panel_focus(&ctx);
+        assert_eq!(
+            ctx.end_pass().viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![
+                egui::ViewportCommand::Visible(false),
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus,
+            ]
+        );
+        assert!(app.macos_window_visible);
+        assert!(!app.macos_panel_acquired_focus);
+        assert!(panel_focus_pass(&mut app, &ctx, false, false).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn focused_window_to_panel_conversion_stays_visible_and_arms_blur() {
+        let mut app = mutation_test_app(true);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(panel_focus_input(true, false));
+        app.set_macos_presentation(&ctx, test_panel_presentation());
+        app.poll_macos_panel_focus(&ctx);
+        assert!(ctx.end_pass().viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .is_empty());
+        assert!(app.macos_window_visible);
+        assert!(app.macos_panel_acquired_focus);
+        // The native presentation is applied before blur handling resumes.
+        app.pending_macos_presentation = None;
+        assert_eq!(
+            panel_focus_pass(&mut app, &ctx, false, false),
+            vec![egui::ViewportCommand::Visible(false)]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_waits_for_fullscreen_exit_without_repeated_exit_or_blur() {
+        let presentation = test_panel_presentation();
+        let mut app = mutation_test_app(true).with_macos_presentation(presentation);
+        app.pending_macos_presentation = Some(presentation);
+        app.macos_panel_acquired_focus = true;
+        let ctx = egui::Context::default();
+        for attempt in 0..2 {
+            ctx.begin_pass(panel_focus_input(false, false));
+            assert!(app.defer_panel_until_fullscreen_exit(&ctx, presentation, true));
+            app.poll_macos_panel_focus(&ctx);
+            let commands = ctx.end_pass().viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .clone();
+            if attempt == 0 {
+                assert_eq!(commands, vec![egui::ViewportCommand::Fullscreen(false)]);
+            } else {
+                assert!(commands.is_empty());
+            }
+            assert_eq!(app.pending_macos_presentation, Some(presentation));
+            assert!(app.macos_window_visible);
+        }
+        ctx.begin_pass(panel_focus_input(true, false));
+        assert!(!app.defer_panel_until_fullscreen_exit(&ctx, presentation, false));
+        assert!(ctx.end_pass().viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .is_empty());
+        assert!(!app.macos_fullscreen_exit_requested);
+        app.pending_macos_presentation = None;
+        assert_eq!(
+            panel_focus_pass(&mut app, &ctx, false, false),
+            vec![egui::ViewportCommand::Visible(false)]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_quit_still_waits_for_saves_and_then_really_closes() {
+        let mut app = mutation_test_app(true).with_macos_presentation(test_panel_presentation());
+        app.pending_settings_save =
+            Some(crate::ui::settings::PendingSettingsSave::inert_for_test());
+        app.quit_requested = true;
+        let ctx = egui::Context::default();
+        ctx.begin_pass(panel_focus_input(false, true));
+        app.poll_macos_panel_focus(&ctx);
+        app.keep_window_open_for_pending_settings_save(&ctx);
+        app.close_after_quit_when_settings_saves_are_drained(&ctx);
+        assert_eq!(
+            ctx.end_pass().viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![egui::ViewportCommand::CancelClose]
+        );
+        app.pending_settings_save = None;
+        ctx.begin_pass(panel_focus_input(false, false));
+        app.poll_macos_panel_focus(&ctx);
+        app.close_after_quit_when_settings_saves_are_drained(&ctx);
+        assert_eq!(
+            ctx.end_pass().viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![egui::ViewportCommand::Close]
+        );
     }
 
     #[test]
