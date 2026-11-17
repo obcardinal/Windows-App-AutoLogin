@@ -171,7 +171,7 @@ macOS grants Accessibility and Keychain access to a specific app identity/path. 
 ## First Run
 
 1. Build and open the app bundle.
-2. Use the menu-bar icon and choose **Open Accounts**.
+2. Use the menu-bar icon and choose **Accounts**.
 3. If Accessibility is missing, click **Request Accessibility Access** or **Open Accessibility Settings**.
 4. Enable Windows App AutoLogin in:
 
@@ -196,18 +196,12 @@ Under **Settings → System**, **Hide menu bar icon** (macOS) or **Hide system t
 
 **Show diagnostic info in menu** controls the gray status lines: Accessibility (macOS), password storage, and the last fill result. It is on by default on both platforms, saves automatically, and applies without restarting. Turning it off hides only those lines and their separator; menu actions remain available.
 
-The menu contains:
+The menu follows these groups, separated by native menu dividers:
 
-- **Open Accounts**
-- **Open Settings**
-- **Start Monitor** / **Stop Monitor**
-- **Request Accessibility Access**
-- **Open Accessibility Settings**
-- Accessibility status
-- Password storage status
-- Last fill result
-- **About**: application icon, version, release date, author, and contact links
-- **Quit**
+- **Accounts** and **Start Monitor** / **Stop Monitor**, followed by the optional diagnostic block: Accessibility (macOS), password storage, and last fill result.
+- **About Windows App AutoLogin**: application icon, version, release date, author, and contact links.
+- **Settings…** (`⌘,` on macOS), followed on macOS by **Request Accessibility Access** and **Open Accessibility Settings**.
+- **Quit Windows App AutoLogin** (`⌘Q` on macOS).
 
 The heavier settings UI is launched only when needed. Closing the settings window returns the app to the lightweight menu-bar process.
 

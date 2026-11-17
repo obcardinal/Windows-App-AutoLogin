@@ -87,33 +87,39 @@ impl AppTray {
 pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let menu = Menu::new();
     let accounts_i = MenuItem::new("Accounts", true, None);
-    let settings_i = MenuItem::new("Settings", true, None);
-    let about_i = MenuItem::new("About", true, None);
+    let settings_i = MenuItem::new("Settings…", true, None);
+    let about_i = MenuItem::new("About Windows App AutoLogin", true, None);
     let toggle_i = MenuItem::new("Start Monitor", true, None);
     let request_accessibility_i = automation_request_item();
     let open_accessibility_i = automation_settings_item();
     let accessibility_i = automation_status_item();
     let keychain_i = MenuItem::new("Password storage: Checking", false, None);
     let last_result_i = MenuItem::new("Last fill: none", false, None);
-    let permission_separator = PredefinedMenuItem::separator();
     let status_separator = PredefinedMenuItem::separator();
+    let about_separator = PredefinedMenuItem::separator();
+    let settings_separator = PredefinedMenuItem::separator();
     let quit_separator = PredefinedMenuItem::separator();
-    let quit_i = MenuItem::new("Quit", true, None);
+    let quit_i = MenuItem::new("Quit Windows App AutoLogin", true, None);
+
+    #[cfg(target_os = "macos")]
+    {
+        use tray_icon::menu::accelerator::{Key, KeyAccelerator, Modifiers};
+        settings_i.set_key_accelerator(Some(KeyAccelerator::new(
+            Some(Modifiers::SUPER),
+            Key::Character(",".into()),
+        )))?;
+        quit_i.set_key_accelerator(Some(KeyAccelerator::new(
+            Some(Modifiers::SUPER),
+            Key::Character("q".into()),
+        )))?;
+    }
 
     // Both menus share item handles, so commands keep their IDs and status updates
     // made while diagnostics are hidden are visible immediately when restored.
     let compact_menu = Menu::new();
     for (menu, diagnostics_visible) in [(&menu, true), (&compact_menu, false)] {
         menu.append(&accounts_i)?;
-        menu.append(&settings_i)?;
         menu.append(&toggle_i)?;
-        if let Some(request_accessibility_i) = &request_accessibility_i {
-            menu.append(&permission_separator)?;
-            menu.append(request_accessibility_i)?;
-        }
-        if let Some(open_accessibility_i) = &open_accessibility_i {
-            menu.append(open_accessibility_i)?;
-        }
         if diagnostics_visible {
             menu.append(&status_separator)?;
             if let Some(accessibility_i) = &accessibility_i {
@@ -122,8 +128,17 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
             menu.append(&keychain_i)?;
             menu.append(&last_result_i)?;
         }
-        menu.append(&quit_separator)?;
+        menu.append(&about_separator)?;
         menu.append(&about_i)?;
+        menu.append(&settings_separator)?;
+        menu.append(&settings_i)?;
+        if let Some(request_accessibility_i) = &request_accessibility_i {
+            menu.append(request_accessibility_i)?;
+        }
+        if let Some(open_accessibility_i) = &open_accessibility_i {
+            menu.append(open_accessibility_i)?;
+        }
+        menu.append(&quit_separator)?;
         menu.append(&quit_i)?;
     }
 
