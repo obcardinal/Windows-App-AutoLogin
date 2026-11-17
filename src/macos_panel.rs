@@ -2,7 +2,7 @@ use anyhow::Context;
 use eframe::egui;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem, NSView, NSWindow,
+    NSColor, NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSSize};
@@ -12,6 +12,7 @@ const MAX_WIRE_BYTES: usize = 240;
 const MAX_COORDINATE: f64 = 100_000.0;
 const MAX_SCREEN_SIZE: f64 = 32_768.0;
 const PANEL_GAP: f64 = 6.0;
+const PANEL_CORNER_RADIUS: f64 = 12.0;
 
 /// Geometry remains in AppKit screen points from capture through placement.
 /// Scaling a global screen origin by one display's DPI breaks mixed-DPI layouts.
@@ -150,6 +151,9 @@ pub(crate) fn configure_viewport(
 ) -> egui::ViewportBuilder {
     let panel = matches!(presentation, Presentation::Panel(_));
     viewport
+        // The GL surface needs alpha from creation, including when a regular
+        // window later switches to a panel without recreating the renderer.
+        .with_transparent(true)
         .with_decorations(!panel)
         .with_resizable(!panel)
         .with_window_level(if panel {
@@ -209,6 +213,27 @@ fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Res
     {
         anyhow::bail!("AppKit window has an invalid content size");
     }
+    let content_view = window
+        .contentView()
+        .context("AppKit window has no content view")?;
+    content_view.setWantsLayer(true);
+    let layer = content_view
+        .layer()
+        .context("AppKit content view has no layer")?;
+    let panel = matches!(presentation, Presentation::Panel(_));
+    // Preserve the renderer's layer and clip its complete contents, including
+    // popups and the toolbar, to the panel's native shape.
+    layer.setCornerRadius(if panel { PANEL_CORNER_RADIUS } else { 0.0 });
+    layer.setMasksToBounds(panel);
+    layer.setBorderWidth(0.0);
+    window.setOpaque(!panel);
+    let background = if panel {
+        NSColor::clearColor()
+    } else {
+        NSColor::windowBackgroundColor()
+    };
+    window.setBackgroundColor(Some(&background));
+    window.setHasShadow(true);
     match presentation {
         Presentation::Panel(anchor) => {
             anyhow::ensure!(anchor.is_valid(), "invalid menu bar panel geometry");
@@ -244,6 +269,7 @@ fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Res
             }
         }
     }
+    window.invalidateShadow();
     Ok(())
 }
 

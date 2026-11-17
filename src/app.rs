@@ -2431,6 +2431,13 @@ fn monitor_control_command(state: MonitorControlState) -> MonitorControlCommand 
 }
 
 impl eframe::App for AutoLoginApp {
+    #[cfg(target_os = "macos")]
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Native panel clipping supplies the shape; untouched pixels must not
+        // leave the renderer's default dark translucent background behind it.
+        [0.0; 4]
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
@@ -2483,7 +2490,7 @@ impl eframe::App for AutoLoginApp {
             }
         }
 
-        egui::Panel::top("top_panel")
+        let toolbar = egui::Panel::top("top_panel")
             .frame(theme::top_bar_frame())
             .show_inside(ui, |ui| {
                 theme::apply_toolbar_style(ui);
@@ -2542,6 +2549,13 @@ impl eframe::App for AutoLoginApp {
                     }
                 }
             });
+
+        // Separate the toolbar without outlining the window's outer edges.
+        ui.painter().hline(
+            toolbar.response.rect.x_range(),
+            toolbar.response.rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, theme::STROKE),
+        );
 
         egui::CentralPanel::default()
             .frame(theme::content_frame())

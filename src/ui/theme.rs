@@ -109,7 +109,6 @@ pub fn top_bar_frame() -> egui::Frame {
             top: 7,
             bottom: 7,
         })
-        .stroke(egui::Stroke::new(1.0, STROKE))
 }
 
 pub fn apply_toolbar_style(ui: &mut egui::Ui) {
