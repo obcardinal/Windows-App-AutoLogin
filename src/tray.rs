@@ -42,10 +42,47 @@ impl AppTray {
         // Drain the queue even after finding a click: move/enter/leave events
         // must not accumulate while the supervisor is running.
         let mut clicked = false;
+        let mut menu_clicked = false;
         for event in tray_icon::TrayIconEvent::receiver().try_iter() {
             clicked |= is_panel_click(&event, self._tray.id());
+            menu_clicked |= is_menu_click(&event, self._tray.id());
+        }
+        if menu_clicked {
+            self.show_context_menu();
         }
         clicked
+    }
+
+    #[cfg(target_os = "macos")]
+    fn show_context_menu(&self) {
+        use objc2::rc::Retained;
+        use objc2_foundation::MainThreadMarker;
+        use tray_icon::menu::ContextMenu;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(status_item) = self.status_item() else {
+            return;
+        };
+        let Some(button) = status_item.button(mtm) else {
+            return;
+        };
+        if button.window().is_none() {
+            return;
+        }
+        let menu = self.current_menu();
+        let position = tray_icon::dpi::LogicalPosition::new(0.0, button.bounds().size.height);
+        // SAFETY: the retained AppKit button remains alive and attached to a
+        // window for the synchronous popup, which runs on the main thread.
+        unsafe {
+            button.highlight(true);
+            menu.show_context_menu_for_nsview(
+                Retained::as_ptr(&button).cast(),
+                Some(position.into()),
+            );
+            button.highlight(false);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -57,13 +94,21 @@ impl AppTray {
         if self.diagnostics_visible.get() == visible {
             return;
         }
-        let menu = if visible {
+        self.diagnostics_visible.set(visible);
+        // On macOS a menu attached to NSStatusItem consumes the left click
+        // before tray-icon can deliver it, even with menu_on_left_click=false.
+        // Keep both menus detached and open the current one on right release.
+        #[cfg(not(target_os = "macos"))]
+        self._tray
+            .set_menu(Some(Box::new(self.current_menu().clone())));
+    }
+
+    fn current_menu(&self) -> &Menu {
+        if self.diagnostics_visible.get() {
             &self.diagnostic_menu
         } else {
             &self.compact_menu
-        };
-        self._tray.set_menu(Some(Box::new(menu.clone())));
-        self.diagnostics_visible.set(visible);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -153,12 +198,15 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let icon = load_icon()?;
 
     let tray_builder = TrayIconBuilder::new()
-        .with_menu(Box::new(compact_menu.clone()))
         .with_tooltip("Windows App AutoLogin")
         .with_icon(icon)
         .with_icon_as_template(tray_icon_uses_template_rendering());
+    #[cfg(not(target_os = "macos"))]
+    let tray_builder = tray_builder.with_menu(Box::new(compact_menu.clone()));
     #[cfg(target_os = "macos")]
-    let tray_builder = tray_builder.with_menu_on_left_click(false);
+    let tray_builder = tray_builder
+        .with_menu_on_left_click(false)
+        .with_menu_on_right_click(false);
     let tray = tray_builder.build()?;
     #[cfg(target_os = "windows")]
     let windows_visibility = windows_visibility::WindowsTrayVisibility::new(tray.clone());
@@ -289,25 +337,40 @@ fn is_panel_click(event: &tray_icon::TrayIconEvent, tray_id: &tray_icon::TrayIco
     )
 }
 
+#[cfg(target_os = "macos")]
+fn is_menu_click(event: &tray_icon::TrayIconEvent, tray_id: &tray_icon::TrayIconId) -> bool {
+    matches!(
+        event,
+        tray_icon::TrayIconEvent::Click {
+            id,
+            button: tray_icon::MouseButton::Right,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } if id == tray_id
+    )
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::is_panel_click;
+    use super::{is_menu_click, is_panel_click};
     use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
 
     #[test]
-    fn only_own_left_release_opens_the_panel() {
+    fn own_left_and_right_releases_have_separate_actions() {
         let own_id = TrayIconId::new("autologin");
-        for (id, button, button_state, expected) in [
+        for (id, button, button_state, panel_expected, menu_expected) in [
             (
                 own_id.clone(),
                 MouseButton::Left,
                 MouseButtonState::Up,
                 true,
+                false,
             ),
             (
                 own_id.clone(),
                 MouseButton::Left,
                 MouseButtonState::Down,
+                false,
                 false,
             ),
             (
@@ -315,11 +378,13 @@ mod tests {
                 MouseButton::Right,
                 MouseButtonState::Up,
                 false,
+                true,
             ),
             (
                 own_id.clone(),
                 MouseButton::Right,
                 MouseButtonState::Down,
+                false,
                 false,
             ),
             (
@@ -327,11 +392,20 @@ mod tests {
                 MouseButton::Middle,
                 MouseButtonState::Up,
                 false,
+                false,
             ),
             (
                 TrayIconId::new("another-app"),
                 MouseButton::Left,
                 MouseButtonState::Up,
+                false,
+                false,
+            ),
+            (
+                TrayIconId::new("another-app"),
+                MouseButton::Right,
+                MouseButtonState::Up,
+                false,
                 false,
             ),
         ] {
@@ -342,7 +416,8 @@ mod tests {
                 button,
                 button_state,
             };
-            assert_eq!(is_panel_click(&event, &own_id), expected);
+            assert_eq!(is_panel_click(&event, &own_id), panel_expected);
+            assert_eq!(is_menu_click(&event, &own_id), menu_expected);
         }
         let movement = TrayIconEvent::Move {
             id: own_id.clone(),
@@ -350,5 +425,6 @@ mod tests {
             rect: Rect::default(),
         };
         assert!(!is_panel_click(&movement, &own_id));
+        assert!(!is_menu_click(&movement, &own_id));
     }
 }
