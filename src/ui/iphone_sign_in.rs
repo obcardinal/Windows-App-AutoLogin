@@ -108,26 +108,33 @@ fn device_label(info: Option<&SetupInfo>) -> &str {
 
 pub(super) fn summary(ui: &mut egui::Ui) {
     let snapshot = DeviceSnapshot::get(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Sign-in details…").clicked() {
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(details_id(), true));
-                ui.ctx().request_repaint();
-            }
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let label = device_label(snapshot.0.get());
-                ui.add(egui::Label::new(format!("iPhone: {label}")).truncate())
-                    .on_hover_text(label);
-                ui.label(
-                    egui::RichText::new("Microsoft Authenticator over Wi-Fi")
-                        .small()
-                        .color(theme::MUTED),
-                );
-            });
-        });
-    });
+    let text_height = ui.text_style_height(&egui::TextStyle::Body)
+        + ui.text_style_height(&egui::TextStyle::Small);
+    let (_, details) = egui::containers::Sides::new()
+        .height(text_height.max(ui.spacing().interact_size.y))
+        .shrink_left()
+        .show(
+            ui,
+            |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let label = device_label(snapshot.0.get());
+                    ui.add(egui::Label::new(format!("iPhone: {label}")).truncate())
+                        .on_hover_text(label);
+                    ui.label(
+                        egui::RichText::new("Microsoft Authenticator over Wi-Fi")
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                });
+            },
+            |ui| ui.add(theme::secondary_button("Sign-in details…")),
+        );
+    if details.clicked() {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(details_id(), true));
+        ui.ctx().request_repaint();
+    }
 }
 
 pub(super) fn show_if_open(ui: &mut egui::Ui) -> bool {
@@ -156,7 +163,7 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> bool {
     if ui
         .add_enabled(
             snapshot.0.get().is_some(),
-            egui::Button::new("Refresh device info").small(),
+            theme::secondary_button("Refresh device info"),
         )
         .clicked()
     {
@@ -177,7 +184,9 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> bool {
             .color(theme::MUTED),
     );
     ui.separator();
-    if ui.button("Back to Settings").clicked()
+    if ui
+        .add(theme::secondary_button("Back to Settings"))
+        .clicked()
         || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         close_details(ui.ctx());
@@ -278,6 +287,7 @@ mod tests {
     #[test]
     fn shared_device_details_return_to_settings_and_preserve_the_selected_offline_phone() {
         let ctx = egui::Context::default();
+        theme::apply(&ctx);
         let view = DeviceSnapshot::default();
         view.0
             .set(SetupInfo::Selected {
@@ -308,7 +318,25 @@ mod tests {
         };
         frame(vec![]);
         let home = frame(vec![]);
-        assert!(text_rect(&home, "iPhone: Work iPhone").is_some());
+        let phone = text_rect(&home, "iPhone: Work iPhone").unwrap();
+        let caption = text_rect(&home, "Microsoft Authenticator over Wi-Fi").unwrap();
+        let details_label = text_rect(&home, "Sign-in details…").unwrap();
+        let button = home
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Rect(rect)
+                    if rect.stroke.color == theme::STROKE
+                        && rect.rect.contains_rect(details_label) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("the details action should use the outlined button style");
+        assert!(button.height() >= 28.0);
+        assert!(phone.right().max(caption.right()) < button.left());
+        assert!((button.center().y - phone.union(caption).center().y).abs() <= 2.0);
         let click_button = |output: &egui::FullOutput, label: &str| {
             let pos = text_rect(output, label).unwrap().center();
             let click = |pressed| egui::Event::PointerButton {
