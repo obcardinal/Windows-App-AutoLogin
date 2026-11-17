@@ -133,7 +133,20 @@ impl AppTray {
     }
 
     pub(crate) fn set_monitor_control_state(&self, state: MonitorControlState) {
+        #[cfg(target_os = "macos")]
+        let changed = self.monitor_i.text() != state.toggle_label();
         self.monitor_i.set_text(state.toggle_label());
+        #[cfg(target_os = "macos")]
+        if changed {
+            let symbol = if state.toggle_requests_stop() {
+                "stop"
+            } else {
+                "play"
+            };
+            for menu in [&self.diagnostic_menu, &self.compact_menu] {
+                set_macos_menu_symbol(menu, state.toggle_label(), symbol);
+            }
+        }
     }
 
     pub(crate) fn set_accessibility_trusted(&self, trusted: bool) {
@@ -207,6 +220,11 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         menu.append(&updates_i)?;
         menu.append(&quit_separator)?;
         menu.append(&quit_i)?;
+        #[cfg(target_os = "macos")]
+        {
+            set_macos_menu_symbol(menu, "Accounts", "person.2");
+            set_macos_menu_symbol(menu, "Start Monitor", "play");
+        }
     }
 
     let icon = load_icon()?;
@@ -287,6 +305,33 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         keychain_i,
         last_result_i,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_menu_symbol(menu: &Menu, title: &str, symbol: &str) {
+    use objc2_app_kit::{NSImage, NSMenu};
+    use objc2_foundation::{MainThreadMarker, NSSize, NSString};
+    use tray_icon::menu::ContextMenu;
+
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // Muda owns each native item and keeps its command ID. Decorate both menu
+    // copies directly so SF Symbols follow macOS appearance and highlighting.
+    // SAFETY: Menu retains this NSMenu; all access is on the AppKit main thread.
+    let native_menu = unsafe { &*menu.ns_menu().cast::<NSMenu>() };
+    let title = NSString::from_str(title);
+    let Some(item) = native_menu.itemWithTitle(&title) else {
+        return;
+    };
+    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol),
+        None,
+    ) {
+        image.setSize(NSSize::new(16.0, 16.0));
+        image.setTemplate(true);
+        item.setImage(Some(&image));
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
