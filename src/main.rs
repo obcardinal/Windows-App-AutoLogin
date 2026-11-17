@@ -24,6 +24,10 @@ pub(crate) mod background;
 pub(crate) mod config;
 pub(crate) mod debug_fill;
 #[cfg(target_os = "macos")]
+pub(crate) mod iphone_sso;
+#[cfg(target_os = "macos")]
+mod iphone_sso_ui;
+#[cfg(target_os = "macos")]
 pub(crate) mod macos_ax;
 pub(crate) mod macos_identity;
 #[cfg(target_os = "macos")]
@@ -920,6 +924,8 @@ struct LightweightSupervisor {
     #[cfg(target_os = "macos")]
     updater: Option<macos_updates::Updater>,
     #[cfg(target_os = "macos")]
+    iphone_progress: iphone_sso_ui::ProgressUi,
+    #[cfg(target_os = "macos")]
     pending_update_check: bool,
     #[cfg(target_os = "macos")]
     update_resume_monitor: Option<bool>,
@@ -984,6 +990,8 @@ impl LightweightSupervisor {
             reopen_registration: None,
             #[cfg(target_os = "macos")]
             updater: None,
+            #[cfg(target_os = "macos")]
+            iphone_progress: iphone_sso_ui::ProgressUi::default(),
             #[cfg(target_os = "macos")]
             pending_update_check: false,
             #[cfg(target_os = "macos")]
@@ -1343,6 +1351,10 @@ impl LightweightSupervisor {
     fn process_worker_events(&mut self) {
         while let Ok(event) = self.worker_event_rx.try_recv() {
             match event {
+                #[cfg(target_os = "macos")]
+                background::WorkerEvent::IphoneAssistance(event) => {
+                    self.iphone_progress.update(event)
+                }
                 background::WorkerEvent::StatusChanged(status) => {
                     self.worker_status = status;
                     self.update_tray_status();
@@ -2980,6 +2992,8 @@ impl ApplicationHandler for LightweightSupervisor {
             return;
         }
         self.process_worker_events();
+        #[cfg(target_os = "macos")]
+        self.iphone_progress.poll();
         self.poll_pending_settings_launch();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.process_local_ipc_commands();

@@ -400,6 +400,8 @@ struct StoredAccountWire {
     has_saved_password: bool,
     #[serde(default = "default_stored_account_enabled")]
     enabled: bool,
+    #[serde(default)]
+    iphone_authenticator_enabled: bool,
     #[serde(default, rename = "target_window_title")]
     _removed_target_window_title: Option<String>,
 }
@@ -450,6 +452,7 @@ impl From<StoredAppConfigWire> for AppConfig {
                     username: account.username,
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
+                    iphone_authenticator_enabled: account.iphone_authenticator_enabled,
                 })
                 .collect(),
             settings: AppSettings {
@@ -6031,6 +6034,7 @@ mod tests {
         let mut account = Account::new("user@example.com");
         account.id = "account-1".to_string();
         account.has_saved_password = true;
+        account.iphone_authenticator_enabled = true;
         let mut config = AppConfig {
             accounts: vec![account],
             ..AppConfig::default()

@@ -13,6 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "macos_sso.rs"]
+pub(crate) mod sso;
+
 const MAX_ELEMENT_COUNT: usize = 900;
 const AX_SEARCH_DEPTH: usize = 12;
 const MAX_DIRECT_SHEET_COUNT: usize = 8;

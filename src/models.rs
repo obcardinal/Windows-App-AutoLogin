@@ -12,6 +12,8 @@ pub struct Account {
     pub has_saved_password: bool,
     #[serde(default = "default_account_enabled", skip_serializing_if = "is_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub iphone_authenticator_enabled: bool,
 }
 
 impl Account {
@@ -21,6 +23,7 @@ impl Account {
             username: username.into(),
             has_saved_password: false,
             enabled: true,
+            iphone_authenticator_enabled: false,
         }
     }
 
@@ -186,10 +189,12 @@ mod tests {
 
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].username, "user@example.com");
+        assert!(!config.accounts[0].iphone_authenticator_enabled);
 
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(!serialized.contains("target_window_title"));
         assert!(!serialized.contains("Legacy Target"));
+        assert!(!serialized.contains("iphone_authenticator_enabled"));
     }
 
     #[test]

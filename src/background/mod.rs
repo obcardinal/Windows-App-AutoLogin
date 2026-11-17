@@ -44,6 +44,8 @@ pub(crate) enum WorkerEvent {
     StatusChanged(WorkerStatus),
     Log(LogEntry),
     FillAttemptReport(FillAttemptReport),
+    #[cfg(target_os = "macos")]
+    IphoneAssistance(crate::iphone_sso::Event),
 }
 
 #[derive(Clone)]
@@ -1547,6 +1549,123 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
     true
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct IphoneAttemptMemory {
+    attempted: std::collections::HashSet<u64>,
+    absent_observations: u8,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct IphoneProbeCadence {
+    last_started: Option<Instant>,
+    owes_monitor_tick: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl IphoneProbeCadence {
+    fn due(&mut self, now: Instant) -> bool {
+        // Even a slow AX probe must yield one normal monitor pass before it
+        // can start again, so opting in cannot starve saved-password filling.
+        if std::mem::take(&mut self.owes_monitor_tick) {
+            return false;
+        }
+        self.last_started
+            .is_none_or(|started| now.duration_since(started) >= Duration::from_secs(1))
+    }
+
+    fn started(&mut self, now: Instant) {
+        self.last_started = Some(now);
+        self.owes_monitor_tick = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct IphoneProbe {
+    accounts: Vec<Account>,
+    pause_latch: WorkerPauseLatch,
+    expected_generation: u64,
+    automation_in_progress: Arc<AtomicBool>,
+    activity_tracker: WorkerActivityTracker,
+    attempts: Arc<Mutex<IphoneAttemptMemory>>,
+    event_tx: Sender<WorkerEvent>,
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_iphone_probe(job: IphoneProbe) -> bool {
+    let Some(automation_guard) = FlagGuard::acquire(&job.automation_in_progress) else {
+        return false;
+    };
+    let Some(activity_guard) = job.activity_tracker.begin_attempt() else {
+        return false;
+    };
+    std::thread::spawn(move || {
+        let _activity_guard = activity_guard;
+        let _automation_guard = automation_guard;
+        let guard = || {
+            job.pause_latch
+                .ensure_attempt_current(job.expected_generation, "iPhone attempt cancelled")
+        };
+        if guard().is_err() {
+            return;
+        }
+        // Detection and assistance share this thread: the retained native AX
+        // objects must never cross threads or be replaced by report strings.
+        let challenge = match crate::macos_ax::sso::detect(&job.accounts, &guard) {
+            Ok(Some(challenge)) => challenge,
+            Ok(None) => {
+                if let Ok(false) = crate::macos_ax::sso::has_visible_sign_in_window(&guard) {
+                    if let Ok(mut memory) = job.attempts.lock() {
+                        memory.absent_observations = memory.absent_observations.saturating_add(1);
+                        if memory.absent_observations >= 2 {
+                            memory.attempted.clear();
+                        }
+                    }
+                } else if let Ok(mut memory) = job.attempts.lock() {
+                    memory.absent_observations = 0;
+                }
+                return;
+            }
+            Err(_) => return,
+        };
+        let Some(account) = job
+            .accounts
+            .iter()
+            .find(|account| challenge.matches_account(account))
+        else {
+            return;
+        };
+        {
+            let Ok(mut memory) = job.attempts.lock() else {
+                return;
+            };
+            memory.absent_observations = 0;
+            // Never automatically replay a failed, cancelled, or ambiguous
+            // approval against the same sign-in request.
+            if memory.attempted.len() >= 128 || !memory.attempted.insert(challenge.fingerprint()) {
+                return;
+            }
+        }
+        let outcome = crate::iphone_sso::assist(&challenge, account, &guard, |event| {
+            let _ = job.event_tx.try_send(WorkerEvent::IphoneAssistance(event));
+        });
+        let message = match outcome {
+            crate::iphone_sso::Outcome::SubmittedUnverified => {
+                "iPhone number submitted; desktop authentication result is not verified"
+            }
+            crate::iphone_sso::Outcome::Cancelled => "iPhone assistance cancelled",
+            crate::iphone_sso::Outcome::Unavailable => {
+                "iPhone assistance unavailable; complete this sign-in manually"
+            }
+        };
+        let _ = job
+            .event_tx
+            .try_send(log_event(LogLevel::Info, message.to_string()));
+    });
+    true
+}
+
 pub(crate) fn spawn(
     mut cmd_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
@@ -1563,6 +1682,10 @@ pub(crate) fn spawn(
             Arc::new(Mutex::new(HashMap::<LoginPromptKey, Instant>::new()));
         let automation_in_progress = Arc::new(AtomicBool::new(false));
         let activity_tracker = WorkerActivityTracker::default();
+        #[cfg(target_os = "macos")]
+        let iphone_attempts = Arc::new(Mutex::new(IphoneAttemptMemory::default()));
+        #[cfg(target_os = "macos")]
+        let mut iphone_probe_cadence = IphoneProbeCadence::default();
         let generation = invalidator.generation;
         #[cfg(target_os = "macos")]
         let mut last_macos_prompt_probe: Option<Instant> = None;
@@ -1651,6 +1774,28 @@ pub(crate) fn spawn(
                     break;
                 }
                 continue;
+            }
+
+            #[cfg(target_os = "macos")]
+            if accounts
+                .iter()
+                .any(|account| account.enabled && account.iphone_authenticator_enabled)
+                && iphone_probe_cadence.due(Instant::now())
+            {
+                if spawn_iphone_probe(IphoneProbe {
+                    accounts: accounts.clone(),
+                    pause_latch: pause_latch.clone(),
+                    expected_generation: current_generation,
+                    automation_in_progress: automation_in_progress.clone(),
+                    activity_tracker: activity_tracker.clone(),
+                    attempts: iphone_attempts.clone(),
+                    event_tx: event_tx.clone(),
+                }) {
+                    iphone_probe_cadence.started(Instant::now());
+                    // The next iteration services Stop/Settings while the
+                    // dedicated thread waits for unlock or Face ID.
+                    continue;
+                }
             }
 
             let has_enabled_account = accounts.iter().any(|account| {
@@ -2129,6 +2274,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iphone_slow_probe_yields_to_the_existing_monitor() {
+        let start = Instant::now();
+        let mut cadence = super::IphoneProbeCadence::default();
+        assert!(cadence.due(start));
+        cadence.started(start);
+        // The interval is already overdue after a slow native observation.
+        let completed = start + Duration::from_secs(3);
+        assert!(!cadence.due(completed));
+        assert!(cadence.due(completed + Duration::from_secs(1)));
+        cadence.started(completed + Duration::from_secs(1));
+        assert!(!cadence.due(completed + Duration::from_millis(1100)));
+        assert!(!cadence.due(completed + Duration::from_millis(1200)));
+    }
 
     fn pause_latch_for_generation(generation: &Arc<AtomicU64>) -> WorkerPauseLatch {
         WorkerInvalidator {
@@ -3952,6 +4113,7 @@ mod tests {
             username: username.to_string(),
             has_saved_password: true,
             enabled,
+            iphone_authenticator_enabled: false,
         }
     }
 

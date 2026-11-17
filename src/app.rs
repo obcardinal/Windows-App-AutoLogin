@@ -2016,6 +2016,8 @@ impl AutoLoginApp {
     fn process_worker_events(&mut self) {
         while let Ok(event) = self.worker_event_rx.try_recv() {
             match event {
+                #[cfg(target_os = "macos")]
+                WorkerEvent::IphoneAssistance(_) => {}
                 WorkerEvent::StatusChanged(status) => {
                     self.worker_status = status;
                 }

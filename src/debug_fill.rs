@@ -2071,6 +2071,7 @@ mod windows_tests {
             username: username.to_string(),
             has_saved_password: true,
             enabled,
+            iphone_authenticator_enabled: false,
         }
     }
 
@@ -2118,6 +2119,7 @@ mod macos_context_tests {
             username: username.to_string(),
             has_saved_password,
             enabled: true,
+            iphone_authenticator_enabled: false,
         }
     }
 

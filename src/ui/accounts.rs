@@ -2499,6 +2499,21 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                         });
                 });
 
+                #[cfg(target_os = "macos")]
+                {
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut account.iphone_authenticator_enabled,
+                        "Confirm sign-in on iPhone",
+                    );
+                    ui.add(
+                        egui::Label::new(theme::muted(
+                            "Requires a connected iPhone with Microsoft Authenticator. Unlock and Face ID stay on your phone.",
+                        ))
+                        .wrap(),
+                    );
+                }
+
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2820,6 +2835,7 @@ fn save_edited_account_transaction(
         && existing_account.is_some_and(|existing| {
             previous_password_saved
                 && existing.enabled == account.enabled
+                && existing.iphone_authenticator_enabled == account.iphone_authenticator_enabled
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
         });
@@ -5154,12 +5170,14 @@ mod tests {
         let mut stale_editor_snapshot = authoritative.clone();
         stale_editor_snapshot.username = "new@example.com".to_string();
         stale_editor_snapshot.enabled = true;
+        stale_editor_snapshot.iphone_authenticator_enabled = true;
 
         let rebased = rebase_editor_enabled_state(&stale_editor_snapshot, Some(&authoritative));
 
         assert_eq!(rebased.username, "new@example.com");
         assert!(!rebased.enabled);
         assert!(rebased.has_saved_password);
+        assert!(rebased.iphone_authenticator_enabled);
     }
 
     #[test]
