@@ -2559,6 +2559,10 @@ impl eframe::App for AutoLoginApp {
             egui::Stroke::new(1.0, theme::STROKE),
         );
 
+        #[cfg(target_os = "macos")]
+        if self.selected_tab != Tab::Settings {
+            crate::ui::iphone_sign_in::close_details(&ctx);
+        }
         egui::CentralPanel::default()
             .frame(theme::content_frame())
             .show_inside(ui, |ui| {

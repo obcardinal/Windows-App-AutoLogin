@@ -2086,6 +2086,7 @@ mod windows_tests {
             enabled,
             remote_pc: String::new(),
             iphone_authenticator_enabled: false,
+            authenticator_provider: Default::default(),
         }
     }
 
@@ -2135,6 +2136,7 @@ mod macos_context_tests {
             enabled: true,
             remote_pc: String::new(),
             iphone_authenticator_enabled: false,
+            authenticator_provider: Default::default(),
         }
     }
 

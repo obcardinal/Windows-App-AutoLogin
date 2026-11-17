@@ -93,6 +93,7 @@ impl Challenge {
             enabled: true,
             remote_pc: String::new(),
             iphone_authenticator_enabled: true,
+            authenticator_provider: Default::default(),
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?
             .context("Microsoft number-matching request is no longer present")?;
@@ -123,6 +124,7 @@ impl Challenge {
             enabled: true,
             remote_pc: String::new(),
             iphone_authenticator_enabled: true,
+            authenticator_provider: Default::default(),
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?;
         guard()?;

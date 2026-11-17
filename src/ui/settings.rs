@@ -145,6 +145,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         .id_salt("settings_scroll")
         .auto_shrink([false; 2])
         .show(ui, |ui| {
+            #[cfg(target_os = "macos")]
+            if crate::ui::iphone_sign_in::show_if_open(ui) {
+                return;
+            }
+
             section(ui, "System", |ui| {
                 let open_at_login = ui
                     .add_enabled(
@@ -239,6 +244,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                     ));
                 }
             });
+
+            #[cfg(target_os = "macos")]
+            {
+                ui.add_space(12.0);
+                section(ui, "iPhone Authentication", crate::ui::iphone_sign_in::summary);
+            }
         });
 
     if settings_changed {

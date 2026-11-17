@@ -4,6 +4,27 @@ use uuid::Uuid;
 pub type AccountId = String;
 pub const FIXED_POLL_INTERVAL_SECS: u64 = 1;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticatorProvider {
+    #[default]
+    MicrosoftAuthenticator,
+}
+
+impl AuthenticatorProvider {
+    pub const SUPPORTED: &'static [Self] = &[Self::MicrosoftAuthenticator];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MicrosoftAuthenticator => "Microsoft Authenticator",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Account {
     pub id: AccountId,
@@ -16,6 +37,8 @@ pub struct Account {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub iphone_authenticator_enabled: bool,
+    #[serde(default, skip_serializing_if = "AuthenticatorProvider::is_default")]
+    pub authenticator_provider: AuthenticatorProvider,
 }
 
 impl Account {
@@ -27,6 +50,7 @@ impl Account {
             has_saved_password: false,
             enabled: true,
             iphone_authenticator_enabled: false,
+            authenticator_provider: AuthenticatorProvider::default(),
         }
     }
 

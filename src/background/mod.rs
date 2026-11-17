@@ -4115,6 +4115,7 @@ mod tests {
             enabled,
             remote_pc: String::new(),
             iphone_authenticator_enabled: false,
+            authenticator_provider: Default::default(),
         }
     }
 

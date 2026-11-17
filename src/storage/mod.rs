@@ -404,6 +404,8 @@ struct StoredAccountWire {
     enabled: bool,
     #[serde(default)]
     iphone_authenticator_enabled: bool,
+    #[serde(default)]
+    authenticator_provider: crate::models::AuthenticatorProvider,
     #[serde(default, rename = "target_window_title")]
     _removed_target_window_title: Option<String>,
 }
@@ -456,6 +458,7 @@ impl From<StoredAppConfigWire> for AppConfig {
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
                     iphone_authenticator_enabled: account.iphone_authenticator_enabled,
+                    authenticator_provider: account.authenticator_provider,
                 })
                 .collect(),
             settings: AppSettings {
@@ -6028,6 +6031,40 @@ mod tests {
             assert!(load_config_from_path(&path).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), sentinel);
             let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn authenticator_provider_preserves_legacy_accounts_and_rejects_unknown_values() {
+        use crate::models::AuthenticatorProvider;
+        use serde_json::json;
+
+        for enabled in [false, true] {
+            let mut legacy = json!({"id": "one", "username": "user@example.test"});
+            if enabled {
+                legacy["iphone_authenticator_enabled"] = json!(true);
+            }
+            let decode = |value| {
+                serde_json::from_value::<super::StoredAppConfigWire>(
+                    json!({"accounts": [value], "settings": {}}),
+                )
+                .map(AppConfig::from)
+            };
+            let mut explicit = legacy.clone();
+            explicit["authenticator_provider"] = json!("microsoft_authenticator");
+            for input in [legacy.clone(), explicit.clone()] {
+                let config = decode(input).unwrap();
+                let account = &config.accounts[0];
+                assert_eq!(
+                    account.authenticator_provider,
+                    AuthenticatorProvider::MicrosoftAuthenticator
+                );
+                assert_eq!(account.iphone_authenticator_enabled, enabled);
+                // The canonical account representation is also used in recovery journals.
+                assert_eq!(serde_json::to_value(account).unwrap(), legacy);
+            }
+            explicit["authenticator_provider"] = json!("duo");
+            assert!(decode(explicit).is_err());
         }
     }
 

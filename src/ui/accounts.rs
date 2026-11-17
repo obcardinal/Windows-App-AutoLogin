@@ -2102,8 +2102,6 @@ fn account_columns(width: f32) -> AccountColumns {
 fn open_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp, account: Account) {
     tracing::info!("Opening account editor");
     #[cfg(target_os = "macos")]
-    crate::ui::iphone_sign_in::reset_editor(ctx, &account.id);
-    #[cfg(target_os = "macos")]
     ctx.data_mut(|data| data.remove_by_type::<RemotePcLookup>());
     if let Some(previous_account) = app.editing_account.as_ref() {
         forget_password_editor_state(ctx, password_editor_id(&previous_account.id));
@@ -2467,7 +2465,7 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
             ui.set_width(ACCOUNT_EDITOR_WIDTH);
             if let Some(ref mut account) = editing {
                 #[cfg(target_os = "macos")]
-                if remote_pc_import::show_if_open(ui, account) || crate::ui::iphone_sign_in::show_if_open(ui, &account.id) {
+                if remote_pc_import::show_if_open(ui, account) {
                     return;
                 }
                 account_editor_input_scope(ui, |ui| {
@@ -2540,8 +2538,14 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                     ui.checkbox(
                         &mut account.iphone_authenticator_enabled,
                         crate::ui::iphone_sign_in::TITLE,
-                    );
-                    crate::ui::iphone_sign_in::summary(ui, &account.id);
+                    )
+                    .on_hover_text(crate::ui::iphone_sign_in::TRIGGER);
+                    if account.iphone_authenticator_enabled {
+                        crate::ui::iphone_sign_in::provider_picker(
+                            ui,
+                            &mut account.authenticator_provider,
+                        );
+                    }
                 }
 
                 ui.separator();
@@ -2880,6 +2884,7 @@ fn save_edited_account_transaction(
             previous_password_saved
                 && existing.enabled == account.enabled
                 && existing.iphone_authenticator_enabled == account.iphone_authenticator_enabled
+                && existing.authenticator_provider == account.authenticator_provider
                 && existing.remote_pc == account.remote_pc
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
