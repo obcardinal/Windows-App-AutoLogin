@@ -172,14 +172,14 @@ macOS grants Accessibility and Keychain access to a specific app identity/path. 
 
 1. Build and open the app bundle.
 2. Use the menu-bar icon and choose **Accounts**.
-3. If Accessibility is missing, click **Request Accessibility Access** or **Open Accessibility Settings**.
+3. If Accessibility is missing, the app requests it once at startup and again when you choose **Start Monitor**. If macOS does not show the system prompt again, use **Open Accessibility Settings** on the permission screen inside the app. That screen also retains **Request Accessibility Access** for a manual retry.
 4. Enable Windows App AutoLogin in:
 
 ```text
 System Settings -> Privacy & Security -> Accessibility
 ```
 
-5. Return to the app. It checks Accessibility status every second.
+5. Return to the app. It checks Accessibility status every second without repeating the prompt. The requested Monitor start resumes after permission is granted; **Stop Monitor** cancels that pending start.
 6. If macOS prompts for Automation permission to control System Events, approve it for the expected Windows App AutoLogin bundle. The app uses that only for Open at Login cleanup and guarded diagnostics/prompt inspection.
 7. Add an account in the **Accounts** tab.
 8. Save the email and password.
@@ -200,7 +200,7 @@ The menu follows these groups, separated by native menu dividers:
 
 - **Accounts** and **Start Monitor** / **Stop Monitor**, followed by the optional diagnostic block: Accessibility (macOS), password storage, and last fill result.
 - **About Windows App AutoLogin**: application icon, version, release date, author, and contact links.
-- **Settings…** (`⌘,` on macOS), followed on macOS by **Request Accessibility Access** and **Open Accessibility Settings**.
+- **Settings…** (`⌘,` on macOS).
 - **Quit Windows App AutoLogin** (`⌘Q` on macOS).
 
 The heavier settings UI is launched only when needed. Closing the settings window returns the app to the lightweight menu-bar process.

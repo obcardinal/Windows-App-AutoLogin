@@ -17,8 +17,6 @@ pub(crate) enum TrayCommand {
     PresentAccounts(Sender<()>),
     PresentSettings(Sender<()>),
     ToggleMonitor,
-    RequestAccessibilityAccess,
-    OpenAccessibilitySettings,
     Exit,
 }
 
@@ -90,8 +88,6 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let settings_i = MenuItem::new("Settings…", true, None);
     let about_i = MenuItem::new("About Windows App AutoLogin", true, None);
     let toggle_i = MenuItem::new("Start Monitor", true, None);
-    let request_accessibility_i = automation_request_item();
-    let open_accessibility_i = automation_settings_item();
     let accessibility_i = automation_status_item();
     let keychain_i = MenuItem::new("Password storage: Checking", false, None);
     let last_result_i = MenuItem::new("Last fill: none", false, None);
@@ -132,12 +128,6 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         menu.append(&about_i)?;
         menu.append(&settings_separator)?;
         menu.append(&settings_i)?;
-        if let Some(request_accessibility_i) = &request_accessibility_i {
-            menu.append(request_accessibility_i)?;
-        }
-        if let Some(open_accessibility_i) = &open_accessibility_i {
-            menu.append(open_accessibility_i)?;
-        }
         menu.append(&quit_separator)?;
         menu.append(&quit_i)?;
     }
@@ -157,18 +147,12 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let settings_id = settings_i.id().clone();
     let about_id = about_i.id().clone();
     let toggle_id = toggle_i.id().clone();
-    let request_accessibility_id = request_accessibility_i
-        .as_ref()
-        .map(|item| item.id().clone());
-    let open_accessibility_id = open_accessibility_i.as_ref().map(|item| item.id().clone());
     let quit_id = quit_i.id().clone();
 
     let tx_accounts = tx.clone();
     let tx_settings = tx.clone();
     let tx_about = tx.clone();
     let tx_toggle = tx.clone();
-    let tx_request_accessibility = tx.clone();
-    let tx_open_accessibility = tx.clone();
     let tx_quit = tx.clone();
 
     std::thread::spawn(move || {
@@ -189,20 +173,6 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
                 }
                 if event.id == toggle_id {
                     let _ = tx_toggle.send(TrayCommand::ToggleMonitor);
-                    continue;
-                }
-                if request_accessibility_id
-                    .as_ref()
-                    .is_some_and(|id| id == &event.id)
-                {
-                    let _ = tx_request_accessibility.send(TrayCommand::RequestAccessibilityAccess);
-                    continue;
-                }
-                if open_accessibility_id
-                    .as_ref()
-                    .is_some_and(|id| id == &event.id)
-                {
-                    let _ = tx_open_accessibility.send(TrayCommand::OpenAccessibilitySettings);
                     continue;
                 }
                 if event.id == quit_id {
@@ -229,34 +199,6 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn automation_request_item() -> Option<MenuItem> {
-    Some(MenuItem::new(
-        automation_request_label(),
-        automation_settings_available(),
-        None,
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn automation_request_item() -> Option<MenuItem> {
-    None
-}
-
-#[cfg(not(target_os = "windows"))]
-fn automation_settings_item() -> Option<MenuItem> {
-    Some(MenuItem::new(
-        automation_settings_label(),
-        automation_settings_available(),
-        None,
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn automation_settings_item() -> Option<MenuItem> {
-    None
-}
-
-#[cfg(not(target_os = "windows"))]
 fn automation_status_item() -> Option<MenuItem> {
     Some(MenuItem::new(automation_status_label(false), false, None))
 }
@@ -264,35 +206,6 @@ fn automation_status_item() -> Option<MenuItem> {
 #[cfg(target_os = "windows")]
 fn automation_status_item() -> Option<MenuItem> {
     None
-}
-
-#[cfg(not(target_os = "windows"))]
-fn automation_request_label() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Request Accessibility Access"
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        "Automation Ready"
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn automation_settings_label() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "Open Accessibility Settings"
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        "No Permission Setup Needed"
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn automation_settings_available() -> bool {
-    cfg!(target_os = "macos")
 }
 
 #[cfg(not(target_os = "windows"))]

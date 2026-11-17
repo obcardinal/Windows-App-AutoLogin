@@ -1644,10 +1644,17 @@ impl AutoLoginApp {
 
     fn toggle_monitor_from_ui(&mut self, ctx: &egui::Context) {
         let command = monitor_control_command(self.monitor_control_state());
-        if command == MonitorControlCommand::Start && !self.accessibility_ready() {
-            self.block_for_accessibility("starting the monitor");
-        } else if self.settings_window_mode {
+        if self.settings_window_mode {
+            // The supervisor owns permission prompts and desired Start/Stop
+            // intent. A missing grant must not prevent this request reaching
+            // it, or a subsequent grant could lose the user's requested Start.
             self.queue_background_monitor_control(ctx, command);
+        } else if command == MonitorControlCommand::Start && !self.accessibility_ready() {
+            if self.automation_start_ready() {
+                self.request_accessibility_access();
+            } else {
+                self.send_local_monitor_control_command(command);
+            }
         } else {
             self.send_local_monitor_control_command(command);
         }
@@ -1664,15 +1671,6 @@ impl AutoLoginApp {
             level,
             message: accessibility_log_message(event, status),
         });
-    }
-
-    fn block_for_accessibility(&mut self, action: &str) {
-        self.log_accessibility_event("accessibility_still_missing", LogLevel::Warn);
-        self.status_message = Some((
-            format!("Accessibility permission is required before {action}"),
-            6.0,
-        ));
-        self.selected_tab = Tab::Accounts;
     }
 
     pub(crate) fn request_accessibility_access(&mut self) {
@@ -1777,12 +1775,6 @@ impl AutoLoginApp {
                     });
                 }
                 TrayCommand::ToggleMonitor => self.toggle_monitor_from_ui(ctx),
-                TrayCommand::RequestAccessibilityAccess => {
-                    self.request_accessibility_access();
-                }
-                TrayCommand::OpenAccessibilitySettings => {
-                    self.open_accessibility_settings();
-                }
                 TrayCommand::Exit => {
                     self.quit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2253,7 +2245,6 @@ impl eframe::App for AutoLoginApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let accessibility_ready = self.accessibility_ready();
-        let monitor_control_state = self.monitor_control_state();
 
         if let Some((_, ref mut remaining)) = self.status_message {
             *remaining -= ctx.input(|i| i.stable_dt) as f64;
@@ -2305,29 +2296,9 @@ impl eframe::App for AutoLoginApp {
                             },
                         );
 
-                        if accessibility_ready {
-                            if monitor_control_state.toggle_requests_stop() {
-                                if ui
-                                    .add_sized(
-                                        [140.0, 30.0],
-                                        theme::secondary_button(
-                                            monitor_control_state.toggle_label(),
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    self.toggle_monitor_from_ui(ui.ctx());
-                                }
-                            } else if ui
-                                .add_sized(
-                                    [140.0, 30.0],
-                                    theme::primary_button(monitor_control_state.toggle_label()),
-                                )
-                                .clicked()
-                            {
-                                self.toggle_monitor_from_ui(ui.ctx());
-                            }
-                        }
+                        // Keep Start/Stop available while onboarding so a
+                        // pending permission-gated Start can also be cancelled.
+                        show_monitor_control(ui, self);
                     });
                 });
 
@@ -2366,6 +2337,18 @@ fn push_bounded_log(logs: &mut VecDeque<LogEntry>, mut entry: LogEntry) {
     logs.push_back(entry);
     while logs.len() > MAX_LOG_ENTRIES {
         logs.pop_front();
+    }
+}
+
+fn show_monitor_control(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
+    let state = app.monitor_control_state();
+    let button = if state.toggle_requests_stop() {
+        theme::secondary_button(state.toggle_label())
+    } else {
+        theme::primary_button(state.toggle_label())
+    };
+    if ui.add_sized([140.0, 30.0], button).clicked() {
+        app.toggle_monitor_from_ui(ui.ctx());
     }
 }
 
@@ -2414,10 +2397,11 @@ mod tests {
     use super::{
         accessibility_log_message, monitor_control_command, push_bounded_log,
         redact_sensitive_log_text, run_monitor_control_request, show_accessibility_onboarding,
-        submit_monitor_control_worker, AutoLoginApp, BackgroundMutationExecutor,
-        BridgedUiStatusPoller, BridgedUiStatusSnapshot, MonitorControlCompletion,
-        MonitorControlExecutor, MonitorControlIntent, PendingMonitorControl, WorkerCommand,
-        ACCESSIBILITY_SETTINGS_INSTRUCTIONS, LOCAL_CONFIG_RELEASE_FAILED_REASON, MAX_LOG_ENTRIES,
+        show_monitor_control, submit_monitor_control_worker, AutoLoginApp,
+        BackgroundMutationExecutor, BridgedUiStatusPoller, BridgedUiStatusSnapshot,
+        MonitorControlCompletion, MonitorControlExecutor, MonitorControlIntent,
+        PendingMonitorControl, WorkerCommand, ACCESSIBILITY_SETTINGS_INSTRUCTIONS,
+        LOCAL_CONFIG_RELEASE_FAILED_REASON, MAX_LOG_ENTRIES,
         MONITOR_CONTROL_SAFETY_STOP_RETRY_INITIAL_INTERVAL,
         MONITOR_CONTROL_SAFETY_STOP_RETRY_MAX_INTERVAL, SETTINGS_WINDOW_CLOSING_REASON,
     };
@@ -2904,6 +2888,81 @@ mod tests {
             app.monitor_control_state(),
             MonitorControlState::PausedWithStartIntent
         );
+    }
+
+    #[test]
+    fn missing_permission_start_reaches_supervisor_and_later_stop_wins_after_grant() {
+        let mut app = mutation_test_app(true);
+        app.accessibility_status.trusted = false;
+        app.bridged_monitor_control_state = MonitorControlState::Stopped;
+        let (task_sender, task_receiver) = sync_channel(1);
+        app.monitor_control_executor = Some(MonitorControlExecutor {
+            sender: task_sender,
+        });
+        let ctx = egui::Context::default();
+
+        app.toggle_monitor_from_ui(&ctx);
+
+        // Capture but never execute the IPC task: this test must not contact a
+        // running supervisor or show a system permission prompt.
+        let _task = task_receiver.try_recv().expect("Start must be queued");
+        let start = app.pending_monitor_control.as_ref().unwrap().active_intent;
+        assert_eq!(start.command, MonitorControlCommand::Start);
+        assert_eq!(
+            app.monitor_control_state(),
+            MonitorControlState::PausedWithStartIntent
+        );
+        assert!(!app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("accessibility_prompt_requested")));
+
+        app.toggle_monitor_from_ui(&ctx);
+        assert_eq!(app.monitor_control_state(), MonitorControlState::Stopped);
+        assert!(app.apply_accessibility_granted_status(AccessibilityStatus {
+            trusted: true,
+            raw_trusted: true,
+            identity_trusted: true,
+            current_process_path: "/test/current-executable".to_string(),
+            app_bundle_path: "/test/WindowsAppAutoLogin.app".to_string(),
+        }));
+        assert_eq!(app.monitor_control_state(), MonitorControlState::Stopped);
+        assert!(task_receiver.try_recv().is_err());
+
+        let (completion_sender, completion_receiver) = sync_channel(1);
+        app.pending_monitor_control.as_mut().unwrap().receiver = completion_receiver;
+        completion_sender
+            .send(MonitorControlCompletion::Acknowledged(start))
+            .unwrap();
+        let successor = std::cell::Cell::new(None);
+        app.poll_background_monitor_control_with(&ctx, |app, _, intent| {
+            successor.set(Some(intent.command));
+            app.apply_acknowledged_monitor_command(intent.command);
+            true
+        });
+        assert_eq!(successor.get(), Some(MonitorControlCommand::Stop));
+        assert_eq!(app.monitor_control_state(), MonitorControlState::Stopped);
+    }
+
+    #[test]
+    fn missing_permission_does_not_bypass_child_storage_recovery_start_gate() {
+        let mut app = mutation_test_app(true).with_storage_recovery_state(false);
+        app.accessibility_status.trusted = false;
+        app.bridged_monitor_control_state = MonitorControlState::Stopped;
+        let (task_sender, task_receiver) = sync_channel(1);
+        app.monitor_control_executor = Some(MonitorControlExecutor {
+            sender: task_sender,
+        });
+
+        app.toggle_monitor_from_ui(&egui::Context::default());
+
+        assert!(task_receiver.try_recv().is_err());
+        assert!(app.pending_monitor_control.is_none());
+        assert_eq!(app.monitor_control_state(), MonitorControlState::Stopped);
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("password storage recovery")));
     }
 
     #[test]
@@ -4486,6 +4545,7 @@ mod tests {
         };
         let ctx = egui::Context::default();
         let output = ctx.run_ui(Default::default(), |ui| {
+            show_monitor_control(ui, &mut app);
             show_accessibility_onboarding(ui, &mut app);
         });
         let mut rendered_text = String::new();
@@ -4496,6 +4556,9 @@ mod tests {
 
         assert!(rendered_text.contains(ACCESSIBILITY_SETTINGS_INSTRUCTIONS));
         assert!(rendered_text.contains("Windows App AutoLogin"));
+        assert!(rendered_text.contains("Start Monitor"));
+        assert!(rendered_text.contains("Request Accessibility Access"));
+        assert!(rendered_text.contains("Open Accessibility Settings"));
         assert!(!rendered_text_lowercase.contains("exact app bundle"));
         assert!(!rendered_text_lowercase.contains("bundle to allow"));
         assert!(!rendered_text_lowercase.contains("sentinel"));

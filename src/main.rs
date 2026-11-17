@@ -816,6 +816,7 @@ struct LightweightSupervisor {
     desired_monitor_running: bool,
     accessibility_trusted: bool,
     last_accessibility_check: Instant,
+    startup_accessibility_checked: bool,
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     monitor_command_watcher: single_instance::MonitorCommandWatcher,
     settings_child: Option<Child>,
@@ -874,6 +875,7 @@ impl LightweightSupervisor {
             desired_monitor_running: true,
             accessibility_trusted: autologin::accessibility_is_trusted(),
             last_accessibility_check: Instant::now(),
+            startup_accessibility_checked: false,
             #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             monitor_command_watcher: single_instance::MonitorCommandWatcher::new(),
             settings_child: None,
@@ -1016,17 +1018,6 @@ impl LightweightSupervisor {
                     tracing::warn!("Rejected a child-only presentation command in the supervisor");
                 }
                 tray::TrayCommand::ToggleMonitor => self.toggle_monitor(),
-                tray::TrayCommand::RequestAccessibilityAccess => {
-                    let trusted = autologin::request_accessibility_access_prompt();
-                    self.apply_accessibility_trust_state(
-                        trusted || autologin::accessibility_is_trusted(),
-                    );
-                }
-                tray::TrayCommand::OpenAccessibilitySettings => {
-                    if let Err(e) = autologin::open_accessibility_settings() {
-                        tracing::warn!("Could not open Accessibility settings: {e}");
-                    }
-                }
                 tray::TrayCommand::Exit => {
                     if self.handle_exit_request() {
                         event_loop.exit();
@@ -1553,6 +1544,7 @@ impl LightweightSupervisor {
         self.accessibility_trusted
     }
 
+    #[cfg(test)]
     fn apply_accessibility_trust_state(&mut self, trusted: bool) {
         self.apply_accessibility_trust_state_with_grant_start(trusted, true);
     }
@@ -1583,6 +1575,11 @@ impl LightweightSupervisor {
             self.stop_monitor();
         } else {
             self.start_monitor_if_ready();
+            if self.desired_monitor_running && !self.accessibility_trusted {
+                // macOS may suppress a repeated system prompt. Show the existing
+                // onboarding with its System Settings fallback after an explicit Start.
+                self.open_accounts_window();
+            }
         }
     }
 
@@ -1598,6 +1595,60 @@ impl LightweightSupervisor {
             self.refresh_accessibility_trust_state_for_start();
         }
         self.accessibility_trusted
+    }
+
+    fn accessibility_ready_for_requested_start(&mut self) -> bool {
+        #[cfg(not(test))]
+        return self.request_accessibility_if_missing_with(
+            autologin::accessibility_is_trusted,
+            || {
+                let _ = autologin::request_accessibility_access_prompt();
+            },
+        );
+        #[cfg(test)]
+        {
+            // Ordinary supervisor tests must never display a real macOS permission prompt.
+            let trusted = self.accessibility_trusted;
+            self.request_accessibility_if_missing_with(|| trusted, || {})
+        }
+    }
+
+    fn request_accessibility_if_missing_with(
+        &mut self,
+        mut check_trust: impl FnMut() -> bool,
+        request_access: impl FnOnce(),
+    ) -> bool {
+        let trusted = check_trust();
+        self.apply_accessibility_trust_state_with_grant_start(trusted, false);
+        if trusted {
+            return true;
+        }
+        request_access();
+        // The prompt only asks macOS; a fresh complete check owns the decision.
+        // Do not start here: the caller still needs to check storage and pause gates.
+        let trusted = check_trust();
+        self.apply_accessibility_trust_state_with_grant_start(trusted, false);
+        trusted
+    }
+
+    fn request_startup_accessibility_once(&mut self) {
+        self.request_startup_accessibility_once_with(Self::accessibility_ready_for_requested_start);
+    }
+
+    fn request_startup_accessibility_once_with(
+        &mut self,
+        request_access: impl FnOnce(&mut Self) -> bool,
+    ) {
+        if self.startup_accessibility_checked {
+            return;
+        }
+        self.startup_accessibility_checked = true;
+        let previously_trusted = self.accessibility_trusted;
+        if request_access(self) && (!previously_trusted || self.worker_pause_latch.is_paused()) {
+            // A stale trusted cache can become denied and granted again during
+            // this check. Recover its new pause through the same guarded path.
+            self.start_monitor_after_accessibility_grant();
+        }
     }
 
     fn start_monitor_if_ready(&mut self) {
@@ -1616,7 +1667,7 @@ impl LightweightSupervisor {
             );
             return;
         }
-        if !self.accessibility_ready_for_start() {
+        if !self.accessibility_ready_for_requested_start() {
             tracing::warn!("Automation permission is required before starting monitor");
             return;
         }
@@ -1690,7 +1741,7 @@ impl LightweightSupervisor {
             );
             return true;
         }
-        if !self.accessibility_ready_for_start() {
+        if !self.accessibility_ready_for_requested_start() {
             tracing::warn!("Automation permission is required before starting monitor");
             return true;
         }
@@ -2606,6 +2657,7 @@ impl ApplicationHandler for LightweightSupervisor {
     }
 
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        self.request_startup_accessibility_once();
         #[cfg(target_os = "macos")]
         if self.reopen_registration.is_none() {
             match macos_reopen::install(self.tray_tx.clone()) {
@@ -4904,6 +4956,129 @@ mod tests {
             if let Some(mut child) = supervisor.settings_child.take() {
                 let _ = child.kill();
             }
+        }
+    }
+
+    fn permission_request_supervisor(
+        trusted: bool,
+    ) -> (
+        LightweightSupervisor,
+        tokio::sync::mpsc::Receiver<WorkerCommand>,
+    ) {
+        let (worker_tx, worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        );
+        supervisor.accessibility_trusted = trusted;
+        (supervisor, worker_rx)
+    }
+
+    #[test]
+    fn explicit_permission_request_uses_fresh_trust_and_never_starts_by_itself() {
+        for (cached, before, after) in [
+            (true, true, true),
+            (false, true, true),
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, false, true),
+        ] {
+            let (mut supervisor, mut worker_rx) = permission_request_supervisor(cached);
+            let checks = std::cell::Cell::new(0);
+            let prompts = std::cell::Cell::new(0);
+            let granted = supervisor.request_accessibility_if_missing_with(
+                || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 1 {
+                        before
+                    } else {
+                        after
+                    }
+                },
+                || prompts.set(prompts.get() + 1),
+            );
+            assert_eq!(granted, if before { before } else { after });
+            assert_eq!(supervisor.accessibility_trusted, granted);
+            assert_eq!(checks.get(), if before { 1 } else { 2 });
+            assert_eq!(prompts.get(), if before { 0 } else { 1 });
+            if cached && !before {
+                assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+            }
+            assert!(
+                worker_rx.try_recv().is_err(),
+                "the caller owns starting after its safety gates"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_permission_is_requested_once_and_only_grant_can_resume() {
+        for granted in [false, true] {
+            let (mut supervisor, mut worker_rx) = permission_request_supervisor(false);
+            supervisor.request_startup_accessibility_once_with(|supervisor| {
+                let mut checks = [false, granted].into_iter();
+                supervisor.request_accessibility_if_missing_with(|| checks.next().unwrap(), || {})
+            });
+            supervisor.request_startup_accessibility_once_with(|_| panic!("must not prompt again"));
+            assert!(supervisor.startup_accessibility_checked);
+            if granted {
+                assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Start)));
+            }
+            assert!(worker_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn denied_start_waits_for_grant_but_explicit_stop_cancels_it() {
+        for cancelled in [false, true] {
+            let (mut supervisor, mut worker_rx) = permission_request_supervisor(false);
+            supervisor.desired_monitor_running = false;
+            supervisor.start_monitor_if_ready();
+            assert!(supervisor.desired_monitor_running);
+            assert!(worker_rx.try_recv().is_err());
+            if cancelled {
+                supervisor.stop_monitor();
+                assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+            }
+            supervisor.apply_accessibility_trust_state(true);
+            assert_eq!(supervisor.desired_monitor_running, !cancelled);
+            if !cancelled {
+                assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Start)));
+            }
+            assert!(worker_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn startup_recovers_permission_lost_and_regained_during_the_request() {
+        for cancelled in [false, true] {
+            let (mut supervisor, mut worker_rx) = permission_request_supervisor(true);
+            supervisor.desired_monitor_running = !cancelled;
+            supervisor.request_startup_accessibility_once_with(|supervisor| {
+                let mut checks = [false, true].into_iter();
+                supervisor.request_accessibility_if_missing_with(|| checks.next().unwrap(), || {})
+            });
+            assert!(supervisor.accessibility_trusted);
+            assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+            if !cancelled {
+                assert!(matches!(
+                    worker_rx.try_recv(),
+                    Ok(WorkerCommand::ApplyConfigAndReleasePause {
+                        start_monitor: true,
+                        ..
+                    })
+                ));
+            }
+            assert!(worker_rx.try_recv().is_err());
         }
     }
 
