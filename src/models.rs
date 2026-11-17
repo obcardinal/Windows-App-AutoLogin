@@ -8,6 +8,8 @@ pub const FIXED_POLL_INTERVAL_SECS: u64 = 1;
 pub struct Account {
     pub id: AccountId,
     pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote_pc: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_saved_password: bool,
     #[serde(default = "default_account_enabled", skip_serializing_if = "is_true")]
@@ -21,6 +23,7 @@ impl Account {
         Self {
             id: Uuid::new_v4().to_string(),
             username: username.into(),
+            remote_pc: String::new(),
             has_saved_password: false,
             enabled: true,
             iphone_authenticator_enabled: false,
@@ -35,6 +38,40 @@ impl Account {
 
         "Untitled account".to_string()
     }
+}
+
+/// Normalize a Remote PC host locally without resolving DNS aliases or suffixes.
+pub(crate) fn canonical_remote_pc(value: &str) -> Option<String> {
+    use std::net::{IpAddr, Ipv6Addr};
+
+    let host = value.trim();
+    if let Some(literal) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return literal.parse::<Ipv6Addr>().ok().map(|ip| ip.to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+    // Numeric addresses must be unambiguous IPv4, not shorthand or octal.
+    if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return host
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .map(|ip| ip.to_string());
+    }
+    let valid = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    valid.then(|| host.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -189,12 +226,49 @@ mod tests {
 
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].username, "user@example.com");
+        assert!(config.accounts[0].remote_pc.is_empty());
         assert!(!config.accounts[0].iphone_authenticator_enabled);
 
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(!serialized.contains("target_window_title"));
         assert!(!serialized.contains("Legacy Target"));
         assert!(!serialized.contains("iphone_authenticator_enabled"));
+        assert!(!serialized.contains("remote_pc"));
+    }
+
+    #[test]
+    fn canonical_remote_pc_rejects_ambiguous_addresses_and_accepts_exact_hosts() {
+        for (input, expected) in [
+            ("  Cloud-PC.Example.NET. ", "cloud-pc.example.net"),
+            ("Cloud-123", "cloud-123"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("[2001:DB8::01]", "2001:db8::1"),
+            ("2001:db8:0:0::1", "2001:db8::1"),
+        ] {
+            assert_eq!(super::canonical_remote_pc(input).as_deref(), Some(expected));
+        }
+        for input in [
+            "",
+            " ",
+            "rdp://host",
+            "host/path",
+            "user@host",
+            "host:3389",
+            "[2001:db8::1]:3389",
+            "*.example.net",
+            ".example.net",
+            "host..net",
+            "host..",
+            "-host",
+            "host-.net",
+            "another host",
+            "127.1",
+            "256.0.0.1",
+            "010.0.0.1",
+            &"x".repeat(64),
+        ] {
+            assert!(super::canonical_remote_pc(input).is_none(), "{input:?}");
+        }
     }
 
     #[test]

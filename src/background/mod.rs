@@ -4113,6 +4113,7 @@ mod tests {
             username: username.to_string(),
             has_saved_password: true,
             enabled,
+            remote_pc: String::new(),
             iphone_authenticator_enabled: false,
         }
     }

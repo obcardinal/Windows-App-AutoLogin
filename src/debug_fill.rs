@@ -866,6 +866,13 @@ fn fill_current_prompt_once_macos(
         return log.fail("password_storage_recovery_pending");
     }
 
+    if let Err(reason) = verified_prompt
+        .prompt
+        .remote_pc
+        .check_account(selected_account, accounts.len())
+    {
+        return log.fail(reason);
+    }
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
     log.set("keychain_account_key", selected_account.id.clone());
@@ -1532,6 +1539,12 @@ fn fill_current_prompt_once_windows(
     if !password_storage_recovery_is_clear() {
         return log.fail("password_storage_recovery_pending");
     }
+    if let Err(reason) = prompt
+        .destination
+        .check_account(selected_account, accounts.len())
+    {
+        return log.fail(reason);
+    }
 
     log.set("password_load_attempted", "true");
     log.set("keychain_service_name", storage::keychain_service_name());
@@ -2071,6 +2084,7 @@ mod windows_tests {
             username: username.to_string(),
             has_saved_password: true,
             enabled,
+            remote_pc: String::new(),
             iphone_authenticator_enabled: false,
         }
     }
@@ -2119,6 +2133,7 @@ mod macos_context_tests {
             username: username.to_string(),
             has_saved_password,
             enabled: true,
+            remote_pc: String::new(),
             iphone_authenticator_enabled: false,
         }
     }

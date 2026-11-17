@@ -91,6 +91,7 @@ impl Challenge {
             username: self.username.clone(),
             has_saved_password: false,
             enabled: true,
+            remote_pc: String::new(),
             iphone_authenticator_enabled: true,
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?
@@ -120,6 +121,7 @@ impl Challenge {
             username: self.username.clone(),
             has_saved_password: false,
             enabled: true,
+            remote_pc: String::new(),
             iphone_authenticator_enabled: true,
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?;

@@ -397,6 +397,8 @@ struct StoredAccountWire {
     id: AccountId,
     username: String,
     #[serde(default)]
+    remote_pc: String,
+    #[serde(default)]
     has_saved_password: bool,
     #[serde(default = "default_stored_account_enabled")]
     enabled: bool,
@@ -450,6 +452,7 @@ impl From<StoredAppConfigWire> for AppConfig {
                 .map(|account| Account {
                     id: account.id,
                     username: account.username,
+                    remote_pc: account.remote_pc,
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
                     iphone_authenticator_enabled: account.iphone_authenticator_enabled,
@@ -6004,6 +6007,7 @@ mod tests {
 
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].username, "user@example.com");
+        assert!(config.accounts[0].remote_pc.is_empty());
         assert_eq!(config.settings.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
         assert!(config.settings.use_keyring);
         assert!(!config.settings.hide_menu_bar_icon);
@@ -6035,6 +6039,7 @@ mod tests {
         account.id = "account-1".to_string();
         account.has_saved_password = true;
         account.iphone_authenticator_enabled = true;
+        account.remote_pc = "desktop.example.test".to_string();
         let mut config = AppConfig {
             accounts: vec![account],
             ..AppConfig::default()

@@ -13,7 +13,7 @@ pub(crate) use application::windows_ui;
 #[cfg(target_os = "windows")]
 pub(crate) use application::{
     about, app, app_identity, autologin, autostart, background, config, debug_fill, models,
-    monitor, private_permissions, single_instance, storage, tray, ui, user_paths,
+    monitor, private_permissions, remote_pc, single_instance, storage, tray, ui, user_paths,
 };
 
 #[cfg(target_os = "windows")]

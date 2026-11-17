@@ -13,6 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "macos_remote_pc.rs"]
+pub(crate) mod remote_pc_info;
 #[path = "macos_sso.rs"]
 pub(crate) mod sso;
 
@@ -107,6 +109,7 @@ impl fmt::Debug for MacosWindowTitle {
 pub(crate) struct MacosPrompt {
     pub(crate) target: MacosTarget,
     pub(crate) email: Option<String>,
+    pub(crate) remote_pc: crate::remote_pc::PromptDestination,
     pub(crate) password_field_description: String,
     pub(crate) password_field_role: String,
     pub(crate) origin: PromptOrigin,
@@ -1007,6 +1010,7 @@ fn record_prompt_candidate(inspection: &mut MacosInspection, prompt: MacosPrompt
 
 fn same_prompt_candidate(left: &MacosPrompt, right: &MacosPrompt) -> bool {
     left.target.process_id == right.target.process_id
+        && left.remote_pc == right.remote_pc
         && left
             .target
             .window_title
@@ -2116,6 +2120,17 @@ fn ensure_prompt_identity_text_still_matches(
     expected_origin: PromptOrigin,
     action: &'static str,
 ) -> anyhow::Result<()> {
+    // Sheet revalidation already reconstructs its candidate and compares its
+    // destination. Standalone credential dialogs need the same live check.
+    if prompt.origin == PromptOrigin::Window {
+        let elements = collect_elements(&prompt.prompt_root).into_complete_elements()?;
+        let destination =
+            native_credential_destination(&elements, &prompt.prompt_root, expected_process_id)?;
+        anyhow::ensure!(
+            destination == prompt.remote_pc,
+            "credential destination changed before {action}"
+        );
+    }
     for snapshot in &prompt.identity_text {
         ensure_element_belongs_to_process(&snapshot.element, expected_process_id, "prompt text")?;
         ensure_element_within_prompt_root(&snapshot.element, &prompt.prompt_root, "prompt text")?;
@@ -2788,6 +2803,11 @@ fn prompt_from_elements(
         );
 
         return Ok(Some(MacosPrompt {
+            remote_pc: native_credential_destination(
+                &scoped_elements,
+                &prompt_root,
+                target.process_id,
+            )?,
             target,
             email: Some(prompt_email),
             password_field_description: element_label_text(&password_field),
@@ -2804,6 +2824,46 @@ fn prompt_from_elements(
     }
 
     Ok(None)
+}
+
+fn native_credential_destination(
+    elements: &[AxElement],
+    root: &AxElement,
+    process_id: i32,
+) -> anyhow::Result<crate::remote_pc::PromptDestination> {
+    let mut labels = String::new();
+    for element in elements {
+        if !role_matches(element, AX_STATIC_TEXT_ROLE) {
+            continue;
+        }
+        // Only read labels native to this prompt, never text embedded in an edit.
+        let mut node = element.clone();
+        for _ in 0..=AX_SEARCH_DEPTH {
+            ensure_element_belongs_to_process(&node, process_id, "credential label")?;
+            if is_hidden(&node)
+                || role_matches(&node, AX_TEXT_FIELD_ROLE)
+                || has_secure_password_field_identity(&node)
+            {
+                break;
+            }
+            if node.same_element(root) {
+                let title = element.string_attr(AX_TITLE);
+                let value = element.string_attr(AX_VALUE);
+                for label in title
+                    .iter()
+                    .chain(value.iter().filter(|v| Some(*v) != title.as_ref()))
+                {
+                    labels.push_str(label);
+                    labels.push('\n');
+                }
+                break;
+            }
+            node = node
+                .parent()
+                .context("credential label lost its native parent")?;
+        }
+    }
+    Ok(crate::remote_pc::prompt_destination(&labels))
 }
 
 fn select_credential_prompt_scope(
@@ -3544,6 +3604,7 @@ const NON_SESSION_TITLE_KEYWORDS: &[&str] = &[
     "preferences",
     "about windows app",
     "connection center",
+    "connection information",
     "connection lost",
     "disconnected",
     "unable to connect",

@@ -188,6 +188,8 @@ System Settings -> Privacy & Security -> Accessibility
 
 When the matching Windows App credential prompt is visible and Windows App is frontmost, the background worker attempts one guarded fill and submit sequence.
 
+In **Add Account** or **Edit Account**, **Remote PC** is the hostname or IP address from **Connection Information → Remote PC**. On macOS, open that dialog for one desktop and select **Use from Windows App** to copy the address into the form. When a native sign-in prompt identifies the remote PC, AutoLogin checks this address along with the visible email. For a single saved account the address can be blank. If the initial prompt identifies only a Microsoft RD Gateway, AutoLogin uses the existing email check.
+
 ## Menu-Bar App
 
 The app keeps a lightweight supervisor running in the background. On a fresh launch it opens Accounts unless **Hide main window at launch** is enabled.

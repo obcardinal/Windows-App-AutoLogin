@@ -39,6 +39,7 @@ mod macos_updates;
 pub(crate) mod models;
 pub(crate) mod monitor;
 pub(crate) mod private_permissions;
+pub(crate) mod remote_pc;
 pub(crate) mod single_instance;
 pub(crate) mod storage;
 pub(crate) mod tray;

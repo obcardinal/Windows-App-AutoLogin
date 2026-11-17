@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::monitor::{MonitorObservation, MonitorStatus};
+use crate::remote_pc::{prompt_destination, PromptDestination};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -10,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uiautomation::patterns::{UIInvokePattern, UIValuePattern};
-use uiautomation::types::{ControlType, Handle, TreeScope};
+use uiautomation::types::{ControlType, Handle, TreeScope, UIProperty};
 use uiautomation::{UIAutomation, UIElement};
 use windows::core::{BOOL, BSTR, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -172,6 +173,7 @@ fn set_windows_target_identity_override(
 pub(crate) struct WindowsPrompt {
     pub(crate) target: WindowsTarget,
     pub(crate) email: Option<String>,
+    pub(crate) destination: PromptDestination,
     pub(crate) password_field_description: String,
     pub(crate) password_field_role: String,
     trust: WindowsPromptTrust,
@@ -221,6 +223,37 @@ impl WindowsPromptTrust {
 impl WindowsPrompt {
     pub(crate) fn trust_label(&self) -> &'static str {
         self.trust.label()
+    }
+
+    fn remote_pc(&self) -> anyhow::Result<PromptDestination> {
+        let automation = UIAutomation::new().or_else(|_| UIAutomation::new_direct())?;
+        self.checked_remote_pc(&automation)
+    }
+
+    fn checked_remote_pc(&self, automation: &UIAutomation) -> anyhow::Result<PromptDestination> {
+        // A label can be inserted after the snapshot, including on a form
+        // that originally showed no destination. Query just native text labels
+        // under this exact prompt, never other windows in the process.
+        let text_controls = automation.create_property_condition(
+            UIProperty::ControlType,
+            (ControlType::Text as i32).into(),
+            None,
+        )?;
+        let labels = self
+            .prompt_root
+            .find_all(TreeScope::Descendants, &text_controls)?;
+        let current = native_prompt_destination(
+            automation,
+            &self.target,
+            &self.prompt_root,
+            &self.password_field,
+            self.submit_button.as_ref(),
+            &labels,
+        )?;
+        if current != self.destination {
+            anyhow::bail!("remote PC changed in the credential prompt");
+        }
+        Ok(current)
     }
 }
 
@@ -810,6 +843,7 @@ fn direct_set_value_pattern_after_final_validation(
     {
         anyhow::bail!("password field is read-only");
     }
+    prompt.remote_pc()?;
     ensure_direct_set_value_target_ready(target_app_name, &prompt)?;
     Ok((prompt, value))
 }
@@ -837,9 +871,8 @@ pub(crate) fn submit_prompt(
     // Runtime-id collection and the session snapshot above may block. Repeat
     // the exact cached-element, owner-chain, foreground, and native identity
     // validation only after those reads, immediately before acquiring the
-    // final InvokePattern. This never performs another Descendants scan.
+    // final InvokePattern. Only native destination labels are queried again.
     let prompt = revalidate_prompt_after_activation(target_app_name, &prompt)?;
-    ensure_prompt_foreground_and_trusted(target_app_name, &prompt, "submit")?;
     let button = prompt
         .submit_button
         .as_ref()
@@ -848,6 +881,8 @@ pub(crate) fn submit_prompt(
     let invoke = button
         .get_pattern::<UIInvokePattern>()
         .map_err(|e| anyhow::anyhow!("submit button lost InvokePattern before submit: {e}"))?;
+    prompt.remote_pc()?;
+    ensure_prompt_foreground_and_trusted(target_app_name, &prompt, "submit")?;
     // Keep cancellation/generation invalidation as the final operation before
     // the single submit side effect. All potentially blocking UIA reads above
     // may have yielded long enough for Stop or ApplyConfig to arrive.
@@ -1519,6 +1554,7 @@ pub(crate) fn preflight_password_load_prompt(
     expected: &WindowsPrompt,
     expected_email: &str,
 ) -> anyhow::Result<WindowsPrompt> {
+    expected.remote_pc()?;
     revalidate_cached_prompt(target_app_name, expected, Some(expected_email), true)
 }
 
@@ -1811,6 +1847,16 @@ fn uia_element_bound_to_prompt_window_checked(
     prompt_root: &UIElement,
     target: &WindowsTarget,
 ) -> anyhow::Result<bool> {
+    uia_element_ancestry_matches(automation, element, prompt_root, target, |_| Ok(true))
+}
+
+fn uia_element_ancestry_matches(
+    automation: &UIAutomation,
+    element: &UIElement,
+    prompt_root: &UIElement,
+    target: &WindowsTarget,
+    eligible: impl Fn(&UIElement) -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
     if target.process_id <= 0 || target.window_handle == 0 {
         return Ok(false);
     }
@@ -1839,6 +1885,9 @@ fn uia_element_bound_to_prompt_window_checked(
         .context("UI Automation raw-view walker unavailable")?;
     let mut current = element.clone();
     for _ in 0..=UIA_SEARCH_DEPTH {
+        if !eligible(&current)? {
+            return Ok(false);
+        }
         if current
             .get_process_id()
             .context("prompt ancestry process identity unavailable")?
@@ -2049,10 +2098,19 @@ fn inspect_prompt_window(
     let password_field_description =
         redacted_element_description_checked(&prompt_candidate.password_field)?;
     let password_field_role = element_role_text_checked(&prompt_candidate.password_field)?;
+    let destination = native_prompt_destination(
+        automation,
+        &target,
+        &window,
+        &prompt_candidate.password_field,
+        prompt_candidate.submit_button.as_ref(),
+        &elements,
+    )?;
     Ok(PromptWindowInspection {
         prompt: Some(WindowsPrompt {
             target,
             email: prompt_candidate.email,
+            destination,
             password_field_description,
             password_field_role,
             trust,
@@ -2870,6 +2928,50 @@ fn submit_button_text_checked(element: &UIElement) -> anyhow::Result<String> {
     push_text(&mut text, element.get_help_text().ok());
     push_text(&mut text, element.get_item_status().ok());
     Ok(text)
+}
+
+fn native_prompt_destination(
+    automation: &UIAutomation,
+    target: &WindowsTarget,
+    root: &UIElement,
+    password_field: &UIElement,
+    submit_button: Option<&UIElement>,
+    elements: &[UIElement],
+) -> anyhow::Result<PromptDestination> {
+    if elements.len() > MAX_ELEMENT_COUNT {
+        anyhow::bail!("too many controls in the credential prompt");
+    }
+    let password_rect = prompt_element_rect_checked(password_field)?
+        .context("password field bounds unavailable for remote PC identification")?;
+    let submit_rect = submit_button
+        .map(prompt_element_rect_checked)
+        .transpose()?
+        .flatten();
+    let mut labels = String::new();
+    for element in elements {
+        if element.get_control_type()? != ControlType::Text || element.is_offscreen()? {
+            continue;
+        }
+        let Some(rect) = prompt_element_rect_checked(element)? else {
+            continue;
+        };
+        if !prompt_text_rect_related_to_password(password_rect, submit_rect, rect) {
+            continue;
+        }
+        // A Text child can be the rendered content of an Edit (including
+        // Username). Only static labels from the bound native form qualify.
+        if !uia_element_ancestry_matches(automation, element, root, target, |node| {
+            Ok(node.get_control_type()? != ControlType::Edit && !node.is_password()?)
+        })? {
+            continue;
+        }
+        let name = element.get_name()?;
+        if !name.trim().is_empty() {
+            labels.push_str(&name);
+            labels.push('\n');
+        }
+    }
+    Ok(prompt_destination(&labels))
 }
 
 fn collect_prompt_text_checked(
