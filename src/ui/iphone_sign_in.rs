@@ -137,62 +137,113 @@ pub(super) fn summary(ui: &mut egui::Ui) {
     }
 }
 
-pub(super) fn show_if_open(ui: &mut egui::Ui) -> bool {
-    let id = details_id();
-    if ui.ctx().data(|data| data.get_temp::<bool>(id)) != Some(true) {
-        return false;
+pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
+    if ui.ctx().data(|data| data.get_temp::<bool>(details_id())) != Some(true) {
+        return None;
     }
-    ui.heading("iPhone sign-in details");
-    ui.add_space(6.0);
-    let snapshot = DeviceSnapshot::get(ui.ctx());
-    ui.strong("Selected iPhone");
-    ui.add(egui::Label::new(device_label(snapshot.0.get())).wrap());
-    let status = match snapshot.0.get() {
-        Some(SetupInfo::Selected { wifi_connected: true, .. }) => Some("Wi-Fi connection reported by this Mac."),
-        Some(SetupInfo::Selected { wifi_connected: false, .. }) => Some("No active Wi-Fi connection reported."),
-        Some(SetupInfo::SelectedUnavailable) => Some("This Mac has a saved selection, but couldn’t identify the phone in its paired devices."),
-        Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => Some("Pair your iPhone with this Mac and select it during iPhone setup. Add the accounts you use to Microsoft Authenticator on the phone."),
-        _ => None,
-    };
-    if let Some(status) = status {
-        ui.label(status);
-    }
-    ui.label(
-        "This Mac uses the same paired iPhone for every account that uses Microsoft Authenticator.",
-    );
-    if ui
-        .add_enabled(
-            snapshot.0.get().is_some(),
-            theme::secondary_button("Refresh device info"),
-        )
-        .clicked()
-    {
-        let fresh = DeviceSnapshot::start(ui.ctx());
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(egui::Id::new("iphone_setup_info"), fresh));
-        ui.ctx().request_repaint();
-    }
-
-    ui.separator();
-    ui.strong("When it runs");
-    ui.label("Open the account you want to use. Under 2FA, choose Microsoft Authenticator from the iPhone app menu and save. With Monitor running, assistance starts when Windows App shows a sign-in number for that account. Choose Off to approve sign-ins manually.");
-    ui.strong("What happens on your iPhone");
-    ui.label("Unlock your iPhone on the same Wi-Fi network. AutoLogin opens Microsoft Authenticator, enters the matching number and taps Approve. Complete Face ID if prompted.");
-    ui.label(
-        egui::RichText::new("Duo Mobile and other authenticator apps are not supported.")
-            .small()
-            .color(theme::MUTED),
-    );
-    ui.separator();
-    if ui
-        .add(theme::secondary_button("Back to Settings"))
-        .clicked()
+    let top = ui.cursor().top();
+    let (_, back) = egui::containers::Sides::new()
+        .height(36.0)
+        .shrink_left()
+        .show(
+            ui,
+            |ui| ui.heading("iPhone sign-in"),
+            |ui| ui.add(theme::secondary_button("Back to Settings")),
+        );
+    if back.clicked()
         || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         close_details(ui.ctx());
         ui.ctx().request_repaint();
     }
-    true
+
+    let body = egui::ScrollArea::vertical()
+        .id_salt("iphone_sign_in_scroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            super::settings::section(ui, "SHARED IPHONE", show_shared_phone);
+            ui.add_space(12.0);
+            super::settings::section(ui, "MICROSOFT AUTHENTICATOR", |ui| {
+                let steps = [
+                    ("Before sign-in", "Unlock your iPhone on the same Wi-Fi as your Mac."),
+                    ("On your Mac", "Monitor reads the number in Windows App."),
+                    ("On your iPhone", "AutoLogin opens Authenticator, enters the number and taps Approve. Use Face ID if asked."),
+                ];
+                let column_gap = 14.0;
+                let description_width = (ui.available_width() - 106.0 - column_gap).max(1.0);
+                egui::Grid::new("iphone_sign_in_steps")
+                    .num_columns(2)
+                    .spacing([column_gap, 8.0])
+                    .max_col_width(description_width)
+                    .show(ui, |ui| {
+                        for (label, description) in steps {
+                            ui.label(egui::RichText::new(label).strong());
+                            ui.add(egui::Label::new(description).wrap());
+                            ui.end_row();
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Set up per account in Accounts → 2FA → iPhone app.").small().color(theme::MUTED));
+        });
+    Some(body.inner_rect.top() - top + body.content_size.y)
+}
+
+fn show_shared_phone(ui: &mut egui::Ui) {
+    let snapshot = DeviceSnapshot::get(ui.ctx());
+    let info = snapshot.0.get();
+    let status = match info {
+        Some(SetupInfo::Selected {
+            wifi_connected: true,
+            ..
+        }) => Some("Connected over Wi-Fi"),
+        Some(SetupInfo::Selected {
+            wifi_connected: false,
+            ..
+        }) => Some("Wi-Fi disconnected"),
+        Some(SetupInfo::SelectedUnavailable) => {
+            Some("The selected iPhone isn’t visible to this Mac.")
+        }
+        Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => {
+            Some("Pair your iPhone with this Mac and select it during setup.")
+        }
+        Some(SetupInfo::ConfigUnavailable) => Some("Refresh to try again."),
+        None => None,
+    };
+    let height = ui.text_style_height(&egui::TextStyle::Body)
+        + ui.text_style_height(&egui::TextStyle::Small);
+    let (_, refresh) = egui::containers::Sides::new()
+        .height(height)
+        .shrink_left()
+        .show(
+            ui,
+            |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let name = device_label(info);
+                    ui.add(egui::Label::new(name).truncate())
+                        .on_hover_text(name);
+                    if let Some(status) = status {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(status).small().color(theme::MUTED),
+                            )
+                            .wrap(),
+                        );
+                    }
+                })
+            },
+            |ui| {
+                ui.add_enabled(info.is_some(), theme::secondary_button("Refresh"))
+                    .on_hover_text("Refresh device info")
+            },
+        );
+    if refresh.clicked() {
+        let fresh = DeviceSnapshot::start(ui.ctx());
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("iphone_setup_info"), fresh));
+        ui.ctx().request_repaint();
+    }
 }
 
 #[cfg(test)]
@@ -304,7 +355,7 @@ mod tests {
                 },
                 |ui| {
                     ui.set_width(420.0);
-                    if !show_if_open(ui) {
+                    if show_if_open(ui).is_none() {
                         summary(ui);
                     }
                 },
@@ -355,10 +406,12 @@ mod tests {
         let details = frame(vec![]);
         for label in [
             "Work iPhone",
-            "No active Wi-Fi connection reported.",
-            "When it runs",
-            "What happens on your iPhone",
-            "Duo Mobile and other authenticator apps are not supported.",
+            "iPhone sign-in",
+            "Wi-Fi disconnected",
+            "Refresh",
+            "Before sign-in",
+            "On your Mac",
+            "On your iPhone",
         ] {
             assert!(text_rect(&details, label).is_some(), "{label}");
         }

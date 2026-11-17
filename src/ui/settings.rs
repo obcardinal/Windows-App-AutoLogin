@@ -131,6 +131,10 @@ enum SettingsSaveCompletion {
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
+    #[cfg(target_os = "macos")]
+    if crate::ui::iphone_sign_in::show_if_open(ui).is_some() {
+        return;
+    }
     let settings_before_input = app.settings_draft.clone();
     let mut settings_changed = false;
     let disabled_reason = settings_disabled_reason(app);
@@ -145,11 +149,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         .id_salt("settings_scroll")
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-            #[cfg(target_os = "macos")]
-            if crate::ui::iphone_sign_in::show_if_open(ui) {
-                return;
-            }
-
             section(ui, "System", |ui| {
                 let open_at_login = ui
                     .add_enabled(
@@ -1022,7 +1021,7 @@ fn storage_cleanup_warning(from_use_keyring: bool, to_use_keyring: bool) -> Stri
     )
 }
 
-fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     theme::compact_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(egui::RichText::new(title).strong());
