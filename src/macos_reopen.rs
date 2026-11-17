@@ -9,12 +9,40 @@ use std::sync::mpsc::Sender;
 const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
 const REOPEN_APPLICATION_EVENT: u32 = u32::from_be_bytes(*b"rapp");
 
+struct ReopenTarget {
+    tx: Sender<TrayCommand>,
+    forward_to_supervisor: bool,
+}
+
+impl ReopenTarget {
+    fn open_accounts(&self) {
+        if self.forward_to_supervisor {
+            let fallback = self.tx.clone();
+            // LaunchServices may target either process in this bundle. Ask
+            // the supervisor for fresh icon geometry without blocking AppKit.
+            if std::thread::Builder::new()
+                .name("ui-reopen".to_string())
+                .spawn(move || {
+                    if let Err(error) = crate::single_instance::request_activation() {
+                        tracing::warn!(%error, "Could not forward app reopening; restoring the existing UI");
+                        let _ = fallback.send(TrayCommand::OpenAccounts);
+                    }
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let _ = self.tx.send(TrayCommand::OpenAccounts);
+    }
+}
+
 define_class!(
     // SAFETY: NSObject has no subclassing requirements; this class has no Drop implementation.
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[name = "WAALReopenApplicationHandler"]
-    #[ivars = Sender<TrayCommand>]
+    #[ivars = ReopenTarget]
     struct ReopenHandler;
 
     // SAFETY: NSObjectProtocol has no additional requirements.
@@ -29,7 +57,7 @@ define_class!(
             _reply: Option<&NSAppleEventDescriptor>,
         ) {
             // Keep all window and monitor state transitions on the existing supervisor path.
-            let _ = self.ivars().send(TrayCommand::OpenAccounts);
+            self.ivars().open_accounts();
         }
     }
 );
@@ -42,9 +70,23 @@ pub(crate) struct ReopenRegistration {
 /// Install from winit's first `resumed` callback and retain until the event loop exits.
 /// AppKit replaces an earlier Apple-event registration while finishing application launch.
 pub(crate) fn install(tx: Sender<TrayCommand>) -> anyhow::Result<ReopenRegistration> {
+    install_target(ReopenTarget {
+        tx,
+        forward_to_supervisor: false,
+    })
+}
+
+pub(crate) fn install_for_ui(tx: Sender<TrayCommand>) -> anyhow::Result<ReopenRegistration> {
+    install_target(ReopenTarget {
+        tx,
+        forward_to_supervisor: true,
+    })
+}
+
+fn install_target(target: ReopenTarget) -> anyhow::Result<ReopenRegistration> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow::anyhow!("macOS reopen handler requires the main thread"))?;
-    let allocated = ReopenHandler::alloc(mtm).set_ivars(tx);
+    let allocated = ReopenHandler::alloc(mtm).set_ivars(target);
     // SAFETY: NSObject's init initializes the newly allocated handler and returns the same type.
     let handler: Retained<ReopenHandler> = unsafe { msg_send![super(allocated), init] };
     let manager = NSAppleEventManager::sharedAppleEventManager();

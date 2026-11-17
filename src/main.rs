@@ -317,6 +317,14 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
                 cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 presentation
             };
+            #[cfg(target_os = "macos")]
+            let reopen_registration = match macos_reopen::install_for_ui(tray_tx.clone()) {
+                Ok(registration) => Some(registration),
+                Err(error) => {
+                    tracing::warn!(%error, "Could not register reopening for the menu bar panel");
+                    None
+                }
+            };
             spawn_full_ui_control_reader(tray_tx, cc.egui_ctx.clone())?;
             let app = app::AutoLoginApp::new(
                 worker_tx,
@@ -329,7 +337,9 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
             )
             .with_storage_recovery_state(storage_recovery_ready);
             #[cfg(target_os = "macos")]
-            let app = app.with_macos_presentation(presentation);
+            let app = app
+                .with_macos_presentation(presentation)
+                .with_macos_reopen_registration(reopen_registration);
             Ok(Box::new(app))
         }),
     );

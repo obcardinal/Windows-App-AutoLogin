@@ -500,6 +500,8 @@ pub(crate) struct AutoLoginApp {
     #[cfg(target_os = "macos")]
     macos_presentation: crate::macos_panel::Presentation,
     #[cfg(target_os = "macos")]
+    _macos_reopen_registration: Option<crate::macos_reopen::ReopenRegistration>,
+    #[cfg(target_os = "macos")]
     pending_macos_presentation: Option<crate::macos_panel::Presentation>,
     #[cfg(target_os = "macos")]
     macos_fullscreen_exit_requested: bool,
@@ -619,6 +621,8 @@ impl AutoLoginApp {
             #[cfg(target_os = "macos")]
             macos_presentation: crate::macos_panel::Presentation::Window,
             #[cfg(target_os = "macos")]
+            _macos_reopen_registration: None,
+            #[cfg(target_os = "macos")]
             pending_macos_presentation: None,
             #[cfg(target_os = "macos")]
             macos_fullscreen_exit_requested: false,
@@ -680,6 +684,15 @@ impl AutoLoginApp {
         // the first frame. Do not apply it twice or arm blur before native focus.
         self.macos_presentation = presentation;
         self.macos_panel_acquired_focus = false;
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_macos_reopen_registration(
+        mut self,
+        registration: Option<crate::macos_reopen::ReopenRegistration>,
+    ) -> Self {
+        self._macos_reopen_registration = registration;
         self
     }
 
