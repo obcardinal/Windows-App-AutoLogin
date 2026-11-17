@@ -131,7 +131,7 @@ struct HelperConfig {
     device_udid: Option<String>,
 }
 
-fn private_file(path: &std::path::Path, limit: u64) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn private_file(path: &std::path::Path, limit: u64) -> anyhow::Result<Vec<u8>> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)

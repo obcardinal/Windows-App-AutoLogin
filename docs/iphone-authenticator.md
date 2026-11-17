@@ -2,8 +2,10 @@
 
 This optional macOS integration assists Microsoft Authenticator number matching
 for an account's Windows App sign-in. In **Accounts**, edit the account and enable
-**Confirm sign-in on iPhone**. The option defaults to **off**, including for
-existing accounts. Installing the helper alone does not enable it. Windows keeps
+**Microsoft Authenticator on iPhone**. Open **Sign-in details…** to see which
+paired iPhone this Mac uses, what starts a request, and which steps you complete
+on the phone. All participating accounts use the same iPhone. Duo Mobile is not
+supported. The option defaults to **off**, including for existing accounts. Installing the helper alone does not enable it. Windows keeps
 its existing sign-in behavior; this iPhone integration requires macOS and Xcode.
 
 The Mac recognizes a supported number-matching prompt from Windows App and binds
