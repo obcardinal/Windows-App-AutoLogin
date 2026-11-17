@@ -309,9 +309,17 @@ fn secure_storage_label(enabled: bool) -> &'static str {
 }
 
 fn load_icon() -> anyhow::Result<tray_icon::Icon> {
+    #[cfg(target_os = "macos")]
     let icon_bytes = include_bytes!("../assets/icon_tray.png");
+    #[cfg(not(target_os = "macos"))]
+    let icon_bytes = include_bytes!("../assets/icon.png");
     let image = image::load_from_memory(icon_bytes)?;
-    let rgba = image.into_rgba8();
+    // AppKit renders the template at 18 points; retain enough pixels for Retina displays.
+    // Windows uses the colored application mark because it does not tint template images.
+    let size = if cfg!(target_os = "macos") { 128 } else { 32 };
+    let rgba = image
+        .resize(size, size, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
     let (width, height) = rgba.dimensions();
     Ok(tray_icon::Icon::from_rgba(rgba.into_raw(), width, height)?)
 }

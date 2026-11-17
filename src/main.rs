@@ -2842,9 +2842,11 @@ fn fill_result_label(report: &debug_fill::FillAttemptReport) -> String {
 }
 
 fn load_icon() -> anyhow::Result<egui::IconData> {
-    let icon_bytes = include_bytes!("../assets/icon_tray.png");
+    let icon_bytes = include_bytes!("../assets/icon.png");
     let image = image::load_from_memory(icon_bytes)?;
-    let rgba = image.into_rgba8();
+    let rgba = image
+        .resize(256, 256, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
     let (width, height) = rgba.dimensions();
     Ok(egui::IconData {
         rgba: rgba.into_raw(),
