@@ -2280,7 +2280,7 @@ fn write_password_file_atomic(
     }
 }
 
-fn write_private_file_atomic(
+pub(crate) fn write_private_file_atomic(
     path: &Path,
     temp_extension: &str,
     bytes: &[u8],

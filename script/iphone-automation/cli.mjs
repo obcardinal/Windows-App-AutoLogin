@@ -6,32 +6,31 @@ import { fileURLToPath } from 'node:url';
 import {
   APPIUM_VERSION, XCUITEST_VERSION, DEVELOPMENT_TEAM, WDA_BUNDLE, AutomationError,
   cleanEnvironment, ensurePrivateDirectory, listPhysicalDevices, pairedDeviceCandidate, paths, probePhysicalDevice, readConfig,
-  runQuiet, runtimeReady, selectPhysicalDevice, status, writePrivateJson,
+  runQuiet, runtimeReady, selectPhysicalDevice, status,
 } from './support.mjs';
 import { createIphoneSession } from './bridge.mjs';
+import { readSetupPreferences, saveInstalledSelection, saveSetupConfig } from './selection-config.mjs';
 
 const source = path.dirname(fileURLToPath(import.meta.url));
 const emit = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 
 async function setup() {
   if (process.platform !== 'darwin') throw new AutomationError('macos_required', 'The iPhone helper currently requires macOS.');
-  const { root, config: configPath } = paths();
+  const { root } = paths();
   await ensurePrivateDirectory(root);
+  // Validate before installing packages. Re-read the choice when saving.
+  await readSetupPreferences(root);
   const packagePath = path.join(source, 'package.json');
   const lockPath = path.join(source, 'package-lock.json');
   const lock = await fs.readFile(lockPath);
   const digest = createHash('sha256').update(lock).digest('hex').slice(0, 16);
   const runtime = path.join(root, `runtime-${digest}`);
-  let previous;
-  try { previous = await readConfig(); } catch (error) {
-    if (error.code !== 'not_configured') throw error;
-  }
   const config = {
     schema_version: 1,
     runtime_dir: runtime,
     node_path: await fs.realpath(process.execPath),
     appium_main: path.join(runtime, 'node_modules', 'appium', 'index.js'),
-    device_udid: previous?.device_udid ?? null,
+    device_udid: null,
     development_team: DEVELOPMENT_TEAM,
     wda_bundle_id: WDA_BUNDLE,
   };
@@ -51,20 +50,19 @@ async function setup() {
     if (path.join(source, file) !== destination) await fs.copyFile(path.join(source, file), destination);
     await fs.chmod(destination, 0o600);
   }
-  await writePrivateJson(configPath, config);
+  const saved = await saveSetupConfig(root, config);
   emit({ phase: 'host_setup_complete', appium_version: APPIUM_VERSION, xcuitest_version: XCUITEST_VERSION,
-    device_selected: config.device_udid !== null, phone_session_started: false });
+    device_selected: saved.device_udid !== null, phone_session_started: false });
 }
 
 async function selectDevice(args) {
   const explicit = args.length === 2 && args[0] === '--udid' ? args[1] : null;
   if (args.length && explicit === null) throw new AutomationError('invalid_arguments', 'Use select-device or select-device --udid IDENTIFIER.');
-  const config = await readConfig();
+  await readConfig();
   const candidate = pairedDeviceCandidate(await listPhysicalDevices(), explicit);
   const available = await probePhysicalDevice(candidate);
   const selected = selectPhysicalDevice(available ? [available] : [], candidate.udid);
-  config.device_udid = selected.udid;
-  await writePrivateJson(paths().config, config);
+  await saveInstalledSelection(paths().root, selected.udid);
   emit({ phase: 'device_selected', device_name: selected.name, developer_mode: selected.developerMode });
 }
 

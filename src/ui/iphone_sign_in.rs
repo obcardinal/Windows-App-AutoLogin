@@ -1,5 +1,5 @@
 //! Account authentication choices and details for the iPhone shared by this Mac.
-use crate::iphone_setup_info::{self, SetupInfo};
+use crate::iphone_setup_info::{self, PairedPhone, SetupInfo};
 use crate::models::{Account, AuthenticatorProvider};
 use crate::ui::theme;
 use eframe::egui;
@@ -57,25 +57,36 @@ pub(super) fn provider_picker(
 #[derive(Clone, Default)]
 struct DeviceSnapshot(Arc<OnceLock<SetupInfo>>);
 
+fn start_task<T: Send + Sync + 'static>(
+    ctx: &egui::Context,
+    work: impl FnOnce() -> T + Send + 'static,
+    unavailable: T,
+) -> Arc<OnceLock<T>> {
+    let result = Arc::new(OnceLock::new());
+    let completion = Arc::clone(&result);
+    let repaint = ctx.clone();
+    let viewport = ctx.viewport_id();
+    if std::thread::Builder::new()
+        .name("iphone-settings".into())
+        .spawn(move || {
+            let _ = completion.set(work());
+            repaint.request_repaint_of(viewport);
+        })
+        .is_err()
+    {
+        let _ = result.set(unavailable);
+    }
+    result
+}
+
 impl DeviceSnapshot {
     fn start(ctx: &egui::Context) -> Self {
-        let snapshot = Self::default();
-        let result = snapshot.0.clone();
-        let repaint = ctx.clone();
-        let viewport = ctx.viewport_id();
-        if std::thread::Builder::new()
-            .name("iphone-setup-info".into())
-            .spawn(move || {
-                let _ = result.set(iphone_setup_info::read());
-                repaint.request_repaint_of(viewport);
-            })
-            .is_err()
-        {
-            let _ = snapshot.0.set(SetupInfo::ConfigUnavailable);
-        }
-        snapshot
+        Self(start_task(
+            ctx,
+            iphone_setup_info::read,
+            SetupInfo::ConfigUnavailable,
+        ))
     }
-
     fn get(ctx: &egui::Context) -> Self {
         let id = egui::Id::new("iphone_setup_info");
         if let Some(cached) = ctx.data_mut(|data| data.get_temp::<Self>(id)) {
@@ -91,23 +102,63 @@ fn details_id() -> egui::Id {
     egui::Id::new("iphone_sign_in_details")
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PhonePage {
+    Details,
+    Setup,
+}
+
 pub(crate) fn close_details(ctx: &egui::Context) {
-    ctx.data_mut(|data| data.remove::<bool>(details_id()));
+    ctx.data_mut(|data| data.remove::<PhonePage>(details_id()));
+}
+
+fn open_page(ctx: &egui::Context, page: PhonePage) {
+    ctx.data_mut(|data| {
+        if page == PhonePage::Setup
+            && !data
+                .get_temp::<PhoneForm>(details_id())
+                .is_some_and(|form| form.save.is_some())
+        {
+            data.remove::<PhoneForm>(details_id());
+        }
+        data.insert_temp(details_id(), page);
+    });
+    ctx.request_repaint();
 }
 
 fn device_label(info: Option<&SetupInfo>) -> &str {
     match info {
         None => "Checking…",
-        Some(SetupInfo::NotConfigured) => "Setup required",
-        Some(SetupInfo::NoDeviceSelected) => "No iPhone selected",
+        Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => "No iPhone selected",
         Some(SetupInfo::ConfigUnavailable) => "Setup information unavailable",
         Some(SetupInfo::SelectedUnavailable) => "Selected iPhone · name unavailable",
+        Some(SetupInfo::SelectedNeedsSetup { name }) => {
+            name.as_deref().unwrap_or("Selected iPhone")
+        }
         Some(SetupInfo::Selected { name, .. }) => name,
     }
 }
 
 pub(super) fn summary(ui: &mut egui::Ui) {
     let snapshot = DeviceSnapshot::get(ui.ctx());
+    let info = snapshot.0.get();
+    let (title, caption, needs_setup) = match info {
+        Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => (
+            device_label(info).to_owned(),
+            "Requires Xcode on this Mac",
+            true,
+        ),
+        Some(SetupInfo::SelectedNeedsSetup { .. }) => (
+            device_label(info).to_owned(),
+            "Mac helper setup required",
+            true,
+        ),
+        _ => (
+            format!("iPhone: {}", device_label(info)),
+            "Microsoft Authenticator over Wi-Fi",
+            false,
+        ),
+    };
     let text_height = ui.text_style_height(&egui::TextStyle::Body)
         + ui.text_style_height(&egui::TextStyle::Small);
     let (_, details) = egui::containers::Sides::new()
@@ -118,49 +169,68 @@ pub(super) fn summary(ui: &mut egui::Ui) {
             |ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    let label = device_label(snapshot.0.get());
-                    ui.add(egui::Label::new(format!("iPhone: {label}")).truncate())
-                        .on_hover_text(label);
-                    ui.label(
-                        egui::RichText::new("Microsoft Authenticator over Wi-Fi")
-                            .small()
-                            .color(theme::MUTED),
-                    );
+                    ui.add(egui::Label::new(&title).truncate())
+                        .on_hover_text(&title);
+                    ui.label(egui::RichText::new(caption).small().color(theme::MUTED));
                 });
             },
-            |ui| ui.add(theme::secondary_button("Sign-in details…")),
+            |ui| {
+                ui.add(theme::secondary_button(if needs_setup {
+                    "Set up iPhone…"
+                } else {
+                    "Sign-in details…"
+                }))
+            },
         );
     if details.clicked() {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(details_id(), true));
-        ui.ctx().request_repaint();
+        open_page(
+            ui.ctx(),
+            if needs_setup {
+                PhonePage::Setup
+            } else {
+                PhonePage::Details
+            },
+        );
     }
 }
 
 pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
-    if ui.ctx().data(|data| data.get_temp::<bool>(details_id())) != Some(true) {
-        return None;
-    }
+    let page = ui
+        .ctx()
+        .data(|data| data.get_temp::<PhonePage>(details_id()))?;
     let top = ui.cursor().top();
     let (_, back) = egui::containers::Sides::new()
         .height(36.0)
         .shrink_left()
         .show(
             ui,
-            |ui| ui.heading("iPhone sign-in"),
+            |ui| {
+                ui.heading(if page == PhonePage::Setup {
+                    "iPhone setup"
+                } else {
+                    "iPhone sign-in"
+                })
+            },
             |ui| ui.add(theme::secondary_button("Back to Settings")),
         );
     if back.clicked()
-        || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        || (!egui::Popup::is_any_open(ui.ctx())
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
     {
         close_details(ui.ctx());
         ui.ctx().request_repaint();
     }
 
     let body = egui::ScrollArea::vertical()
-        .id_salt("iphone_sign_in_scroll")
+        .id_salt(("iphone_sign_in_scroll", page == PhonePage::Setup))
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            if page == PhonePage::Setup {
+                super::settings::section(ui, "SHARED IPHONE", show_setup);
+                ui.add_space(12.0);
+                crate::ui::iphone_setup_guide::show(ui);
+                return;
+            }
             super::settings::section(ui, "SHARED IPHONE", show_shared_phone);
             ui.add_space(12.0);
             super::settings::section(ui, "MICROSOFT AUTHENTICATOR", |ui| {
@@ -204,6 +274,9 @@ fn show_shared_phone(ui: &mut egui::Ui) {
         Some(SetupInfo::SelectedUnavailable) => {
             Some("The selected iPhone isn’t visible to this Mac.")
         }
+        Some(SetupInfo::SelectedNeedsSetup { .. }) => {
+            Some("Finish setting up the local helper on this Mac.")
+        }
         Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => {
             Some("Pair your iPhone with this Mac and select it during setup.")
         }
@@ -212,7 +285,7 @@ fn show_shared_phone(ui: &mut egui::Ui) {
     };
     let height = ui.text_style_height(&egui::TextStyle::Body)
         + ui.text_style_height(&egui::TextStyle::Small);
-    let (_, refresh) = egui::containers::Sides::new()
+    let (_, (change, refresh)) = egui::containers::Sides::new()
         .height(height)
         .shrink_left()
         .show(
@@ -234,10 +307,16 @@ fn show_shared_phone(ui: &mut egui::Ui) {
                 })
             },
             |ui| {
-                ui.add_enabled(info.is_some(), theme::secondary_button("Refresh"))
-                    .on_hover_text("Refresh device info")
+                let change = ui.add(theme::secondary_button("iPhone setup…"));
+                let refresh = ui
+                    .add_enabled(info.is_some(), theme::secondary_button("Refresh"))
+                    .on_hover_text("Refresh device info");
+                (change, refresh)
             },
         );
+    if change.clicked() {
+        open_page(ui.ctx(), PhonePage::Setup);
+    }
     if refresh.clicked() {
         let fresh = DeviceSnapshot::start(ui.ctx());
         ui.ctx()
@@ -246,9 +325,299 @@ fn show_shared_phone(ui: &mut egui::Ui) {
     }
 }
 
+#[derive(Clone)]
+struct PhoneForm {
+    phones: Arc<OnceLock<Result<Vec<PairedPhone>, String>>>,
+    draft: Option<String>,
+    save: Option<Arc<OnceLock<Result<(), String>>>>,
+    feedback: Option<String>,
+}
+
+impl PhoneForm {
+    fn discover(ctx: &egui::Context) -> Self {
+        Self {
+            phones: start_task(
+                ctx,
+                iphone_setup_info::paired_phones,
+                Err("Couldn’t check paired iPhones. Try Refresh.".into()),
+            ),
+            draft: None,
+            save: None,
+            feedback: None,
+        }
+    }
+}
+
+fn show_setup(ui: &mut egui::Ui) {
+    let id = details_id();
+    let mut form = ui
+        .ctx()
+        .data(|d| d.get_temp::<PhoneForm>(id))
+        .unwrap_or_else(|| PhoneForm::discover(ui.ctx()));
+    if let Some(result) = form.save.as_ref().and_then(|task| task.get()).cloned() {
+        match result {
+            Ok(()) => {
+                form = PhoneForm::discover(ui.ctx());
+                form.feedback = Some("Shared iPhone saved.".into());
+            }
+            Err(message) => {
+                form.save = None;
+                form.feedback = Some(message);
+            }
+        }
+    }
+
+    ui.add(egui::Label::new("Choose the iPhone to use for all accounts. Install and open Xcode on this Mac to find paired iPhones.").wrap());
+    ui.add_space(4.0);
+    let busy = form.save.is_some();
+    let mut can_save = false;
+    match form.phones.get() {
+        None => {
+            ui.label("Looking for paired iPhones…");
+        }
+        Some(Err(message)) => {
+            ui.add(egui::Label::new(message.as_str()).wrap());
+        }
+        Some(Ok(phones)) if phones.is_empty() => {
+            ui.add(
+                egui::Label::new(
+                    "No paired iPhones found. Pair your iPhone with Xcode, then refresh the list.",
+                )
+                .wrap(),
+            );
+        }
+        Some(Ok(phones)) => {
+            can_save = ui
+                .add_enabled_ui(!busy, |ui| phone_choice(ui, phones, &mut form.draft))
+                .inner;
+        }
+    }
+    ui.add_space(4.0);
+    let (refresh, save) =
+        phone_actions(ui, !busy && form.phones.get().is_some(), !busy && can_save);
+    if let Some(device) = form.draft.as_ref().filter(|_| save).cloned() {
+        let ctx = ui.ctx().clone();
+        form.feedback = None;
+        form.save = Some(start_task(
+            ui.ctx(),
+            move || {
+                iphone_setup_info::select_phone(&device)?;
+                ctx.data_mut(|d| d.remove::<DeviceSnapshot>(egui::Id::new("iphone_setup_info")));
+                Ok(())
+            },
+            Err("Couldn’t save the selected iPhone. Try again.".into()),
+        ));
+    }
+
+    if refresh {
+        form = PhoneForm::discover(ui.ctx());
+        ui.ctx()
+            .data_mut(|d| d.remove::<DeviceSnapshot>(egui::Id::new("iphone_setup_info")));
+    }
+    if form.save.is_some() {
+        ui.label("Saving iPhone…");
+    } else if let Some(message) = &form.feedback {
+        ui.add(egui::Label::new(message.as_str()).wrap());
+    }
+    let snapshot = DeviceSnapshot::get(ui.ctx());
+    if matches!(snapshot.0.get(), Some(SetupInfo::SelectedNeedsSetup { .. })) {
+        ui.add(egui::Label::new("Your iPhone is selected. Finish installing the local helper on this Mac using Setup instructions.").wrap());
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(id, form));
+}
+
+fn phone_choice(ui: &mut egui::Ui, phones: &[PairedPhone], draft: &mut Option<String>) -> bool {
+    let chosen = phones
+        .iter()
+        .find(|phone| draft.as_ref().map_or(phone.selected, |id| id == &phone.id));
+    let popup_id = ui.make_persistent_id("paired_iphone_picker");
+    let response = ui
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 28.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let label = ui.label("Paired iPhone");
+                super::accounts::account_picker_button(
+                    ui,
+                    popup_id,
+                    chosen.map_or("Choose iPhone…", |p| p.name.as_str()),
+                    ui.available_width(),
+                )
+                .labelled_by(label.id)
+            },
+        )
+        .inner;
+    let frame = egui::Frame::popup(ui.style());
+    let width = response.rect.width() - frame.total_margin().sum().x;
+    egui::Popup::menu(&response)
+        .id(popup_id)
+        .width(response.rect.width())
+        .frame(frame)
+        .style(egui::style::StyleModifier::default())
+        .show(|ui| {
+            ui.set_width(width);
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for phone in phones {
+                        let selected = chosen.is_some_and(|chosen| chosen.id == phone.id);
+                        if ui.selectable_label(selected, &phone.name).clicked() {
+                            *draft = Some(phone.id.clone());
+                            ui.close();
+                        }
+                    }
+                });
+        });
+    if let Some(phone) = chosen {
+        ui.label(
+            egui::RichText::new(if phone.wifi_connected {
+                "Connected over Wi-Fi"
+            } else {
+                "Wi-Fi disconnected"
+            })
+            .small()
+            .color(theme::MUTED),
+        );
+    }
+    phones
+        .iter()
+        .any(|p| Some(&p.id) == draft.as_ref() && !p.selected)
+}
+
+fn phone_actions(ui: &mut egui::Ui, can_refresh: bool, can_save: bool) -> (bool, bool) {
+    egui::containers::Sides::new().height(28.0).show(
+        ui,
+        |ui| {
+            ui.add_enabled(can_refresh, theme::secondary_button("Refresh iPhones"))
+                .clicked()
+        },
+        |ui| {
+            ui.add_enabled(can_save, theme::primary_button("Save iPhone"))
+                .clicked()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_rect(frame: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
+        frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
+            _ => None,
+        })
+    }
+
+    fn click_events(frame: &egui::FullOutput, label: &str) -> Vec<egui::Event> {
+        let pos = text_rect(frame, label)
+            .unwrap_or_else(|| panic!("missing {label}"))
+            .center();
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![egui::Event::PointerMoved(pos), press(true), press(false)]
+    }
+
+    #[test]
+    fn choosing_a_shared_iphone_requires_an_explicit_selection_and_save() {
+        let ctx = egui::Context::default();
+        let phones = [PairedPhone {
+            id: "AAAAAAAA-1234567890000001".into(),
+            name: "Work iPhone".into(),
+            wifi_connected: true,
+            selected: false,
+        }];
+        let mut draft = None;
+        let mut requests = Vec::new();
+        let mut frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_width(300.0);
+                    let can_save = phone_choice(ui, &phones, &mut draft);
+                    if phone_actions(ui, true, can_save).1 {
+                        requests.push(draft.clone());
+                    }
+                },
+            )
+        };
+        frame(vec![]);
+        let initial = frame(vec![]);
+        let field_label = text_rect(&initial, "Paired iPhone").unwrap();
+        let field = text_rect(&initial, "Choose iPhone…").unwrap();
+        assert!(
+            (field_label.center().y - field.center().y).abs() < 2.0
+                && field_label.right() < field.left(),
+            "label {field_label:?}, choice {field:?}"
+        );
+        let refresh = text_rect(&initial, "Refresh iPhones").unwrap();
+        let save = text_rect(&initial, "Save iPhone").unwrap();
+        assert!(
+            (refresh.center().y - save.center().y).abs() < 2.0 && refresh.right() < save.left()
+        );
+        frame(click_events(&initial, "Save iPhone"));
+        frame(click_events(&initial, "Choose iPhone…"));
+        let open = frame(vec![]);
+        assert!(text_rect(&open, &phones[0].id).is_none());
+        frame(click_events(&open, "Work iPhone"));
+        let selected = frame(vec![]);
+        assert!(text_rect(&selected, "Connected over Wi-Fi").is_some());
+        frame(click_events(&selected, "Save iPhone"));
+        assert_eq!(requests, vec![Some(phones[0].id.clone())]);
+    }
+
+    #[test]
+    fn first_run_settings_link_and_setup_statuses_explain_the_next_step() {
+        let cases = [
+            (SetupInfo::NotConfigured, Ok(vec![]), "No iPhone selected", "Requires Xcode on this Mac", "No paired iPhones found. Pair your iPhone with Xcode, then refresh the list."),
+            (SetupInfo::NoDeviceSelected, Err("Open Xcode on this Mac.".into()), "No iPhone selected", "Requires Xcode on this Mac", "Open Xcode on this Mac."),
+            (SetupInfo::SelectedNeedsSetup { name: Some("Work iPhone".into()) }, Ok(vec![]), "Work iPhone", "Mac helper setup required", "Your iPhone is selected. Finish installing the local helper on this Mac using Setup instructions."),
+        ];
+        for (info, scan, title, caption, status) in cases {
+            let ctx = egui::Context::default();
+            let snapshot = DeviceSnapshot::default();
+            snapshot.0.set(info).unwrap();
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("iphone_setup_info"), snapshot));
+            let frame = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.set_width(440.0);
+                        if show_if_open(ui).is_none() {
+                            summary(ui)
+                        }
+                    },
+                )
+            };
+            frame(vec![]);
+            let home = frame(vec![]);
+            assert!(text_rect(&home, title).is_some(), "{title}");
+            assert!(text_rect(&home, caption).is_some(), "{caption}");
+            frame(click_events(&home, "Set up iPhone…"));
+            let form = PhoneForm {
+                phones: Arc::new(OnceLock::from(scan)),
+                draft: None,
+                save: None,
+                feedback: None,
+            };
+            ctx.data_mut(|d| d.insert_temp(details_id(), form));
+            frame(vec![]);
+            let setup = frame(vec![]);
+            for text in ["iPhone setup", "Refresh iPhones", status] {
+                assert!(text_rect(&setup, text).is_some(), "{text}");
+            }
+        }
+    }
 
     #[test]
     fn provider_picker_selects_and_restores_the_account_choice() {

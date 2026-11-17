@@ -2,8 +2,9 @@
 
 This optional macOS integration assists Microsoft Authenticator number matching
 for an account's Windows App sign-in. In **Settings → iPhone Authentication**,
-check the selected iPhone or open **Sign-in details…**. All participating
-accounts use that same phone. In **Accounts**, open an account and choose
+click **Set up iPhone…**, choose a paired device by name, and click **Save iPhone**.
+All participating accounts use this phone. The choice is saved on this Mac by
+device identifier. Open **Sign-in details… → iPhone setup…** to change it later. In **Accounts**, open an account and choose
 **Microsoft Authenticator** from the **2FA → iPhone app** dropdown, then save.
 Choose **Off** to handle sign-in requests manually. New accounts default to
 **Off**. This feature requires macOS and Xcode.
@@ -74,17 +75,14 @@ device and reuses an already installed matching runtime.
 2. Enable Developer Mode and enable
    **Settings → Developer → Enable UI Automation**.
 3. Ensure Microsoft Authenticator is installed and its required account is set up.
-4. Select the device:
+4. In **Settings → iPhone Authentication**, open **Set up iPhone…**. Choose a
+   phone from **Paired iPhone** and click **Save iPhone**. If the phone is missing,
+   check pairing in Xcode, then click **Refresh iPhones**. You can save the phone
+   before installing the host helper. Setup uses the saved choice on this Mac.
 
-   ```sh
-   node script/iphone-automation/cli.mjs select-device
-   ```
-
-   This succeeds only with exactly one paired physical iPhone. A bounded
-   CoreDevice read wakes a dormant Wi-Fi tunnel for that exact trusted phone.
-   If multiple phones are paired, use `select-device --udid IDENTIFIER` with the
-   exact identifier shown by Xcode. Device identifiers are not printed in ordinary
-   status output. Simulators are never selected.
+   For command-line setup, `node script/iphone-automation/cli.mjs select-device`
+   selects the sole paired physical iPhone. With multiple paired phones, pass
+   `--udid IDENTIFIER` from Xcode’s **Window → Devices and Simulators**.
 
 5. After the device is connected and unlocked, deliberately prepare WDA:
 
