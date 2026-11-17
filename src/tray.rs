@@ -145,7 +145,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     let icon = load_icon()?;
 
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu.clone()))
+        .with_menu(Box::new(compact_menu.clone()))
         .with_tooltip("Windows App AutoLogin")
         .with_icon(icon)
         .with_icon_as_template(tray_icon_uses_template_rendering())
@@ -217,7 +217,7 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
         _tray: tray,
         diagnostic_menu: menu,
         compact_menu,
-        diagnostics_visible: Cell::new(true),
+        diagnostics_visible: Cell::new(false),
         #[cfg(target_os = "windows")]
         windows_visibility,
         monitor_i: toggle_i,

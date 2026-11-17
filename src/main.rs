@@ -2900,7 +2900,7 @@ mod tests {
         let mut next_config = AppConfig::default();
         next_config.settings.start_minimized = true;
         next_config.settings.hide_menu_bar_icon = true;
-        next_config.settings.show_menu_diagnostics = false;
+        next_config.settings.show_menu_diagnostics = true;
         let expected = next_config.clone();
         let ack_saw_no_released_command = std::cell::Cell::new(false);
 

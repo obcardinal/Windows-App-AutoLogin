@@ -194,7 +194,7 @@ The app keeps a lightweight supervisor running in the background. On a fresh lau
 
 Under **Settings → System**, **Hide menu bar icon** (macOS) or **Hide system tray icon** (Windows) hides the icon without stopping the app. This option is off by default, is saved automatically, and takes effect without restarting. Open Windows App AutoLogin again from Finder or Spotlight on macOS, or launch its shortcut or main executable again on Windows, to return to the window and restore the icon in Settings. Both platforms store this preference as `hide_menu_bar_icon` in the configuration.
 
-**Show diagnostic info in menu** controls the gray status lines: Accessibility (macOS), password storage, and the last fill result. It is on by default on both platforms, saves automatically, and applies without restarting. Turning it off hides only those lines and their separator; menu actions remain available.
+**Show diagnostic info in menu** controls the gray status lines: Accessibility (macOS), password storage, and the last fill result. It is off by default on both platforms, including configurations that do not yet contain this setting. An explicitly saved preference is preserved. Changes save automatically and apply without restarting. Turning it off hides only those lines and their separator; menu actions remain available.
 
 The menu follows these groups, separated by native menu dividers:
 
@@ -242,7 +242,7 @@ Example:
     "auto_start": false,
     "start_minimized": false,
     "hide_menu_bar_icon": false,
-    "show_menu_diagnostics": true,
+    "show_menu_diagnostics": false,
     "use_keyring": true
   }
 }

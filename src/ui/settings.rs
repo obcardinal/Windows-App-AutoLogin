@@ -1497,7 +1497,7 @@ mod tests {
         let mut latest = requested.clone();
         latest.auto_start = true;
         latest.hide_menu_bar_icon = true;
-        latest.show_menu_diagnostics = false;
+        latest.show_menu_diagnostics = true;
         app.settings_draft = latest.clone();
 
         let (sender, receiver) = sync_channel(1);
@@ -1591,7 +1591,7 @@ mod tests {
         let mut latest = requested.clone();
         latest.auto_start = false;
         latest.hide_menu_bar_icon = true;
-        latest.show_menu_diagnostics = false;
+        latest.show_menu_diagnostics = true;
         latest.use_keyring = true;
 
         let mut authoritative = requested.clone();
@@ -1607,7 +1607,7 @@ mod tests {
         assert!(!rebased.auto_start);
         assert!(rebased.start_minimized);
         assert!(rebased.hide_menu_bar_icon);
-        assert!(!rebased.show_menu_diagnostics);
+        assert!(rebased.show_menu_diagnostics);
         assert!(rebased.use_keyring);
         assert_eq!(rebased.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
     }
@@ -1623,13 +1623,13 @@ mod tests {
         let mut authoritative = requested.clone();
         authoritative.auto_start = false;
         authoritative.hide_menu_bar_icon = false;
-        authoritative.show_menu_diagnostics = false;
+        authoritative.show_menu_diagnostics = true;
         let mut queued_intent = QueuedSettingsIntent::default();
 
         let mut away = requested.clone();
         away.auto_start = false;
         away.hide_menu_bar_icon = false;
-        away.show_menu_diagnostics = false;
+        away.show_menu_diagnostics = true;
         queued_intent.record_changes(&requested, &away);
         queued_intent.record_changes(&away, &latest);
 
@@ -1638,7 +1638,7 @@ mod tests {
 
         assert!(rebased.auto_start);
         assert!(rebased.hide_menu_bar_icon);
-        assert!(rebased.show_menu_diagnostics);
+        assert!(!rebased.show_menu_diagnostics);
         assert_ne!(rebased, authoritative);
     }
 

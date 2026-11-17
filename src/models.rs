@@ -54,7 +54,7 @@ impl Default for AppSettings {
             auto_start: false,
             start_minimized: false,
             hide_menu_bar_icon: false,
-            show_menu_diagnostics: true,
+            show_menu_diagnostics: false,
             use_keyring: true,
         }
     }

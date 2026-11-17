@@ -431,7 +431,7 @@ impl Default for StoredAppSettingsWire {
             auto_start: false,
             start_minimized: false,
             hide_menu_bar_icon: false,
-            show_menu_diagnostics: true,
+            show_menu_diagnostics: false,
             use_keyring: true,
             _removed_reconnect_delay_secs: 2,
             _removed_macos_app_name: None,
@@ -6004,7 +6004,7 @@ mod tests {
         assert_eq!(config.settings.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
         assert!(config.settings.use_keyring);
         assert!(!config.settings.hide_menu_bar_icon);
-        assert!(config.settings.show_menu_diagnostics);
+        assert!(!config.settings.show_menu_diagnostics);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6038,7 +6038,7 @@ mod tests {
         config.settings.auto_start = true;
         config.settings.start_minimized = true;
         config.settings.hide_menu_bar_icon = true;
-        config.settings.show_menu_diagnostics = false;
+        config.settings.show_menu_diagnostics = true;
         config.settings.use_keyring = false;
 
         save_config_to_file(&config, &path).unwrap();
