@@ -2257,6 +2257,7 @@ impl eframe::App for AutoLoginApp {
         egui::Panel::top("top_panel")
             .frame(theme::top_bar_frame())
             .show_inside(ui, |ui| {
+                theme::apply_toolbar_style(ui);
                 ui.horizontal(|ui| {
                     if accessibility_ready {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -2357,7 +2358,16 @@ fn show_monitor_control(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
         )
     };
     if ui
-        .add_sized([168.0, 30.0], button.wrap_mode(egui::TextWrapMode::Extend))
+        .scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(12.0, 4.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add(
+                button
+                    .wrap_mode(egui::TextWrapMode::Extend)
+                    .min_size(egui::vec2(152.0, 30.0)),
+            )
+        })
+        .inner
         .clicked()
     {
         app.toggle_monitor_from_ui(ui.ctx());

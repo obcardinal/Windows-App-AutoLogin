@@ -21,7 +21,7 @@ fn glass_dense() -> egui::Color32 {
 }
 
 fn top_bar() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(250, 252, 255, 236)
+    egui::Color32::from_rgb(250, 252, 255)
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -106,10 +106,23 @@ pub fn top_bar_frame() -> egui::Frame {
         .inner_margin(egui::Margin {
             left: 12,
             right: 12,
-            top: 10,
-            bottom: 8,
+            top: 7,
+            bottom: 7,
         })
         .stroke(egui::Stroke::new(1.0, STROKE))
+}
+
+pub fn apply_toolbar_style(ui: &mut egui::Ui) {
+    let visuals = ui.visuals_mut();
+    visuals.override_text_color = Some(TEXT);
+    visuals.selection.bg_fill = ACCENT_SOFT;
+    visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(238, 246, 252);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
 }
 
 pub fn content_frame() -> egui::Frame {
@@ -134,6 +147,7 @@ pub fn compact_frame() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(12, 10))
 }
 
+#[cfg(feature = "diagnostics-ui")]
 pub fn page_header(
     ui: &mut egui::Ui,
     title: &str,

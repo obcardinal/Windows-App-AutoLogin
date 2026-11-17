@@ -35,7 +35,7 @@ const ACCOUNT_TOGGLE_JOB_DISCONNECTED_REASON: &str =
 const ACCOUNT_TRANSACTION_IN_PROGRESS_REASON: &str =
     "Wait for the current account or settings update to finish.";
 
-const STATE_COLUMN_WIDTH: f32 = 88.0;
+const STATE_COLUMN_WIDTH: f32 = 72.0;
 const TABLE_SPACING: f32 = 8.0;
 const EDIT_BUTTON_WIDTH: f32 = 40.0;
 const DELETE_BUTTON_WIDTH: f32 = 40.0;
@@ -70,25 +70,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let projected_enabled_states = projected_account_enabled_states(app);
 
     let account_count = app.config.accounts.len();
-    theme::page_header(
-        ui,
-        "Accounts",
-        &format!("{account_count} saved account(s) monitored through Windows App."),
-        |ui| {
-            let add_account = ui.add_enabled(
-                launch_controls_enabled,
-                theme::primary_button("+ Add Account").min_size(egui::vec2(182.0, 30.0)),
-            );
-            if with_transaction_disabled_reason(
-                add_account,
-                launch_controls_disabled_reason(&availability),
-            )
-            .clicked()
-            {
-                open_account_editor(ui.ctx(), app, Account::new(""));
-            }
-        },
-    );
+    let add_account = show_accounts_page_header(ui, account_count, launch_controls_enabled);
+    if with_transaction_disabled_reason(add_account, launch_controls_disabled_reason(&availability))
+        .clicked()
+    {
+        open_account_editor(ui.ctx(), app, Account::new(""));
+    }
 
     if app.config.accounts.is_empty() {
         theme::glass_frame().show(ui, |ui| {
@@ -97,19 +84,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                 ui.label(theme::muted(
                     "Add an email and password to start monitoring.",
                 ));
-                ui.add_space(6.0);
-                let add_account = ui.add_enabled(
-                    launch_controls_enabled,
-                    theme::primary_button("+ Add Account").min_size(egui::vec2(182.0, 30.0)),
-                );
-                if with_transaction_disabled_reason(
-                    add_account,
-                    launch_controls_disabled_reason(&availability),
-                )
-                .clicked()
-                {
-                    open_account_editor(ui.ctx(), app, Account::new(""));
-                }
             });
         });
     } else {
@@ -118,6 +92,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
             .show(ui, |ui| {
                 theme::compact_frame().show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    ui.visuals_mut().widgets.noninteractive.bg_stroke =
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 235, 240));
                     show_accounts_header(ui);
                     ui.separator();
 
@@ -126,15 +102,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                             .get(&account.id)
                             .copied()
                             .unwrap_or(account.enabled);
-                        show_account_row(
-                            ui,
-                            account,
-                            displayed_enabled,
-                            toggle_controls_enabled,
-                            launch_controls_enabled,
-                            launch_controls_disabled_reason(&availability),
-                            &mut row_actions,
-                        );
+                        ui.push_id(&account.id, |ui| {
+                            show_account_row(
+                                ui,
+                                account,
+                                displayed_enabled,
+                                toggle_controls_enabled,
+                                launch_controls_enabled,
+                                launch_controls_disabled_reason(&availability),
+                                &mut row_actions,
+                            );
+                        });
                         if idx + 1 < app.config.accounts.len() {
                             ui.separator();
                         }
@@ -1876,6 +1854,42 @@ fn storage_prepare_failure_status(
     }
 }
 
+fn show_accounts_page_header(
+    ui: &mut egui::Ui,
+    account_count: usize,
+    controls_enabled: bool,
+) -> egui::Response {
+    ui.add_space(2.0);
+    let response = ui
+        .horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.label(
+                egui::RichText::new("Accounts")
+                    .size(20.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(format!("· {account_count}"))
+                    .size(15.0)
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
+                ui.add_enabled(
+                    controls_enabled,
+                    theme::primary_button("+ Add Account")
+                        .wrap_mode(egui::TextWrapMode::Extend)
+                        .min_size(egui::vec2(144.0, 32.0)),
+                )
+            })
+            .inner
+        })
+        .inner;
+    ui.add_space(10.0);
+    response
+}
+
 struct AccountColumns {
     email: f32,
     state: f32,
@@ -1897,7 +1911,10 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             cells.state,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(table_header_text("Enabled"));
+                ui.add_sized(
+                    [ui.available_width(), 22.0],
+                    egui::Label::new(table_header_text("Enabled")).halign(egui::Align::Center),
+                );
             },
         );
         show_cell(
@@ -1905,7 +1922,10 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             cells.actions,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(table_header_text("Actions"));
+                ui.add_sized(
+                    [ui.available_width(), 22.0],
+                    egui::Label::new(table_header_text("Actions")).halign(egui::Align::Center),
+                );
             },
         );
     });
@@ -1913,7 +1933,7 @@ fn show_accounts_header(ui: &mut egui::Ui) {
 
 fn table_header_text(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text)
-        .size(14.0)
+        .size(13.0)
         .color(theme::MUTED)
         .line_height(Some(19.0))
 }
@@ -1944,9 +1964,10 @@ fn show_account_row(
                 if email.is_empty() {
                     ui.label(theme::muted("Missing email"));
                 } else {
-                    ui.add_sized(
-                        [ui.available_width(), 21.0],
-                        egui::Label::new(egui::RichText::new(email).strong()).truncate(),
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(email).color(theme::TEXT))
+                            .halign(egui::Align::LEFT)
+                            .truncate(),
                     )
                     .on_hover_text(email);
                 }
@@ -1959,10 +1980,17 @@ fn show_account_row(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let mut enabled = displayed_enabled;
-                if ui
-                    .add_enabled(toggle_enabled, egui::Checkbox::without_text(&mut enabled))
-                    .changed()
-                {
+                ui.add_space(((ui.available_width() - 40.0) / 2.0).max(0.0));
+                let response = ui
+                    .add_enabled_ui(toggle_enabled, |ui| {
+                        crate::ui::toggle::switch(
+                            ui,
+                            &mut enabled,
+                            &format!("Enable account {email}"),
+                        )
+                    })
+                    .inner;
+                if response.changed() {
                     actions.toggle_enabled.push((account.id.clone(), enabled));
                 }
             },
@@ -2544,22 +2572,20 @@ fn account_action_button(
     icon: AccountActionIcon,
     enabled: bool,
 ) -> egui::Response {
-    let (width, bytes_uri, icon_bytes, fill, stroke, icon_color) = match icon {
+    let (width, bytes_uri, icon_bytes, icon_color, label) = match icon {
         AccountActionIcon::Edit => (
             EDIT_BUTTON_WIDTH,
             "bytes://icons/pencil.svg",
             PENCIL_ICON,
-            egui::Color32::from_rgb(246, 249, 252),
-            egui::Stroke::new(1.0, theme::STROKE),
             theme::TEXT,
+            "Edit account",
         ),
         AccountActionIcon::Delete => (
             DELETE_BUTTON_WIDTH,
             "bytes://icons/trash.svg",
             TRASH_ICON,
-            theme::DANGER_SOFT,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(235, 177, 177)),
             theme::DANGER,
+            "Delete account",
         ),
     };
     let icon_color = if enabled {
@@ -2567,22 +2593,34 @@ fn account_action_button(
     } else {
         theme::MUTED.linear_multiply(0.55)
     };
-    let button = egui::Button::image(svg_icon(
-        bytes_uri,
-        icon_bytes,
-        ACTION_ICON_SIZE,
-        icon_color,
-    ))
-    .fill(if enabled {
-        fill
-    } else {
-        egui::Color32::from_rgb(241, 245, 249)
-    })
-    .stroke(stroke)
-    .corner_radius(egui::CornerRadius::same(7))
-    .min_size(egui::vec2(width, ROW_BUTTON_HEIGHT));
-
-    ui.add_enabled(enabled, button)
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(248, 250, 252);
+            widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(225, 232, 238));
+            if matches!(icon, AccountActionIcon::Delete) {
+                widgets.hovered.weak_bg_fill = theme::DANGER_SOFT;
+                widgets.active.weak_bg_fill = theme::DANGER_SOFT;
+                widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme::DANGER);
+                widgets.active.bg_stroke = egui::Stroke::new(1.0, theme::DANGER);
+            }
+            ui.add_enabled(
+                enabled,
+                egui::Button::image(svg_icon(
+                    bytes_uri,
+                    icon_bytes,
+                    ACTION_ICON_SIZE,
+                    icon_color,
+                ))
+                .corner_radius(egui::CornerRadius::same(7))
+                .min_size(egui::vec2(width, ROW_BUTTON_HEIGHT)),
+            )
+        })
+        .inner;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response
 }
 
 fn password_visibility_button(
