@@ -44,12 +44,17 @@ The report is private to the local user and contains no account or device identi
 sign-in numbers, passwords, or screen contents.
 
 `milestones_ms` gives elapsed milliseconds from the start of assistance to the
-first time the Mac receives each status. `runner_starting` marks the Xcode
+first time the Mac observes each event. `helper_spawned` marks the Mac helper process
+starting. `runner_starting` marks the Xcode
 launch request, `runner_ready` marks the iPhone runner answering, and
 `phone_connected` marks the Appium session ready after the lock check.
+`authenticator_open_requested` and `field_check_requested` record when the Mac
+receives the requests to open Authenticator and check the number field.
 `number_entry_starting` marks the start of entry. An attempt that ends earlier
 omits the later milestones. The clock starts after Monitor recognizes the sign-in
-request, so it excludes time spent waiting for detection.
+request. A separate `detection_scan_ms` field measures how long the Mac spent
+scanning the Windows App window on the pass that recognized the request. The
+time between the number appearing on screen and that scan starting is unknown.
 
 Supported Authenticator UI is pinned to the observed selectors in
 `script/iphone-automation/authenticator.mjs`. A missing profile fails before a

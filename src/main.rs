@@ -69,6 +69,11 @@ use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
+#[cfg(target_os = "macos")]
+use iphone_sso_ui::PendingProgress as SupervisorEvent;
+#[cfg(not(target_os = "macos"))]
+type SupervisorEvent = ();
+
 const _ICON_ASSET_FINGERPRINT: &str = env!("WAAL_ICON_ASSET_FINGERPRINT");
 const SUPERVISOR_TICK: Duration = Duration::from_millis(250);
 const STORAGE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -141,7 +146,7 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     // Initialize AppKit before native storage/security work can service the
     // initial LaunchServices event, then install our activation handlers.
     #[cfg(target_os = "macos")]
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<SupervisorEvent>::with_user_event().build()?;
     #[cfg(target_os = "macos")]
     event_loop.set_control_flow(ControlFlow::Wait);
     let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
@@ -224,6 +229,8 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
         accounts,
         worker_invalidator.clone(),
         worker_pause_latch.clone(),
+        #[cfg(target_os = "macos")]
+        std::sync::Arc::new(event_loop.create_proxy()),
     );
     publish_initial_monitor_status(single_instance::write_monitor_status);
 
@@ -1354,10 +1361,6 @@ impl LightweightSupervisor {
     fn process_worker_events(&mut self) {
         while let Ok(event) = self.worker_event_rx.try_recv() {
             match event {
-                #[cfg(target_os = "macos")]
-                background::WorkerEvent::IphoneAssistance(event) => {
-                    self.iphone_progress.update(event)
-                }
                 background::WorkerEvent::StatusChanged(status) => {
                     self.worker_status = status;
                     self.update_tray_status();
@@ -2951,7 +2954,14 @@ impl LightweightSupervisor {
     }
 }
 
-impl ApplicationHandler for LightweightSupervisor {
+impl ApplicationHandler<SupervisorEvent> for LightweightSupervisor {
+    #[cfg(target_os = "macos")]
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, pending: SupervisorEvent) {
+        if let Some(event) = pending.take() {
+            self.iphone_progress.update(event);
+        }
+    }
+
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         if matches!(cause, StartCause::Init) {
             self.ensure_tray();

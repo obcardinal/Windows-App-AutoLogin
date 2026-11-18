@@ -44,8 +44,6 @@ pub(crate) enum WorkerEvent {
     StatusChanged(WorkerStatus),
     Log(LogEntry),
     FillAttemptReport(FillAttemptReport),
-    #[cfg(target_os = "macos")]
-    IphoneAssistance(crate::iphone_sso::Event),
 }
 
 #[derive(Clone)]
@@ -1557,6 +1555,25 @@ struct IphoneAttemptMemory {
 }
 
 #[cfg(target_os = "macos")]
+impl IphoneAttemptMemory {
+    fn observe_no_challenge(&mut self, window_present: impl FnOnce() -> anyhow::Result<bool>) {
+        // Window absence only matters when a previous request is suppressed.
+        if self.attempted.is_empty() {
+            return;
+        }
+        if matches!(window_present(), Ok(false)) {
+            self.absent_observations += 1;
+            if self.absent_observations == 2 {
+                self.attempted.clear();
+                self.absent_observations = 0;
+            }
+        } else {
+            self.absent_observations = 0;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct IphoneProbeCadence {
     last_started: Option<Instant>,
@@ -1590,6 +1607,7 @@ struct IphoneProbe {
     activity_tracker: WorkerActivityTracker,
     attempts: Arc<Mutex<IphoneAttemptMemory>>,
     event_tx: Sender<WorkerEvent>,
+    progress_proxy: crate::iphone_sso_ui::ProgressProxy,
 }
 
 #[cfg(target_os = "macos")]
@@ -1612,23 +1630,20 @@ fn spawn_iphone_probe(job: IphoneProbe) -> bool {
         }
         // Detection and assistance share this thread: the retained native AX
         // objects must never cross threads or be replaced by report strings.
+        let scan_started = Instant::now();
         let challenge = match crate::macos_ax::sso::detect(&job.accounts, &guard) {
             Ok(Some(challenge)) => challenge,
             Ok(None) => {
-                if let Ok(false) = crate::macos_ax::sso::has_visible_sign_in_window(&guard) {
-                    if let Ok(mut memory) = job.attempts.lock() {
-                        memory.absent_observations = memory.absent_observations.saturating_add(1);
-                        if memory.absent_observations >= 2 {
-                            memory.attempted.clear();
-                        }
-                    }
-                } else if let Ok(mut memory) = job.attempts.lock() {
-                    memory.absent_observations = 0;
+                if let Ok(mut memory) = job.attempts.lock() {
+                    memory.observe_no_challenge(|| {
+                        crate::macos_ax::sso::has_visible_sign_in_window(&guard)
+                    });
                 }
                 return;
             }
             Err(_) => return,
         };
+        let detection_time = scan_started.elapsed();
         let Some(account) = job
             .accounts
             .iter()
@@ -1647,9 +1662,13 @@ fn spawn_iphone_probe(job: IphoneProbe) -> bool {
                 return;
             }
         }
-        let outcome = crate::iphone_sso::assist(&challenge, account, &guard, |event| {
-            let _ = job.event_tx.try_send(WorkerEvent::IphoneAssistance(event));
-        });
+        let pending = crate::iphone_sso_ui::PendingProgress::default();
+        let outcome =
+            crate::iphone_sso::assist(&challenge, account, detection_time, &guard, |event| {
+                pending.publish(event, |update| {
+                    let _ = job.progress_proxy.send_event(update);
+                });
+            });
         let message = match outcome {
             crate::iphone_sso::Outcome::SubmittedUnverified => {
                 "iPhone number submitted; desktop authentication result is not verified"
@@ -1676,6 +1695,7 @@ pub(crate) fn spawn(
     initial_accounts: Vec<Account>,
     invalidator: WorkerInvalidator,
     pause_latch: WorkerPauseLatch,
+    #[cfg(target_os = "macos")] progress_proxy: crate::iphone_sso_ui::ProgressProxy,
 ) {
     tokio::spawn(async move {
         let mut settings = initial_settings;
@@ -1793,6 +1813,7 @@ pub(crate) fn spawn(
                     activity_tracker: activity_tracker.clone(),
                     attempts: iphone_attempts.clone(),
                     event_tx: event_tx.clone(),
+                    progress_proxy: progress_proxy.clone(),
                 }) {
                     iphone_probe_cadence.started(Instant::now());
                     // The next iteration services Stop/Settings while the
@@ -2277,6 +2298,23 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iphone_absence_scan_only_runs_while_a_previous_attempt_is_suppressed() {
+        let mut memory = super::IphoneAttemptMemory::default();
+        memory.observe_no_challenge(|| panic!("nothing to rearm"));
+        memory.attempted.insert(1);
+        memory.observe_no_challenge(|| Ok(false));
+        memory.observe_no_challenge(|| Ok(true));
+        memory.observe_no_challenge(|| Ok(false));
+        memory.observe_no_challenge(|| anyhow::bail!("unknown window state"));
+        memory.observe_no_challenge(|| Ok(false));
+        assert!(memory.attempted.contains(&1));
+        memory.observe_no_challenge(|| Ok(false));
+        assert!(memory.attempted.is_empty());
+        memory.observe_no_challenge(|| panic!("suppression was cleared"));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

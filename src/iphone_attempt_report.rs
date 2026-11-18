@@ -6,17 +6,20 @@ use std::collections::{btree_map::Entry, BTreeMap};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const FILE_NAME: &str = "last-iphone-attempt.json";
 
-/// Elapsed times when the Mac first observes each known helper status.
+/// Elapsed times when the Mac first observes each milestone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Milestone {
+    HelperSpawned,
     RunnerStarting,
     RunnerReady,
     PhoneConnected,
+    AuthenticatorOpenRequested,
+    FieldCheckRequested,
     NumberEntryStarting,
 }
 
@@ -145,6 +148,7 @@ impl Reason {
 struct Report {
     recorded_at: String,
     elapsed_ms: u64,
+    detection_scan_ms: u64,
     stage: Stage,
     outcome: Outcome,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -155,6 +159,7 @@ struct Report {
 
 pub(crate) struct Trace {
     started: Instant,
+    detection_scan_ms: u64,
     stage: Stage,
     milestones_ms: BTreeMap<Milestone, u64>,
     pending: Arc<Mutex<Option<Report>>>,
@@ -162,11 +167,16 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    pub(crate) fn start() -> Self {
-        Self::start_with(|| Ok(crate::user_paths::runtime_dir()?.join(FILE_NAME)))
+    pub(crate) fn start(detection_time: Duration) -> Self {
+        Self::start_with(detection_time, || {
+            Ok(crate::user_paths::runtime_dir()?.join(FILE_NAME))
+        })
     }
 
-    fn start_with(resolve_path: impl FnOnce() -> anyhow::Result<PathBuf> + Send + 'static) -> Self {
+    fn start_with(
+        detection_time: Duration,
+        resolve_path: impl FnOnce() -> anyhow::Result<PathBuf> + Send + 'static,
+    ) -> Self {
         let started = Instant::now();
         let pending = Arc::new(Mutex::new(None::<Report>));
         let queued = Arc::clone(&pending);
@@ -198,6 +208,7 @@ impl Trace {
 
         let trace = Self {
             started,
+            detection_scan_ms: u64::try_from(detection_time.as_millis()).unwrap_or(u64::MAX),
             stage: Stage::Preparing,
             milestones_ms: BTreeMap::new(),
             pending,
@@ -208,7 +219,12 @@ impl Trace {
     }
 
     pub(crate) fn advance(&mut self, stage: Stage) {
-        self.observe(stage, None);
+        let milestone = match stage {
+            Stage::OpeningAuthenticator => Some(Milestone::AuthenticatorOpenRequested),
+            Stage::VerifyingNumberField => Some(Milestone::FieldCheckRequested),
+            _ => None,
+        };
+        self.observe(stage, milestone);
     }
 
     pub(super) fn observe(&mut self, stage: Stage, milestone: Option<Milestone>) {
@@ -237,6 +253,7 @@ impl Trace {
         let report = Report {
             recorded_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            detection_scan_ms: self.detection_scan_ms,
             stage: self.stage,
             outcome,
             milestones_ms: self.milestones_ms.clone(),
@@ -271,7 +288,7 @@ mod tests {
         let path = directory.join(FILE_NAME);
         let start = || {
             let path = path.clone();
-            Trace::start_with(move || Ok(path))
+            Trace::start_with(Duration::from_millis(147), move || Ok(path))
         };
         let mut previous = start();
         previous.advance(Stage::Connecting);
@@ -287,8 +304,11 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(bytes.len() < 512);
-        assert_eq!(report.as_object().unwrap().len(), 5);
-        assert!(report.get("milestones_ms").is_none());
+        assert_eq!(report.as_object().unwrap().len(), 7);
+        assert_eq!(report["detection_scan_ms"], 147);
+        let times = report["milestones_ms"].as_object().unwrap();
+        assert_eq!(times.len(), 1);
+        assert!(times["field_check_requested"].is_u64());
         assert_eq!(report["stage"], "verifying_number_field");
         assert_eq!(report["outcome"], "failed");
         assert_eq!(report["reason"], "account_mismatch");
@@ -309,7 +329,7 @@ mod tests {
         let path = directory.join(FILE_NAME);
         let writer_path = path.clone();
         let (release, wait) = mpsc::channel();
-        let mut trace = Trace::start_with(move || {
+        let mut trace = Trace::start_with(Duration::ZERO, move || {
             wait.recv()?;
             Ok(writer_path)
         });

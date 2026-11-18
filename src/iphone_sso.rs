@@ -408,6 +408,7 @@ fn desktop_reason(error: anyhow::Error) -> Reason {
 pub(crate) fn assist(
     challenge: &crate::macos_ax::sso::Challenge,
     account: &crate::models::Account,
+    detection_time: Duration,
     guard: &dyn Fn() -> anyhow::Result<()>,
     progress: impl Fn(Event),
 ) -> Outcome {
@@ -427,7 +428,7 @@ pub(crate) fn assist(
         );
         guard()
     };
-    let mut trace = report::Trace::start();
+    let mut trace = report::Trace::start(detection_time);
     let validate_desktop = || challenge.revalidate(&is_current).map_err(desktop_reason);
     notify(Phase::Preparing);
     let mut failure_phase = Phase::Failed;
@@ -454,6 +455,7 @@ pub(crate) fn assist(
             reader: None,
             cleanup_failed: cleanup_failed.clone(),
         };
+        trace.observe(Stage::Preparing, Some(Milestone::HelperSpawned));
         process.input = Some(process.child.stdin.take().ok_or(Reason::HelperIoFailed)?);
         let output = process.child.stdout.take().ok_or(Reason::HelperIoFailed)?;
         let (tx, rx) = mpsc::sync_channel(16);

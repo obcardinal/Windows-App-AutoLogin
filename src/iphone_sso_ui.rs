@@ -7,7 +7,26 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{NSAlert, NSAlertStyle, NSFloatingWindowLevel, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+pub(crate) type ProgressProxy = Arc<winit::event_loop::EventLoopProxy<PendingProgress>>;
+
+/// Each sign-in attempt has at most one pending main-thread notification.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct PendingProgress(Arc<Mutex<Option<Event>>>);
+
+impl PendingProgress {
+    pub(crate) fn publish(&self, event: Event, wake: impl FnOnce(Self)) {
+        let needs_wake = self.0.lock().unwrap().replace(event).is_none();
+        if needs_wake {
+            wake(self.clone());
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<Event> {
+        self.0.lock().unwrap().take()
+    }
+}
 
 define_class!(
     #[unsafe(super = NSObject)]
@@ -51,10 +70,11 @@ impl ProgressUi {
             event.cancelled.store(false, Ordering::SeqCst);
         }
         if matches!(event.phase, Phase::Finished | Phase::Cancelled) {
+            // The first phase displayed for a newer attempt can be its last.
             if self
                 .panel
                 .as_ref()
-                .is_some_and(|panel| panel.id == event.id)
+                .is_some_and(|panel| panel.id <= event.id)
             {
                 self.panel = None;
             }
@@ -119,5 +139,41 @@ impl ProgressUi {
         {
             self.panel = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_wakes_once_per_pending_update_and_preserves_each_attempts_last_phase() {
+        let first = PendingProgress::default();
+        let second = PendingProgress::default();
+        let mut wakes = Vec::new();
+        let event = |id, phase| Event {
+            id,
+            phase,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        first.publish(event(1, Phase::Preparing), |wake| wakes.push(wake));
+        first.publish(event(1, Phase::Connecting), |_| panic!("already awake"));
+        assert_eq!(
+            wakes.pop().unwrap().take().unwrap().phase,
+            Phase::Connecting
+        );
+
+        first.publish(event(1, Phase::FaceId), |wake| wakes.push(wake));
+        first.publish(event(1, Phase::Failed), |_| panic!("already awake"));
+        second.publish(event(2, Phase::Preparing), |wake| wakes.push(wake));
+        second.publish(event(2, Phase::Cancelled), |_| panic!("already awake"));
+        let shown: Vec<_> = wakes
+            .iter()
+            .map(|wake| {
+                let event = wake.take().unwrap();
+                (event.id, event.phase)
+            })
+            .collect();
+        assert_eq!(shown, [(1, Phase::Failed), (2, Phase::Cancelled)]);
     }
 }
