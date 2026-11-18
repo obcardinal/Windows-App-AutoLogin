@@ -24,18 +24,18 @@ These checks run on your computer. The Microsoft client handles authentication. 
 
 | Platform | Download | Install |
 | --- | --- | --- |
-| macOS 11+, Apple silicon | [macOS v0.4.1](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.1) | Extract the ZIP and move `WindowsAppAutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
+| macOS 11+, Apple silicon | [macOS v1.0.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.0) | Extract the ZIP and move `WindowsAppAutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
 | Windows 10/11, x64 | [Windows v0.4.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.0) | Extract the ZIP and run `WindowsAppAutoLogin.exe`. Keep `WindowsAppAutoLoginUI.exe` in the same folder. Both executables are unsigned. |
 
 1. Open AutoLogin. On macOS, grant it **Accessibility** under **System Settings → Privacy & Security** so it can read and fill the sign-in prompt.
 2. In **Accounts**, click **+** (Add Account). Save the email that Windows App shows at sign-in and the password for that account.
 3. If monitoring is paused, choose **Start Monitor**. Open the remote desktop and leave its sign-in prompt in front. Enable **Settings → System → Open at Login** if you want AutoLogin to start with your computer.
 
+On macOS, right-click the menu bar icon and choose **Check for Updates…** to get future releases. If you use v0.4.1 or earlier, install the v1.0.0 ZIP once to enable this option.
+
 The Windows version also recognizes Microsoft Remote Desktop and the built-in Remote Desktop Connection client.
 
 ## Linked desktops and two-factor sign-in on macOS
-
-These features are in the current source and were added after the v0.4.1 release.
 
 ### Reconnect to a locked desktop
 
