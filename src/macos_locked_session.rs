@@ -2,10 +2,12 @@
 //! is only a reason to reconnect; this module never retrieves or sends a password.
 use super::{
     device_launch::{self, SavedDevice},
-    device_windows, usernames_match, AXUIElementRef, AxElement, AX_FRONTMOST, AX_SHEETS, AX_TITLE,
+    device_windows, remote_pc_info, role_matches, usernames_match, AXUIElementRef, AxElement,
+    AX_BUTTON_ROLE, AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_SHEETS, AX_TITLE, AX_WINDOWS,
 };
 use crate::models::{canonical_remote_pc, Account};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LockedSession {
@@ -193,6 +195,178 @@ pub(crate) fn probe(accounts: &[Account]) -> Result<Option<LockedSession>> {
         remote_pc: canonical_remote_pc(&account.remote_pc),
         other_sessions,
     }))
+}
+
+fn same_focused_session(session: &LockedSession, app: &AxElement) -> Result<AxElement> {
+    let (title, window, others) =
+        focused_desktop(app)?.context("The connected desktop lost focus.")?;
+    ensure!(
+        app.process_id() == Some(session.pid)
+            && title == session.title()
+            && others == session.other_sessions
+            && window_id(&window) == Some(session.window_id),
+        "The connected desktop changed."
+    );
+    Ok(window)
+}
+
+fn preflight_reconnect(
+    session: &LockedSession,
+    accounts: &[Account],
+    app: &AxElement,
+    original: &AxElement,
+    cancelled: &impl Fn() -> bool,
+) -> Result<()> {
+    match &session.device {
+        BoundDevice::Window(title) => {
+            ensure!(
+                native_account(accounts, title).is_some_and(|a| a.id == session.account_id
+                    && a.username == session.username
+                    && canonical_remote_pc(&a.remote_pc) == session.remote_pc),
+                "The selected session or account changed."
+            );
+            let verified =
+                device_launch::verify_window_device(app, title, &session.username, cancelled);
+            // Restore only our own handoff to Connection Center. Switching to
+            // another app or desktop at any time belongs to the user.
+            let center = device_launch::center_window(app);
+            if app.bool_attr(AX_FRONTMOST) == Some(true)
+                && center.as_ref().is_some_and(|center| {
+                    app.element_attr("AXFocusedWindow")
+                        .is_some_and(|focused| focused.same_element(center))
+                })
+            {
+                let restored = device_windows::focus_session_in_app(
+                    app,
+                    title,
+                    &|| {
+                        app.bool_attr(AX_FRONTMOST) != Some(true)
+                            || !app.element_attr("AXFocusedWindow").is_some_and(|w| {
+                                w.same_element(original)
+                                    || center.as_ref().is_some_and(|c| w.same_element(c))
+                            })
+                    },
+                    || {},
+                )?;
+                ensure!(
+                    restored.is_some_and(|w| w.same_element(original)),
+                    "The original desktop could not be restored."
+                );
+            }
+            verified?;
+            same_focused_session(session, app)?;
+            Ok(())
+        }
+        BoundDevice::Saved(device) => {
+            let catalog = device_launch::saved_devices()?;
+            ensure!(
+                scoped_account(accounts, &catalog, session.title()).is_some_and(|(a, d)| d
+                    == device
+                    && a.id == session.account_id
+                    && a.username == session.username
+                    && canonical_remote_pc(&a.remote_pc) == session.remote_pc),
+                "The selected session or account changed."
+            );
+            device_launch::verify_card_identity_in(&catalog, device)?;
+            let center = device_launch::center_window(app).context(
+                "Open the Devices view in Windows App so AutoLogin can reconnect this desktop.",
+            )?;
+            let (_, cards) = device_launch::read_cards(&center)?
+                .context("The saved desktop is unavailable in the Windows App Devices view.")?;
+            device_launch::exact_device(&cards, session.title())?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn reconnect(
+    session: &LockedSession,
+    accounts: &[Account],
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    ensure!(!cancelled(), "Cancelled.");
+    let app = device_windows::running_app()?.context("Windows App closed.")?;
+    let window = same_focused_session(session, &app)?;
+    if let Some(expected_host) = &session.remote_pc {
+        let endpoint =
+            remote_pc_info::read_focused_session(&app, &window, session.title(), &cancelled)?;
+        ensure!(
+            matches!(endpoint, remote_pc_info::SessionRemotePc::Selected(host) if &host == expected_host),
+            "The active Remote PC could not be matched to this account."
+        );
+    }
+    preflight_reconnect(session, accounts, &app, &window, &cancelled)?;
+    let current = same_focused_session(session, &app)?;
+    let close = current
+        .element_attr("AXCloseButton")
+        .filter(|b| {
+            b.process_id() == Some(session.pid)
+                && role_matches(b, AX_BUTTON_ROLE)
+                && b.bool_attr(AX_ENABLED) == Some(true)
+        })
+        .context("This desktop does not have an enabled close button.")?;
+    ensure!(
+        current.same_element(&window) && !cancelled(),
+        "The selected desktop changed."
+    );
+    // AX can time out after accepting a press. Observe the exact window and its
+    // native session entry to establish disconnection before issuing Connect.
+    close.perform_action(AX_PRESS);
+    wait_for_disconnect(session, &app, &window)?;
+    // Once the selected session has closed, restore that same device even if
+    // the user stopped Monitor in the meantime. Never choose another profile.
+    let can_reopen = || {
+        let (count, others) =
+            session_members(session.title(), device_windows::session_entries(&app)?);
+        ensure!(
+            count == 0 && others == session.other_sessions,
+            "The open sessions changed after disconnect. Open the selected desktop in Windows App."
+        );
+        Ok(())
+    };
+    can_reopen()?;
+    // A successful native Connect action only means the client accepted the
+    // request. Release Monitor immediately so it can handle any credential prompt.
+    match &session.device {
+        BoundDevice::Saved(device) => device_launch::open_saved_device_if(device, can_reopen),
+        BoundDevice::Window(title) => device_launch::reconnect_window_device_if(&app, title, &session.username, can_reopen),
+    }.context("The desktop disconnected, but Windows App could not reopen it. Open the selected desktop again.")
+}
+
+fn wait_for_disconnect(session: &LockedSession, app: &AxElement, window: &AxElement) -> Result<()> {
+    let until = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let (Ok(entries), Ok(windows)) = (
+            device_windows::session_entries(app),
+            app.array_attr_result(AX_WINDOWS),
+        ) {
+            let (count, others) = session_members(session.title(), entries);
+            ensure!(
+                count <= 1 && others == session.other_sessions,
+                "The open sessions changed while the selected desktop was closing."
+            );
+            let old_window_present = windows.iter().any(|w| w.same_element(window));
+            if count == 0 && !old_window_present {
+                return Ok(());
+            }
+            // The AX object can disappear between the window-list snapshot and
+            // this read. The next list observation still establishes disconnection.
+            if old_window_present
+                && window
+                    .optional_relationship_array_attr_result(AX_SHEETS)
+                    .is_ok_and(|sheets| !sheets.is_empty())
+            {
+                anyhow::bail!(
+                    "Windows App is waiting for confirmation before disconnecting this desktop."
+                );
+            }
+        }
+        ensure!(
+            Instant::now() < until,
+            "Windows App did not confirm that the selected desktop disconnected."
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[cfg(test)]
