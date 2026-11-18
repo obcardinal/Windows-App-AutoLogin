@@ -4,6 +4,8 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
+import timers from 'node:timers/promises';
 import * as support from './support.mjs';
 import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, tunnelEndpoint } from './wda.mjs';
 
@@ -31,14 +33,71 @@ test('only the remainder of the polling interval is spent asleep after a readine
   assert.deepEqual(sleeps, [400]);
 });
 
+for (const duringFetch of [false, true]) {
+  const scenario = duringFetch ? 'during a status request' : 'during the polling interval';
+  test(`an XCTest server marker ${scenario} wakes one sequential status probe`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 0 });
+    t.mock.method(performance, 'now', () => Date.now());
+    t.mock.module('node:timers/promises', { namedExports: { setTimeout: timers.setTimeout } });
+    const { waitForRunnerReady } = await import(`./wda.mjs?marker-during-fetch=${duringFetch}`);
+    const child = Object.assign(new EventEmitter(), {
+      exitCode: null, signalCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
+    });
+    const output = duringFetch ? child.stderr : child.stdout;
+    const otherOutput = duringFetch ? child.stdout : child.stderr;
+    const firstReply = Promise.withResolvers();
+    const starts = [];
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+      assert.equal(url, 'http://[::1]:8100/status');
+      assert.equal(options.redirect, 'error');
+      starts.push(performance.now());
+      if (duringFetch && starts.length === 1) await firstReply.promise;
+      return Response.json({ value: { ready: starts.length === 3 } });
+    });
+    const controller = new AbortController();
+    const ready = waitForRunnerReady('http://[::1]:8100', child, controller.signal);
+    t.after(async () => {
+      firstReply.resolve();
+      controller.abort();
+      await ready.catch(() => {});
+      child.stdout.destroy();
+      child.stderr.destroy();
+    });
+
+    await timers.setImmediate();
+    output.write(Buffer.from('ServerURL'));
+    otherOutput.write(Buffer.from('Here->'));
+    await timers.setImmediate();
+    assert.deepEqual(starts, [0]);
+    output.write(Buffer.from('Here->'));
+    await timers.setImmediate();
+    if (duringFetch) {
+      assert.deepEqual(starts, [0]);
+      firstReply.resolve();
+      await timers.setImmediate();
+    }
+    assert.deepEqual(starts, [0, 0]);
+    otherOutput.write(Buffer.from('ServerURLHere->'));
+    await timers.setImmediate();
+    t.mock.timers.tick(499);
+    await timers.setImmediate();
+    assert.deepEqual(starts, [0, 0]);
+    t.mock.timers.tick(1);
+    await timers.setImmediate();
+    assert.deepEqual(starts, [0, 0, 500]);
+    await ready;
+  });
+}
+
 test('a ready reply is rejected if the runner exited, the deadline expired, or the caller cancelled', async t => {
   const { waitForRunnerReady } = await import('./wda.mjs');
   let now = 0;
   t.mock.method(performance, 'now', () => now);
   for (const cause of ['exit', 'deadline', 'abort']) {
-    const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, stdout: new PassThrough() });
     const controller = new AbortController();
     const fetch = t.mock.method(globalThis, 'fetch', async () => {
+      child.stdout.write(Buffer.from('ServerURLHere->'));
       if (cause === 'exit') child.exitCode = 1;
       if (cause === 'deadline') now += 45000;
       if (cause === 'abort') controller.abort();

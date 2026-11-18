@@ -239,10 +239,37 @@ async function preparedTestRun(config, signal, onStatus) {
   return buildTestRun(config, upstream, source, derived, signal, false);
 }
 
-// Poll at most twice a second. Time spent waiting for the previous HTTP
-// response counts toward that interval; requests never overlap.
+// XCTest prints this marker after binding its HTTP listener. We only use it
+// to wake one poll. The endpoint always comes from the selected phone's tunnel.
+function watchRunnerOutput(stream, hint) {
+  if (!stream) return () => {};
+  const marker = 'ServerURLHere->';
+  let tail = '';
+  const onData = chunk => {
+    if (hint.signal.aborted) return;
+    const text = tail + chunk.toString('latin1');
+    if (text.includes(marker)) {
+      tail = '';
+      hint.abort();
+    } else {
+      tail = text.slice(1 - marker.length);
+    }
+  };
+  stream.on('data', onData);
+  return () => {
+    stream.off('data', onData);
+    stream.resume(); // Drain subsequent XCTest output without retaining or logging it.
+  };
+}
+
+// Poll twice a second, plus one early probe on the listener announcement.
+// Time spent waiting for a response counts toward the interval. Requests never overlap.
 export async function waitForRunnerReady(url, child, signal) {
   const deadline = performance.now() + 45000;
+  const hint = new AbortController();
+  const wakeSignal = AbortSignal.any([signal, hint.signal]);
+  const stopWatching = [child.stdout, child.stderr].map(stream => watchRunnerOutput(stream, hint));
+  let usedHint = false;
   let spawnFailed = false;
   const onError = () => { spawnFailed = true; };
   const check = () => {
@@ -265,10 +292,19 @@ export async function waitForRunnerReady(url, child, signal) {
       check();
       if (ready) return;
       const pause = Math.min(started + 500, deadline) - performance.now();
-      if (pause > 0) await delay(Math.ceil(pause), undefined, { signal });
+      if (pause > 0) {
+        try {
+          await delay(Math.ceil(pause), undefined, { signal: usedHint ? signal : wakeSignal });
+        } catch (error) {
+          signal.throwIfAborted();
+          if (usedHint || !hint.signal.aborted) throw error;
+        }
+      }
+      usedHint = hint.signal.aborted;
     }
   } finally {
     child.removeListener('error', onError);
+    for (const stop of stopWatching) stop();
   }
 }
 
@@ -299,7 +335,7 @@ export async function startNativeWda(config, device, { signal, onStatus = () => 
     child = spawn('/usr/bin/xcodebuild', ['test-without-building', '-xctestrun', files.privateFile,
       '-destination', `id=${config.device_udid}`, '-destination-timeout', '20', '-allowProvisioningUpdates',
       '-resultBundlePath', path.join(resultsDirectory, 'results.xcresult')], {
-      env: cleanEnvironment(), detached: true, stdio: 'ignore',
+      env: cleanEnvironment(), detached: true, stdio: ['ignore', 'pipe', 'pipe'],
     });
     await waitForRunnerReady(url, child, signal);
     return { url, platformVersion: device.osVersion, close };
