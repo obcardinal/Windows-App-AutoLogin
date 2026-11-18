@@ -115,6 +115,64 @@ fn element_midpoint(node: &AxElement) -> Option<Point> {
     })
 }
 
+pub(super) fn click_profile_email(
+    app: &AxElement,
+    center: &AxElement,
+    sheet: &AxElement,
+    row: &AxElement,
+    email: &AxElement,
+    before_click: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let pid = app.process_id().context(PROFILE_ERROR)?;
+    ensure!(
+        crate::autologin::accessibility_is_trusted()
+            && unsafe { CGPreflightPostEventAccess() }
+            && [center, sheet, row, email]
+                .iter()
+                .all(|e| e.process_id() == Some(pid))
+            && role_matches(center, "AXWindow")
+            && role_matches(sheet, "AXSheet")
+            && role_matches(email, "AXStaticText")
+            && children(row)?.iter().any(|child| child.same_element(email))
+            && app
+                .array_attr_result(AX_WINDOWS)?
+                .iter()
+                .any(|w| w.same_element(center)),
+        PROFILE_ERROR
+    );
+    let controls = sheet_controls(sheet).context(PROFILE_ERROR)?;
+    let mut lists = controls.iter().filter(|i| role_matches(i, "AXScrollArea"));
+    let list = lists.next().context(PROFILE_ERROR)?;
+    ensure!(
+        lists.next().is_none() && children(list)?.iter().any(|r| r.same_element(row)),
+        PROFILE_ERROR
+    );
+    let point = element_midpoint(email).context(PROFILE_ERROR)?;
+    let raw = unsafe { AXUIElementCreateSystemWide() };
+    ensure!(!raw.is_null(), PROFILE_ERROR);
+    let system = AxElement { raw };
+    let down = mouse_event(1, point, 0)?;
+    let up = mouse_event(2, point, 0)?;
+    before_click()?;
+    ensure!(
+        app.bool_attr(AX_FRONTMOST) == Some(true)
+            && app
+                .element_attr("AXFocusedWindow")
+                .is_some_and(|w| w.same_element(center) || w.same_element(sheet))
+            && profile_selector(center).is_some_and(|(current, _)| current.same_element(sheet))
+            && hit_test(&system, point).is_some_and(|hit| hit.process_id() == Some(pid)
+                && (hit.same_element(email) || hit.same_element(row))),
+        PROFILE_ERROR
+    );
+    // The profile rows are not AX buttons. Click only their exact hit-tested
+    // address or its enclosing row, never the separate actions button.
+    unsafe {
+        CGEventPost(0, down.as_CFTypeRef());
+        CGEventPost(0, up.as_CFTypeRef());
+    }
+    Ok(())
+}
+
 fn card_state(commands: &[(String, Option<bool>)]) -> Result<bool> {
     let mut choices = commands
         .iter()

@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 mod catalog;
 #[path = "macos_connected_card.rs"]
 mod connected;
+#[path = "macos_enter_profile.rs"]
+mod enter_profile;
+use enter_profile::prepare_enter_devices;
 pub(super) use catalog::verify_card_identity_in;
 pub(crate) use catalog::{saved_devices, saved_remote_pc, SavedDevice};
 
@@ -29,6 +32,15 @@ struct DeviceList {
 }
 
 pub(crate) fn open_saved_device(device: &SavedDevice) -> Result<()> {
+    if device.id.starts_with("workspace:") && !device.owner.trim().is_empty() {
+        let app = trusted_app()?;
+        let (list, profile) = prepare_enter_devices(&app, &device.owner)?;
+        catalog::verify_card_identity(device)?;
+        return list.connect(&device.name, || {
+            list.ensure_profile(&profile)?;
+            catalog::verify_card_identity(device)
+        });
+    }
     open_saved_device_if(device, || Ok(()))
 }
 
@@ -48,7 +60,12 @@ pub(super) fn open_saved_device_if(
 /// can still reconnect the exact card under the account that owns the binding.
 pub(crate) fn reconnect_window_device(name: &str, account_email: &str) -> Result<()> {
     let app = trusted_app()?;
-    reconnect_window_device_if(&app, name, account_email, || Ok(()))
+    ensure!(
+        !name.trim().is_empty(),
+        "Choose a desktop in the account editor."
+    );
+    let (list, profile) = prepare_enter_devices(&app, account_email)?;
+    list.connect(name, || list.ensure_profile(&profile))
 }
 
 pub(super) fn reconnect_window_device_if(
@@ -65,10 +82,7 @@ pub(super) fn reconnect_window_device_if(
     exact_device(&list.devices, name)?;
     let profile = list.verify_profile(account_email.trim())?;
     list.connect(name, || {
-        ensure!(
-            profile_label(&list.window)?.1 == profile,
-            "The active Windows App account changed. Try opening the desktop again."
-        );
+        list.ensure_profile(&profile)?;
         before_connect()
     })
 }
@@ -178,6 +192,14 @@ pub(super) fn exact_device<'a, T>(devices: &'a [(String, T)], name: &str) -> Res
 }
 
 impl DeviceList {
+    fn ensure_profile(&self, expected: &str) -> Result<()> {
+        ensure!(
+            profile_label(&self.window)?.1 == expected,
+            "The active Windows App account changed. Try opening the desktop again."
+        );
+        Ok(())
+    }
+
     fn connect(&self, name: &str, verify_binding: impl FnOnce() -> Result<()>) -> Result<()> {
         let item = exact_device(&self.devices, name)?;
         self.select(item)?;
@@ -196,37 +218,7 @@ impl DeviceList {
     }
 
     fn verify_profile(&self, email: &str) -> Result<String> {
-        let (button, label) = profile_label(&self.window)?;
-        ensure!(
-            children(&self.window)?
-                .iter()
-                .all(|node| !role_matches(node, "AXSheet")),
-            PROFILE_ERROR
-        );
-        // Opening the selector can outlast the AX reply timeout even though
-        // Windows App has accepted the press. Observe its resulting sheet.
-        button.perform_action(AX_PRESS);
-        let (sheet, close) = wait_for(|| profile_selector(&self.window))
-            .context("Windows App did not display its account selector.")?;
-        let verified = wait_for(|| {
-            let controls = sheet_controls(&sheet)?;
-            let owners = profile_owners(&controls, &label)?;
-            Some(matches!(owners.as_slice(), [owner] if owner.eq_ignore_ascii_case(email)))
-        });
-        close.perform_action(AX_PRESS);
-        wait_for(|| {
-            children(&self.window)
-                .ok()?
-                .iter()
-                .all(|node| !node.same_element(&sheet))
-                .then_some(())
-        })
-        .context("Windows App did not finish closing its account selector.")?;
-        ensure!(
-            verified.context(PROFILE_ERROR)?,
-            "The selected desktop could not be verified under this Windows App account."
-        );
-        Ok(label)
+        enter_profile::verify_selected_owner(&self.app, &self.window, email)
     }
 
     fn select(&self, item: &AxElement) -> Result<()> {
@@ -317,42 +309,21 @@ fn profile_selector(window: &AxElement) -> Option<(AxElement, AxElement)> {
     Some((sheet, close))
 }
 
-fn profile_owners(controls: &[AxElement], label: &str) -> Option<Vec<String>> {
-    let scroll = controls
-        .iter()
-        .find(|node| role_matches(node, "AXScrollArea"))?;
-    let rows = children(scroll).ok()?;
-    if rows.is_empty() {
-        return None;
-    }
-    let mut owners = Vec::new();
-    for row in rows {
-        let texts: Vec<_> = children(&row)
-            .ok()?
-            .into_iter()
-            .filter(|node| role_matches(node, "AXStaticText"))
-            .map(|node| node.string_attr(AX_VALUE))
-            .collect::<Option<_>>()?;
-        let [display, owner, organization] = texts.as_slice() else {
-            return None;
-        };
-        if label == format!("{display} {organization}") {
-            owners.push(owner.clone());
-        }
-    }
-    Some(owners)
+fn devices_in_app(app: AxElement) -> Result<DeviceList> {
+    let window = devices_window(&app)?;
+    devices_from_window(app, window)
 }
 
-fn devices_in_app(app: AxElement) -> Result<DeviceList> {
+fn devices_window(app: &AxElement) -> Result<AxElement> {
     app.set_bool_attr(AX_FRONTMOST, true);
-    let mut window = center_window(&app);
+    let mut window = center_window(app);
     if window
         .as_ref()
         .is_none_or(|w| w.bool_attr(AX_MAIN) != Some(true))
     {
         let show_center = wait_for(|| {
             menu_item(
-                &app,
+                app,
                 &["Window", "窗口"],
                 &["Connection Center", "连接中心"],
             )
@@ -362,14 +333,18 @@ fn devices_in_app(app: AxElement) -> Result<DeviceList> {
             show_center.perform_action(AX_PRESS),
             "Could not open the Windows App Connection Center."
         );
-        window = wait_for(|| center_window(&app));
+        window = wait_for(|| center_window(app));
     }
     let window = window.context("The Windows App Connection Center did not open.")?;
     if window.bool_attr("AXMinimized") == Some(true) {
         window.set_bool_attr("AXMinimized", false);
     }
     window.perform_action("AXRaise");
-    show_devices(&app, &window)?;
+    show_devices(app, &window)?;
+    Ok(window)
+}
+
+fn devices_from_window(app: AxElement, window: AxElement) -> Result<DeviceList> {
     let (collection, devices) = wait_for(|| read_cards(&window).transpose())
         .context("Windows App did not load the saved devices for this profile.")??;
     Ok(DeviceList {
