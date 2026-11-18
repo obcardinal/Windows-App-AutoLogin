@@ -19,6 +19,21 @@ KEY = base64.b64encode(bytes(range(32))).decode()
 
 
 class UpdatePreparationTests(unittest.TestCase):
+    def test_release_notes_keep_paragraphs_and_escape_literal_markup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            notes = Path(temp) / "notes.txt"
+            notes.write_bytes(' Accounts & updates\r\nSecond line.\r\n \r\n<em>“Example”</em>\n'.encode("utf-8"))
+            self.assertEqual(UPDATE.read_release_notes(notes),
+                             "<p>Accounts &amp; updates<br>Second line.</p>\n<p>&lt;em&gt;“Example”&lt;/em&gt;</p>")
+
+    def test_invalid_release_notes_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            notes = Path(temp) / "notes.txt"
+            for data in (b" \r\n  ", b"x\x00y", b"x" * (UPDATE.MAX_RELEASE_NOTES + 1)):
+                with self.subTest(length=len(data)), self.assertRaises(UPDATE.PreparationError):
+                    notes.write_bytes(data)
+                    UPDATE.read_release_notes(notes)
+
     def identity(self, channel="development"):
         identity, prefix, _ = UPDATE.CHANNELS[channel]
         return {

@@ -7,6 +7,7 @@ import argparse
 import base64
 import ctypes
 import hashlib
+import html
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
@@ -34,6 +35,7 @@ CHANNELS = {
 MAX_ARCHIVE = 1024 * 1024 * 1024
 MAX_EXPANDED = 2 * MAX_ARCHIVE
 MAX_FEED = 2 * 1024 * 1024
+MAX_RELEASE_NOTES = 64 * 1024
 ET.register_namespace("sparkle", SPARKLE)
 ET.register_namespace("atom", ATOM)
 
@@ -223,7 +225,17 @@ def publish_directory(source: Path, destination: Path) -> None:
         raise OSError(code, os.strerror(code), str(destination))
 
 
-def prepare(archive: Path, output: Path, channel: str, existing: Path | None) -> None:
+def read_release_notes(path: Path) -> str:
+    text = read_regular(path, MAX_RELEASE_NOTES).decode("utf-8")
+    require(not re.search(r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]", text),
+            "Release notes contain a character unsupported in XML")
+    text = "\n".join(line.strip() for line in text.splitlines()).strip()
+    require(bool(text), "Release notes are empty")
+    paragraphs = re.split(r"\n{2,}", text)
+    return "\n".join("<p>" + html.escape(paragraph).replace("\n", "<br>") + "</p>" for paragraph in paragraphs)
+
+
+def prepare(archive: Path, output: Path, channel: str, existing: Path | None, release_notes: Path | None = None) -> None:
     require(sys.platform == "darwin", "Sparkle preparation requires macOS")
     require(not os.path.lexists(output), "Output directory already exists; immutable output is never overwritten")
     require(output.parent.is_dir(), "Output parent directory must already exist")
@@ -231,6 +243,7 @@ def prepare(archive: Path, output: Path, channel: str, existing: Path | None) ->
     require(len(base64.b64decode(public_key, validate=True)) == 32, "Invalid project Sparkle public key")
     previous_data = read_regular(existing, MAX_FEED) if existing else None
     previous = parse_feed(previous_data, channel) if previous_data is not None else None
+    description_html = read_release_notes(release_notes) if release_notes is not None else None
     with tempfile.TemporaryDirectory(prefix=".waal-update-", dir=output.parent) as temporary:
         work = Path(temporary)
         snapshot = work / "input.zip"
@@ -279,6 +292,12 @@ def prepare(archive: Path, output: Path, channel: str, existing: Path | None) ->
         signature = enclosure.get(f"{{{SPARKLE}}}edSignature", "")
         require(len(base64.b64decode(signature, validate=True)) == 64, "Generated archive lacks Ed25519 signature")
         run([tool("sign_update"), "--account", ACCOUNT, "--verify", str(update), signature])
+        if description_html is not None:
+            description = item.find("description")
+            if description is None:
+                description = ET.SubElement(item, "description")
+            description.set(f"{{{SPARKLE}}}descriptionFormat", "html")
+            description.text = description_html
         if previous is not None:
             feed = previous
             channel_element = feed.find("channel")
@@ -310,9 +329,10 @@ def main() -> int:
     parser.add_argument("output", type=Path, help="New output directory; existing paths are rejected")
     parser.add_argument("--channel", required=True, choices=CHANNELS)
     parser.add_argument("--existing-appcast", type=Path, help="Previous same-channel feed; never modified")
+    parser.add_argument("--release-notes", type=Path, help="UTF-8 plain text to display in Sparkle; separate paragraphs with a blank line")
     args = parser.parse_args()
     try:
-        prepare(args.archive.absolute(), args.output.absolute(), args.channel, args.existing_appcast)
+        prepare(args.archive.absolute(), args.output.absolute(), args.channel, args.existing_appcast, args.release_notes)
     except (PreparationError, OSError, ValueError, RuntimeError, ET.ParseError, zipfile.BadZipFile, subprocess.TimeoutExpired) as error:
         print(f"Update preparation failed: {error}", file=sys.stderr)
         return 1
