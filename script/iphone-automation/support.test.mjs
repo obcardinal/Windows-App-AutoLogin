@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
 import { physicalDevices, selectPhysicalDevice, pairedDeviceCandidate, deviceFromDetails, parseLockState, validateConfig } from './support.mjs';
 
 const udid = '00000000-0000000000000001';
@@ -45,6 +46,43 @@ test('unknown or failed lock responses never authorize an unlocked session', () 
   assert.equal(parseLockState({ result: { passcodeRequired: false, unlockedSinceBoot: true } }), false);
   assert.equal(parseLockState({ result: { passcodeRequired: true, unlockedSinceBoot: true } }), true);
   assert.equal(parseLockState({ result: { passcodeRequired: false, unlockedSinceBoot: false } }), null);
+});
+
+test('Wi-Fi preparation reads only the selected paired phone, skips active sessions, and retains no device state', async t => {
+  const phone = device('physical', false);
+  let devices = [phone];
+  let sessionActive = false;
+  let details = 0;
+  t.mock.method(fs, 'lstat', async () => {
+    if (sessionActive) return {};
+    throw Object.assign(new Error(), { code: 'ENOENT' });
+  });
+  t.mock.module('node:child_process', { namedExports: { execFile(file, args, options, callback) {
+    assert.equal(file, '/usr/bin/xcrun');
+    assert.equal(options.signal.aborted, false);
+    if (args[1] === 'list') return callback(null, JSON.stringify({ result: { devices } }));
+    assert.deepEqual(args.slice(0, 6), ['devicectl', 'device', 'info', 'details', '--device', udid]);
+    details++;
+    callback(null, JSON.stringify({ result: phone }));
+  } } });
+  const { warmSelectedWifi } = await import('./support.mjs?warm-wifi');
+  const signal = new AbortController().signal;
+  const warm = () => warmSelectedWifi(udid, signal);
+  phone.connectionProperties.transportType = 'wired';
+  await warm();
+  phone.connectionProperties.transportType = 'localNetwork';
+  phone.connectionProperties.pairingState = 'unpaired';
+  await warm();
+  phone.connectionProperties.pairingState = 'paired';
+  devices = [phone, phone];
+  await warm();
+  devices = [phone];
+  sessionActive = true;
+  await warm();
+  assert.equal(details, 0);
+  sessionActive = false;
+  assert.equal(await warm(), undefined);
+  assert.equal(details, 1);
 });
 
 test('private configuration cannot redirect Appium outside its pinned runtime', () => {

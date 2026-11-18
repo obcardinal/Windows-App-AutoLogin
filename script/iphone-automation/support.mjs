@@ -151,6 +151,23 @@ export async function probePhysicalDevice(device, { signal } = {}) {
   }
 }
 
+// A password write can precede the sign-in request by enough time to wake
+// CoreDevice's Wi-Fi tunnel. Discard the result: the session verifies it afresh.
+export async function warmSelectedWifi(udid, signal) {
+  try {
+    if (!validUdid(udid)) return;
+    const devices = await listPhysicalDevices({ signal });
+    const selected = pairedDeviceCandidate(devices, udid);
+    if (selected.transport !== 'localNetwork') return;
+    try { await fs.lstat(paths().lock); return; }
+    catch (error) { if (error.code !== 'ENOENT') return; }
+    signal.throwIfAborted();
+    await probePhysicalDevice(selected, { signal });
+  } catch {
+    // Optional preparation never delays sign-in or substitutes for discovery.
+  }
+}
+
 export function parseLockState(document) {
   const result = document?.result;
   // Treat unknown versions of Apple's response schema as unknown, never unlocked.

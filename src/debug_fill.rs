@@ -1024,6 +1024,10 @@ fn fill_current_prompt_once_macos(
     };
     record_password_write_completed(&mut log);
     log.set(
+        "iphone_authenticator_enabled",
+        selected_account.iphone_authenticator_enabled.to_string(),
+    );
+    log.set(
         "fill_duration_ms",
         fill_start.elapsed().as_millis().to_string(),
     );

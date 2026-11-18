@@ -92,9 +92,15 @@ export async function stopOwnedProcessGroup(child) {
   const alive = () => { try { process.kill(-child.pid, 0); return true; } catch { return false; } };
   if (!alive()) return;
   try { process.kill(-child.pid, 'SIGTERM'); } catch {}
-  if (!alive()) return;
-  await delay(1200);
-  if (alive()) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
+  const deadline = performance.now() + 1200;
+  while (alive()) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+      return;
+    }
+    await delay(Math.min(50, Math.ceil(remaining)));
+  }
 }
 
 async function buildRunner(args, signal, detached) {

@@ -17,7 +17,7 @@ const EOF_GRACE: Duration = Duration::from_secs(4);
 pub(crate) enum Trigger {
     Tick,
     Configuration,
-    PasswordWritten,
+    PasswordWritten { warm_wifi: bool },
 }
 
 // The shared phone selector and setup CLI publish config.json by rename.
@@ -78,12 +78,12 @@ impl HostPreparation {
     }
 
     pub(crate) fn poll(&mut self, now: Instant, eligible: bool, trigger: Trigger) {
-        self.poll_with(
-            now,
-            eligible,
-            trigger,
-            crate::iphone_sso::host_prepare_command,
-        );
+        self.poll_with(now, eligible, trigger, move || {
+            crate::iphone_sso::host_prepare_command(matches!(
+                trigger,
+                Trigger::PasswordWritten { warm_wifi: true }
+            ))
+        });
     }
 
     fn poll_with(
@@ -127,9 +127,11 @@ impl HostPreparation {
         if self.config.is_none() || self.job.is_some() {
             return;
         }
-        if self.outcome == Outcome::Pending
-            || (self.outcome == Outcome::Failed && trigger == Trigger::PasswordWritten)
-        {
+        let should_prepare = match trigger {
+            Trigger::PasswordWritten { warm_wifi } => warm_wifi || self.outcome != Outcome::Ready,
+            _ => self.outcome == Outcome::Pending,
+        };
+        if should_prepare {
             match PreparationJob::start(command) {
                 Ok(job) => self.job = Some(job),
                 Err(_) => self.outcome = Outcome::Failed,
@@ -312,15 +314,29 @@ mod tests {
             panic!("unchanged config")
         });
         assert!(preparation.job.is_none());
-        preparation.poll_with(now, true, Trigger::PasswordWritten, || {
-            Ok(Command::new("/usr/bin/true"))
-        });
+        preparation.poll_with(
+            now,
+            true,
+            Trigger::PasswordWritten { warm_wifi: false },
+            || Ok(Command::new("/usr/bin/true")),
+        );
         finish(&mut preparation);
         assert!(preparation.outcome == Outcome::Ready);
-        preparation.poll_with(now, true, Trigger::PasswordWritten, || {
-            panic!("already prepared")
-        });
+        preparation.poll_with(
+            now,
+            true,
+            Trigger::PasswordWritten { warm_wifi: false },
+            || panic!("2FA is off for this account and the build is ready"),
+        );
         assert!(preparation.job.is_none());
+        preparation.poll_with(
+            now,
+            true,
+            Trigger::PasswordWritten { warm_wifi: true },
+            || Ok(Command::new("/usr/bin/true")),
+        );
+        assert!(preparation.job.is_some()); // warm the Wi-Fi tunnel even with a ready build
+        finish(&mut preparation);
 
         // A separately saved choice is published by renaming a new file. Its
         // metadata is seen on the next periodic check while the app is idle.

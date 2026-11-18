@@ -1,4 +1,4 @@
-import { readConfig, runtimeReady } from './support.mjs';
+import { readConfig, runtimeReady, warmSelectedWifi } from './support.mjs';
 import { prepareHostRunner } from './wda.mjs';
 
 // The supervisor holds this pipe open only while the configuration is eligible.
@@ -14,11 +14,15 @@ try {
   if (!config.device_udid || !await runtimeReady(config)) {
     process.exitCode = 1;
   } else {
-    await prepareHostRunner(config, controller.signal);
+    await Promise.all([
+      prepareHostRunner(config, controller.signal),
+      process.argv[1] === 'warm-wifi' && warmSelectedWifi(config.device_udid, controller.signal),
+    ]);
   }
 } catch {
   process.exitCode = 1;
 } finally {
+  controller.abort();
   process.stdin.destroy();
   process.removeListener('SIGTERM', cancel);
   process.removeListener('SIGINT', cancel);

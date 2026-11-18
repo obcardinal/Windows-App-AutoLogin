@@ -1576,7 +1576,7 @@ impl IphoneAttemptMemory {
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct IphoneProbeCadence {
-    last_started: Option<Instant>,
+    next_start: Option<Instant>,
     owes_monitor_tick: bool,
 }
 
@@ -1588,14 +1588,19 @@ impl IphoneProbeCadence {
         if std::mem::take(&mut self.owes_monitor_tick) {
             return false;
         }
-        self.last_started
-            .is_none_or(|started| now.duration_since(started) >= Duration::from_secs(1))
+        self.next_start.is_none_or(|deadline| now >= deadline)
     }
 
     fn started(&mut self, now: Instant) {
-        self.last_started = Some(now);
+        self.next_start = Some(now + Duration::from_secs(1));
         self.owes_monitor_tick = true;
     }
+}
+
+fn monitor_wait(normal_wait: Duration, next_probe: Option<Instant>, now: Instant) -> Duration {
+    next_probe.map_or(normal_wait, |deadline| {
+        normal_wait.min(deadline.saturating_duration_since(now))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1796,13 +1801,19 @@ pub(crate) fn spawn(
                 continue;
             }
 
+            #[cfg(not(target_os = "macos"))]
+            let next_probe = None;
+            // A rejected reservation keeps the usual monitor interval.
+            #[cfg(target_os = "macos")]
+            let mut next_probe = None;
             #[cfg(target_os = "macos")]
             if accounts
                 .iter()
                 .any(|account| account.enabled && account.iphone_authenticator_enabled)
-                && iphone_probe_cadence.due(Instant::now())
             {
-                if spawn_iphone_probe(IphoneProbe {
+                if !iphone_probe_cadence.due(Instant::now()) {
+                    next_probe = iphone_probe_cadence.next_start;
+                } else if spawn_iphone_probe(IphoneProbe {
                     accounts: accounts.clone(),
                     pause_latch: pause_latch.clone(),
                     expected_generation: current_generation,
@@ -1826,7 +1837,7 @@ pub(crate) fn spawn(
             if !has_enabled_account {
                 pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
-                    fixed_poll_interval(),
+                    monitor_wait(fixed_poll_interval(), next_probe, Instant::now()),
                     &mut cmd_rx,
                     &event_tx,
                     &mut running,
@@ -2253,7 +2264,11 @@ pub(crate) fn spawn(
             }
 
             if !wait_or_handle_command(
-                remaining_tick_delay(tick_start, next_poll_delay),
+                monitor_wait(
+                    remaining_tick_delay(tick_start, next_poll_delay),
+                    next_probe,
+                    Instant::now(),
+                ),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -2327,6 +2342,36 @@ mod tests {
         cadence.started(completed + Duration::from_secs(1));
         assert!(!cadence.due(completed + Duration::from_millis(1100)));
         assert!(!cadence.due(completed + Duration::from_millis(1200)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iphone_probe_wait_uses_its_original_deadline_after_servicing_password_monitor() {
+        let start = Instant::now();
+        let normal_wait = Duration::from_secs(1);
+        let mut cadence = super::IphoneProbeCadence::default();
+        cadence.started(start);
+        let monitor_start = start + Duration::from_millis(250);
+        assert!(!cadence.due(monitor_start)); // the password monitor gets this pass
+        let wait = |now| super::monitor_wait(normal_wait, cadence.next_start, now);
+        assert_eq!(wait(monitor_start), Duration::from_millis(750)); // no saved password
+        assert_eq!(
+            wait(start + Duration::from_millis(800)),
+            Duration::from_millis(200)
+        );
+        assert_eq!(wait(start + Duration::from_secs(2)), Duration::ZERO);
+        assert_eq!(
+            super::monitor_wait(
+                Duration::from_millis(100),
+                cadence.next_start,
+                monitor_start
+            ),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            super::monitor_wait(normal_wait, None, monitor_start),
+            normal_wait
+        );
     }
 
     fn pause_latch_for_generation(generation: &Arc<AtomicU64>) -> WorkerPauseLatch {

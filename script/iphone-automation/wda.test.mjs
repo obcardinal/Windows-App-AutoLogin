@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import * as support from './support.mjs';
-import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, stopOwnedProcessGroup, tunnelEndpoint } from './wda.mjs';
+import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, tunnelEndpoint } from './wda.mjs';
 
 const udid = '00000000-0000000000000001';
 const device = { udid, paired: true, connected: true, transport: 'localNetwork', tunnelAddress: 'fd00::1', osVersion: '27.2' };
@@ -70,18 +70,29 @@ test('WDA test launch binds only the tunnel address and deletes diagnostic attac
   assert.throws(() => configureTestRun(original, '0.0.0.0'), { code: 'wda_build_failed' });
 });
 
-test('cleanup still stops descendants after the owned group leader already exited', async t => {
-  const signals = [];
-  let alive = true;
-  t.mock.method(process, 'kill', (pid, signal) => {
-    assert.equal(pid, -99999999);
-    if (!alive) throw Object.assign(new Error('missing'), { code: 'ESRCH' });
-    if (signal !== 0) signals.push(signal);
-    if (signal === 'SIGKILL') alive = false;
+for (const groupExitAt of [75, Infinity]) {
+  const graceful = Number.isFinite(groupExitAt);
+  test(graceful ? 'cleanup returns promptly when the owned group exits on TERM'
+    : 'cleanup gives surviving descendants the full grace period after their leader exits', async t => {
+    let now = 0;
+    const signals = [];
+    t.mock.method(performance, 'now', () => now);
+    t.mock.module('node:timers/promises', { namedExports: { setTimeout: async ms => { now += ms; } } });
+    t.mock.method(process, 'kill', (pid, signal) => {
+      assert.equal(pid, -99999999);
+      if (now >= groupExitAt) throw Object.assign(new Error('missing'), { code: 'ESRCH' });
+      if (signal !== 0) signals.push([signal, now]);
+    });
+    const { stopOwnedProcessGroup } = await import(`./wda.mjs?cleanup=${groupExitAt}`);
+    await stopOwnedProcessGroup({ pid: 99999999, exitCode: 1, signalCode: null });
+    if (graceful) {
+      assert.deepEqual(signals, [['SIGTERM', 0]]);
+      assert.ok(now >= groupExitAt && now <= groupExitAt + 50);
+    } else {
+      assert.deepEqual(signals, [['SIGTERM', 0], ['SIGKILL', 1200]]);
+    }
   });
-  await stopOwnedProcessGroup({ pid: 99999999, exitCode: 1, signalCode: null });
-  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
-});
+}
 
 test('phone cleanup selects only this app dedicated signed WDA executable', () => {
   const bundle = 'com.obcardinal.WindowsAppAutoLogin.WebDriverAgentRunner';

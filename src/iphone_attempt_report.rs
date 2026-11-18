@@ -21,6 +21,9 @@ pub(super) enum Milestone {
     AuthenticatorOpenRequested,
     FieldCheckRequested,
     NumberEntryStarting,
+    SubmitRequested,
+    SubmissionAcknowledged,
+    CleanupRequested,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -220,6 +223,9 @@ impl Trace {
         let milestone = match stage {
             Stage::OpeningAuthenticator => Some(Milestone::AuthenticatorOpenRequested),
             Stage::VerifyingNumberField => Some(Milestone::FieldCheckRequested),
+            Stage::SubmittingNumber => Some(Milestone::SubmitRequested),
+            Stage::WaitingForConfirmation => Some(Milestone::SubmissionAcknowledged),
+            Stage::ClosingSession => Some(Milestone::CleanupRequested),
             _ => None,
         };
         self.observe(stage, milestone);
@@ -338,7 +344,14 @@ mod tests {
         trace.observe(Stage::Connecting, Some(Milestone::RunnerStarting));
         trace.observe(Stage::Connecting, Some(Milestone::PhoneConnected));
         trace.observe(Stage::EnteringNumber, Some(Milestone::NumberEntryStarting));
+        trace.advance(Stage::SubmittingNumber);
+        // A progress message may precede the protocol's submission acknowledgement.
+        trace.observe(Stage::WaitingForConfirmation, None);
+        assert!(!trace
+            .milestones_ms
+            .contains_key(&Milestone::SubmissionAcknowledged));
         trace.advance(Stage::WaitingForConfirmation);
+        trace.advance(Stage::ClosingSession);
         release.send(()).unwrap();
         trace.finish(Outcome::SubmittedUnverified, None);
 
@@ -346,14 +359,18 @@ mod tests {
         let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let times = report["milestones_ms"].as_object().unwrap();
         let first = first.unwrap();
-        assert_eq!(times.len(), 4);
+        assert_eq!(times.len(), 7);
         assert_eq!(times["runner_starting"], first);
         let ready = times["runner_ready"].as_u64().unwrap();
         let connected = times["phone_connected"].as_u64().unwrap();
         let entry = times["number_entry_starting"].as_u64().unwrap();
         assert!(first < ready && ready <= connected && connected <= entry);
-        assert!(entry <= report["elapsed_ms"].as_u64().unwrap());
-        assert_eq!(report["stage"], "waiting_for_confirmation");
+        let submit = times["submit_requested"].as_u64().unwrap();
+        let acknowledged = times["submission_acknowledged"].as_u64().unwrap();
+        let cleanup = times["cleanup_requested"].as_u64().unwrap();
+        assert!(entry <= submit && submit <= acknowledged && acknowledged <= cleanup);
+        assert!(cleanup <= report["elapsed_ms"].as_u64().unwrap());
+        assert_eq!(report["stage"], "closing_session");
         assert_eq!(report["outcome"], "submitted_unverified");
         std::fs::remove_dir_all(directory).unwrap();
     }

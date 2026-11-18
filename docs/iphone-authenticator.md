@@ -50,9 +50,20 @@ launch request, `runner_ready` marks the iPhone runner answering, and
 `phone_connected` marks the Appium session ready after the lock check.
 `authenticator_open_requested` and `field_check_requested` record when the Mac
 receives the requests to open Authenticator and check the number field.
-`number_entry_starting` marks the start of entry. An attempt that ends earlier
-omits the later milestones. The clock starts after Monitor recognizes the sign-in
-request. A separate `detection_scan_ms` field measures how long the Mac spent
+`number_entry_starting` marks the start of entry. The later milestones separate
+three intervals:
+
+- From `submit_requested` to `submission_acknowledged`, the Mac and iPhone
+  complete the final checks and the helper reports that its Approve tap returned.
+- From `submission_acknowledged` to `cleanup_requested`, the Mac waits until it
+  observes that the desktop challenge is no longer pending. This interval can
+  include Face ID and the desktop response.
+- From `cleanup_requested` to the final `elapsed_ms` of a submitted attempt,
+  the helper closes the session and its process exits.
+
+An attempt that ends earlier omits the later milestones. The clock starts after
+Monitor recognizes the sign-in request. A separate `detection_scan_ms` field
+measures how long the Mac spent
 scanning the Windows App window on the pass that recognized the request. The
 time between the number appearing on screen and that scan starting is unknown.
 
@@ -106,6 +117,11 @@ saving a phone in Settings. If a build is needed, AutoLogin runs its own
 The signed product stays on disk across app restarts. A failed preparation can
 retry after a password write. Turning off the last eligible account or quitting
 AutoLogin cancels an in-progress build.
+
+After AutoLogin fills a password for an account using Microsoft Authenticator,
+it can also wake the selected paired iPhone's
+Wi-Fi tunnel with a read-only CoreDevice query. The actual request checks the
+device, Wi-Fi transport and lock state again. No phone session is kept open.
 
 The Xcode app can stay open for other projects. Each real sign-in starts a
 private Appium server and a fresh XCTest session on the selected iPhone. Both
