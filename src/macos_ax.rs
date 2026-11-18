@@ -13,6 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "macos_desktops.rs"]
+pub(crate) mod desktops;
 #[path = "macos_device_launch.rs"]
 pub(crate) mod device_launch;
 #[path = "macos_device_windows.rs"]
