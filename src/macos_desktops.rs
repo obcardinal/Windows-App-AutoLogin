@@ -1,7 +1,9 @@
 //! Link the user's choice to a saved desktop when possible. An open session
 //! can also be focused by title when it has no matching catalog entry.
-use super::device_launch::{saved_devices, SavedDevice};
-use super::device_windows::open_session_titles;
+use super::device_launch::{
+    open_saved_device, reconnect_window_device, saved_devices, SavedDevice,
+};
+use super::device_windows::{focus_open_session, open_session_titles};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
@@ -85,6 +87,25 @@ fn choices_from_sources(
     Ok(choices)
 }
 
+pub(crate) fn open_desktop(id: &str, name: &str, owner: &str, account_email: &str) -> Result<()> {
+    open_with(
+        id,
+        name,
+        owner,
+        saved_devices,
+        focus_open_session,
+        open_saved_device,
+        |title| {
+            if let Ok(devices) = saved_devices() {
+                if let Some(device) = saved_window_device(&devices, title, account_email)? {
+                    return open_saved_device(device);
+                }
+            }
+            reconnect_window_device(title, account_email)
+        },
+    )
+}
+
 pub(crate) fn remote_pc_session_title(id: &str, name: &str, owner: &str) -> Result<Option<String>> {
     session_title_with(id, name, owner, saved_devices)
 }
@@ -111,9 +132,51 @@ fn session_title_with(
     Ok(Some(device.name.clone()))
 }
 
+fn open_with(
+    id: &str,
+    name: &str,
+    owner: &str,
+    catalog: impl FnOnce() -> Result<Vec<SavedDevice>>,
+    focus: impl FnOnce(&str) -> Result<bool>,
+    connect: impl FnOnce(&SavedDevice) -> Result<()>,
+    reconnect: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    if id == WINDOW_ONLY {
+        ensure!(!name.trim().is_empty(), "The linked VM has no device name.");
+        return if focus(name)? {
+            Ok(())
+        } else {
+            reconnect(name)
+        };
+    }
+
+    let catalog = catalog()?;
+    let device = selected_saved_device(&catalog, id, name, owner)?;
+    if has_unique_title(&catalog, device) && focus(&device.name)? {
+        return Ok(());
+    }
+    connect(device)
+}
+
 // Windows App identifies its session windows by title only.
 fn has_unique_title(catalog: &[SavedDevice], device: &SavedDevice) -> bool {
     catalog.iter().filter(|d| d.name == device.name).count() == 1
+}
+
+fn saved_window_device<'a>(
+    devices: &'a [SavedDevice],
+    title: &str,
+    account_email: &str,
+) -> Result<Option<&'a SavedDevice>> {
+    let mut matches = devices.iter().filter(|device| {
+        device.name == title
+            && (device.id.starts_with("bookmark:")
+                || (!device.owner.is_empty()
+                    && device.owner.eq_ignore_ascii_case(account_email.trim())))
+    });
+    let device = matches.next();
+    ensure!(matches.next().is_none(), "More than one saved desktop matches this VM. Choose the intended device in the account editor.");
+    Ok(device)
 }
 
 fn selected_saved_device<'a>(
@@ -223,4 +286,115 @@ mod tests {
         assert!(duplicates.open[0].ambiguous);
     }
 
+    #[test]
+    fn existing_link_focuses_first_and_connects_only_if_the_session_is_closed() {
+        // A previous version saved only the name and account UPN. A new link
+        // can also survive a rename because it identifies the catalog record.
+        for (id, name, owner) in [
+            ("", "Desktop", "OWNER@example.test"),
+            ("workspace:example", "Old name", ""),
+        ] {
+            open_with(
+                id,
+                name,
+                owner,
+                || Ok(vec![saved()]),
+                |title| {
+                    assert_eq!(title, "Desktop");
+                    Ok(true)
+                },
+                |_| panic!("an open session must not reconnect"),
+                |_| panic!("saved catalog binding"),
+            )
+            .unwrap();
+        }
+        let mut connected = false;
+        open_with(
+            "workspace:example",
+            "Desktop",
+            "",
+            || Ok(vec![saved()]),
+            |_| Ok(false),
+            |d| {
+                assert_eq!(d.id, saved().id);
+                connected = true;
+                Ok(())
+            },
+            |_| panic!("saved catalog binding"),
+        )
+        .unwrap();
+        assert!(connected);
+        open_with(
+            WINDOW_ONLY,
+            "Visible",
+            "",
+            || panic!("no catalog needed"),
+            |_| Ok(true),
+            |_| panic!("focus only"),
+            |_| panic!("an open window must not start another connection"),
+        )
+        .unwrap();
+        assert!(open_with(
+            "",
+            "Desktop",
+            "different@example.test",
+            || Ok(vec![saved()]),
+            |_| panic!("wrong profile"),
+            |_| panic!("wrong profile"),
+            |_| panic!("wrong profile"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn closed_window_link_reconnects_the_selected_vm_without_reopening_the_editor() {
+        let mut requested = Vec::new();
+        open_with(
+            WINDOW_ONLY,
+            "Selected VM",
+            "",
+            || panic!("a window binding is independent of the saved catalog ID"),
+            |name| {
+                assert_eq!(name, "Selected VM");
+                Ok(false)
+            },
+            |_| panic!("a window binding has no saved ID"),
+            |name| {
+                requested.push(name.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(requested, ["Selected VM"]);
+        assert!(open_with(
+            WINDOW_ONLY,
+            "Selected VM",
+            "",
+            || panic!("no catalog ID"),
+            |_| anyhow::bail!("ambiguous open windows"),
+            |_| panic!("ambiguous"),
+            |_| panic!("an ambiguous open session must not reconnect"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resolves_a_closed_window_by_exact_title_and_account() {
+        let other = SavedDevice::for_test("workspace:other", "Desktop", "other@example.test");
+        let mut devices = vec![other, saved()];
+        assert_eq!(
+            saved_window_device(&devices, "Desktop", "OWNER@example.test").unwrap(),
+            Some(&devices[1])
+        );
+        assert!(saved_window_device(&devices, "Desk", "owner@example.test")
+            .unwrap()
+            .is_none());
+        assert!(
+            saved_window_device(&devices, "Desktop", "unrelated@example.test")
+                .unwrap()
+                .is_none()
+        );
+        devices.push(SavedDevice::for_test("bookmark:pc", "Desktop", ""));
+        assert!(saved_window_device(&devices, "Desktop", "owner@example.test").is_err());
+    }
 }
