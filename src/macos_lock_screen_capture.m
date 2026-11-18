@@ -108,6 +108,47 @@ static id copyWindowImage(pid_t pid, CGWindowID windowID) {
     return captured;
 }
 
+static VNRecognizeTextRequest *englishTextRequest(VNRequestTextRecognitionLevel level) {
+    VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
+    request.recognitionLevel = level;
+    request.usesLanguageCorrection = NO;
+    request.recognitionLanguages = @[@"en-US"];
+    return request;
+}
+
+// Fast OCR can read the empty field's "Password" as "kassword". A near
+// match only triggers a second read. It is never itself evidence of a lock.
+static bool needsPlaceholderConfirmation(NSString *text) {
+    if (text.length != 8 || ![text hasSuffix:@"assword"]) return false;
+    unichar first = [text characterAtIndex:0];
+    return ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) &&
+           first != 'P' && first != 'p';
+}
+
+static bool confirmsPassword(VNImageRequestHandler *handler, CGRect box) {
+    CGRect region = CGRectIntersection(CGRectMake(0, 0, 1, 1), CGRectInset(box, -.012, -.009));
+    if (CGRectIsEmpty(region)) return false;
+    VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
+    request.regionOfInterest = region;
+    if (![handler performRequests:@[request] error:nil] || request.results.count != 1) return false;
+    VNRecognizedTextObservation *observation = request.results.firstObject;
+    VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
+    if (!candidate || candidate.confidence < 0.50 ||
+        [candidate.string caseInsensitiveCompare:@"Password"] != NSOrderedSame) return false;
+
+    // Vision reports this observation relative to the region of interest.
+    CGRect local = observation.boundingBox;
+    CGRect confirmed = CGRectMake(region.origin.x + local.origin.x * region.size.width,
+                                  region.origin.y + local.origin.y * region.size.height,
+                                  local.size.width * region.size.width, local.size.height * region.size.height);
+    CGRect overlap = CGRectIntersection(confirmed, box);
+    if (CGRectIsEmpty(overlap)) return false;
+    double area = overlap.size.width * overlap.size.height;
+    // Accurate OCR can include more space above and below small glyphs.
+    return area >= .70 * box.size.width * box.size.height &&
+           area >= .60 * confirmed.size.width * confirmed.size.height;
+}
+
 bool waal_observe_lock_screen(pid_t pid, uint32_t windowID, WaalTextVisitor visitor, void *context) {
     @autoreleasepool {
         if (!visitor || !context || !windowID || pid <= 0 || !waal_lock_capture_allowed() ||
@@ -118,10 +159,7 @@ bool waal_observe_lock_screen(pid_t pid, uint32_t windowID, WaalTextVisitor visi
 
             CGRect masked = CGRectNull;
             bool hasMaskedField = waal_masked_field((__bridge CGImageRef)image, &masked);
-            VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
-            request.recognitionLevel = VNRequestTextRecognitionLevelFast;
-            request.usesLanguageCorrection = NO;
-            request.recognitionLanguages = @[@"en-US"];
+            VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelFast);
             VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
                 initWithCGImage:(__bridge CGImageRef)image options:@{}];
             if (![handler performRequests:@[request] error:nil] || !isFrontmost(pid) ||
@@ -131,12 +169,17 @@ bool waal_observe_lock_screen(pid_t pid, uint32_t windowID, WaalTextVisitor visi
                 visitor(context, NULL, 0, 1.0, CGRectGetMidX(masked), CGRectGetMidY(masked),
                         masked.size.width, masked.size.height);
             }
+            bool canConfirm = !hasMaskedField;
             for (VNRecognizedTextObservation *observation in request.results) {
                 CGRect box = observation.boundingBox;
                 if (hasMaskedField && CGRectContainsRect(
                     CGRectInset(masked, -0.002, -0.002), box)) continue;
                 VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
                 NSString *string = candidate.string;
+                if (canConfirm && candidate.confidence >= 0.50 && needsPlaceholderConfirmation(string)) {
+                    canConfirm = false;
+                    if (confirmsPassword(handler, box)) string = @"Password";
+                }
                 const char *utf8 = string.UTF8String;
                 size_t length = [string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
                 if (!utf8 || !length || length > 512) return false;
