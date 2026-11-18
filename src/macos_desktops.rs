@@ -4,6 +4,7 @@ use super::device_launch::{
     open_saved_device, reconnect_window_device, saved_devices, SavedDevice,
 };
 use super::device_windows::{focus_open_session, open_session_titles};
+use crate::models::{canonical_remote_pc, Account};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
@@ -87,7 +88,53 @@ fn choices_from_sources(
     Ok(choices)
 }
 
-pub(crate) fn open_desktop(id: &str, name: &str, owner: &str, account_email: &str) -> Result<()> {
+pub(crate) struct LaunchHost {
+    address: String,
+    allow_short_name: bool,
+}
+
+impl LaunchHost {
+    pub(crate) fn for_account(account: &Account, accounts: &[Account]) -> Option<Self> {
+        let address = canonical_remote_pc(&account.remote_pc)?;
+        if crate::remote_pc::is_cloud_pc_gateway(&address) {
+            return None;
+        }
+        let label = address.split('.').next()?;
+        let allow_short_name = address.parse::<std::net::IpAddr>().is_err()
+            && !accounts.iter().any(|other| {
+                other.id != account.id
+                    && canonical_remote_pc(&other.remote_pc)
+                        .is_some_and(|host| host.split('.').next() == Some(label))
+            });
+        Some(Self {
+            address,
+            allow_short_name,
+        })
+    }
+
+    /// Windows App can show the Windows computer name without its DNS suffix.
+    /// This comparison only chooses a card to open in the current profile.
+    pub(super) fn matches(&self, device_name: &str) -> bool {
+        let Some(name) = canonical_remote_pc(device_name) else {
+            return false;
+        };
+        name == self.address
+            || (self.allow_short_name
+                && !name.contains('.')
+                && self
+                    .address
+                    .split_once('.')
+                    .is_some_and(|(label, _)| label == name))
+    }
+}
+
+pub(crate) fn open_desktop(
+    id: &str,
+    name: &str,
+    owner: &str,
+    account_email: &str,
+    host: Option<&LaunchHost>,
+) -> Result<()> {
     open_with(
         id,
         name,
@@ -96,12 +143,15 @@ pub(crate) fn open_desktop(id: &str, name: &str, owner: &str, account_email: &st
         focus_open_session,
         open_saved_device,
         |title| {
+            if host.is_some() {
+                return reconnect_window_device(title, account_email, host);
+            }
             if let Ok(devices) = saved_devices() {
                 if let Some(device) = saved_window_device(&devices, title, account_email)? {
                     return open_saved_device(device);
                 }
             }
-            reconnect_window_device(title, account_email)
+            reconnect_window_device(title, account_email, None)
         },
     )
 }

@@ -1,4 +1,5 @@
 //! Launch the saved Windows App device so its workspace and gateway settings apply.
+use super::desktops::LaunchHost;
 use super::{
     collect_descendants_bounded, macos_identity, role_matches, AXUIElementSetAttributeValue,
     AxElement, AX_CHILDREN, AX_DESCRIPTION, AX_ENABLED, AX_FRONTMOST, AX_MAIN, AX_PRESS, AX_ROLE,
@@ -58,14 +59,26 @@ pub(super) fn open_saved_device_if(
 
 /// Window-only bindings predate a stable resource ID. The native Devices view
 /// can still reconnect the exact card under the account that owns the binding.
-pub(crate) fn reconnect_window_device(name: &str, account_email: &str) -> Result<()> {
+pub(crate) fn reconnect_window_device(
+    name: &str,
+    account_email: &str,
+    host: Option<&LaunchHost>,
+) -> Result<()> {
     let app = trusted_app()?;
     ensure!(
         !name.trim().is_empty(),
         "Choose a desktop in the account editor."
     );
     let (list, profile) = prepare_enter_devices(&app, account_email)?;
-    list.connect(name, || list.ensure_profile(&profile))
+    let selected = launch_card_name(&list.devices, name, host, |card| {
+        list.ensure_profile(&profile)?;
+        connected::cloud_pc_device_name(&app, &list.window, card)
+    })?;
+    // On repeated Enter Windows App may already have a newly named session.
+    if selected != name && super::device_windows::focus_open_session(selected)? {
+        return Ok(());
+    }
+    list.connect(selected, || list.ensure_profile(&profile))
 }
 
 pub(super) fn reconnect_window_device_if(
@@ -85,6 +98,28 @@ pub(super) fn reconnect_window_device_if(
         list.ensure_profile(&profile)?;
         before_connect()
     })
+}
+
+fn launch_card_name<'a, T>(
+    cards: &'a [(String, T)],
+    title: &str,
+    host: Option<&LaunchHost>,
+    mut read_device_name: impl FnMut(&T) -> Result<Option<String>>,
+) -> Result<&'a str> {
+    if let Some((name, _)) = cards.iter().find(|(name, _)| name == title) {
+        exact_device(cards, name)?;
+        return Ok(name);
+    }
+    let host = host.context("The saved device was not found. Choose its current name in the account editor or set its Remote PC address.")?;
+    let mut matched = None;
+    for (name, card) in cards {
+        if read_device_name(card)?.is_some_and(|reported| host.matches(&reported)) {
+            ensure!(matched.is_none(), "Multiple Windows App devices match this Remote PC. Choose the intended device in the account editor.");
+            exact_device(cards, name)?;
+            matched = Some(name.as_str());
+        }
+    }
+    matched.context("No Cloud PC in the selected Windows App profile matches this account’s Remote PC. Check the address or choose the device in the account editor.")
 }
 
 /// Preflight a window-only binding through the client's current Devices view
@@ -547,6 +582,50 @@ pub(super) fn menu_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_after_restart_recognizes_the_cloud_pc_by_its_computer_name() {
+        use crate::models::Account;
+        let mut account = Account::new("user@example.test");
+        account.remote_pc = "vm-01.north.example.test".into();
+        let mut other = Account::new("another@example.test");
+        other.remote_pc = "vm-02.south.example.test".into();
+        let host = LaunchHost::for_account(&account, &[account.clone(), other.clone()]).unwrap();
+        let cards = vec![
+            ("Personal".into(), "VM-010"),
+            ("Renamed desktop".into(), "VM-01"),
+        ];
+        assert_eq!(
+            launch_card_name(&cards, "Previous title", Some(&host), |s| Ok(Some(
+                s.to_string()
+            )))
+            .unwrap(),
+            "Renamed desktop"
+        );
+        assert_eq!(
+            launch_card_name(&cards, "Personal", None, |_| panic!("exact title")).unwrap(),
+            "Personal"
+        );
+        assert!(
+            launch_card_name(&cards, "Previous title", Some(&host), |_| Ok(Some(
+                "VM-01".into()
+            )))
+            .is_err()
+        );
+        assert!(launch_card_name(&cards, "Previous title", Some(&host), |_| Ok(None)).is_err());
+        assert!(
+            launch_card_name(&cards, "Previous title", Some(&host), |_| anyhow::bail!(
+                "profile changed"
+            ))
+            .is_err()
+        );
+        assert!(launch_card_name(&cards, "Previous title", None, |_| panic!("no host")).is_err());
+        assert!(!host.matches("vm-01.wrong.example.test"));
+        other.remote_pc = "VM-01.south.example.test".into();
+        let ambiguous = LaunchHost::for_account(&account, &[account.clone(), other]).unwrap();
+        assert!(!ambiguous.matches("VM-01"));
+        assert!(ambiguous.matches("VM-01.NORTH.EXAMPLE.TEST."));
+    }
 
     #[test]
     fn reconnect_uses_the_connected_card_for_a_single_renamed_session() {
