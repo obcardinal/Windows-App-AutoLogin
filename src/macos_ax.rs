@@ -1688,11 +1688,32 @@ pub(crate) fn post_check_state(
             submitted_prompt_absent_since = None;
         }
 
-        if started.elapsed() >= timeout {
+        let now = Instant::now();
+        let remaining = timeout.saturating_sub(now.duration_since(started));
+        if remaining.is_zero() {
             return last_visible_prompt_state.unwrap_or("prompt_gone_unknown");
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(post_submit_poll_delay(
+            now,
+            remaining,
+            submitted_prompt_absent_since,
+        ));
     }
+}
+
+fn post_submit_poll_delay(
+    now: Instant,
+    remaining: Duration,
+    absent_since: Option<Instant>,
+) -> Duration {
+    let normal_delay = Duration::from_millis(100).min(remaining);
+    // Once the dwell has elapsed, other evidence may still be inconclusive.
+    // Resume the normal cadence until a fresh inspection establishes success.
+    let dwell = Duration::from_millis(POST_SUBMIT_REQUIRED_ABSENCE_DWELL_MS);
+    absent_since
+        .and_then(|since| dwell.checked_sub(now.saturating_duration_since(since)))
+        .filter(|until_dwell| !until_dwell.is_zero())
+        .map_or(normal_delay, |until_dwell| normal_delay.min(until_dwell))
 }
 
 fn post_submit_prompt_state_is_terminal_during_poll(
@@ -4860,6 +4881,24 @@ mod tests {
             final_start + required,
             required,
         ));
+    }
+
+    #[test]
+    fn post_submit_poll_wakes_for_pending_dwell_and_deadline_without_spinning() {
+        let started = Instant::now();
+        let dwell = Duration::from_millis(super::POST_SUBMIT_REQUIRED_ABSENCE_DWELL_MS);
+        let end = started + dwell;
+        let normal = Duration::from_millis(100);
+        let plenty = Duration::from_secs(2);
+        let short = Duration::from_millis(6);
+        let before_end = end - short;
+        let delay = super::post_submit_poll_delay;
+        assert_eq!(delay(started, plenty, Some(started)), normal);
+        assert_eq!(delay(before_end, plenty, Some(started)), short);
+        assert_eq!(delay(before_end, plenty, None), normal);
+        assert_eq!(delay(end, plenty, Some(started)), normal);
+        assert_eq!(delay(end + short, plenty, Some(started)), normal);
+        assert_eq!(delay(started, short, Some(started)), short);
     }
 
     #[test]

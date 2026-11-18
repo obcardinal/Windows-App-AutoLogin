@@ -1,3 +1,6 @@
+#[cfg(target_os = "macos")]
+mod window_hints;
+
 use crate::config::Config;
 use crate::debug_fill::{self, FillAttemptReport, FillMethod};
 use crate::models::{Account, AppSettings, LogEntry, LogLevel, WorkerStatus};
@@ -1369,6 +1372,30 @@ async fn wait_or_handle_command(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn send_password_written(event_tx: &Sender<WorkerEvent>, generation: u64, warm_wifi: bool) {
+    use block2::RcBlock;
+    use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
+    use objc2_foundation::NSRunLoop;
+
+    if event_tx
+        .try_send(WorkerEvent::PasswordWritten {
+            generation,
+            warm_wifi,
+        })
+        .is_ok()
+    {
+        // The normal supervisor turn drains tray commands before this queue
+        // and checks the generation. The block only wakes that turn.
+        // SAFETY: The run loop is the process's main loop, and the scheduled
+        // block captures no values and can execute on any thread.
+        unsafe {
+            NSRunLoop::mainRunLoop().performBlock(&RcBlock::new(|| {}));
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
+    }
+}
+
 fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
     if job
         .pause_latch
@@ -1457,10 +1484,7 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                     },
                     #[cfg(target_os = "macos")]
                     |warm_wifi| {
-                        let _ = event_tx.try_send(WorkerEvent::PasswordWritten {
-                            generation: expected_generation,
-                            warm_wifi,
-                        });
+                        send_password_written(&event_tx, expected_generation, warm_wifi);
                     },
                 )
             };
@@ -1698,6 +1722,8 @@ pub(crate) fn spawn(
         let iphone_attempts = Arc::new(Mutex::new(IphoneAttemptMemory::default()));
         #[cfg(target_os = "macos")]
         let mut iphone_probe_cadence = IphoneProbeCadence::default();
+        #[cfg(target_os = "macos")]
+        let mut window_hints = window_hints::WindowHints::default();
         let generation = invalidator.generation;
         #[cfg(target_os = "macos")]
         let mut last_macos_prompt_probe: Option<Instant> = None;
@@ -1731,6 +1757,7 @@ pub(crate) fn spawn(
                 no_prompt_tracker.reset();
                 #[cfg(target_os = "macos")]
                 {
+                    window_hints.set_target(None);
                     process_exit_tracker.reset();
                     sheet_exit_tracker.reset();
                 }
@@ -1761,6 +1788,7 @@ pub(crate) fn spawn(
                 no_prompt_tracker.reset();
                 #[cfg(target_os = "macos")]
                 {
+                    window_hints.set_target(None);
                     process_exit_tracker.reset();
                     sheet_exit_tracker.reset();
                 }
@@ -1790,15 +1818,18 @@ pub(crate) fn spawn(
                 continue;
             }
 
+            #[cfg(target_os = "macos")]
+            let early_deadline = window_hints.begin_pass(Instant::now());
             #[cfg(not(target_os = "macos"))]
             let next_probe = None;
             // A rejected reservation keeps the usual monitor interval.
             #[cfg(target_os = "macos")]
             let mut next_probe = None;
             #[cfg(target_os = "macos")]
-            if accounts
-                .iter()
-                .any(|account| account.enabled && account.iphone_authenticator_enabled)
+            if early_deadline.is_none()
+                && accounts
+                    .iter()
+                    .any(|account| account.enabled && account.iphone_authenticator_enabled)
             {
                 if !iphone_probe_cadence.due(Instant::now()) {
                     next_probe = iphone_probe_cadence.next_start;
@@ -1824,6 +1855,8 @@ pub(crate) fn spawn(
             });
 
             if !has_enabled_account {
+                #[cfg(target_os = "macos")]
+                window_hints.set_target(None);
                 pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
                     sleep(monitor_wait(
@@ -1850,35 +1883,37 @@ pub(crate) fn spawn(
             let monitor = AppMonitor::new(runtime_config(&settings));
             let tick_start = Instant::now();
             #[cfg(target_os = "macos")]
-            match observe_suppressed_macos_episode_exits(
-                &mut process_exit_tracker,
-                &mut sheet_exit_tracker,
-                &recent_prompt_attempts,
-                || {
-                    pause_latch.ensure_attempt_current(
-                        current_generation,
-                        "accounts/settings changed during suppressed-process probe",
-                    )
-                },
-            ) {
-                Ok((released_processes, released_sheet_episodes))
-                    if released_processes > 0 || released_sheet_episodes > 0 =>
-                {
-                    debug!(
-                        released_processes,
-                        released_sheet_episodes,
-                        "macOS prompt retry suppression re-armed after confirmed episode exit"
-                    );
-                }
-                Ok(_) => {}
-                Err(reason) => {
-                    process_exit_tracker.reset();
-                    sheet_exit_tracker.reset();
-                    debug!(
-                        reason = %reason,
-                        "macOS suppressed-process probe was cancelled"
-                    );
-                    continue;
+            if early_deadline.is_none() {
+                match observe_suppressed_macos_episode_exits(
+                    &mut process_exit_tracker,
+                    &mut sheet_exit_tracker,
+                    &recent_prompt_attempts,
+                    || {
+                        pause_latch.ensure_attempt_current(
+                            current_generation,
+                            "accounts/settings changed during suppressed-process probe",
+                        )
+                    },
+                ) {
+                    Ok((released_processes, released_sheet_episodes))
+                        if released_processes > 0 || released_sheet_episodes > 0 =>
+                    {
+                        debug!(
+                            released_processes,
+                            released_sheet_episodes,
+                            "macOS prompt retry suppression re-armed after confirmed episode exit"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(reason) => {
+                        process_exit_tracker.reset();
+                        sheet_exit_tracker.reset();
+                        debug!(
+                            reason = %reason,
+                            "macOS suppressed-process probe was cancelled"
+                        );
+                        continue;
+                    }
                 }
             }
             #[cfg(target_os = "windows")]
@@ -1897,6 +1932,38 @@ pub(crate) fn spawn(
                     "macOS monitor snapshot was cancelled before it could affect automation state"
                 );
                 continue;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let target_pid = macos_monitor_snapshot_this_tick
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.target_process_id);
+                let same_visible_prompt = matches!(
+                    &monitor_observation.status,
+                    MonitorStatus::LoginWindowDetected { process_id, .. }
+                        if Some(*process_id) == target_pid && window_hints.targets(*process_id)
+                );
+                window_hints.set_target(target_pid);
+                // An early hint never provides evidence to rearm a retry. Only
+                // the observer's freshly verified foreground prompt proceeds.
+                if let Some(deadline) = early_deadline.filter(|_| !same_visible_prompt) {
+                    if !wait_or_handle_command(
+                        sleep(deadline.saturating_duration_since(Instant::now())),
+                        &mut cmd_rx,
+                        &event_tx,
+                        &mut running,
+                        &mut settings,
+                        &mut accounts,
+                        &generation,
+                        &pause_latch,
+                        &activity_tracker,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
             }
             #[cfg(not(target_os = "macos"))]
             let monitor_observation = monitor.check_status();
@@ -2226,12 +2293,24 @@ pub(crate) fn spawn(
                 continue;
             }
 
+            let now = Instant::now();
+            let delay = monitor_wait(
+                remaining_tick_delay(tick_start, next_poll_delay),
+                next_probe,
+                now,
+            );
+            #[cfg(target_os = "macos")]
+            let wake = window_hints.wait(
+                early_deadline.unwrap_or(now + delay),
+                early_deadline.is_none()
+                    && recent_prompt_attempts
+                        .lock()
+                        .is_ok_and(|prompts| prompts.is_empty()),
+            );
+            #[cfg(not(target_os = "macos"))]
+            let wake = sleep(delay);
             if !wait_or_handle_command(
-                sleep(monitor_wait(
-                    remaining_tick_delay(tick_start, next_poll_delay),
-                    next_probe,
-                    Instant::now(),
-                )),
+                wake,
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
