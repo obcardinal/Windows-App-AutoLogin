@@ -90,6 +90,7 @@ windows = { version = "0.62", features = [
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "native-tls"] }
 eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 core-foundation = "0.10"
 security-framework = "3.7"

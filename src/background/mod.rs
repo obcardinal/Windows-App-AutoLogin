@@ -51,7 +51,7 @@ pub(crate) enum WorkerEvent {
     #[cfg(target_os = "macos")]
     PasswordWritten {
         generation: u64,
-        warm_wifi: bool,
+        microsoft_authenticator_enabled: bool,
     },
 }
 
@@ -1373,7 +1373,11 @@ async fn wait_or_handle_command(
 }
 
 #[cfg(target_os = "macos")]
-fn send_password_written(event_tx: &Sender<WorkerEvent>, generation: u64, warm_wifi: bool) {
+fn send_password_written(
+    event_tx: &Sender<WorkerEvent>,
+    generation: u64,
+    microsoft_authenticator_enabled: bool,
+) {
     use block2::RcBlock;
     use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
     use objc2_foundation::NSRunLoop;
@@ -1381,7 +1385,7 @@ fn send_password_written(event_tx: &Sender<WorkerEvent>, generation: u64, warm_w
     if event_tx
         .try_send(WorkerEvent::PasswordWritten {
             generation,
-            warm_wifi,
+            microsoft_authenticator_enabled,
         })
         .is_ok()
     {
@@ -1483,8 +1487,12 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                         )
                     },
                     #[cfg(target_os = "macos")]
-                    |warm_wifi| {
-                        send_password_written(&event_tx, expected_generation, warm_wifi);
+                    |microsoft_authenticator_enabled| {
+                        send_password_written(
+                            &event_tx,
+                            expected_generation,
+                            microsoft_authenticator_enabled,
+                        );
                     },
                 )
             };

@@ -133,6 +133,7 @@ enum SettingsSaveCompletion {
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     #[cfg(target_os = "macos")]
     if crate::ui::iphone_sign_in::show_if_open(ui).is_some() {
+        app.telegram_settings.leave(ui.ctx());
         return;
     }
     let settings_before_input = app.settings_draft.clone();
@@ -247,7 +248,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
             #[cfg(target_os = "macos")]
             {
                 ui.add_space(12.0);
-                section(ui, "iPhone Authentication", crate::ui::iphone_sign_in::summary);
+                section(ui, "iPhone Authentication", |ui| {
+                    crate::ui::iphone_sign_in::summary(ui);
+                    ui.add(egui::Separator::default().spacing(8.0));
+                    let closing = app.window_closing_mutations_disabled_reason().is_some();
+                    ui.add_enabled_ui(!closing, |ui| app.telegram_settings.show(ui));
+                });
             }
         });
 

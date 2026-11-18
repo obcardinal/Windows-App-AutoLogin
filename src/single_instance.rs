@@ -520,6 +520,14 @@ fn acquire_lock_dir_in_root(
     }
 }
 
+/// Serialize Telegram link changes between Settings and a one-shot pairing process.
+#[cfg(target_os = "macos")]
+pub(crate) fn try_lock_telegram_link() -> anyhow::Result<std::fs::File> {
+    let root = lock_root()?;
+    prepare_lock_root(&root)?;
+    acquire_named_file_lock(&root, "telegram-link.lock", "Telegram link is busy")
+}
+
 fn prepare_lock_root(root: &Path) -> std::io::Result<()> {
     secure_lock_root_parent_if_app_runtime(root)?;
     match std::fs::symlink_metadata(root) {

@@ -46,6 +46,8 @@ pub(crate) mod private_permissions;
 pub(crate) mod remote_pc;
 pub(crate) mod single_instance;
 pub(crate) mod storage;
+#[cfg(target_os = "macos")]
+pub(crate) mod telegram_notifications;
 pub(crate) mod tray;
 pub(crate) mod ui;
 pub(crate) mod user_paths;
@@ -104,6 +106,26 @@ pub(crate) fn main() -> anyhow::Result<()> {
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    if let Some(command) = args.first().map(String::as_str) {
+        match command {
+            "--link-telegram-stdin" | "--test-telegram-notification" if args.len() != 1 => {
+                anyhow::bail!("The Telegram command takes no additional arguments.");
+            }
+            "--link-telegram-stdin" => {
+                telegram_notifications::pair_from_stdin().map_err(anyhow::Error::msg)?;
+                println!("Telegram notifications linked.");
+                return Ok(());
+            }
+            "--test-telegram-notification" => {
+                telegram_notifications::send_reminder(Instant::now())
+                    .map_err(anyhow::Error::msg)?;
+                println!("Telegram reminder sent.");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     #[cfg(target_os = "windows")]
     match app_identity::windows_binary_role()? {
         app_identity::WindowsBinaryRole::FullUi => {
@@ -1397,11 +1419,14 @@ impl LightweightSupervisor {
                 #[cfg(target_os = "macos")]
                 background::WorkerEvent::PasswordWritten {
                     generation,
-                    warm_wifi,
+                    microsoft_authenticator_enabled,
                 } => {
                     if self.worker_pause_latch.stable_unpaused_generation() == Some(generation) {
+                        if microsoft_authenticator_enabled && !self.exit_requested {
+                            telegram_notifications::schedule_reminder();
+                        }
                         self.poll_iphone_preparation(iphone_preparation::Trigger::PasswordWritten {
-                            warm_wifi,
+                            warm_wifi: microsoft_authenticator_enabled,
                         });
                     }
                 }

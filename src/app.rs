@@ -477,6 +477,8 @@ pub(crate) struct AutoLoginApp {
     pub(crate) editing_account: Option<Account>,
     pub(crate) confirm_delete_account: Option<AccountId>,
     pub(crate) settings_draft: AppSettings,
+    #[cfg(target_os = "macos")]
+    pub(crate) telegram_settings: crate::ui::telegram::TelegramSettings,
     pub(crate) temp_password: Zeroizing<String>,
     pub(crate) show_password: bool,
     pub(crate) status_message: Option<(String, f64)>,
@@ -595,6 +597,8 @@ impl AutoLoginApp {
             editing_account: None,
             confirm_delete_account: None,
             settings_draft,
+            #[cfg(target_os = "macos")]
+            telegram_settings: Default::default(),
             temp_password: Zeroizing::new(String::new()),
             show_password: false,
             status_message: None,
@@ -783,7 +787,7 @@ impl AutoLoginApp {
             .or_else(|| self.settings_save_fail_closed_reason())
     }
 
-    fn window_closing_mutations_disabled_reason(&self) -> Option<&str> {
+    pub(crate) fn window_closing_mutations_disabled_reason(&self) -> Option<&str> {
         if self.quit_requested
             || (self.settings_window_mode
                 && (self.close_settings_window_after_sync
@@ -805,6 +809,10 @@ impl AutoLoginApp {
     }
 
     pub(crate) fn settings_save_in_progress(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.telegram_settings.change_in_progress() {
+            return true;
+        }
         self.pending_settings_save.is_some()
             || self.pending_account_toggle.is_some()
             || !self.queued_account_toggles.is_empty()
@@ -1973,6 +1981,7 @@ impl AutoLoginApp {
 
     #[cfg(target_os = "macos")]
     fn hide_macos_panel(&mut self, ctx: &egui::Context) {
+        self.telegram_settings.clear_code(ctx);
         self.macos_window_visible = false;
         self.macos_panel_acquired_focus = false;
         self.close_settings_window_after_sync = false;
@@ -2458,6 +2467,8 @@ impl eframe::App for AutoLoginApp {
         self.poll_bridged_ui_status(ctx);
         crate::ui::accounts::poll_background_account_toggle(self, ctx);
         crate::ui::settings::poll_background_save(self, ctx);
+        #[cfg(target_os = "macos")]
+        self.telegram_settings.poll();
         crate::ui::accounts::poll_background_account_transaction(self, ctx);
         self.poll_background_storage_recovery_signal(ctx);
         self.close_settings_window_after_successful_sync(ctx);
@@ -2474,6 +2485,8 @@ impl eframe::App for AutoLoginApp {
             && ctx.input(|input| input.viewport().close_requested())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            #[cfg(target_os = "macos")]
+            self.telegram_settings.clear_code(ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -2559,6 +2572,10 @@ impl eframe::App for AutoLoginApp {
             egui::Stroke::new(1.0, theme::STROKE),
         );
 
+        #[cfg(target_os = "macos")]
+        if self.selected_tab != Tab::Settings || !accessibility_ready {
+            self.telegram_settings.leave(&ctx);
+        }
         #[cfg(target_os = "macos")]
         if self.selected_tab != Tab::Settings {
             crate::ui::iphone_sign_in::close_details(&ctx);

@@ -2116,7 +2116,7 @@ fn clear_temp_password(app: &mut AutoLoginApp) {
     app.temp_password = empty_password_buffer();
 }
 
-fn empty_password_buffer() -> Zeroizing<String> {
+pub(super) fn empty_password_buffer() -> Zeroizing<String> {
     // Fixed up-front capacity prevents password edits from leaving old heap
     // allocations behind during String growth. Zeroizing wipes the entire
     // capacity when this buffer is replaced or dropped.
@@ -2181,6 +2181,35 @@ fn secure_password_editor(
     let (_, rect) = ui.allocate_space(desired_size);
     let (text_rect, visibility_rect) = password_editor_regions(rect);
     let field_response = ui.interact(text_rect, id, egui::Sense::click());
+    let field = secure_input_field(ui, password, field_response, rect, hint, "Password", reveal);
+    let visibility = password_visibility_button(ui, visibility_rect, id, reveal);
+    SecurePasswordEditorResponse { field, visibility }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn masked_code_editor(
+    ui: &mut egui::Ui,
+    code: &mut Zeroizing<String>,
+    id: egui::Id,
+    width: f32,
+) -> egui::Response {
+    let (_, rect) = ui.allocate_space(egui::vec2(width, ACCOUNT_EDITOR_CONTROL_HEIGHT));
+    let field = ui.interact(rect, id, egui::Sense::click());
+    secure_input_field(
+        ui, code, field, rect, "Link code", "Telegram link code", false,
+    )
+}
+
+fn secure_input_field(
+    ui: &mut egui::Ui,
+    password: &mut Zeroizing<String>,
+    field_response: egui::Response,
+    rect: egui::Rect,
+    hint: &str,
+    label: &str,
+    reveal: bool,
+) -> egui::Response {
+    let text_rect = field_response.rect;
     if field_response.clicked() {
         field_response.request_focus();
     }
@@ -2232,18 +2261,13 @@ fn secure_password_editor(
         );
     }
     field_response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), "Password")
+        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), label)
     });
-    ui.ctx().accesskit_node_builder(id, |builder| {
+    ui.ctx().accesskit_node_builder(field_response.id, |builder| {
         builder.set_role(egui::accesskit::Role::PasswordInput);
         builder.clear_value();
     });
-    let visibility_response = password_visibility_button(ui, visibility_rect, id, reveal);
-
-    SecurePasswordEditorResponse {
-        field: field_response,
-        visibility: visibility_response,
-    }
+    field_response
 }
 
 struct SecurePasswordEditorResponse {
