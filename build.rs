@@ -45,10 +45,13 @@ fn main() {
         println!("cargo:rerun-if-changed={bridge}");
         println!("cargo:rerun-if-changed=src/macos_masked_field.h");
         println!("cargo:rerun-if-changed=src/macos_masked_field.m");
+        println!("cargo:rerun-if-changed=src/macos_guest_viewport.h");
+        println!("cargo:rerun-if-changed=src/macos_guest_viewport.m");
         let mut native = cc::Build::new();
         native
             .file(bridge)
             .file("src/macos_masked_field.m")
+            .file("src/macos_guest_viewport.m")
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .compile("waal_lock_screen_capture");
