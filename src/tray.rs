@@ -326,6 +326,15 @@ fn set_macos_menu_symbol(menu: &Menu, title: &str, symbol: &str) {
         image.setSize(NSSize::new(16.0, 16.0));
         image.setTemplate(true);
         item.setImage(Some(&image));
+        if objc2::available!(macos = 27.0) {
+            // AppKit 27 normally hides menu images with automatic visibility.
+            // SAFETY: The version check guards this NSMenuItem setter, whose
+            // parameter is NSMenuItemImageVisibility (NSInteger in the SDK).
+            const IMAGE_VISIBILITY_VISIBLE: isize = 1;
+            let _: () = unsafe {
+                objc2::msg_send![&*item, setPreferredImageVisibility: IMAGE_VISIBILITY_VISIBLE]
+            };
+        }
     }
 }
 
