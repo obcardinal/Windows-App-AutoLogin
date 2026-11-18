@@ -37,6 +37,26 @@ fn observe_frame(
     instruction: Option<(&str, usize, usize, usize)>,
     tile_caption: Option<&str>,
 ) -> LockScreenObservation {
+    observe_editor(
+        width,
+        height,
+        editor_width,
+        placeholder,
+        instruction,
+        tile_caption,
+        "#3173d0",
+    )
+}
+
+fn observe_editor(
+    width: usize,
+    height: usize,
+    editor_width: usize,
+    placeholder: &str,
+    instruction: Option<(&str, usize, usize, usize)>,
+    tile_caption: Option<&str>,
+    underline: &str,
+) -> LockScreenObservation {
     // Window and editor sizes vary independently, as they do when resizing the RDP client.
     let center = width as f64 / 2.;
     let (extra_text, instruction_x, instruction_y, instruction_size) =
@@ -64,7 +84,7 @@ fn observe_frame(
             <g transform="translate({center} {top}) scale({scale})">
               <text x="0" y="-40" text-anchor="middle" font-size="{name_size}">Example Person</text>
               <rect x="-150" y="0" width="300" height="35" fill="#181d32"/>
-              <rect x="-150" y="33" width="300" height="2" fill="#3173d0"/>
+              <rect x="-150" y="33" width="300" height="2" fill="{underline}"/>
               <text x="-138" y="23" font-size="{password_size}">{placeholder}</text>
               <path d="M 126 18 H 138 M 132 12 L 138 18 L 132 24" fill="none"
                     stroke="#e5e6e8" stroke-width="2"/>
@@ -205,6 +225,57 @@ fn compressed_other_user_captions_veto_a_small_password_editor() {
             observe_frame(1100, 619, 130, "Password", below, Some(tile)),
             expected,
             "tile {tile:?}, below editor {below:?}"
+        );
+    }
+}
+
+#[test]
+fn unfocused_editor_requires_exact_password_and_rejects_competing_labels() {
+    use LockScreenObservation::{Other, Password};
+    for (w, h, ew, underline) in [
+        (1366, 768, 300, "#767676"),
+        (3800, 1236, 580, "none"),
+        (850, 1011, 300, "#767676"),
+        (5120, 2880, 295, "none"),
+        (1100, 619, 130, "none"),
+    ] {
+        assert_eq!(
+            observe_editor(w, h, ew, "Password", None, Some("Work account"), underline),
+            Password,
+            "unfocused {w}x{h} editor {ew}"
+        );
+    }
+    for (placeholder, tile, extra) in [
+        ("Kassword", "Work account", None),
+        ("PIN", "Work account", None),
+        ("Password", "Other user", None),
+        ("Password", "Work account", Some(("Password", 280, 90, 22))),
+        (
+            "Password",
+            "Work account",
+            Some(("Sign-in options", 540, 440, 18)),
+        ),
+    ] {
+        assert_eq!(
+            observe_editor(1366, 768, 300, placeholder, extra, Some(tile), "none"),
+            Other,
+            "unfocused {placeholder:?}, tile {tile:?}, extra {extra:?}"
+        );
+    }
+    // The native reading band contains another sign-in method only a few
+    // guest pixels high. A readable Password on the same frame must lose.
+    for (x, y) in [(2355, 1636), (2480, 1602)] {
+        assert_eq!(
+            observe_editor(
+                5120,
+                2880,
+                295,
+                "Password",
+                Some(("PIN", x, y, 14)),
+                None,
+                "none"
+            ),
+            Other
         );
     }
 }

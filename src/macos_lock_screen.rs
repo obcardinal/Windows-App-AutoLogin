@@ -140,6 +140,7 @@ const VERIFIED_PLACEHOLDER: i32 = 2;
 const EDITOR_BOUNDS: i32 = 3;
 const CORNER_TEXT: i32 = 4;
 const ACCOUNT_TEXT: i32 = 5;
+const LAYOUT_TEXT: i32 = 6;
 
 extern "C" fn visit_line(
     context: *mut c_void,
@@ -156,9 +157,23 @@ extern "C" fn visit_line(
     // detail observation. The screen text is discarded in this callback.
     let lines = unsafe { &mut *context.cast::<Vec<Line>>() };
     let label = match kind {
-        OVERVIEW_TEXT | CORNER_TEXT | ACCOUNT_TEXT if !bytes.is_null() => {
+        OVERVIEW_TEXT | CORNER_TEXT | ACCOUNT_TEXT | LAYOUT_TEXT if !bytes.is_null() => {
             let utf8 = unsafe { slice::from_raw_parts(bytes, len) };
-            let label = str::from_utf8(utf8).map_or(Label::Conflict, label);
+            let text = str::from_utf8(utf8);
+            let label = text.map_or(Label::Conflict, label);
+            if kind == LAYOUT_TEXT && label != Label::Conflict {
+                // Windows displays the input language as a short uppercase
+                // abbreviation. Only a confident native read may clear a
+                // garbled reading of these same glyphs by fast OCR.
+                if label != Label::SmallMark
+                    || confidence < 0.80
+                    || !text.is_ok_and(|s| {
+                        (2..=3).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_uppercase())
+                    })
+                {
+                    return;
+                }
+            }
             // The accurate corner pass can veto an alternative sign-in method,
             // even when fast OCR misses the tile or garbles its caption.
             if (kind == CORNER_TEXT && label != Label::Conflict)
@@ -181,7 +196,10 @@ extern "C" fn visit_line(
         width,
         height,
     };
-    if kind == VERIFIED_PLACEHOLDER || (kind == ACCOUNT_TEXT && label == Label::Name) {
+    if kind == VERIFIED_PLACEHOLDER
+        || (kind == ACCOUNT_TEXT && label == Label::Name)
+        || (kind == LAYOUT_TEXT && label == Label::SmallMark)
+    {
         merge_detail(lines, line);
     } else {
         lines.push(line);
@@ -209,10 +227,17 @@ fn merge_detail(lines: &mut Vec<Line>, verified: Line) {
         let area = w.max(0.0) * h.max(0.0);
         let fast = line.width * line.height;
         let accurate = verified.width * verified.height;
-        if verified.label == Label::Name {
+        if matches!(verified.label, Label::Name | Label::SmallMark) {
             area >= 0.50 * fast.max(accurate)
         } else {
-            area >= 0.85 * fast && area >= 0.33 * accurate
+            // The accurate crop can fit the ink more tightly on all four
+            // sides. Match a near-concentric whole word or a contained
+            // fragment, never an adjacent word on the same baseline.
+            let same_word = dx <= 0.12 * line.width.min(verified.width)
+                && dy <= 0.15 * line.height.min(verified.height)
+                && w >= 0.82 * line.width.max(verified.width)
+                && h >= 0.70 * line.height.max(verified.height);
+            same_word || (area >= 0.85 * fast && area >= 0.33 * accurate)
         }
     });
     if let Some(same) = overlaps.next() {
@@ -233,7 +258,11 @@ fn merge_detail(lines: &mut Vec<Line>, verified: Line) {
             return;
         }
     }
-    lines.push(verified);
+    // The system indicator can only correct a misread mark at this location.
+    // It contributes no new evidence for a password screen.
+    if verified.label != Label::SmallMark {
+        lines.push(verified);
+    }
 }
 
 fn label(raw: &str) -> Label {
@@ -294,7 +323,7 @@ fn is_tile_caption(line: &Line, editor: &Line) -> bool {
         && (0.10..=0.41).contains(&left)
         && line.width <= editor.width * 0.75
         && line.height <= editor.height * 0.62
-        && line.y <= editor.height * 3.55
+        && line.y - line.height / 2.0 <= editor.height * 3.55
         && line.y + line.height / 2.0 < editor.y - editor.height / 2.0
 }
 
@@ -333,7 +362,11 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
         .filter(|line| matches!(line.label, Label::EditorBounds | Label::MaskedField));
     let editor = editors.next();
     if editors.next().is_some()
-        || editor.is_some_and(|e| !(0.47..=0.53).contains(&e.x) || !(0.20..=0.56).contains(&e.y))
+        || editor.is_some_and(|e| {
+            // At the client's minimum size the sign-in group can sit slightly
+            // to one side. Limit that offset to a fraction of the editor itself.
+            (e.x - 0.50).abs() > (0.16 * e.width).clamp(0.03, 0.08) || !(0.20..=0.56).contains(&e.y)
+        })
     {
         return Other;
     }
@@ -348,12 +381,7 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
         {
             return Other;
         }
-        // Vision's y-axis points upwards. The native window title is above
-        // the guest. Keep ambiguous/conflicting text inside the guest visible
-        // to the classifier, even when outside the expected password field.
-        if line.y > 0.965 {
-            continue;
-        }
+        // Only guest pixels reach the classifier, including the very top row.
         if line.label == Label::Conflict {
             return Other;
         }
@@ -382,7 +410,7 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
         match line.label {
             Label::Name
                 if line.confidence >= 0.50
-                    && (0.465..=0.535).contains(&line.x)
+                    && (line.x - editor.map_or(0.50, |e| e.x)).abs() <= 0.035
                     && (0.34..=0.63).contains(&line.y)
                     && editor.map_or_else(
                         || (0.010..=0.120).contains(&line.height),
@@ -506,11 +534,163 @@ mod tests {
     #[test]
     fn sparse_centered_name_and_password_below_are_visual_evidence() {
         let mut frame = form().to_vec();
-        frame.extend([
-            line("Cloud PC title", 0.50, 0.985, 0.012),
-            line("ENG", 0.90, 0.03, 0.009),
-        ]);
+        frame.push(line("ENG", 0.90, 0.03, 0.009));
         assert_eq!(classify(&frame), LockScreenObservation::Password);
+        for text in ["Other user", "Network maintenance"] {
+            let mut with_banner = frame.clone();
+            with_banner.push(line(text, 0.50, 0.985, 0.012));
+            assert_eq!(classify(&with_banner), LockScreenObservation::Other);
+        }
+    }
+
+    #[test]
+    fn windowed_layout_indicator_requires_a_matching_native_read() {
+        // Geometry observed in a 1650 × 960 point window on a Retina display.
+        let mut editor = line("", 0.500, 0.443, 0.023);
+        editor.label = Label::EditorBounds;
+        editor.width = 0.114;
+        let mut password = line("Password", 0.457, 0.443, 0.012);
+        password.width = 0.024;
+        let mut mark = line("EN6G", 0.964, 0.028, 0.005);
+        mark.width = 0.009;
+        let frame = vec![
+            editor,
+            line("Example Person", 0.5, 0.484, 0.019),
+            password,
+            mark,
+        ];
+        assert_eq!(classify(&frame), LockScreenObservation::Other);
+        let read = |lines: &mut Vec<Line>, text: &str, x: f64, confidence: f32| {
+            visit_line(
+                (lines as *mut Vec<Line>).cast(),
+                LAYOUT_TEXT,
+                text.as_ptr(),
+                text.len(),
+                confidence,
+                x,
+                mark.y,
+                mark.width,
+                mark.height,
+            );
+        };
+        let mut verified = frame.clone();
+        read(&mut verified, "ENG", mark.x, 1.0);
+        assert_eq!(classify(&verified), LockScreenObservation::Password);
+        for (text, x, confidence) in [
+            ("PIN", mark.x, 1.0),
+            ("Other user", mark.x, 1.0),
+            ("ENG", mark.x - 0.02, 1.0),
+            ("ENG", mark.x, 0.50),
+            ("EN6G", mark.x, 1.0),
+        ] {
+            let mut lines = frame.clone();
+            read(&mut lines, text, x, confidence);
+            assert_eq!(classify(&lines), LockScreenObservation::Other);
+        }
+        let mut conflict = frame;
+        conflict.last_mut().unwrap().label = Label::Conflict;
+        read(&mut conflict, "ENG", mark.x, 1.0);
+        assert_eq!(classify(&conflict), LockScreenObservation::Other);
+    }
+
+    #[test]
+    fn native_name_read_at_large_guest_scale_only_repairs_the_same_caption() {
+        // Captured guest geometry in a wide 1900 × 650 point window.
+        let mut editor = line("", 0.500, 0.402, 0.057);
+        editor.label = Label::EditorBounds;
+        editor.width = 0.158;
+        let mut password = line("Password", 0.443, 0.402, 0.020);
+        password.width = 0.031;
+        let mut caption = line("Unreadab1e", 0.500, 0.501, 0.046);
+        caption.width = 0.144;
+        let form = vec![caption, password, editor];
+        let account = b"Example Person";
+        let reread = |lines: &mut Vec<Line>, x: f64| {
+            visit_line(
+                (lines as *mut Vec<Line>).cast(),
+                ACCOUNT_TEXT,
+                account.as_ptr(),
+                account.len(),
+                1.0,
+                x,
+                caption.y,
+                caption.width,
+                caption.height,
+            );
+        };
+        assert_eq!(classify(&form), LockScreenObservation::Other);
+        let mut corrected = form.clone();
+        reread(&mut corrected, caption.x);
+        assert_eq!(classify(&corrected), LockScreenObservation::Password);
+        let mut separate = form.clone();
+        reread(&mut separate, caption.x + caption.width);
+        assert_eq!(classify(&separate), LockScreenObservation::Other);
+        let mut conflicting = form;
+        conflicting[0].label = Label::Conflict;
+        reread(&mut conflicting, caption.x);
+        assert_eq!(classify(&conflicting), LockScreenObservation::Other);
+    }
+
+    #[test]
+    fn compact_guest_accepts_a_shifted_group_only_with_an_aligned_name_and_editor() {
+        // 640 × 512 point window, with a 640 × 480 point remote viewport.
+        let mut editor = line("", 0.544, 0.374, 0.068);
+        editor.label = Label::EditorBounds;
+        editor.width = 0.43;
+        let mut password = line("Password", 0.395, 0.374, 0.025);
+        password.width = 0.091;
+        let name = line("Example Person", 0.552, 0.507, 0.044);
+        let mut tile = line("Work account", 0.174, 0.235, 0.021);
+        tile.width = 0.048;
+        assert_eq!(
+            classify(&[editor, password, name, tile]),
+            LockScreenObservation::Password
+        );
+        for (e, n, t) in [
+            (editor, Line { x: 0.50, ..name }, tile),
+            (Line { x: 0.65, ..editor }, name, tile),
+            (
+                editor,
+                name,
+                Line {
+                    label: Label::Conflict,
+                    ..tile
+                },
+            ),
+        ] {
+            assert_eq!(classify(&[e, password, n, t]), LockScreenObservation::Other);
+        }
+    }
+
+    #[test]
+    fn tighter_native_bounds_match_the_same_word_across_guest_dpi() {
+        // Fast and Accurate bounds of the same caption at 150% and 200% DPI.
+        for (fast, exact) in [
+            (
+                [0.4501, 0.4360, 0.0296, 0.0243],
+                [0.4517, 0.4372, 0.0268, 0.0182],
+            ),
+            (
+                [0.4365, 0.4173, 0.0333, 0.0261],
+                [0.4365, 0.4167, 0.0350, 0.0211],
+            ),
+        ] {
+            let word = |text, b: [f64; 4]| Line {
+                width: b[2],
+                ..line(text, b[0], b[1], b[3])
+            };
+            let misread = word("Passw0rd", fast);
+            let correct = word("Password", exact);
+            let mut lines = vec![misread];
+            merge_detail(&mut lines, correct);
+            assert!(matches!(lines.as_slice(), [l] if l.label == Label::Password));
+
+            for invalid in [vec![misread, misread], vec![word("Other user", fast)]] {
+                let mut lines = invalid;
+                merge_detail(&mut lines, correct);
+                assert!(lines.iter().any(|l| l.label == Label::Conflict));
+            }
+        }
     }
 
     #[test]

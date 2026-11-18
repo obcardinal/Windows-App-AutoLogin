@@ -11,7 +11,7 @@
 #include <math.h>
 #include <stdint.h>
 
-enum { OverviewText, MaskedField, VerifiedPlaceholder, EditorBounds, CornerText, AccountText };
+enum { OverviewText, MaskedField, VerifiedPlaceholder, EditorBounds, CornerText, AccountText, LayoutText, AmbiguousText };
 typedef void (*WaalTextVisitor)(void *, int, const char *, size_t, float, double, double, double, double);
 
 bool waal_lock_capture_supported(void) {
@@ -286,15 +286,6 @@ static VNRecognizeTextRequest *englishTextRequest(VNRequestTextRecognitionLevel 
     return request;
 }
 
-// Fast OCR can read the empty field's "Password" as "kassword". A near
-// match only triggers a second read. It is never itself evidence of a lock.
-static bool needsPlaceholderConfirmation(NSString *text) {
-    if (text.length != 8 || ![text hasSuffix:@"assword"]) return false;
-    unichar first = [text characterAtIndex:0];
-    return ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) &&
-           first != 'P' && first != 'p';
-}
-
 // The overview and the crop cover the same captured frame. Only the overview
 // is downsized. All observations passed to Rust use full-window Vision coordinates.
 static CGImageRef copyBitmap(CGImageRef source, size_t width, size_t height) {
@@ -328,6 +319,39 @@ static CGImageRef copyDetail(CGImageRef source, CGRect pixels, double scale) {
     return bitmap;
 }
 
+static CGRect readPasswordPixels(CGImageRef source, CGRect pixels, double scale, WaalTextVisitor veto,
+                                 void *context, float *confidence) {
+    size_t w = CGImageGetWidth(source), h = CGImageGetHeight(source);
+    CGImageRef detail = copyDetail(source, pixels, scale);
+    if (!detail) return CGRectNull;
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:detail options:@{}];
+    CGImageRelease(detail);
+    VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
+    if (veto) request.minimumTextHeight = .004;
+    if (![handler performRequests:@[request] error:nil] || request.results.count > (veto ? 8u : 1u)) return CGRectNull;
+    CGRect result = CGRectNull;
+    for (VNRecognizedTextObservation *observation in request.results) {
+        VNRecognizedText *word = [observation topCandidates:1].firstObject;
+        const char *utf8 = word.string.UTF8String;
+        size_t length = [word.string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        if (!utf8 || !length || length > 512) return CGRectNull;
+        CGRect box = observation.boundingBox;
+        CGRect normalized = CGRectMake((pixels.origin.x + box.origin.x * pixels.size.width) / w,
+                        1 - (CGRectGetMaxY(pixels) - box.origin.y * pixels.size.height) / h,
+                        box.size.width * pixels.size.width / w, box.size.height * pixels.size.height / h);
+        if ([word.string caseInsensitiveCompare:@"Password"] != NSOrderedSame) {
+            // The same conflict-only visitor handles accurately read account tiles.
+            if (veto) veto(context, CornerText, utf8, length, word.confidence,
+                           CGRectGetMidX(normalized), CGRectGetMidY(normalized), normalized.size.width, normalized.size.height);
+            continue;
+        }
+        if (!CGRectIsNull(result) || word.confidence < 0.50) return CGRectNull;
+        result = normalized;
+        *confidence = word.confidence;
+    }
+    return result;
+}
+
 static CGRect readPassword(CGImageRef source, CGRect region, float *confidence) {
     size_t w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     // CGImage crops have their origin at the top left; Vision's is at the bottom left.
@@ -336,22 +360,7 @@ static CGRect readPassword(CGImageRef source, CGRect region, float *confidence) 
     pixels = CGRectIntersection(pixels, CGRectMake(0, 0, w, h));
     if (CGRectIsEmpty(pixels)) return CGRectNull;
     // Give Vision a readable raster for small controls on low-resolution sessions.
-    double scale = fmin(4.0, fmax(1.0, 48.0 / pixels.size.height));
-    CGImageRef detail = copyDetail(source, pixels, scale);
-    if (!detail) return CGRectNull;
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:detail options:@{}];
-    CGImageRelease(detail);
-    VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
-    if (![handler performRequests:@[request] error:nil] || request.results.count != 1) return CGRectNull;
-    VNRecognizedTextObservation *observation = request.results.firstObject;
-    VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
-    if (!candidate || candidate.confidence < 0.50 ||
-        [candidate.string caseInsensitiveCompare:@"Password"] != NSOrderedSame) return CGRectNull;
-    *confidence = candidate.confidence;
-    CGRect local = observation.boundingBox;
-    return CGRectMake((pixels.origin.x + local.origin.x * pixels.size.width) / w,
-                      1 - (CGRectGetMaxY(pixels) - local.origin.y * pixels.size.height) / h,
-                      local.size.width * pixels.size.width / w, local.size.height * pixels.size.height / h);
+    return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 48.0 / pixels.size.height)), NULL, NULL, confidence);
 }
 
 static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int kind,
@@ -364,9 +373,14 @@ static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int 
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:detail options:@{}];
     CGImageRelease(detail);
     VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
-    NSUInteger limit = kind == AccountText ? 1 : 16;
-    if (![handler performRequests:@[request] error:nil] || !request.results || request.results.count > limit)
-        return false;
+    NSUInteger limit = kind == AccountText || kind == LayoutText ? 1 : 16;
+    if (![handler performRequests:@[request] error:nil] || !request.results) return false;
+    if (kind == AccountText && request.results.count > 1) {
+        visitor(context, AmbiguousText, NULL, 0, 1.0, CGRectGetMidX(pixels) / w,
+                1.0 - CGRectGetMidY(pixels) / h, pixels.size.width / w, pixels.size.height / h);
+        return true;
+    }
+    if (request.results.count > limit) return false;
     for (VNRecognizedTextObservation *observation in request.results) {
         VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
         NSString *text = candidate.string;
@@ -450,6 +464,60 @@ static bool visitOverview(CGImageRef image, VNRecognizeTextRequest *existing, CG
     return true;
 }
 
+// At low guest DPI the fast overview may miss both the name and the prompt.
+// Restrict an accurate read to the left half of the centered editor band.
+// Full guest context is still checked after recovering the native word.
+static CGRect findSmallPassword(CGImageRef source, WaalTextVisitor veto, void *context, float *confidence) {
+    double w = CGImageGetWidth(source), h = CGImageGetHeight(source);
+    double left = fmax(0.06 * w, 0.50 * w - 1024);
+    CGRect pixels = CGRectIntegral(CGRectMake(left, 0.42 * h, 0.51 * w - left, 0.38 * h));
+    double scale = fmin(4.0, fmax(1.0, 1536.0 / pixels.size.width));
+    return readPasswordPixels(source, pixels, scale, veto, context, confidence);
+}
+
+// The unfocused editor can lose both its blue underline and a reliable fast
+// OCR reading of the placeholder. Use the centered account caption to choose
+// a native search region. Its pixel height tracks the guest DPI.
+static CGRect unfocusedPassword(CGImageRef source, VNRecognizeTextRequest *overview,
+                               WaalTextVisitor veto, void *context, double *editorCenter, float *confidence) {
+    double w = CGImageGetWidth(source), h = CGImageGetHeight(source);
+    CGRect caption = CGRectNull, fastWord = CGRectNull;
+    unsigned centeredCaptions = 0;
+    for (VNRecognizedTextObservation *observation in overview.results) {
+        CGRect box = observation.boundingBox;
+        NSString *word = [observation topCandidates:1].firstObject.string;
+        // Preserve the direct native re-read when fast OCR already locates
+        // Password, including the common single-letter misread of its P.
+        if (word.length == 8 && [[word substringFromIndex:1] caseInsensitiveCompare:@"assword"] == NSOrderedSame) {
+            if (!CGRectIsNull(fastWord)) return CGRectNull;
+            fastWord = CGRectInset(box, -.012, -.009);
+        }
+        double centerTolerance = fmax(.035, fmin(.08, .16 * box.size.width));
+        if (fabs(CGRectGetMidX(box) - 0.5) > centerTolerance || CGRectGetMidY(box) < 0.34 ||
+            CGRectGetMidY(box) > 0.63 || box.size.width < box.size.height * h / w * 2) continue;
+        // The placeholder starts to the left of center. The account caption
+        // spans it; a second centered caption makes the screen ambiguous.
+        if (CGRectGetMinX(box) >= 0.5 || CGRectGetMaxX(box) <= 0.5) continue;
+        centeredCaptions++;
+        caption = box;
+    }
+    *editorCenter = centeredCaptions == 1 ? CGRectGetMidX(caption) : 0.5;
+    if (!CGRectIsNull(fastWord)) {
+        CGRect exact = readPassword(source, fastWord, confidence);
+        if (!CGRectIsEmpty(exact)) return exact;
+    }
+    if (centeredCaptions == 0 && overview.results.count <= 8) return findSmallPassword(source, veto, context, confidence);
+    if (centeredCaptions != 1) return CGRectNull;
+    double font = caption.size.height * h, cx = *editorCenter * w;
+    double top = (1.0 - CGRectGetMinY(caption)) * h;
+    // Enough space for the left-aligned prompt for both compact usernames
+    // and long domain names, without including the centered name above it.
+    CGRect pixels = CGRectIntersection(CGRectIntegral(CGRectMake(cx - 11 * font, top + .10 * font,
+                                             12 * font, 4 * font)), CGRectMake(0, 0, w, h));
+    if (CGRectIsEmpty(pixels)) return CGRectNull;
+    return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 36.0 / font)), veto, context, confidence);
+}
+
 bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void *context) {
     if (!source || !visitor || !context) return false;
     size_t w = CGImageGetWidth(source), h = CGImageGetHeight(source);
@@ -478,47 +546,59 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
     if (!overview) return false;
     VNRecognizeTextRequest *existing = nil;
     if (kind == WaalFieldNone) {
-        // An editor without an underline uses the bounded whole-window overview.
-        // Locate a likely placeholder and verify it in the original pixels.
         existing = overviewRequest((__bridge CGImageRef)overview);
         if (!existing) return false;
-        CGRect region = CGRectNull;
-        for (VNRecognizedTextObservation *observation in existing.results) {
-            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
-            NSString *text = candidate.string;
-            if (text && ([text caseInsensitiveCompare:@"Password"] == NSOrderedSame ||
-                         needsPlaceholderConfirmation(text))) {
-                if (!CGRectIsNull(region)) return true;
-                region = CGRectInset(observation.boundingBox, -.012, -.009);
-            }
-        }
-        if (CGRectIsNull(region)) return true;
-        placeholder = readPassword(source, region, &confidence);
+        double editorCenter;
+        placeholder = unfocusedPassword(source, existing, visitor, context, &editorCenter, &confidence);
         if (CGRectIsEmpty(placeholder)) return true;
+        field = waal_neutral_password_field(source, placeholder);
+        if (CGRectIsEmpty(field)) {
+            // On a centered form the measured word inset gives the scale for
+            // the context reads. A shifted form requires its visible outline.
+            if (fabs(editorCenter - .5) > .035) return true;
+            double ew = (editorCenter - CGRectGetMinX(placeholder)) * w / 0.46;
+            double eh = 0.118 * ew;
+            if (ew < 90 || ew > .85 * w || placeholder.size.width * w < ew * .10 ||
+                placeholder.size.width * w > ew * .46 || placeholder.size.height * h < eh * .15 ||
+                placeholder.size.height * h > eh * .90) return true;
+            field = CGRectMake(editorCenter - .5 * ew / w, CGRectGetMidY(placeholder) - .5 * eh / h,
+                               ew / w, eh / h);
+        }
+        kind = WaalFieldPlaceholderCandidate;
+        double contextScale = fmin(1.0, fmax(scale, 290.0 / (field.size.width * w)));
+        if (contextScale >= .95) contextScale = 1.0;
+        if (contextScale != scale) {
+            overview = CFBridgingRelease(copyScaledImage(source, lround(w * contextScale), lround(h * contextScale)));
+            if (!overview) return false;
+            existing = nil;
+        }
     }
     CGRect masked = kind == WaalFieldMasked ? CGRectInset(field, -.002, -.002) : CGRectNull;
     if (!visitOverview((__bridge CGImageRef)overview, existing, masked, visitor, context)) return false;
-    if (kind != WaalFieldNone) {
-        double ew = field.size.width * w, eh = field.size.height * h;
-        // The overview may omit small account tiles, including "Other user".
-        double cornerHeight = fmin(floor(h / 3.0), ew);
-        CGRect corner = CGRectMake(0, h - cornerHeight, fmin(w / 3.0, 1.5 * ew), cornerHeight);
-        double detailScale = eh < 32 ? fmin(5.0, 48.0 / eh) : 1.0;
-        if (!visitDetailText(source, corner, detailScale, CornerText, visitor, context)) return false;
-        if (eh < 32) {
-            // On a downsampled desktop, Fast can merge the words of the name.
-            // Anchor the native read to the actual editor directly below it.
-            CGRect name = CGRectMake(CGRectGetMidX(field) * w - 0.8 * ew,
-                                     (1.0 - CGRectGetMidY(field)) * h - 3.1 * eh,
-                                     1.6 * ew, 2.45 * eh);
-            if (!visitDetailText(source, name, 1.0, AccountText, visitor, context)) return false;
-            // A compressed "Other user" or instruction just below the editor
-            // may also disappear from the fast window-wide pass.
-            CGRect below = CGRectMake(CGRectGetMidX(field) * w - 0.85 * ew,
-                                      (1.0 - field.origin.y) * h + 0.05 * eh,
-                                      1.7 * ew, 3.8 * eh);
-            if (!visitDetailText(source, below, detailScale, OverviewText, visitor, context)) return false;
-        }
+    double ew = field.size.width * w, eh = field.size.height * h;
+    // The overview may omit small account tiles, including "Other user".
+    double cornerHeight = fmin(floor(h / 3.0), ew);
+    CGRect corner = CGRectMake(0, h - cornerHeight, fmin(w / 3.0, 1.5 * ew), cornerHeight);
+    double detailScale = eh < 32 ? fmin(5.0, 48.0 / eh) : 1.0;
+    if (!visitDetailText(source, corner, detailScale, CornerText, visitor, context)) return false;
+    // Vision can turn the input-language abbreviation into a longer word
+    // when the guest is scaled to fit a window. Re-read the indicator in
+    // original pixels. This optional read can only repair a matching line.
+    CGRect layout = CGRectMake(w - 0.38 * ew, h - 1.51 * eh, 0.13 * ew, 0.64 * eh);
+    visitDetailText(source, layout, detailScale, LayoutText, visitor, context);
+    // Fast can misread a centered name even on a large remote display
+    // resized to a wide window. Read its native pixels at every guest DPI.
+    CGRect name = CGRectMake(CGRectGetMidX(field) * w - 0.8 * ew,
+                             (1.0 - CGRectGetMidY(field)) * h - 3.1 * eh,
+                             1.6 * ew, 2.45 * eh);
+    if (!visitDetailText(source, name, 1.0, AccountText, visitor, context)) return false;
+    if (eh < 32) {
+        // A compressed "Other user" or instruction just below the editor
+        // may also disappear from the fast window-wide pass.
+        CGRect below = CGRectMake(CGRectGetMidX(field) * w - 0.85 * ew,
+                                  (1.0 - field.origin.y) * h + 0.05 * eh,
+                                  1.7 * ew, 3.8 * eh);
+        if (!visitDetailText(source, below, detailScale, OverviewText, visitor, context)) return false;
     }
     CGRect box = kind == WaalFieldMasked ? field : placeholder;
     if (kind == WaalFieldPlaceholderCandidate) {
