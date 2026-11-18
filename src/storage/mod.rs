@@ -404,9 +404,11 @@ struct StoredAccountWire {
     vm_profile: String,
     #[serde(default)]
     vm_device_id: String,
+    #[serde(default = "crate::models::default_true")]
+    reconnect_locked_vm: bool,
     #[serde(default)]
     has_saved_password: bool,
-    #[serde(default = "default_stored_account_enabled")]
+    #[serde(default = "crate::models::default_true")]
     enabled: bool,
     #[serde(default)]
     iphone_authenticator_enabled: bool,
@@ -414,10 +416,6 @@ struct StoredAccountWire {
     authenticator_provider: crate::models::AuthenticatorProvider,
     #[serde(default, rename = "target_window_title")]
     _removed_target_window_title: Option<String>,
-}
-
-fn default_stored_account_enabled() -> bool {
-    true
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -464,6 +462,7 @@ impl From<StoredAppConfigWire> for AppConfig {
                     vm_target: account.vm_target,
                     vm_profile: account.vm_profile,
                     vm_device_id: account.vm_device_id,
+                    reconnect_locked_vm: account.reconnect_locked_vm,
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
                     iphone_authenticator_enabled: account.iphone_authenticator_enabled,
@@ -6023,6 +6022,7 @@ mod tests {
         assert!(config.accounts[0].vm_target.is_empty());
         assert!(config.accounts[0].vm_profile.is_empty());
         assert!(config.accounts[0].vm_device_id.is_empty());
+        assert!(config.accounts[0].reconnect_locked_vm);
         assert_eq!(config.settings.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
         assert!(config.settings.use_keyring);
         assert!(!config.settings.hide_menu_bar_icon);
@@ -6102,10 +6102,11 @@ mod tests {
         config.settings.show_menu_diagnostics = true;
         config.settings.use_keyring = false;
 
-        save_config_to_file(&config, &path).unwrap();
-        let loaded = load_config_from_path(&path).unwrap();
-
-        assert_eq!(loaded, config);
+        for reconnect in [true, false] {
+            config.accounts[0].reconnect_locked_vm = reconnect;
+            save_config_to_file(&config, &path).unwrap();
+            assert_eq!(load_config_from_path(&path).unwrap(), config);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

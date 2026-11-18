@@ -4275,6 +4275,7 @@ mod tests {
             vm_target: String::new(),
             vm_profile: String::new(),
             vm_device_id: String::new(),
+            reconnect_locked_vm: false,
             iphone_authenticator_enabled: false,
             authenticator_provider: Default::default(),
         }

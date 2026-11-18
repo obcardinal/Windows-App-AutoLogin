@@ -40,9 +40,12 @@ pub struct Account {
     /// Windows App catalog identifier, or "open-window" for a window-only macOS link.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vm_device_id: String,
+    /// Reconnect this linked VM through Windows App when returning to its locked session on macOS.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub reconnect_locked_vm: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_saved_password: bool,
-    #[serde(default = "default_account_enabled", skip_serializing_if = "is_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub iphone_authenticator_enabled: bool,
@@ -59,11 +62,25 @@ impl Account {
             vm_target: String::new(),
             vm_profile: String::new(),
             vm_device_id: String::new(),
+            reconnect_locked_vm: true,
             has_saved_password: false,
             enabled: true,
             iphone_authenticator_enabled: false,
             authenticator_provider: AuthenticatorProvider::default(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn locked_vm_reconnect_enabled(&self) -> bool {
+        let catalog_binding = self.vm_device_id.starts_with("workspace:")
+            || self.vm_device_id.starts_with("bookmark:");
+        let window_binding = !self.vm_target.trim().is_empty()
+            && (self.vm_device_id == "open-window"
+                || (self.vm_device_id.is_empty() && !self.vm_profile.trim().is_empty()));
+        self.enabled
+            && self.reconnect_locked_vm
+            && self.has_saved_password
+            && (catalog_binding || window_binding)
     }
 
     pub fn display_name(&self) -> String {
@@ -144,7 +161,7 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
-fn default_account_enabled() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 
@@ -263,6 +280,7 @@ mod tests {
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].username, "user@example.com");
         assert!(config.accounts[0].remote_pc.is_empty());
+        assert!(config.accounts[0].reconnect_locked_vm);
         assert!(!config.accounts[0].iphone_authenticator_enabled);
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -270,6 +288,46 @@ mod tests {
         assert!(!serialized.contains("Legacy Target"));
         assert!(!serialized.contains("iphone_authenticator_enabled"));
         assert!(!serialized.contains("remote_pc"));
+        assert!(!serialized.contains("reconnect_locked_vm"));
+    }
+
+    #[test]
+    fn new_account_defaults_to_reconnect_and_remembers_explicit_off() {
+        let mut account = super::Account::new("user@example.test");
+        assert!(account.reconnect_locked_vm);
+        account.reconnect_locked_vm = false;
+        let wire = serde_json::to_value(&account).unwrap();
+        assert_eq!(wire["reconnect_locked_vm"], false);
+        assert_eq!(
+            serde_json::from_value::<super::Account>(wire).unwrap(),
+            account
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_reconnect_requires_a_saved_password_and_a_linked_desktop() {
+        let mut account = super::Account::new("user@example.test");
+        account.has_saved_password = true;
+        for (device, title, profile, eligible) in [
+            ("", "", "", false),
+            ("", "Desktop", "", false),
+            ("open-window", "", "", false),
+            ("open-window", "Desktop", "", true),
+            ("", "Desktop", "user@example.test", true),
+            ("workspace:one", "", "", true),
+            ("bookmark:one", "Desktop", "", true),
+        ] {
+            account.vm_device_id = device.into();
+            account.vm_target = title.into();
+            account.vm_profile = profile.into();
+            assert_eq!(account.locked_vm_reconnect_enabled(), eligible);
+        }
+        account.has_saved_password = false;
+        assert!(!account.locked_vm_reconnect_enabled());
+        account.has_saved_password = true;
+        account.enabled = false;
+        assert!(!account.locked_vm_reconnect_enabled());
     }
 
     #[test]
