@@ -427,15 +427,14 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
 }
 
 fn full_ui_renderer() -> eframe::Renderer {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        // Clean Windows VMs commonly expose DirectX through the Microsoft
-        // software adapter but no OpenGL 2.0 driver. WGPU can use that DX12
-        // path, while Glow fails before the Accounts window is created.
+        // AppKit can detach an ordered-out window from its OpenGL context.
+        // Metal supports hiding and restoring the panel; Windows uses DX12.
         eframe::Renderer::Wgpu
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         eframe::Renderer::Glow
     }
@@ -4127,15 +4126,15 @@ mod tests {
         assert!(config_load < ui_start);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
-    fn windows_full_ui_uses_wgpu_without_an_opengl_requirement() {
+    fn macos_and_windows_full_ui_use_the_native_gpu_backend() {
         assert_eq!(full_ui_renderer(), eframe::Renderer::Wgpu);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
-    fn non_windows_full_ui_keeps_the_existing_glow_renderer() {
+    fn other_platforms_keep_the_existing_glow_renderer() {
         assert_eq!(full_ui_renderer(), eframe::Renderer::Glow);
     }
 

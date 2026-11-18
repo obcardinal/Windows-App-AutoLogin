@@ -6,6 +6,7 @@ use objc2_app_kit::{
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSSize};
+use objc2_quartz_core::{kCAGravityBottomLeft, CALayer, CAMetalLayer};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const MAX_WIRE_BYTES: usize = 240;
@@ -151,7 +152,7 @@ pub(crate) fn configure_viewport(
 ) -> egui::ViewportBuilder {
     let panel = matches!(presentation, Presentation::Panel(_));
     viewport
-        // The GL surface needs alpha from creation, including when a regular
+        // The rendering surface needs alpha from creation, including when a regular
         // window later switches to a panel without recreating the renderer.
         .with_transparent(true)
         .with_decorations(!panel)
@@ -194,6 +195,25 @@ fn native_window(handle: &impl HasWindowHandle) -> anyhow::Result<Retained<NSWin
     view.window().context("AppKit view has no window")
 }
 
+fn pin_metal_drawable(layer: &CALayer) {
+    // While the next drawable is rendering, keep the previous frame at its
+    // original pixel scale. The Metal surface can be the view layer itself
+    // or the sublayer installed by raw-window-metal.
+    if layer.downcast_ref::<CAMetalLayer>().is_some() {
+        // The macOS Metal drawable is vertically flipped. Its lower-left
+        // gravity keeps the first row of the UI against the title bar.
+        // SAFETY: This immutable QuartzCore constant is available on all supported macOS versions.
+        layer.setContentsGravity(unsafe { kCAGravityBottomLeft });
+    } else {
+        // SAFETY: Only inspect the app's layer tree, synchronously on AppKit's main thread.
+        if let Some(children) = unsafe { layer.sublayers() } {
+            for child in children.iter() {
+                pin_metal_drawable(&child);
+            }
+        }
+    }
+}
+
 fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Result<()> {
     if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
         // AppKit owns the asynchronous fullscreen transition. The UI requests
@@ -220,6 +240,7 @@ fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Res
     let layer = content_view
         .layer()
         .context("AppKit content view has no layer")?;
+    pin_metal_drawable(&layer);
     let panel = matches!(presentation, Presentation::Panel(_));
     // Preserve the renderer's layer and clip its complete contents, including
     // popups and the toolbar, to the panel's native shape.

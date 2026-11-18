@@ -94,12 +94,12 @@ eframe = { version = "0.34", default-features = false, features = ["default_font
 
 [target.'cfg(target_os = "macos")'.dependencies]
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "native-tls"] }
-eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
 core-foundation = "0.10"
 security-framework = "3.7"
 objc2 = "0.6.4"
 block2 = "0.6.2"
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "objc2-core-foundation"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer", "objc2-core-foundation"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSAttributedString", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSImage", "NSParagraphStyle", "NSResponder", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSText", "NSTextAttachment", "NSView", "NSWindow", "block2", "objc2-core-foundation", "objc2-quartz-core"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSAttributedString", "NSBundle", "NSCalendar", "NSData", "NSDate", "NSDateFormatter", "NSDictionary", "NSError", "NSGeometry", "NSLocale", "NSRunLoop", "NSTimeZone", "NSValue", "NSRange", "NSString", "NSURL", "objc2-core-services"] }
 
