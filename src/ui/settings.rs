@@ -248,9 +248,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
             #[cfg(target_os = "macos")]
             {
                 ui.add_space(12.0);
-                section(ui, "iPhone Authentication", |ui| {
-                    crate::ui::iphone_sign_in::summary(ui);
-                    ui.add(egui::Separator::default().spacing(8.0));
+                section(ui, "iPhone Authentication", crate::ui::iphone_sign_in::summary);
+                ui.add_space(12.0);
+                section(ui, "2FA Notifications", |ui| {
                     let closing = app.window_closing_mutations_disabled_reason().is_some();
                     ui.add_enabled_ui(!closing, |ui| app.telegram_settings.show(ui));
                 });

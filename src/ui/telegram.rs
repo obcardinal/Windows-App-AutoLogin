@@ -107,26 +107,23 @@ impl TelegramSettings {
                 None => "Link status unavailable",
             },
         };
-        let height = ui.text_style_height(&egui::TextStyle::Body)
-            + ui.text_style_height(&egui::TextStyle::Small);
         let form_was_closed = self.code.is_none();
-        egui::containers::Sides::new()
-            .height(height)
+        let (title_left, _) = egui::containers::Sides::new()
+            .height(ui.spacing().interact_size.y)
             .shrink_left()
             .show(
                 ui,
                 |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         ui.add(theme::toolbar_icon(egui::include_image!(
                             "../../assets/about/contact-telegram.svg"
                         )));
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.label("Telegram wake-up notification");
-                            ui.label(egui::RichText::new(status).small().color(theme::MUTED));
-                        });
-                    });
+                        let title = ui.strong("Telegram");
+                        ui.label(egui::RichText::new(status).small().color(theme::MUTED));
+                        title.rect.left()
+                    })
+                    .inner
                 },
                 |ui| {
                     if operation.is_some() {
@@ -164,9 +161,23 @@ impl TelegramSettings {
                     }
                 },
             );
-        ui.add(egui::Label::new(egui::RichText::new(
-            "Telegram can wake your iPhone for faster sign-in. You’ll get an alert only when Windows App asks for two-factor authentication with Microsoft Authenticator.",
-        ).small().color(theme::MUTED)).wrap());
+        let indent = title_left - ui.next_widget_position().x;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(indent);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for line in [
+                    "Can wake your iPhone for faster sign-in.",
+                    "Only for Microsoft Authenticator 2FA requests.",
+                ] {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(line).small().color(theme::MUTED))
+                            .wrap(),
+                    );
+                }
+            });
+        });
 
         if let Some(error) = self.error {
             ui.add(
@@ -179,14 +190,11 @@ impl TelegramSettings {
         let Some(code) = self.code.as_mut() else {
             return;
         };
-        ui.add_space(4.0);
-        ui.hyperlink_to("@windows_app_autologin_bot", BOT_URL);
-        ui.add(
-            egui::Label::new(
-                "Open the bot on your phone, send /link and enter its single-use code here.",
-            )
-            .wrap(),
-        );
+        ui.add(egui::Separator::default().spacing(12.0));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("For a pairing code, send /link to");
+            ui.hyperlink_to("@windows_app_autologin_bot", BOT_URL);
+        });
         let submit = ui
             .horizontal(|ui| {
                 let width = (ui.available_width() - 80.0).clamp(1.0, 200.0);

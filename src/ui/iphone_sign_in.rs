@@ -142,25 +142,17 @@ fn device_label(info: Option<&SetupInfo>) -> &str {
 pub(super) fn summary(ui: &mut egui::Ui) {
     let snapshot = DeviceSnapshot::get(ui.ctx());
     let info = snapshot.0.get();
-    let (title, caption, needs_setup) = match info {
-        Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => (
-            device_label(info).to_owned(),
-            "Requires Xcode on this Mac",
-            true,
-        ),
-        Some(SetupInfo::SelectedNeedsSetup { .. }) => (
-            device_label(info).to_owned(),
-            "Mac helper setup required",
-            true,
-        ),
-        _ => (
-            format!("iPhone: {}", device_label(info)),
-            "Microsoft Authenticator over Wi-Fi",
-            false,
-        ),
+    let title = device_label(info);
+    let (caption, needs_setup) = match info {
+        Some(SetupInfo::NotConfigured | SetupInfo::NoDeviceSelected) => {
+            ("Requires Xcode on this Mac", true)
+        }
+        Some(SetupInfo::SelectedNeedsSetup { .. }) => ("Mac helper setup required", true),
+        _ => ("Microsoft Authenticator over Wi-Fi", false),
     };
     let text_height = ui.text_style_height(&egui::TextStyle::Body)
-        + ui.text_style_height(&egui::TextStyle::Small);
+        + ui.text_style_height(&egui::TextStyle::Small)
+        + 3.0;
     let (_, details) = egui::containers::Sides::new()
         .height(text_height.max(ui.spacing().interact_size.y))
         .shrink_left()
@@ -168,9 +160,9 @@ pub(super) fn summary(ui: &mut egui::Ui) {
             ui,
             |ui| {
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.add(egui::Label::new(&title).truncate())
-                        .on_hover_text(&title);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate())
+                        .on_hover_text(title);
                     ui.label(egui::RichText::new(caption).small().color(theme::MUTED));
                 });
             },
@@ -838,7 +830,7 @@ mod tests {
         };
         frame(vec![]);
         let home = frame(vec![]);
-        let phone = text_rect(&home, "iPhone: Work iPhone").unwrap();
+        let phone = text_rect(&home, "Work iPhone").unwrap();
         let caption = text_rect(&home, "Microsoft Authenticator over Wi-Fi").unwrap();
         let details_label = text_rect(&home, "Sign-in details…").unwrap();
         let button = home
@@ -886,7 +878,7 @@ mod tests {
         }
         click_button(&details, "Back to Settings");
         let home = frame(vec![]);
-        assert!(text_rect(&home, "iPhone: Work iPhone").is_some());
+        assert!(text_rect(&home, "Work iPhone").is_some());
         click_button(&home, "Sign-in details…");
         frame(vec![]);
         frame(vec![egui::Event::Key {
