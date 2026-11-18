@@ -47,6 +47,29 @@ pub(crate) enum Completion {
     Changed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopCheckFailure {
+    Expired,
+    WindowGone,
+    WindowChanged,
+    RequestGone,
+    RequestChanged,
+}
+
+impl std::fmt::Display for DesktopCheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Expired => "iPhone sign-in request expired",
+            Self::WindowGone => "Microsoft sign-in window is no longer visible",
+            Self::WindowChanged => "Microsoft sign-in window changed",
+            Self::RequestGone => "Microsoft number-matching request is no longer present",
+            Self::RequestChanged => "Microsoft number-matching request changed",
+        })
+    }
+}
+
+impl std::error::Error for DesktopCheckFailure {}
+
 impl Challenge {
     pub(crate) fn matches_account(&self, account: &Account) -> bool {
         account.enabled
@@ -76,15 +99,15 @@ impl Challenge {
     pub(crate) fn revalidate(&self, guard: &dyn Fn() -> anyhow::Result<()>) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.detected_at.elapsed() <= MAX_AGE,
-            "iPhone sign-in request expired"
+            DesktopCheckFailure::Expired
         );
         guard()?;
         let Some((process, window)) = unique_sign_in_window(guard)? else {
-            anyhow::bail!("Microsoft sign-in window is no longer visible");
+            anyhow::bail!(DesktopCheckFailure::WindowGone);
         };
         anyhow::ensure!(
             same_process(&self.process, &process) && self.window.same_element(&window),
-            "Microsoft sign-in window changed"
+            DesktopCheckFailure::WindowChanged
         );
         let account = Account {
             id: self.account_id.clone(),
@@ -96,10 +119,10 @@ impl Challenge {
             authenticator_provider: Default::default(),
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?
-            .context("Microsoft number-matching request is no longer present")?;
+            .context(DesktopCheckFailure::RequestGone)?;
         anyhow::ensure!(
             self.same_request(&current),
-            "Microsoft number-matching request changed"
+            DesktopCheckFailure::RequestChanged
         );
         guard()
     }

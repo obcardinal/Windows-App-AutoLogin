@@ -1,6 +1,10 @@
 //! Bounded, cancellable handoff to the local iPhone helper. Numbers travel only
 //! over stdin; the helper must obtain a fresh desktop permit before each action.
 
+#[path = "iphone_attempt_report.rs"]
+mod report;
+
+use report::{Reason, Stage};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -72,18 +76,24 @@ impl Phase {
         }
     }
 
-    fn from_helper(value: &str) -> anyhow::Result<Self> {
+    fn from_helper(value: &str) -> Result<(Self, Stage), Reason> {
         Ok(match value {
-            "waiting_for_device" => Self::WaitingForDevice,
-            "waiting_for_unlock" | "lock_state_unavailable" => Self::Unlock,
+            "waiting_for_device" => (Self::WaitingForDevice, Stage::WaitingForDevice),
+            "waiting_for_unlock" | "lock_state_unavailable" => {
+                (Self::Unlock, Stage::WaitingForUnlock)
+            }
             "starting_iphone_connection"
             | "preparing_iphone_runner"
             | "starting_iphone_runner"
-            | "iphone_connected" => Self::Connecting,
-            "waiting_for_authenticator" | "waiting_for_number_request" => Self::WaitingForRequest,
-            "entering_number" => Self::EnteringNumber,
-            "manual_confirmation_required" | "complete_confirmation_on_iphone" => Self::FaceId,
-            _ => anyhow::bail!("unexpected iPhone progress"),
+            | "iphone_connected" => (Self::Connecting, Stage::Connecting),
+            "waiting_for_authenticator" | "waiting_for_number_request" => {
+                (Self::WaitingForRequest, Stage::WaitingForRequest)
+            }
+            "entering_number" => (Self::EnteringNumber, Stage::EnteringNumber),
+            "manual_confirmation_required" | "complete_confirmation_on_iphone" => {
+                (Self::FaceId, Stage::WaitingForConfirmation)
+            }
+            _ => return Err(Reason::ProtocolError),
         })
     }
 
@@ -247,18 +257,21 @@ struct Protocol {
 }
 
 impl Protocol {
-    fn authorize(&mut self, sequence: u64, action: &str) -> anyhow::Result<()> {
-        const ACTIONS: [&str; 3] = ["open_authenticator", "enter_number", "submit_number"];
+    fn authorize(&mut self, sequence: u64, action: &str) -> anyhow::Result<Stage> {
+        const ACTIONS: [(&str, Stage); 3] = [
+            ("open_authenticator", Stage::OpeningAuthenticator),
+            ("enter_number", Stage::VerifyingNumberField),
+            ("submit_number", Stage::SubmittingNumber),
+        ];
+        let (expected, stage) = ACTIONS
+            .get(self.next)
+            .ok_or_else(|| anyhow::anyhow!("unexpected iPhone action"))?;
         anyhow::ensure!(
-            !self.submitted
-                && sequence == self.next as u64 + 1
-                && ACTIONS
-                    .get(self.next)
-                    .is_some_and(|expected| *expected == action),
+            !self.submitted && sequence == self.next as u64 + 1 && *expected == action,
             "unexpected iPhone action"
         );
         self.next += 1;
-        Ok(())
+        Ok(*stage)
     }
 
     fn submitted(&mut self) -> anyhow::Result<()> {
@@ -334,6 +347,18 @@ impl Drop for HelperProcess {
     }
 }
 
+fn desktop_reason(error: anyhow::Error) -> Reason {
+    use crate::macos_ax::sso::DesktopCheckFailure;
+    match error.downcast_ref::<DesktopCheckFailure>() {
+        Some(DesktopCheckFailure::Expired) => Reason::DesktopRequestExpired,
+        Some(DesktopCheckFailure::WindowGone) => Reason::DesktopWindowGone,
+        Some(DesktopCheckFailure::WindowChanged) => Reason::DesktopWindowChanged,
+        Some(DesktopCheckFailure::RequestGone) => Reason::DesktopRequestGone,
+        Some(DesktopCheckFailure::RequestChanged) => Reason::DesktopRequestChanged,
+        None => Reason::DesktopRequestUnavailable,
+    }
+}
+
 /// Caller owns the current automation/activity guards for the entire operation.
 /// Disappearance of an SSO dialog does not prove authentication succeeded.
 pub(crate) fn assist(
@@ -358,35 +383,31 @@ pub(crate) fn assist(
         );
         guard()
     };
+    let mut trace = report::Trace::start();
+    let validate_desktop = || challenge.revalidate(&is_current).map_err(desktop_reason);
     notify(Phase::Preparing);
     let mut failure_phase = Phase::Failed;
     let cleanup_failed = Arc::new(AtomicBool::new(false));
-    let result = (|| -> anyhow::Result<Outcome> {
-        anyhow::ensure!(
-            account.enabled && account.iphone_authenticator_enabled,
-            "iPhone assistance is disabled"
-        );
-        anyhow::ensure!(challenge.matches_account(account), "iPhone account changed");
-        challenge.revalidate(&is_current)?;
-        let mut command = helper_command().inspect_err(|_| failure_phase = Phase::SetupRequired)?;
+    let result = (|| -> Result<(), Reason> {
+        if !account.enabled || !account.iphone_authenticator_enabled {
+            return Err(Reason::AccountDisabled);
+        }
+        if !challenge.matches_account(account) {
+            return Err(Reason::AccountChanged);
+        }
+        validate_desktop()?;
+        let mut command = helper_command().map_err(|_| {
+            failure_phase = Phase::SetupRequired;
+            Reason::HelperSetupRequired
+        })?;
         let mut process = HelperProcess {
-            child: command.spawn()?,
+            child: command.spawn().map_err(|_| Reason::HelperStartFailed)?,
             input: None,
             reader: None,
             cleanup_failed: cleanup_failed.clone(),
         };
-        process.input = Some(
-            process
-                .child
-                .stdin
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("missing helper input"))?,
-        );
-        let output = process
-            .child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("missing helper output"))?;
+        process.input = Some(process.child.stdin.take().ok_or(Reason::HelperIoFailed)?);
+        let output = process.child.stdout.take().ok_or(Reason::HelperIoFailed)?;
         let (tx, rx) = mpsc::sync_channel(16);
         let reader_cleanup_failed = cleanup_failed.clone();
         process.reader = Some(std::thread::spawn(move || {
@@ -422,63 +443,78 @@ pub(crate) fn assist(
                 number: challenge.number(),
                 expires_in_ms: LIFETIME.as_millis() as u64,
             },
-        )?;
+        )
+        .map_err(|_| Reason::HelperIoFailed)?;
         let deadline = Instant::now() + LIFETIME;
         let mut protocol = Protocol::default();
         let mut last_validation = Instant::now();
         let mut cleanup_deadline = None;
         loop {
-            is_current()?;
-            anyhow::ensure!(
-                Instant::now() < cleanup_deadline.unwrap_or(deadline),
-                "iPhone assistance expired"
-            );
+            is_current().map_err(|_| Reason::Cancelled)?;
+            if Instant::now() >= cleanup_deadline.unwrap_or(deadline) {
+                return Err(Reason::DeadlineExceeded);
+            }
             if !protocol.finishing && last_validation.elapsed() >= Duration::from_millis(500) {
                 if protocol.submitted {
                     use crate::macos_ax::sso::Completion;
-                    if !matches!(challenge.poll_completion(&is_current)?, Completion::Pending) {
+                    if !matches!(
+                        challenge
+                            .poll_completion(&is_current)
+                            .map_err(desktop_reason)?,
+                        Completion::Pending
+                    ) {
                         send(
                             process.input.as_mut().unwrap(),
                             &serde_json::json!({"finish": true}),
-                        )?;
-                        protocol.finish()?;
+                        )
+                        .map_err(|_| Reason::HelperIoFailed)?;
+                        protocol.finish().map_err(|_| Reason::ProtocolError)?;
+                        trace.advance(Stage::ClosingSession);
                         cleanup_deadline = Some(Instant::now() + Duration::from_secs(12));
                     }
                 } else if protocol.next < 3 {
                     // Once submit is permitted the desktop can advance before
                     // WDA returns its click response. Await the explicit helper
                     // response instead of cancelling a completed click as stale.
-                    challenge.revalidate(&is_current)?;
+                    validate_desktop()?;
                 }
                 last_validation = Instant::now();
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(Some(HelperEvent::Status { phase }))) => {
-                    notify(Phase::from_helper(&phase)?);
+                    let (phase, stage) = Phase::from_helper(&phase)?;
+                    trace.advance(stage);
+                    notify(phase);
                 }
                 Ok(Ok(Some(HelperEvent::Authorize { sequence, action }))) => {
-                    protocol.authorize(sequence, &action)?;
-                    challenge.revalidate(&is_current)?;
+                    let stage = protocol
+                        .authorize(sequence, &action)
+                        .map_err(|_| Reason::ProtocolError)?;
+                    trace.advance(stage);
+                    validate_desktop()?;
                     send(
                         process.input.as_mut().unwrap(),
                         &serde_json::json!({"permit": sequence}),
-                    )?;
+                    )
+                    .map_err(|_| Reason::HelperIoFailed)?;
                 }
                 Ok(Ok(Some(HelperEvent::Submitted {}))) => {
-                    protocol.submitted()?;
+                    protocol.submitted().map_err(|_| Reason::ProtocolError)?;
+                    trace.advance(Stage::WaitingForConfirmation);
                     notify(Phase::FaceId);
                 }
                 Ok(Ok(Some(HelperEvent::Closed {}))) => {
-                    protocol.closed()?;
-                    return Ok(Outcome::SubmittedUnverified);
+                    protocol.closed().map_err(|_| Reason::ProtocolError)?;
+                    return Ok(());
                 }
                 Ok(Ok(Some(HelperEvent::Error { code }))) => {
                     // Never interpolate helper-provided strings into an error.
                     failure_phase = Phase::from_error(&code);
-                    anyhow::bail!("iPhone helper could not complete");
+                    return Err(Reason::from_helper(&code));
                 }
-                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("iPhone helper ended before completion")
+                Ok(Err(())) => return Err(Reason::ProtocolError),
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Reason::UnexpectedEnd)
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -487,18 +523,27 @@ pub(crate) fn assist(
     match result {
         _ if cleanup_failed.load(Ordering::SeqCst) => {
             notify(Phase::CleanupFailed);
+            trace.finish(report::Outcome::Failed, Some(Reason::WdaCleanupUnverified));
             Outcome::Unavailable
         }
-        Ok(outcome) => {
+        Ok(()) => {
             notify(Phase::Finished);
-            outcome
+            trace.finish(report::Outcome::SubmittedUnverified, None);
+            Outcome::SubmittedUnverified
         }
         Err(_) if cancelled.load(Ordering::SeqCst) || guard().is_err() => {
+            let reason = if cancelled.load(Ordering::SeqCst) {
+                Reason::UserCancelled
+            } else {
+                Reason::MonitorPaused
+            };
             notify(Phase::Cancelled);
+            trace.finish(report::Outcome::Cancelled, Some(reason));
             Outcome::Cancelled
         }
-        Err(_) => {
+        Err(reason) => {
             notify(failure_phase);
+            trace.finish(report::Outcome::Failed, Some(reason));
             Outcome::Unavailable
         }
     }
@@ -515,11 +560,20 @@ mod tests {
         assert!(state.submitted().is_err());
         assert!(state.closed().is_err());
         assert!(state.finish().is_err());
-        state.authorize(1, "open_authenticator").unwrap();
+        assert_eq!(
+            state.authorize(1, "open_authenticator").unwrap(),
+            Stage::OpeningAuthenticator
+        );
         assert!(state.authorize(1, "open_authenticator").is_err());
-        state.authorize(2, "enter_number").unwrap();
+        assert_eq!(
+            state.authorize(2, "enter_number").unwrap(),
+            Stage::VerifyingNumberField
+        );
         assert!(state.authorize(3, "accept_alert").is_err());
-        state.authorize(3, "submit_number").unwrap();
+        assert_eq!(
+            state.authorize(3, "submit_number").unwrap(),
+            Stage::SubmittingNumber
+        );
         state.submitted().unwrap();
         assert!(state.closed().is_err());
         state.finish().unwrap();
@@ -527,6 +581,27 @@ mod tests {
         assert!(state.finish().is_err());
         assert!(state.submitted().is_err());
         assert!(state.authorize(4, "submit_number").is_err());
+    }
+
+    #[test]
+    fn diagnostics_distinguish_desktop_and_phone_failures_before_entry() {
+        use crate::macos_ax::sso::DesktopCheckFailure;
+        assert_eq!(
+            desktop_reason(anyhow::Error::new(DesktopCheckFailure::RequestChanged)),
+            Reason::DesktopRequestChanged
+        );
+        assert_eq!(
+            desktop_reason(anyhow::anyhow!("opaque error")),
+            Reason::DesktopRequestUnavailable
+        );
+        assert_eq!(
+            Phase::from_helper("waiting_for_number_request").unwrap().1,
+            Stage::WaitingForRequest
+        );
+        assert_eq!(
+            Phase::from_helper("unrecognized"),
+            Err(Reason::ProtocolError)
+        );
     }
 
     #[test]

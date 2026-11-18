@@ -199,7 +199,7 @@ pub(crate) fn write_last_fill_attempt_report(report: &FillAttemptReport) -> anyh
     write_private_report_atomic(&path, &bytes)
 }
 
-fn write_private_report_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private_report_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let parent = path

@@ -26,6 +26,18 @@ The Mac progress panel has **Cancel**. Stopping Monitor, opening Settings, or
 editing account configuration cancels current assistance and waits for its helper
 to finish closing before making the configuration available to another attempt.
 
+### Diagnose a stopped attempt
+
+Once Monitor recognizes a sign-in request and starts iPhone assistance, it updates
+`~/Library/Application Support/WindowsAppAutoLogin/Runtime/last-iphone-attempt.json`.
+The file holds only the latest attempt. It records the UTC time, elapsed milliseconds,
+stage, outcome and, when available, a reason such as `account_mismatch`,
+`screen_changed` or `authorization_expired`. If the app exits during an attempt,
+the last recorded stage can still show `in_progress`. `submitted_unverified`
+means that the iPhone helper reported submission. It does not confirm desktop sign-in.
+The report is private to the local user and contains no account or device identifiers,
+sign-in numbers, passwords, or screen contents.
+
 Supported Authenticator UI is pinned to the observed selectors in
 `script/iphone-automation/authenticator.mjs`. A missing profile fails before a
 phone session starts; an unexpected language, alert, account label, or
