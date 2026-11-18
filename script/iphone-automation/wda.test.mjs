@@ -1,5 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import * as support from './support.mjs';
 import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, stopOwnedProcessGroup, tunnelEndpoint } from './wda.mjs';
 
 const udid = '00000000-0000000000000001';
@@ -54,4 +59,148 @@ test('phone cleanup selects only this app dedicated signed WDA executable', () =
   assert.throws(() => dedicatedRunnerExecutable({ result: { apps: [app, app] } }, bundle), { code: 'wda_cleanup_unverified' });
   assert.throws(() => dedicatedRunnerExecutable({ result: { apps: [{ ...app, url: 'file:///another/app/' }] } }, bundle), { code: 'wda_cleanup_unverified' });
   assert.throws(() => dedicatedRunnerPids({}, executable), { code: 'wda_cleanup_unverified' });
+});
+
+const manifestName = 'WebDriverAgentRunner_iphoneos-arm64.xctestrun';
+
+async function writeProducts(products) {
+  const app = path.join(products, 'Debug-iphoneos', 'WebDriverAgentRunner-Runner.app');
+  const plugin = path.join(app, 'PlugIns', 'WebDriverAgentRunner.xctest');
+  await fs.mkdir(plugin, { recursive: true });
+  await fs.writeFile(path.join(app, 'WebDriverAgentRunner-Runner'), 'fixture', { mode: 0o700 });
+  await fs.writeFile(path.join(plugin, 'WebDriverAgentRunner'), 'fixture', { mode: 0o700 });
+  await fs.writeFile(path.join(products, manifestName), 'fixture');
+}
+
+async function buildFixture(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'waal-wda-test-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const config = { runtime_dir: path.join(root, 'runtime'), development_team: 'fixture-team', device_udid: udid };
+  const upstream = path.join(config.runtime_dir, 'node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent');
+  await fs.mkdir(path.join(upstream, 'WebDriverAgent.xcodeproj'), { recursive: true });
+  await fs.writeFile(path.join(upstream, 'package.json'), '{"version":"1.2.3"}');
+  await fs.writeFile(path.join(upstream, 'WebDriverAgent.xcodeproj/project.pbxproj'), 'com.facebook.WebDriverAgentRunner');
+  const fixture = { builds: [], readManifests: [], profileDevices: [udid], profileExpiry: '2099-01-01T00:00:00Z', build: async (_args, products) => {
+    await writeProducts(products);
+    return 0;
+  } };
+  t.mock.module('node:child_process', { namedExports: { spawn(file, args, options) {
+    assert.equal(file, '/usr/bin/xcodebuild');
+    assert.equal(options.detached, !args.includes('generic/platform=iOS'));
+    assert.equal(args.at(-1), 'build-for-testing');
+    const child = new EventEmitter();
+    Object.assign(child, { pid: 99999998, exitCode: null, signalCode: null,
+      kill: signal => { fixture.onChildSignal?.(signal); return true; } });
+    fixture.builds.push(args);
+    const products = path.join(args[args.indexOf('-derivedDataPath') + 1], 'Build/Products');
+    Promise.resolve().then(() => fixture.build(args, products)).then(
+      code => { child.exitCode = code; child.emit('exit', code, null); }, cause => child.emit('error', cause));
+    return child;
+  } } });
+  t.mock.method(process, 'kill', (_pid, _signal) => { throw Object.assign(new Error(), { code: 'ESRCH' }); });
+  // Stop foreground requests at their first plist read, before XCTest or device access.
+  t.mock.module('./support.mjs', { namedExports: { ...support, runQuiet: async (file, args) => {
+    if (file === '/usr/bin/security') { assert.deepEqual(args.slice(0, 3), ['cms', '-D', '-i']); return ''; }
+    assert.equal(file, '/usr/bin/plutil');
+    if (args[0] === '-extract') {
+      return args[1] === 'ProvisionedDevices' ? JSON.stringify(fixture.profileDevices) : fixture.profileExpiry;
+    }
+    fixture.readManifests.push(args.at(-1));
+    throw new Error('fixture plist');
+  } } });
+  const api = await import(`./wda.mjs?fixture=${path.basename(root)}`);
+  const host = path.join(root, 'wda-host-products-1.2.3');
+  const existing = path.join(root, 'wda-derived-data-1.2.3/Build/Products');
+  return Object.assign(fixture, { ...api, config, host, existing, root });
+}
+
+test('host preparation reuses existing signed products and requires no selected phone', async t => {
+  const f = await buildFixture(t);
+  await writeProducts(f.existing);
+  const hostConfig = { ...f.config, get device_udid() { throw new Error('host preparation used phone selection'); } };
+  await f.prepareHostRunner(hostConfig, new AbortController().signal);
+  assert.deepEqual(f.builds, []);
+  assert.deepEqual(f.readManifests, []);
+});
+
+test('host build uses local signing and publishes complete products for foreground reuse', async t => {
+  const f = await buildFixture(t);
+  const signal = new AbortController().signal;
+  const hostConfig = { ...f.config, get device_udid() { throw new Error('host preparation used phone selection'); } };
+  await f.prepareHostRunner(hostConfig, signal);
+  await f.prepareHostRunner(hostConfig, signal);
+  const [args] = f.builds;
+  assert.equal(args[args.indexOf('-destination') + 1], 'generic/platform=iOS');
+  assert.ok(args.includes('DEVELOPMENT_TEAM=fixture-team'));
+  assert.ok(args.includes('CODE_SIGN_IDENTITY=Apple Development'));
+  assert.ok(!args.includes('-allowProvisioningUpdates'));
+  assert.ok(!args.includes('-allowProvisioningDeviceRegistration'));
+  assert.ok(!args.some(arg => arg.includes(udid)));
+  await assert.rejects(f.startNativeWda(f.config, device, { signal }), /fixture plist/);
+  assert.equal(f.builds.length, 1);
+  assert.deepEqual(f.readManifests, [path.join(f.host, manifestName)]);
+  assert.ok(!(await fs.readdir(f.root)).some(item => item.startsWith('wda-host-build-')));
+});
+
+test('generic signing for another device or an expired profile falls back to the targeted build', async t => {
+  const f = await buildFixture(t);
+  const signal = new AbortController().signal;
+  await f.prepareHostRunner(f.config, signal);
+  f.profileDevices = ['different-device'];
+  await assert.rejects(f.startNativeWda(f.config, device, { signal }), /fixture plist/);
+  await fs.rm(f.existing, { recursive: true });
+  f.profileDevices = [udid];
+  f.profileExpiry = '2000-01-01T00:00:00Z';
+  await assert.rejects(f.startNativeWda(f.config, device, { signal }), /fixture plist/);
+  assert.equal(f.builds.length, 3);
+  assert.deepEqual(f.readManifests, [path.join(f.existing, manifestName), path.join(f.existing, manifestName)]);
+});
+
+test('foreground fallback never consumes an unfinished optional build or waits for it', async t => {
+  const f = await buildFixture(t);
+  const staged = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const signal = new AbortController().signal;
+  f.build = async (args, products) => {
+    await writeProducts(products);
+    if (!args.includes('generic/platform=iOS')) return 0;
+    staged.resolve();
+    await release.promise;
+    return 1;
+  };
+  const background = f.prepareHostRunner(f.config, signal);
+  try {
+    await staged.promise;
+    await assert.rejects(fs.stat(f.host), { code: 'ENOENT' });
+    await assert.rejects(f.startNativeWda(f.config, device, { signal }), /fixture plist/);
+    assert.deepEqual(f.readManifests, [path.join(f.existing, manifestName)]);
+    assert.ok(f.builds[1].includes(`id=${udid}`));
+    assert.ok(f.builds[1].includes('-allowProvisioningUpdates'));
+  } finally {
+    release.resolve();
+    await assert.rejects(background, { code: 'wda_build_failed' });
+  }
+  assert.ok(!(await fs.readdir(f.root)).some(item => item.startsWith('wda-host-build-')));
+});
+
+test('aborted preparation stops the compiler in the supervisor group and discards staging products', async t => {
+  const f = await buildFixture(t);
+  const staged = Promise.withResolvers();
+  const terminated = Promise.withResolvers();
+  const controller = new AbortController();
+  const signals = [];
+  t.mock.method(process, 'kill', () => { assert.fail('host build attempted to signal a separate process group'); });
+  f.onChildSignal = signal => { signals.push(signal); terminated.resolve(); };
+  f.build = async (_args, products) => {
+    await writeProducts(products);
+    staged.resolve();
+    await terminated.promise;
+    return 0;
+  };
+  const prepared = f.prepareHostRunner(f.config, controller.signal);
+  await staged.promise;
+  controller.abort();
+  await assert.rejects(prepared, { name: 'AbortError' });
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.deepEqual((await fs.readdir(f.root)).sort(), ['runtime']);
 });

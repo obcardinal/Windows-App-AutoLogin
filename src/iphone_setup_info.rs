@@ -139,7 +139,7 @@ fn selected_id(root: &Path) -> Result<(String, bool), SetupInfo> {
     id_from_document(&pending).map(|id| (id, false))
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     let hex = |s: &str, n| s.len() == n && s.bytes().all(|c| c.is_ascii_hexdigit());
     hex(id, 40)
         || id

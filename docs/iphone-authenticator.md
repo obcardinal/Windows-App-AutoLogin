@@ -96,6 +96,22 @@ user; `config.json` is mode `0600`. Setup copies the helper's `.mjs` modules the
 rerun it after updating helper source. Repeated setup preserves the selected
 device and reuses an already installed matching runtime.
 
+### What happens before a sign-in
+
+When at least one enabled account uses Microsoft Authenticator and an installed
+helper has a selected iPhone, AutoLogin checks for an existing XCTest build on
+this Mac. It does this at startup and after a configuration change, including
+saving a phone in Settings. If a build is needed, AutoLogin runs its own
+`xcodebuild build-for-testing` in the background using the local signing setup.
+The signed product stays on disk across app restarts. A failed preparation can
+retry after a password write. Turning off the last eligible account or quitting
+AutoLogin cancels an in-progress build.
+
+The Xcode app can stay open for other projects. Each real sign-in starts a
+private Appium server and a fresh XCTest session on the selected iPhone. Both
+are closed at the end of the attempt. Preparing the build uses no phone session
+and does not open Authenticator.
+
 ## Select and prepare the physical iPhone
 
 1. Keep this Mac and the previously paired iPhone on the same trusted Wi-Fi

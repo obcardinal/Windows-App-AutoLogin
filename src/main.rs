@@ -24,6 +24,8 @@ pub(crate) mod background;
 pub(crate) mod config;
 pub(crate) mod debug_fill;
 #[cfg(target_os = "macos")]
+mod iphone_preparation;
+#[cfg(target_os = "macos")]
 pub(crate) mod iphone_setup_info;
 #[cfg(target_os = "macos")]
 pub(crate) mod iphone_sso;
@@ -254,6 +256,10 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
     .with_storage_recovery_sticky_blocked(storage_recovery_sticky_blocked);
     #[cfg(target_os = "macos")]
     {
+        supervisor.iphone_preparation = user_paths::config_dir().ok().map(|dir| {
+            iphone_preparation::HostPreparation::new(dir.join("iphone-automation/config.json"))
+        });
+        supervisor.poll_iphone_preparation(iphone_preparation::Trigger::Configuration);
         // Native startup/keychain work can already service Apple events.
         // Retain the handler registered before that work, and refresh after
         // native startup as well as after finishLaunching.
@@ -936,6 +942,8 @@ struct LightweightSupervisor {
     #[cfg(target_os = "macos")]
     iphone_progress: iphone_sso_ui::ProgressUi,
     #[cfg(target_os = "macos")]
+    iphone_preparation: Option<iphone_preparation::HostPreparation>,
+    #[cfg(target_os = "macos")]
     pending_update_check: bool,
     #[cfg(target_os = "macos")]
     update_resume_monitor: Option<bool>,
@@ -1002,6 +1010,8 @@ impl LightweightSupervisor {
             updater: None,
             #[cfg(target_os = "macos")]
             iphone_progress: iphone_sso_ui::ProgressUi::default(),
+            #[cfg(target_os = "macos")]
+            iphone_preparation: None,
             #[cfg(target_os = "macos")]
             pending_update_check: false,
             #[cfg(target_os = "macos")]
@@ -1283,6 +1293,9 @@ impl LightweightSupervisor {
             #[cfg(target_os = "macos")]
             {
                 self.pending_update_check = false;
+                if let Some(preparation) = &mut self.iphone_preparation {
+                    preparation.stop();
+                }
             }
             self.worker_pause_latch.pause();
             self.worker_invalidator.invalidate();
@@ -1358,6 +1371,22 @@ impl LightweightSupervisor {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn poll_iphone_preparation(&mut self, trigger: iphone_preparation::Trigger) {
+        let Some(preparation) = &mut self.iphone_preparation else {
+            return;
+        };
+        let eligible = !self.exit_requested
+            && self.storage_recovery_ready
+            && !self.storage_recovery_sticky_blocked
+            && self
+                .config
+                .accounts
+                .iter()
+                .any(|account| account.enabled && account.iphone_authenticator_enabled);
+        preparation.poll(Instant::now(), eligible, trigger);
+    }
+
     fn process_worker_events(&mut self) {
         while let Ok(event) = self.worker_event_rx.try_recv() {
             match event {
@@ -1366,6 +1395,10 @@ impl LightweightSupervisor {
                     self.update_tray_status();
                 }
                 background::WorkerEvent::FillAttemptReport(report) => {
+                    #[cfg(target_os = "macos")]
+                    if report.field("password_write_state") == Some("completed") {
+                        self.poll_iphone_preparation(iphone_preparation::Trigger::PasswordWritten);
+                    }
                     if let Some(tray) = &self.tray {
                         tray.set_last_result(&fill_result_label(&report));
                     }
@@ -2869,6 +2902,8 @@ impl LightweightSupervisor {
             self.config.settings.hide_menu_bar_icon != next_config.settings.hide_menu_bar_icon;
         self.config = next_config;
         self.storage_recovery_ready = true;
+        #[cfg(target_os = "macos")]
+        self.poll_iphone_preparation(iphone_preparation::Trigger::Configuration);
         self.update_tray_status();
         #[cfg(target_os = "macos")]
         if presentation_changed {
@@ -3026,6 +3061,8 @@ impl ApplicationHandler<SupervisorEvent> for LightweightSupervisor {
             return;
         }
         self.retry_blocked_storage_recovery();
+        #[cfg(target_os = "macos")]
+        self.poll_iphone_preparation(iphone_preparation::Trigger::Tick);
         self.poll_accessibility();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + SUPERVISOR_TICK));
     }

@@ -189,6 +189,24 @@ pub(crate) fn private_file(path: &std::path::Path, limit: u64) -> anyhow::Result
 }
 
 fn helper_command() -> anyhow::Result<Command> {
+    let mut command = verified_node_command()?;
+    command.arg("./run-request.mjs");
+    Ok(command)
+}
+
+pub(crate) fn host_prepare_command() -> anyhow::Result<Command> {
+    let mut command = verified_node_command()?;
+    // The preparation entry point travels inside the signed app. Relative
+    // imports resolve to the installed modules verified below.
+    command.args([
+        "--input-type=module",
+        "--eval",
+        include_str!("../script/iphone-automation/prepare-host.mjs"),
+    ]);
+    Ok(command)
+}
+
+fn verified_node_command() -> anyhow::Result<Command> {
     let root = crate::user_paths::config_dir()?.join("iphone-automation");
     let metadata = std::fs::symlink_metadata(&root)?;
     anyhow::ensure!(
@@ -200,7 +218,11 @@ fn helper_command() -> anyhow::Result<Command> {
     let config: HelperConfig =
         serde_json::from_slice(&private_file(&root.join("config.json"), 8192)?)?;
     anyhow::ensure!(
-        config.schema_version == 1 && config.device_udid.is_some(),
+        config.schema_version == 1
+            && config
+                .device_udid
+                .as_deref()
+                .is_some_and(crate::iphone_setup_info::valid_id),
         "iPhone is not configured"
     );
     anyhow::ensure!(
@@ -242,7 +264,6 @@ fn helper_command() -> anyhow::Result<Command> {
     }
     let mut command = Command::new(&config.node_path);
     command
-        .arg(root.join("run-request.mjs"))
         .current_dir(&root)
         .env_clear()
         .env(
