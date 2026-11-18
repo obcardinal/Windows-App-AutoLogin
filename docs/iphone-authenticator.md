@@ -17,9 +17,10 @@ The helper waits for the selected iPhone to be unlocked, opens Microsoft
 Authenticator, and waits for the supported request screen for that exact account.
 It enters the number and submits that request only after the Mac rechecks that
 the original challenge is still current. Unknown, ambiguous, changed, or expired
-screens stop assistance. The field check has up to ten seconds. If it takes
-more than two seconds, the Mac rechecks the request before entry and asks
-you to review it and tap **Approve** on the iPhone.
+screens stop assistance. The field check has up to ten seconds. After successful
+entry verification and a fresh desktop permit, the helper checks the account,
+number, and enabled button again, then clicks **Approve** once. Each action permit
+allows up to ten seconds for its phone checks.
 
 The user enters the iPhone passcode and performs Face ID on the phone. Developer
 Mode, Appium, and XCUITest do not bypass either. A submitted request is not reported
@@ -37,8 +38,7 @@ stage, outcome and, when available, a reason such as `account_mismatch`,
 `screen_changed` or `authorization_expired`. If the app exits during an attempt,
 the last recorded stage can still show `in_progress`. `submitted_unverified`
 means that the iPhone helper reported submission. It does not confirm desktop sign-in.
-`manual_approval_required` means the helper entered the number and handed the
-request back to you. `field_verification_timeout` means the ten-second field
+`field_verification_timeout` means the ten-second field
 check expired before entry.
 The report is private to the local user and contains no account or device identifiers,
 sign-in numbers, passwords, or screen contents.

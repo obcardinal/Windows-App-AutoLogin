@@ -27,7 +27,6 @@ pub(crate) enum Phase {
     WaitingForRequest,
     EnteringNumber,
     FaceId,
-    ManualApprovalRequired,
     Finished,
     Cancelled,
     Failed,
@@ -43,8 +42,7 @@ impl Phase {
     pub(crate) fn needs_close_button(self) -> bool {
         matches!(
             self,
-            Self::ManualApprovalRequired
-                | Self::Failed
+            Self::Failed
                 | Self::FieldCheckTimedOut
                 | Self::SetupRequired
                 | Self::DeviceSetupRequired
@@ -127,7 +125,6 @@ impl Phase {
             Self::WaitingForRequest => "Waiting for the matching Microsoft Authenticator request…",
             Self::EnteringNumber => "Entering the sign-in number on your iPhone…",
             Self::FaceId => "Complete Face ID or the remaining confirmation on your iPhone.",
-            Self::ManualApprovalRequired => "Review the sign-in request in Microsoft Authenticator on your iPhone. If it’s yours, tap Approve and complete Face ID if asked.",
             Self::Finished => "iPhone assistance finished.",
             Self::Cancelled => "iPhone assistance cancelled. You can finish signing in manually.",
             Self::Failed => {
@@ -153,7 +150,6 @@ pub(crate) struct Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     SubmittedUnverified,
-    ManualApprovalRequired,
     Cancelled,
     Unavailable,
 }
@@ -290,7 +286,6 @@ enum HelperEvent {
     Status { phase: String },
     Authorize { sequence: u64, action: String },
     Submitted {},
-    ManualApprovalRequired {},
     Closed {},
     Error { code: String },
 }
@@ -302,7 +297,6 @@ enum Protocol {
     OpenPermitted,
     EntryPermitted,
     SubmitPermitted,
-    ManualEntryPermitted,
     Submitted,
     Finishing,
     Closed,
@@ -319,9 +313,6 @@ impl Protocol {
             }
             (Self::EntryPermitted, 3, "submit_number") => {
                 (Self::SubmitPermitted, Stage::SubmittingNumber)
-            }
-            (Self::EntryPermitted, 3, "enter_number_for_manual_approval") => {
-                (Self::ManualEntryPermitted, Stage::RecheckingManualEntry)
             }
             _ => anyhow::bail!("unexpected iPhone action"),
         };
@@ -348,15 +339,6 @@ impl Protocol {
         anyhow::ensure!(
             *self == Self::Finishing,
             "unexpected iPhone cleanup response"
-        );
-        *self = Self::Closed;
-        Ok(())
-    }
-
-    fn manual_approval_required(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            *self == Self::ManualEntryPermitted,
-            "unexpected iPhone handoff"
         );
         *self = Self::Closed;
         Ok(())
@@ -454,11 +436,7 @@ pub(crate) fn assist(
     notify(Phase::Preparing);
     let mut failure_phase = Phase::Failed;
     let cleanup_failed = Arc::new(AtomicBool::new(false));
-    enum CompletionMode {
-        Submitted,
-        ManualApprovalRequired,
-    }
-    let result = (|| -> Result<CompletionMode, Reason> {
+    let result = (|| -> Result<(), Reason> {
         if !account.enabled || !account.iphone_authenticator_enabled {
             return Err(Reason::AccountDisabled);
         }
@@ -545,10 +523,7 @@ pub(crate) fn assist(
                     }
                 } else if matches!(
                     protocol,
-                    Protocol::Initial
-                        | Protocol::OpenPermitted
-                        | Protocol::EntryPermitted
-                        | Protocol::ManualEntryPermitted
+                    Protocol::Initial | Protocol::OpenPermitted | Protocol::EntryPermitted
                 ) {
                     // Once submit is permitted the desktop can advance before
                     // WDA returns its click response. Await the explicit helper
@@ -582,13 +557,7 @@ pub(crate) fn assist(
                 }
                 Ok(Ok(Some(HelperEvent::Closed {}))) => {
                     protocol.closed().map_err(|_| Reason::ProtocolError)?;
-                    return Ok(CompletionMode::Submitted);
-                }
-                Ok(Ok(Some(HelperEvent::ManualApprovalRequired {}))) => {
-                    protocol
-                        .manual_approval_required()
-                        .map_err(|_| Reason::ProtocolError)?;
-                    return Ok(CompletionMode::ManualApprovalRequired);
+                    return Ok(());
                 }
                 Ok(Ok(Some(HelperEvent::Error { code }))) => {
                     // Never interpolate helper-provided strings into an error.
@@ -609,13 +578,7 @@ pub(crate) fn assist(
             trace.finish(report::Outcome::Failed, Some(Reason::WdaCleanupUnverified));
             Outcome::Unavailable
         }
-        Ok(CompletionMode::ManualApprovalRequired) => {
-            trace.advance(Stage::WaitingForConfirmation);
-            trace.finish(report::Outcome::ManualApprovalRequired, None);
-            notify(Phase::ManualApprovalRequired);
-            Outcome::ManualApprovalRequired
-        }
-        Ok(CompletionMode::Submitted) => {
+        Ok(()) => {
             notify(Phase::Finished);
             trace.finish(report::Outcome::SubmittedUnverified, None);
             Outcome::SubmittedUnverified
@@ -673,41 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_entry_requires_a_separate_permit_and_cannot_submit() {
-        let mut state = Protocol::default();
-        assert!(state.manual_approval_required().is_err());
-        assert!(state
-            .authorize(3, "enter_number_for_manual_approval")
-            .is_err());
-        state.authorize(1, "open_authenticator").unwrap();
-        assert!(state.manual_approval_required().is_err());
-        state.authorize(2, "enter_number").unwrap();
-        assert!(state.manual_approval_required().is_err());
-        let mut automatic = state;
-        automatic.authorize(3, "submit_number").unwrap();
-        assert!(automatic.manual_approval_required().is_err());
-        assert!(automatic
-            .authorize(4, "enter_number_for_manual_approval")
-            .is_err());
-        assert_eq!(
-            state
-                .authorize(3, "enter_number_for_manual_approval")
-                .unwrap(),
-            Stage::RecheckingManualEntry
-        );
-        assert!(state.authorize(3, "submit_number").is_err());
-        assert!(state.authorize(4, "submit_number").is_err());
-        assert!(state.submitted().is_err());
-        assert!(state.finish().is_err());
-        assert!(state.closed().is_err());
-        state.manual_approval_required().unwrap();
-        assert!(state.manual_approval_required().is_err());
-        assert!(state.submitted().is_err());
-        assert!(Phase::ManualApprovalRequired.needs_close_button());
-        assert_eq!(
-            serde_json::to_value(report::Outcome::ManualApprovalRequired).unwrap(),
-            "manual_approval_required"
-        );
+    fn field_timeout_has_a_distinct_status() {
         assert_eq!(
             Reason::from_helper("field_verification_timeout"),
             Reason::FieldVerificationTimeout

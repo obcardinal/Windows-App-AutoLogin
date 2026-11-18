@@ -2,8 +2,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { AUTHENTICATOR_BUNDLE, AutomationError } from './support.mjs';
 
 const ELEMENT_KEY = 'element-6066-11e4-a52e-4f735466cecf';
-const PERMIT_MAX_AGE_MS = 2000;
 const FIELD_VERIFICATION_LIMIT_MS = 10000;
+const PERMIT_MAX_AGE_MS = FIELD_VERIFICATION_LIMIT_MS;
 
 // Observed on a physical iPhone on 2026-11-17. The account is exposed as one
 // accessibility group, labelled "<organization>, <email>". The organization's
@@ -176,32 +176,13 @@ export async function assistNumberMatch({ session, layout, request, authorize, o
   const fieldCheckMs = fieldVerifiedAt - writePermit;
   if (fieldCheckMs > FIELD_VERIFICATION_LIMIT_MS) throw failure('field_verification_timeout');
   if (!sameControls(screen, beforeWrite) || !layout.empty_values.includes(beforeWrite.value)) throw failure('screen_changed');
-  const manualApproval = fieldCheckMs > PERMIT_MAX_AGE_MS;
-  if (manualApproval) {
-    // The earlier permit expired during a read. Bind entry to a new desktop
-    // check and to the recently observed phone controls. This branch can only
-    // hand off to the person using the phone.
-    await permit('enter_number_for_manual_approval');
-    await unlocked(session);
-    const [active, value, accounts] = await Promise.all([
-      session.execute('mobile: activeAppInfo'),
-      session.request('GET', `/element/${beforeWrite.field}/attribute/value`),
-      matches(session, accountSelector(layout, request.account)),
-    ]);
-    if (active?.bundleId !== AUTHENTICATOR_BUNDLE || !layout.empty_values.includes(value) || accounts.length !== 1) {
-      throw failure('screen_changed');
-    }
-    freshPermit(fieldVerifiedAt);
-  } else {
-    freshPermit(writePermit);
-  }
+  freshPermit(writePermit);
   onStatus('entering_number');
   await session.request('POST', `/element/${beforeWrite.field}/value`, { text: request.number });
   current();
   const afterWrite = await observeNumberMatch(session, layout, request.account);
   current();
   if (!sameControls(beforeWrite, afterWrite) || afterWrite.value !== request.number) throw failure('number_entry_unconfirmed');
-  if (manualApproval) return 'manual_approval_required';
   const submitPermit = await permit('submit_number');
   const beforeSubmit = await observeNumberMatch(session, layout, request.account);
   current();

@@ -6,7 +6,7 @@ import { assistNumberMatch, verifiedAuthenticatorLayout } from './authenticator.
 import { AutomationError } from './support.mjs';
 
 const MAX_LINE_BYTES = 4096;
-const ACTIONS_BY_STEP = [['open_authenticator'], ['enter_number'], ['submit_number', 'enter_number_for_manual_approval']];
+const ACTIONS_BY_STEP = ['open_authenticator', 'enter_number', 'submit_number'];
 const PHASES = new Set(['waiting_for_device', 'waiting_for_unlock', 'lock_state_unavailable',
   'preparing_iphone_runner', 'starting_iphone_runner', 'starting_iphone_connection', 'iphone_connected', 'waiting_for_authenticator',
   'manual_confirmation_required', 'waiting_for_number_request', 'entering_number',
@@ -125,9 +125,9 @@ export class RequestProtocol {
 
   authorize(action) {
     if (this.failure) return Promise.reject(this.failure);
-    if (this.state !== 'running' || !ACTIONS_BY_STEP[this.sequence]?.includes(action)) return Promise.reject(error('invalid_protocol'));
+    if (this.state !== 'running' || this.sequence >= ACTIONS_BY_STEP.length
+        || ACTIONS_BY_STEP[this.sequence] !== action) return Promise.reject(error('invalid_protocol'));
     this.sequence++;
-    this.lastAction = action;
     this.state = 'permission';
     const promise = new Promise((resolve, reject) => { this.resolvePermit = resolve; this.rejectPermit = reject; });
     this.permissionTimer = setTimeout(() => this.fail('authorization_timeout'), 5000);
@@ -137,12 +137,7 @@ export class RequestProtocol {
 
   complete(result) {
     if (this.failure) return Promise.reject(this.failure);
-    if (this.state !== 'running' || this.sequence !== 3) return Promise.reject(error('invalid_protocol'));
-    if (this.lastAction === 'enter_number_for_manual_approval' && result === 'manual_approval_required') {
-      this.state = 'manual_cleanup';
-      return;
-    }
-    if (this.lastAction !== 'submit_number' || result !== undefined) return Promise.reject(error('invalid_protocol'));
+    if (this.state !== 'running' || this.sequence !== 3 || result !== undefined) return Promise.reject(error('invalid_protocol'));
     this.state = 'submitted';
     const promise = new Promise((resolve, reject) => { this.resolveFinish = resolve; this.rejectFinish = reject; });
     this.emit({ type: 'submitted' });
@@ -215,9 +210,6 @@ export async function runRequest({ input = process.stdin, output = process.stdou
     // earlier request failure for confirmation that the phone runner stopped.
     if (terminalError) {
       protocol.emit({ type: 'error', code: terminalError });
-    } else if (protocol.state === 'manual_cleanup') {
-      protocol.state = 'finished';
-      protocol.emit({ type: 'manual_approval_required' });
     } else if (protocol.state === 'finished') {
       protocol.emit({ type: 'closed' });
     }
