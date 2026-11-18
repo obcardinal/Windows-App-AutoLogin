@@ -2924,6 +2924,15 @@ fn account_editor_contents(
                 account_editor_help(ui, message);
             });
         }
+        show_locked_vm_reconnect(
+            ui,
+            account,
+            app.config.accounts.len() + usize::from(!is_existing),
+            crate::macos_lock_screen::supported(),
+            crate::macos_lock_screen::screen_recording_allowed,
+            crate::macos_lock_screen::request_screen_recording_on_opt_in,
+            crate::macos_lock_screen::open_screen_recording_settings,
+        );
     });
 
     #[cfg(target_os = "macos")]
@@ -2991,6 +3000,92 @@ fn account_editor_card(ui: &mut egui::Ui, section: &str, contents: impl FnOnce(&
 #[cfg(target_os = "macos")]
 fn account_editor_help(ui: &mut egui::Ui, message: &str) {
     ui.add(egui::Label::new(egui::RichText::new(message).small().color(theme::MUTED)).wrap());
+}
+
+#[cfg(target_os = "macos")]
+fn show_locked_vm_reconnect(
+    ui: &mut egui::Ui,
+    account: &mut Account,
+    account_count: usize,
+    supported: bool,
+    permission_allowed: impl FnOnce() -> bool,
+    request_permission: impl FnOnce() -> bool,
+    open_settings: impl FnOnce() -> bool,
+) {
+    if device_needs_setup(account) {
+        return;
+    }
+    ui.separator();
+    let label = "Reconnect when locked";
+    let hint = "Reconnect the selected desktop when Windows App shows its lock screen.";
+    let changed = ui
+        .add_enabled_ui(supported || account.reconnect_locked_vm, |ui| {
+            let (_, switch) = egui::containers::Sides::new()
+                .height(36.0)
+                .shrink_left()
+                .wrap()
+                .show(
+                    ui,
+                    |ui| {
+                        let text = egui::RichText::new(label).color(theme::TEXT);
+                        ui.add(egui::Label::new(text).selectable(false))
+                    },
+                    |ui| {
+                        crate::ui::toggle::switch(ui, &mut account.reconnect_locked_vm, label)
+                            .on_hover_text(hint)
+                    },
+                );
+            switch.changed()
+        })
+        .inner;
+    if !supported {
+        account_editor_help(ui, "Automatic reconnect requires macOS 14 or later.");
+        return;
+    }
+    if account.reconnect_locked_vm {
+        if account_count > 1 && account.remote_pc.trim().is_empty() {
+            account_editor_help(ui, "Select Import next to VM device so AutoLogin can match this account to the locked desktop.");
+        }
+        // Only an explicit opt-in can present the system permission dialog.
+        // While the editor is open, notice changes in System Settings without
+        // consulting the macOS permission service on every animation frame.
+        let permission_id = egui::Id::new("locked_vm_screen_recording_permission");
+        let cached = ui
+            .ctx()
+            .data(|data| data.get_temp::<(Instant, bool)>(permission_id));
+        let allowed = match cached {
+            Some((checked, allowed)) if !changed && checked.elapsed() < Duration::from_secs(2) => {
+                allowed
+            }
+            _ => {
+                let allowed = permission_allowed() || (changed && request_permission());
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(permission_id, (Instant::now(), allowed)));
+                allowed
+            }
+        };
+        if !allowed {
+            account_editor_help(ui, "Allow Screen Recording for Windows App AutoLogin.");
+            let open_failed = permission_id.with("open_settings_failed");
+            if theme::settings_button(ui, "Open System Settings…").clicked() {
+                let failed = !open_settings();
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(open_failed, failed));
+            }
+            if ui.ctx().data(|data| data.get_temp(open_failed)) == Some(true) {
+                account_editor_help(
+                    ui,
+                    "Open Privacy & Security → Screen & System Audio Recording in System Settings.",
+                );
+            }
+            ui.ctx().request_repaint_after(Duration::from_secs(2));
+            return;
+        }
+    }
+    account_editor_help(
+        ui,
+        "Windows App reconnects when you return to the locked desktop.",
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -3579,6 +3674,7 @@ fn save_edited_account_transaction(
                 && existing.vm_target == account.vm_target
                 && existing.vm_profile == account.vm_profile
                 && existing.vm_device_id == account.vm_device_id
+                && existing.reconnect_locked_vm == account.reconnect_locked_vm
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
         });
@@ -4609,104 +4705,262 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn device_picker_selects_and_clears_a_profile_scoped_device_in_the_draft() {
+    fn locked_vm_switch_requests_permission_only_on_explicit_opt_in() {
         let ctx = egui::Context::default();
+        ctx.enable_accesskit();
         crate::ui::theme::apply(&ctx);
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
-        let app = account_test_app(config_with_account(true));
-        let account = app.config.accounts[0].clone();
-        let mut draft = account.clone();
-        draft.remote_pc = "previous.example".into();
-        let notice = "The list from Windows App may be incomplete. Refresh devices to look for more desktops.";
-        let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
-            super::DeviceChoices {
-                open: vec![super::DeviceChoice {
-                    id: "workspace:fixture".into(),
-                    name: "Selected desktop".into(),
-                    owner: "Work profile".into(),
-                    ambiguous: false,
-                }],
-                saved: vec![super::DeviceChoice {
-                    id: "workspace:closed".into(),
-                    name: "Closed desktop".into(),
-                    owner: "Work profile".into(),
-                    ambiguous: false,
-                }],
-                notices: vec![notice],
-            },
-        ))));
-        ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new(("windows_app_devices", &account.id)), task)
-        });
-        let render = |events, draft: &mut Account| {
+        let allowed = std::cell::Cell::new(false);
+        let requests = std::cell::Cell::new(0);
+        let checks = std::cell::Cell::new(0);
+        let supported = std::cell::Cell::new(true);
+        let account_count = std::cell::Cell::new(1);
+        let label = "Reconnect when locked";
+        let settings_hint = "Allow Screen Recording for Windows App AutoLogin.";
+        let opens = std::cell::Cell::new(0);
+        let mut account = Account::new("user@example.test");
+        let render = |account: &mut Account, events| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(508.0, crate::app::FULL_WINDOW_HEIGHT),
+                    egui::vec2(440.0, 200.0),
                 )),
                 events,
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
-                super::show_device_picker(ui, draft, 332.0);
+                super::show_locked_vm_reconnect(
+                    ui,
+                    account,
+                    account_count.get(),
+                    supported.get(),
+                    || {
+                        checks.set(checks.get() + 1);
+                        allowed.get()
+                    },
+                    || {
+                        requests.set(requests.get() + 1);
+                        false
+                    },
+                    || {
+                        opens.set(opens.get() + 1);
+                        true
+                    },
+                )
             })
         };
-        render(vec![], &mut draft);
-        let editor = render(vec![], &mut draft);
-        let choose = visible_text_rects(&editor, "Choose device…")[0].center();
-        render(click(choose), &mut draft);
-        render(vec![], &mut draft);
-        let menu = render(vec![], &mut draft);
-        assert_eq!(visible_text_rects(&menu, "Open windows").len(), 1);
-        assert_eq!(visible_text_rects(&menu, "Saved desktops").len(), 1);
-        assert_eq!(visible_text_rects(&menu, "Closed desktop").len(), 1);
-        let message = menu
-            .shapes
+        assert!(visible_text_rects(&render(&mut account, vec![]), label).is_empty());
+        assert_eq!(checks.get(), 0);
+        account.vm_target = "Cloud PC".into();
+        account.vm_device_id = "open-window".into();
+        let frame = render(&mut account, vec![]);
+        let switch_label = visible_text_rects(&frame, label)[0].center();
+        let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+        let (switch_id, node) = tree
+            .nodes
             .iter()
-            .find_map(|item| match &item.shape {
-                egui::Shape::Text(text) if text.galley.text() == notice => Some(text),
-                _ => None,
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::CheckBox && node.label() == Some(label)
             })
-            .expect("the device list notice must be shown");
-        assert!(message.galley.rows.len() > 1 && !message.galley.elided);
-        assert_eq!(message.galley.job.halign, egui::Align::Min);
-        assert!(!message.galley.job.justify, "wrapped notices stretch words");
-        let row = visible_text_rects(&menu, "Selected desktop")[0];
-        let right_edge = visible_text_rects(&editor, "Import")[0].right();
-        assert!(right_edge > row.right());
-        let hit = egui::pos2(right_edge, row.center().y);
-        render(vec![egui::Event::PointerMoved(hit)], &mut draft);
-        let hover = render(vec![], &mut draft);
-        assert!(hover.shapes.iter().any(|item| matches!(
-            &item.shape, egui::Shape::Rect(shape)
-                if shape.fill == crate::ui::theme::SURFACE && shape.rect.contains(hit)
-        )));
-        assert_eq!(visible_text_rects(&hover, "Selected desktop")[0], row);
-        assert_eq!(
-            visible_text_rects(&hover, "Closed desktop"),
-            visible_text_rects(&menu, "Closed desktop")
+            .unwrap();
+        assert_eq!(node.toggled(), Some(egui::accesskit::Toggled::True));
+        let bounds = node.bounds().unwrap();
+        let switch = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
         );
-        render(click(hit), &mut draft);
-        assert_eq!(draft.vm_device_id, "workspace:fixture");
-        assert_eq!(draft.vm_profile, "Work profile");
-        assert!(draft.remote_pc.is_empty());
-        draft.remote_pc = "selected.example".into();
-        let editor = render(vec![], &mut draft);
-        let bound_device =
-            visible_text_rects(&editor, "Selected desktop · Work profile")[0].center();
-        render(click(bound_device), &mut draft);
-        // The popup remeasures after a selected target adds its Clear action.
-        render(vec![], &mut draft);
-        let menu = render(vec![], &mut draft);
-        assert_eq!(visible_text_rects(&menu, "Refresh devices").len(), 1);
-        let clear = visible_text_rects(&menu, "Clear selection")[0].center();
-        render(click(clear), &mut draft);
-        assert!(draft.vm_target.is_empty());
-        assert!(draft.vm_profile.is_empty());
-        assert!(draft.vm_device_id.is_empty());
-        assert!(draft.remote_pc.is_empty());
-        assert!(app.config.accounts[0].vm_profile.is_empty());
-        assert!(app.config.accounts[0].vm_target.is_empty());
+        assert!(!visible_text_rects(&frame, settings_hint).is_empty());
+        assert_eq!(checks.get(), 1);
+        let label_click = render(&mut account, click(switch_label));
+        assert!(account.reconnect_locked_vm);
+        assert_ne!(
+            label_click.platform_output.accesskit_update.unwrap().focus,
+            *switch_id
+        );
+        assert_eq!(checks.get(), 1);
+        assert_eq!(requests.get(), 0);
+        render(&mut account, click(switch));
+        assert!(!account.reconnect_locked_vm);
+        render(&mut account, click(switch_label));
+        assert!(!account.reconnect_locked_vm);
+        assert_eq!(requests.get(), 0);
+        supported.set(false);
+        let unsupported = render(&mut account, click(switch));
+        assert!(!account.reconnect_locked_vm);
+        assert!(!visible_text_rects(
+            &unsupported,
+            "Automatic reconnect requires macOS 14 or later."
+        )
+        .is_empty());
+        assert_eq!(checks.get(), 1);
+        assert_eq!(requests.get(), 0);
+        supported.set(true);
+        render(&mut account, vec![]);
+        let denied = render(&mut account, click(switch));
+        assert!(account.reconnect_locked_vm);
+        assert!(!visible_text_rects(&denied, settings_hint).is_empty());
+        assert_eq!(requests.get(), 1);
+        render(&mut account, vec![]);
+        assert_eq!(requests.get(), 1);
+        assert_eq!(opens.get(), 0);
+        let settings_button = visible_text_rects(&denied, "Open System Settings…")[0].center();
+        render(&mut account, click(settings_button));
+        assert_eq!(opens.get(), 1);
+        assert_eq!(requests.get(), 1);
+        render(&mut account, click(switch));
+        assert!(!account.reconnect_locked_vm);
+        render(&mut account, click(switch));
+        assert!(account.reconnect_locked_vm);
+        assert_eq!(requests.get(), 2);
+        render(&mut account, click(switch));
+        assert!(!account.reconnect_locked_vm);
+        allowed.set(true);
+        let granted = render(&mut account, click(switch));
+        assert!(account.reconnect_locked_vm);
+        let label_color = granted.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.galley.job.sections[0].format.color)
+            }
+            _ => None,
+        });
+        assert_eq!(label_color, Some(crate::ui::theme::TEXT));
+        assert!(visible_text_rects(&granted, settings_hint).is_empty());
+        assert!(visible_text_rects(&granted, "Open System Settings…").is_empty());
+        assert!(!visible_text_rects(
+            &granted,
+            "Windows App reconnects when you return to the locked desktop."
+        )
+        .is_empty());
+        assert_eq!(requests.get(), 2);
+        let host_hint = "Select Import next to VM device so AutoLogin can match this account to the locked desktop.";
+        assert!(visible_text_rects(&granted, host_hint).is_empty());
+        account_count.set(2);
+        assert!(!visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
+        account.remote_pc = "myvm.example.test".into();
+        assert!(visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
+        let key_press = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(&mut account, vec![key_press(egui::Key::Tab)]);
+        render(&mut account, vec![key_press(egui::Key::Space)]);
+        assert!(!account.reconnect_locked_vm);
+        render(&mut account, vec![key_press(egui::Key::Enter)]);
+        assert!(account.reconnect_locked_vm);
+        assert_eq!(requests.get(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_picker_selects_and_clears_a_profile_scoped_device_in_the_draft() {
+        for reconnect in [true, false] {
+            let ctx = egui::Context::default();
+            crate::ui::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| style.animation_time = 0.0);
+            let app = account_test_app(config_with_account(true));
+            let account = app.config.accounts[0].clone();
+            let mut draft = account.clone();
+            assert!(draft.reconnect_locked_vm);
+            if !reconnect {
+                draft.reconnect_locked_vm = false;
+            }
+            draft.remote_pc = "previous.example".into();
+            let notice = "The list from Windows App may be incomplete. Refresh devices to look for more desktops.";
+            let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
+                super::DeviceChoices {
+                    open: vec![super::DeviceChoice {
+                        id: "workspace:fixture".into(),
+                        name: "Selected desktop".into(),
+                        owner: "Work profile".into(),
+                        ambiguous: false,
+                    }],
+                    saved: vec![super::DeviceChoice {
+                        id: "workspace:closed".into(),
+                        name: "Closed desktop".into(),
+                        owner: "Work profile".into(),
+                        ambiguous: false,
+                    }],
+                    notices: vec![notice],
+                },
+            ))));
+            ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new(("windows_app_devices", &account.id)), task)
+            });
+            let render = |events, draft: &mut Account| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(508.0, crate::app::FULL_WINDOW_HEIGHT),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| {
+                    super::show_device_picker(ui, draft, 332.0);
+                })
+            };
+            render(vec![], &mut draft);
+            let editor = render(vec![], &mut draft);
+            let choose = visible_text_rects(&editor, "Choose device…")[0].center();
+            render(click(choose), &mut draft);
+            render(vec![], &mut draft);
+            let menu = render(vec![], &mut draft);
+            assert_eq!(visible_text_rects(&menu, "Open windows").len(), 1);
+            assert_eq!(visible_text_rects(&menu, "Saved desktops").len(), 1);
+            assert_eq!(visible_text_rects(&menu, "Closed desktop").len(), 1);
+            let message = menu
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Text(text) if text.galley.text() == notice => Some(text),
+                    _ => None,
+                })
+                .expect("the device list notice must be shown");
+            assert!(message.galley.rows.len() > 1 && !message.galley.elided);
+            assert_eq!(message.galley.job.halign, egui::Align::Min);
+            assert!(!message.galley.job.justify, "wrapped notices stretch words");
+            let row = visible_text_rects(&menu, "Selected desktop")[0];
+            let right_edge = visible_text_rects(&editor, "Import")[0].right();
+            assert!(right_edge > row.right());
+            let hit = egui::pos2(right_edge, row.center().y);
+            render(vec![egui::Event::PointerMoved(hit)], &mut draft);
+            let hover = render(vec![], &mut draft);
+            assert!(hover.shapes.iter().any(|item| matches!(
+                &item.shape, egui::Shape::Rect(shape)
+                    if shape.fill == crate::ui::theme::SURFACE && shape.rect.contains(hit)
+            )));
+            assert_eq!(visible_text_rects(&hover, "Selected desktop")[0], row);
+            assert_eq!(
+                visible_text_rects(&hover, "Closed desktop"),
+                visible_text_rects(&menu, "Closed desktop")
+            );
+            render(click(hit), &mut draft);
+            assert_eq!(draft.vm_device_id, "workspace:fixture");
+            assert_eq!(draft.vm_profile, "Work profile");
+            assert!(draft.remote_pc.is_empty());
+            assert_eq!(draft.reconnect_locked_vm, reconnect);
+            draft.remote_pc = "selected.example".into();
+            let editor = render(vec![], &mut draft);
+            let bound_device =
+                visible_text_rects(&editor, "Selected desktop · Work profile")[0].center();
+            render(click(bound_device), &mut draft);
+            // The popup remeasures after a selected target adds its Clear action.
+            render(vec![], &mut draft);
+            let menu = render(vec![], &mut draft);
+            assert_eq!(visible_text_rects(&menu, "Refresh devices").len(), 1);
+            let clear = visible_text_rects(&menu, "Clear selection")[0].center();
+            render(click(clear), &mut draft);
+            assert!(draft.vm_target.is_empty());
+            assert!(draft.vm_profile.is_empty());
+            assert!(draft.vm_device_id.is_empty());
+            assert!(draft.remote_pc.is_empty());
+            assert_eq!(draft.reconnect_locked_vm, reconnect);
+            assert!(app.config.accounts[0].vm_profile.is_empty());
+            assert!(app.config.accounts[0].vm_target.is_empty());
+        }
     }
 
     #[test]
