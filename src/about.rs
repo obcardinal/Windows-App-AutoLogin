@@ -12,15 +12,6 @@ const HOMEPAGE: &str = "https://obcardinal.com";
 #[cfg(target_os = "windows")]
 const APP_ICON: &[u8] = include_bytes!("../assets/icon.png");
 
-fn release_date(version: &str) -> Option<&'static str> {
-    // Published at https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.1.
-    // Keep the date tied to its version so a future version never inherits a stale date.
-    match version {
-        "0.4.1" => Some("2026-09-02"),
-        _ => None,
-    }
-}
-
 struct ContactLink {
     label: &'static str,
     url: &'static str,

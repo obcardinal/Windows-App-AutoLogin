@@ -1,4 +1,4 @@
-use super::{release_date, APP_ICON, APP_NAME, AUTHOR, CONTACTS, HOMEPAGE, VERSION};
+use super::{APP_ICON, APP_NAME, AUTHOR, CONTACTS, HOMEPAGE, VERSION};
 use std::cell::Cell;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -360,7 +360,8 @@ unsafe fn create_content(
 }
 
 fn release_label() -> Option<String> {
-    let date = chrono::NaiveDate::parse_from_str(release_date(VERSION)?, "%Y-%m-%d").ok()?;
+    let date =
+        chrono::NaiveDate::parse_from_str(option_env!("WAAL_RELEASE_DATE")?, "%Y-%m-%d").ok()?;
     Some(format!("Released {}", date.format("%b %-d, %Y")))
 }
 

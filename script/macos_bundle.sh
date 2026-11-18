@@ -127,6 +127,8 @@ waal_write_info_plist() {
   escaped_app_display_name="$(/usr/bin/printf '%s' "$app_display_name" | waal_xml_escape)"
   escaped_cargo_version="$(/usr/bin/printf '%s' "$cargo_version" | waal_xml_escape)"
   escaped_build_version="$(/usr/bin/printf '%s' "$build_version" | waal_xml_escape)"
+  local release_date
+  release_date="$(/bin/date -u +%Y-%m-%d)" || return 1
 
   /bin/cat >"$contents_dir/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -151,6 +153,8 @@ waal_write_info_plist() {
   <string>$escaped_cargo_version</string>
   <key>CFBundleVersion</key>
   <string>$escaped_build_version</string>
+  <key>WAALReleaseDate</key>
+  <string>$release_date</string>
   <key>LSMinimumSystemVersion</key>
   <string>11.0</string>
   <key>LSApplicationCategoryType</key>

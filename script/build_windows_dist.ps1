@@ -565,6 +565,7 @@ $WindowsDirectory = $null
 $WindowsSystemDirectory = $null
 $ReleaseTreeEntries = @()
 $ReleaseGitCommit = $null
+$ReleaseDate = [DateTime]::UtcNow.ToString("yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture)
 $ReleaseGitTree = $null
 $SigningCertificate = $null
 $WindowsPublisher = ""
@@ -5252,6 +5253,7 @@ function Invoke-SanitizedCargo {
             RUSTC_WRAPPER = ""
             RUSTC_WORKSPACE_WRAPPER = ""
             WAAL_RELEASE_GIT_COMMIT = $ReleaseGitCommit
+            WAAL_RELEASE_DATE = $ReleaseDate
             WAAL_RELEASE_GIT_TREE = $ReleaseGitTree
             WAAL_RELEASE_CARGO_VERSION = $CargoVersion
             WAAL_RELEASE_RUSTC_VERSION = $RustcVersion

@@ -1,4 +1,4 @@
-use super::{release_date, ContactLink, APP_NAME, AUTHOR, CONTACTS, HOMEPAGE, VERSION};
+use super::{ContactLink, APP_NAME, AUTHOR, CONTACTS, HOMEPAGE, VERSION};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool};
@@ -39,7 +39,7 @@ pub(super) fn show() -> anyhow::Result<()> {
     let released = if timestamp_build {
         parse_date(&bundle_build, "yyyyMMddHHmmss")
     } else {
-        release_date(&version).and_then(|date| parse_date(date, "yyyy-MM-dd"))
+        bundle_string("WAALReleaseDate").and_then(|date| parse_date(&date, "yyyy-MM-dd"))
     };
     // Match Instance Control: show a distinct build, but hide timestamps and duplicates.
     let build = NSString::from_str(if timestamp_build || bundle_build == version {
