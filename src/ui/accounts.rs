@@ -2,6 +2,8 @@
 #[path = "remote_pc_import.rs"]
 mod remote_pc_import;
 #[cfg(target_os = "macos")]
+use crate::macos_ax::desktops::{DeviceChoice, DeviceChoices};
+#[cfg(target_os = "macos")]
 use remote_pc_import::RemotePcLookup;
 
 use crate::app::{
@@ -2005,6 +2007,35 @@ struct AccountRowActions {
     confirm_delete_account: Option<String>,
 }
 
+#[derive(Clone)]
+struct DeviceTask<T>(std::sync::Arc<std::sync::OnceLock<Result<T, String>>>);
+
+impl<T: Send + Sync + 'static> DeviceTask<T> {
+    fn start(
+        ctx: &egui::Context,
+        work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    ) -> Self {
+        let result = std::sync::Arc::new(std::sync::OnceLock::new());
+        let completion = std::sync::Arc::clone(&result);
+        let repaint = ctx.clone();
+        let viewport = ctx.viewport_id();
+        if std::thread::Builder::new()
+            .name("windows-app-device".into())
+            .spawn(move || {
+                let _ = completion.set(work().map_err(|error| error.to_string()));
+                repaint.request_repaint_of(viewport);
+            })
+            .is_err()
+        {
+            let _ = result.set(Err(
+                "Could not start the Windows App action. Try again.".into()
+            ));
+            ctx.request_repaint();
+        }
+        Self(result)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AccountRowControls<'a> {
     toggle: bool,
@@ -2237,6 +2268,7 @@ fn open_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp, account: Acc
     #[cfg(target_os = "macos")]
     ctx.data_mut(|data| {
         data.remove_by_type::<RemotePcLookup>();
+        data.remove_by_type::<DeviceTask<DeviceChoices>>();
     });
     forget_password_editor_state(ctx, password_editor_id(&account.id));
     app.editing_account = Some(account);
@@ -2645,6 +2677,7 @@ pub(crate) fn show_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp) {
             #[cfg(target_os = "macos")]
             ui.ctx().data_mut(|data| {
                 data.remove_by_type::<RemotePcLookup>();
+                data.remove_by_type::<DeviceTask<DeviceChoices>>();
             });
             forget_password_editor_state(ui.ctx(), password_editor_id(&account.id));
             clear_temp_password(app);
@@ -2671,11 +2704,6 @@ fn account_editor_contents(
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         return true;
-    }
-
-    #[cfg(target_os = "macos")]
-    if remote_pc_import::show_if_open(ui, account) {
-        return false;
     }
 
     let password_editor_id = password_editor_id(&account.id);
@@ -2743,19 +2771,31 @@ fn account_editor_contents(
                 .num_columns(2)
                 .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
                 .show(ui, |ui| {
-                    let label = account_editor_field_label(ui, "Remote PC");
-                    ui.add_sized(
-                        [field_width, ACCOUNT_EDITOR_CONTROL_HEIGHT],
-                        egui::TextEdit::singleline(&mut account.remote_pc)
-                            .hint_text("Hostname or IP address"),
-                    )
-                    .labelled_by(label.id);
+                    show_device_target_field(ui, account, field_width);
                     ui.end_row();
-                    ui.label("");
-                    remote_pc_import::import_button(ui, account);
+                    let label = account_editor_field_label(ui, "Remote PC");
+                    remote_pc_display(ui, &account.remote_pc, field_width).labelled_by(label.id);
                     ui.end_row();
                 });
         });
+        remote_pc_import::show_result(ui, account);
+        account_editor_help(ui, "Use Import to match this account to its desktop. Optional if you have only one account.");
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("With a linked VM, AutoLogin can:")
+                .text_style(egui::TextStyle::Button)
+                .size(12.5)
+                .color(theme::TEXT),
+        );
+        for message in [
+            "Match the active remote desktop session to this account.",
+        ] {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("•").small().color(theme::MUTED));
+                account_editor_help(ui, message);
+            });
+        }
     });
 
     #[cfg(target_os = "macos")]
@@ -2826,6 +2866,49 @@ fn account_editor_help(ui: &mut egui::Ui, message: &str) {
 }
 
 #[cfg(target_os = "macos")]
+fn remote_pc_display(ui: &mut egui::Ui, host: &str, width: f32) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, ACCOUNT_EDITOR_CONTROL_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(
+        rect,
+        ui.visuals().widgets.inactive.corner_radius,
+        theme::SURFACE,
+    );
+    let content = rect.shrink2(egui::vec2(ui.spacing().button_padding.x, 0.0));
+    let mut cell = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let text = if host.is_empty() {
+        egui::RichText::new("Not imported").color(theme::MUTED)
+    } else {
+        egui::RichText::new(host).color(theme::TEXT)
+    };
+    cell.add(
+        egui::Label::new(text)
+            .selectable(!host.is_empty())
+            .truncate(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn show_device_target_field(ui: &mut egui::Ui, account: &mut Account, field_width: f32) {
+    let label = account_editor_field_label(ui, "VM device");
+    let response = show_device_picker(ui, account, field_width).labelled_by(label.id);
+    let focus_request = egui::Id::new(("focus_vm_target", &account.id));
+    if ui
+        .ctx()
+        .data_mut(|data| data.remove_temp::<bool>(focus_request))
+        == Some(true)
+    {
+        response.request_focus();
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub(super) fn account_picker_button(
     ui: &mut egui::Ui,
     popup_id: egui::Id,
@@ -2850,6 +2933,211 @@ pub(super) fn account_picker_button(
         info
     });
     response
+}
+
+#[cfg(target_os = "macos")]
+fn show_device_picker(
+    ui: &mut egui::Ui,
+    account: &mut Account,
+    field_width: f32,
+) -> egui::Response {
+    let id = egui::Id::new(("windows_app_devices", &account.id));
+    let selection = if device_needs_setup(account) {
+        "Choose device…".to_owned()
+    } else if account.vm_profile.is_empty() {
+        account.vm_target.clone()
+    } else {
+        format!("{} · {}", account.vm_target, account.vm_profile)
+    };
+    let popup_id = id.with("menu");
+    let response = ui
+        .horizontal(|ui| {
+            let picker_width =
+                field_width - remote_pc_import::BUTTON_WIDTH - ui.spacing().item_spacing.x;
+            let picker = account_picker_button(ui, popup_id, &selection, picker_width);
+            remote_pc_import::import_button(ui, account);
+            picker
+        })
+        .inner;
+    let frame = egui::Frame::popup(ui.style())
+        .inner_margin(8)
+        .corner_radius(9)
+        .stroke(egui::Stroke::new(1.0, theme::STROKE));
+    let margins = frame.total_margin().sum();
+    let viewport = ui.ctx().content_rect();
+    let room =
+        (viewport.bottom() - response.rect.bottom()).max(response.rect.top() - viewport.top());
+    egui::Popup::menu(&response)
+        .id(popup_id)
+        .width(field_width)
+        .frame(frame)
+        .layout(egui::Layout::top_down(egui::Align::Min))
+        .style(theme::picker_popup_style)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_width(field_width - margins.x);
+            let top = ui.cursor().top();
+            let task = ui
+                .ctx()
+                .data_mut(|data| data.get_temp::<DeviceTask<DeviceChoices>>(id));
+            let result = task.as_ref().and_then(|task| task.0.get());
+            let (refresh, clear) = ui
+                .horizontal(|ui| {
+                    let icon =
+                        theme::toolbar_icon(egui::include_image!("../../assets/icons/refresh.svg"))
+                            .tint(theme::ACCENT);
+                    let refresh = ui
+                        .add_enabled(
+                            result.is_some(),
+                            egui::Button::image_and_text(
+                                icon,
+                                egui::RichText::new("Refresh devices")
+                                    .small()
+                                    .color(theme::ACCENT),
+                            )
+                            .frame_when_inactive(false),
+                        )
+                        .clicked();
+                    let clear = (!account.vm_target.is_empty()
+                        || !account.vm_profile.is_empty()
+                        || !account.remote_pc.is_empty())
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Clear selection")
+                                        .small()
+                                        .color(theme::MUTED),
+                                )
+                                .frame_when_inactive(false),
+                            )
+                            .clicked();
+                    (refresh, clear)
+                })
+                .inner;
+            if clear {
+                account.vm_target.clear();
+                account.vm_profile.clear();
+                account.vm_device_id.clear();
+                account.remote_pc.clear();
+                ui.close();
+                return;
+            }
+            ui.separator();
+            if refresh || task.is_none() {
+                let task = DeviceTask::start(ui.ctx(), crate::macos_ax::desktops::device_choices);
+                ui.ctx().data_mut(|data| data.insert_temp(id, task));
+                account_editor_help(ui, "Reading Windows App devices…");
+                return;
+            }
+            match result {
+                Some(Ok(choices)) => {
+                    // The menu may have opened with just the loading message. Size the list
+                    // against the viewport, independently of that earlier popup height.
+                    let list_height = (room - margins.y - (ui.cursor().top() - top)).max(0.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(id)
+                        .min_scrolled_height(list_height)
+                        .max_height(list_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            show_device_group(ui, "Open windows", &choices.open, account);
+                            show_device_group(ui, "Saved desktops", &choices.saved, account);
+                            if choices.open.is_empty()
+                                && choices.saved.is_empty()
+                                && choices.notices.is_empty()
+                            {
+                                account_editor_help(ui, "No Windows App desktops found.");
+                            }
+                            if !choices.notices.is_empty() {
+                                egui::Frame::new()
+                                    .fill(theme::SURFACE)
+                                    .corner_radius(6)
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        for notice in &choices.notices {
+                                            account_editor_help(ui, notice);
+                                        }
+                                    });
+                            }
+                        });
+                }
+                Some(Err(error)) => {
+                    account_editor_help(ui, error);
+                }
+                None => {
+                    account_editor_help(ui, "Reading Windows App devices…");
+                }
+            }
+        });
+    response.on_hover_text(if device_needs_setup(account) {
+        "Choose the desktop to open for this account.".to_owned()
+    } else {
+        selection
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn show_device_group(
+    ui: &mut egui::Ui,
+    heading: &str,
+    devices: &[DeviceChoice],
+    account: &mut Account,
+) {
+    if devices.is_empty() {
+        return;
+    }
+    ui.label(theme::section_label(heading));
+    for device in devices {
+        let selected = account.vm_target == device.name
+            && (account.vm_device_id == device.id
+                || (account.vm_device_id.is_empty() && account.vm_profile == device.owner));
+        let label = if device.ambiguous {
+            format!("{} (multiple windows)", device.name)
+        } else if devices
+            .iter()
+            .any(|other| other.id != device.id && other.name == device.name)
+        {
+            format!(
+                "{} · {}",
+                device.name,
+                if device.owner.is_empty() {
+                    "Local PC"
+                } else {
+                    &device.owner
+                }
+            )
+        } else {
+            device.name.clone()
+        };
+        let icon = theme::toolbar_icon(egui::include_image!("../../assets/icons/desktop.svg"))
+            .tint(if selected {
+                theme::ACCENT
+            } else {
+                theme::MUTED
+            });
+        let button = ui.add_enabled(
+            !device.ambiguous,
+            egui::Button::selectable(selected, (icon, &label))
+                .min_size(egui::vec2(ui.available_width(), 28.0))
+                .truncate(),
+        );
+        if button
+            .on_hover_text(&label)
+            .on_disabled_hover_text(
+                "Several open windows have this title. Select the intended window in Windows App.",
+            )
+            .clicked()
+        {
+            if !selected || account.vm_profile != device.owner {
+                account.remote_pc.clear();
+            }
+            account.vm_device_id.clone_from(&device.id);
+            account.vm_target.clone_from(&device.name);
+            account.vm_profile.clone_from(&device.owner);
+            ui.close();
+        }
+    }
 }
 
 fn account_editor_field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -3032,7 +3320,7 @@ fn save_edited_account(
     } else if let Some(host) = canonical_remote_pc(&account.remote_pc) {
         host
     } else {
-        return Err("Enter a valid Remote PC hostname or IP address.".to_owned());
+        return Err("Import a valid Remote PC address or clear the device selection.".to_owned());
     };
     let effective_enabled = app
         .config
@@ -3152,6 +3440,9 @@ fn save_edited_account_transaction(
                 && existing.iphone_authenticator_enabled == account.iphone_authenticator_enabled
                 && existing.authenticator_provider == account.authenticator_provider
                 && existing.remote_pc == account.remote_pc
+                && existing.vm_target == account.vm_target
+                && existing.vm_profile == account.vm_profile
+                && existing.vm_device_id == account.vm_device_id
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
         });
@@ -3952,6 +4243,171 @@ mod tests {
             });
             assert_eq!(painted, expected_hover);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_picker_shows_the_full_error_after_a_pending_lookup() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut draft = Account::new("user@example.test");
+        let pending =
+            super::DeviceTask::<super::DeviceChoices>(Arc::new(std::sync::OnceLock::new()));
+        let id = egui::Id::new(("windows_app_devices", &draft.id));
+        ctx.data_mut(|data| data.insert_temp(id, pending.clone()));
+        let mut render = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(480.0, 428.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.add_space(150.0);
+                    super::show_device_picker(ui, &mut draft, 320.0);
+                },
+            )
+        };
+        let editor = render(vec![]);
+        render(click(
+            visible_text_rects(&editor, "Choose device…")[0].center(),
+        ));
+        let loading = render(vec![]);
+        assert_eq!(
+            visible_text_rects(&loading, "Reading Windows App devices…").len(),
+            1
+        );
+
+        let error = "Could not read the device list from Windows App. Open the Devices tab in the intended work profile and wait for its desktops to appear, then refresh the list.";
+        assert!(pending.0.set(Err(error.into())).is_ok());
+        render(vec![]);
+        let menu = render(vec![]);
+        let message = menu
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Text(text) if text.galley.text() == error => {
+                    Some((text, item.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("lookup error must be shown");
+        let (text, clip) = message;
+        assert!(text.galley.rows.len() >= 3 && !text.galley.elided);
+        assert_eq!(text.galley.job.halign, egui::Align::Min);
+        assert!(
+            !text.galley.job.justify,
+            "wrapped lookup errors stretch words"
+        );
+        assert!(
+            clip.contains_rect(text.visual_bounding_rect()),
+            "lookup error is clipped"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_picker_selects_and_clears_a_profile_scoped_device_in_the_draft() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let app = account_test_app(config_with_account(true));
+        let account = app.config.accounts[0].clone();
+        let mut draft = account.clone();
+        draft.remote_pc = "previous.example".into();
+        let notice = "The list from Windows App may be incomplete. Refresh devices to look for more desktops.";
+        let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
+            super::DeviceChoices {
+                open: vec![super::DeviceChoice {
+                    id: "workspace:fixture".into(),
+                    name: "Selected desktop".into(),
+                    owner: "Work profile".into(),
+                    ambiguous: false,
+                }],
+                saved: vec![super::DeviceChoice {
+                    id: "workspace:closed".into(),
+                    name: "Closed desktop".into(),
+                    owner: "Work profile".into(),
+                    ambiguous: false,
+                }],
+                notices: vec![notice],
+            },
+        ))));
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new(("windows_app_devices", &account.id)), task)
+        });
+        let render = |events, draft: &mut Account| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(508.0, crate::app::FULL_WINDOW_HEIGHT),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                super::show_device_picker(ui, draft, 332.0);
+            })
+        };
+        render(vec![], &mut draft);
+        let editor = render(vec![], &mut draft);
+        let choose = visible_text_rects(&editor, "Choose device…")[0].center();
+        render(click(choose), &mut draft);
+        render(vec![], &mut draft);
+        let menu = render(vec![], &mut draft);
+        assert_eq!(visible_text_rects(&menu, "Open windows").len(), 1);
+        assert_eq!(visible_text_rects(&menu, "Saved desktops").len(), 1);
+        assert_eq!(visible_text_rects(&menu, "Closed desktop").len(), 1);
+        let message = menu
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Text(text) if text.galley.text() == notice => Some(text),
+                _ => None,
+            })
+            .expect("the device list notice must be shown");
+        assert!(message.galley.rows.len() > 1 && !message.galley.elided);
+        assert_eq!(message.galley.job.halign, egui::Align::Min);
+        assert!(!message.galley.job.justify, "wrapped notices stretch words");
+        let row = visible_text_rects(&menu, "Selected desktop")[0];
+        let right_edge = visible_text_rects(&editor, "Import")[0].right();
+        assert!(right_edge > row.right());
+        let hit = egui::pos2(right_edge, row.center().y);
+        render(vec![egui::Event::PointerMoved(hit)], &mut draft);
+        let hover = render(vec![], &mut draft);
+        assert!(hover.shapes.iter().any(|item| matches!(
+            &item.shape, egui::Shape::Rect(shape)
+                if shape.fill == crate::ui::theme::SURFACE && shape.rect.contains(hit)
+        )));
+        assert_eq!(visible_text_rects(&hover, "Selected desktop")[0], row);
+        assert_eq!(
+            visible_text_rects(&hover, "Closed desktop"),
+            visible_text_rects(&menu, "Closed desktop")
+        );
+        render(click(hit), &mut draft);
+        assert_eq!(draft.vm_device_id, "workspace:fixture");
+        assert_eq!(draft.vm_profile, "Work profile");
+        assert!(draft.remote_pc.is_empty());
+        draft.remote_pc = "selected.example".into();
+        let editor = render(vec![], &mut draft);
+        let bound_device =
+            visible_text_rects(&editor, "Selected desktop · Work profile")[0].center();
+        render(click(bound_device), &mut draft);
+        // The popup remeasures after a selected target adds its Clear action.
+        render(vec![], &mut draft);
+        let menu = render(vec![], &mut draft);
+        assert_eq!(visible_text_rects(&menu, "Refresh devices").len(), 1);
+        let clear = visible_text_rects(&menu, "Clear selection")[0].center();
+        render(click(clear), &mut draft);
+        assert!(draft.vm_target.is_empty());
+        assert!(draft.vm_profile.is_empty());
+        assert!(draft.vm_device_id.is_empty());
+        assert!(draft.remote_pc.is_empty());
+        assert!(app.config.accounts[0].vm_profile.is_empty());
+        assert!(app.config.accounts[0].vm_target.is_empty());
     }
 
     #[test]
@@ -6184,6 +6640,200 @@ mod tests {
     }
 
     #[test]
+    fn account_editor_shows_validation_and_keeps_the_draft_in_view() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut app = account_test_app(AppConfig::default());
+        let original_status = app.status_message.clone();
+        let mut draft = Account::new(if cfg!(target_os = "macos") {
+            "user@example.test"
+        } else {
+            ""
+        });
+        draft.remote_pc = "https://invalid.example".into();
+        app.temp_password.push_str("fixture");
+        let mut height = if cfg!(target_os = "macos") {
+            428.0
+        } else {
+            173.0
+        };
+        let margin = f32::from(super::ACCOUNT_EDITOR_MARGIN);
+        #[cfg(target_os = "macos")]
+        let picker_id = egui::Id::new(("windows_app_devices", &draft.id));
+        let mut render = |events| {
+            let mut close = false;
+            let size = egui::vec2(super::ACCOUNT_EDITOR_WIDTH, height);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
+            let frame = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(
+                        crate::ui::theme::content_frame()
+                            .inner_margin(super::ACCOUNT_EDITOR_MARGIN),
+                    )
+                    .show_inside(ui, |ui| {
+                        let body = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                close =
+                                    super::account_editor_contents(ui, &mut app, &mut draft, false);
+                            });
+                        if !close && !ui.ctx().will_discard() {
+                            height = (body.content_size.y + 2.0 * margin).ceil();
+                        }
+                    });
+            });
+            (frame, close, size)
+        };
+        render(vec![]);
+        let (frame, _, size) = render(vec![]);
+        let save = visible_text_rects(&frame, "Save")[0];
+        let panel_right = size.x - margin;
+        let white_cards = frame
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == egui::Color32::WHITE
+                        && rect.corner_radius == egui::CornerRadius::same(10) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            white_cards.len(),
+            if cfg!(target_os = "macos") { 3 } else { 1 }
+        );
+        for name in ["SIGN-IN", "Email", "Password"] {
+            assert!(!visible_text_rects(&frame, name).is_empty(), "{name}");
+        }
+        for name in [
+            "CONNECTION",
+            "Remote PC",
+            "VM device",
+            "Choose device…",
+            "Import",
+            "With a linked VM, AutoLogin can:",
+            "Match the active remote desktop session to this account.",
+            "2FA",
+            "iPhone app",
+            "Off",
+        ] {
+            assert_eq!(
+                !visible_text_rects(&frame, name).is_empty(),
+                cfg!(target_os = "macos"),
+                "{name}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let field_for = |text| {
+                let text = visible_text_rects(&frame, text)[0];
+                frame
+                    .shapes
+                    .iter()
+                    .find_map(|item| match &item.shape {
+                        egui::Shape::Rect(rect)
+                            if rect.rect.contains(text.center())
+                                && (rect.rect.height() - ACCOUNT_EDITOR_CONTROL_HEIGHT).abs()
+                                    < 1.0 =>
+                        {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let vm = field_for("Choose device…");
+            let import = field_for("Import");
+            let phone = field_for("Off");
+            assert_eq!(
+                field_for("https://invalid.example").x_range(),
+                phone.x_range()
+            );
+            assert_eq!(vm.left(), phone.left());
+            assert!(vm.right() < import.left());
+            assert_eq!(import.right(), phone.right());
+            assert_eq!(vm.y_range(), import.y_range());
+            assert_eq!(vm.height(), phone.height());
+            let help = visible_text_rects(&frame, crate::ui::iphone_sign_in::ACCOUNT_HELP)[0];
+            assert!(phone.bottom() < help.top() && help.bottom() < save.top());
+        }
+        assert!(visible_text_rects(&frame, "Sign-in details…").is_empty());
+        assert!(visible_text_rects(&frame, "Microsoft Authenticator").is_empty());
+        assert!(visible_text_rects(&frame, "Desktop ID").is_empty());
+        for card in white_cards {
+            assert!((card.left() - 18.0).abs() < 0.6 && (card.right() - panel_right).abs() < 0.6);
+        }
+        let save_button = frame
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == crate::ui::theme::ACCENT
+                        && rect.rect.contains(save.center()) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!((save_button.right() - panel_right).abs() < 0.6);
+        assert!(visible_text_rects(&frame, "Cancel")[0].right() < save.left());
+        let (_, close, _) = render(click(save.center()));
+        assert!(!close);
+        render(vec![]); // Measure the validation message before the viewport resizes.
+        let (frame, _, size) = render(vec![]);
+        let message = if cfg!(target_os = "macos") {
+            "Import a valid Remote PC address or clear the device selection."
+        } else {
+            "Email is required"
+        };
+        assert_eq!(visible_text_rects(&frame, message).len(), 1);
+        let save = visible_text_rects(&frame, "Save")[0];
+        assert!(save.right() < size.x && save.bottom() < size.y);
+        let escape = || {
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
+                super::DeviceChoices {
+                    saved: vec![super::DeviceChoice {
+                        id: "workspace:fixture".into(),
+                        name: "Desktop".into(),
+                        owner: "Work".into(),
+                        ambiguous: false,
+                    }],
+                    ..Default::default()
+                },
+            ))));
+            ctx.data_mut(|data| data.insert_temp(picker_id, task));
+            let choose = visible_text_rects(&frame, "Choose device…")[0];
+            render(click(choose.center()));
+            let (menu, _, _) = render(vec![]);
+            assert_eq!(visible_text_rects(&menu, "Desktop").len(), 1);
+            assert!(!render(escape()).1);
+            render(vec![]);
+        }
+        assert!(render(escape()).1);
+        assert_eq!(draft.remote_pc, "https://invalid.example");
+        assert_eq!(app.temp_password.as_str(), "fixture");
+        assert_eq!(app.status_message, original_status);
+    }
+
+    #[test]
     fn account_editor_fields_keep_idle_outline_on_hover_and_focus_outline_distinct() {
         let ctx = egui::Context::default();
         crate::ui::theme::apply(&ctx);
@@ -6234,6 +6884,104 @@ mod tests {
         assert_eq!(cursor_before, cursor_after);
         assert_eq!(response_rect, visibility);
         assert!(outer.contains_rect(response_rect));
+    }
+
+    #[test]
+    fn account_editor_centers_placeholders_and_values_in_their_fields() {
+        let ctx = egui::Context::default();
+        #[cfg(target_os = "macos")]
+        ctx.enable_accesskit();
+        crate::ui::theme::apply(&ctx);
+        let mut app = account_test_app(AppConfig::default());
+        let render = |draft: &mut Account, app: &mut AutoLoginApp, is_existing| {
+            ctx.run_ui(Default::default(), |ui| {
+                ui.set_width(
+                    super::ACCOUNT_EDITOR_WIDTH - 2.0 * f32::from(super::ACCOUNT_EDITOR_MARGIN),
+                );
+                super::account_editor_contents(ui, app, draft, is_existing);
+            })
+        };
+        for (is_existing, password, reveal, expected_password) in [
+            (false, "", false, "Password"),
+            (true, "", false, "Leave blank to keep saved password"),
+            (true, "sample", false, "••••••"),
+            (true, "sample", true, "sample"),
+        ] {
+            let (email, host, expected_email, expected_host) = if is_existing {
+                (
+                    "me@example.test",
+                    "vm.example",
+                    "me@example.test",
+                    "vm.example",
+                )
+            } else {
+                ("", "", "user@domain.com", "Not imported")
+            };
+            let mut draft = Account::new(email);
+            draft.remote_pc = host.into();
+            app.temp_password = empty_password_buffer();
+            app.temp_password.push_str(password);
+            app.show_password = reveal;
+            render(&mut draft, &mut app, is_existing);
+            let frame = render(&mut draft, &mut app, is_existing);
+            let text_rect = |value| {
+                frame
+                    .shapes
+                    .iter()
+                    .filter_map(|item| match &item.shape {
+                        egui::Shape::Text(text) if text.galley.text() == value => {
+                            Some(text.galley.rect.translate(text.pos.to_vec2()))
+                        }
+                        _ => None,
+                    })
+                    // The empty Add Account field and its caption both say “Password”.
+                    .max_by(|a, b| a.left().total_cmp(&b.left()))
+                    .unwrap_or_else(|| panic!("missing field text {value:?}"))
+            };
+            let enclosing_input = |text: egui::Rect| {
+                frame.shapes.iter().find_map(|item| match &item.shape {
+                    egui::Shape::Rect(field)
+                        if field.rect.height() == ACCOUNT_EDITOR_CONTROL_HEIGHT
+                            && !field.stroke.is_empty()
+                            && field.rect.contains(text.center()) =>
+                    {
+                        Some(field.rect)
+                    }
+                    _ => None,
+                })
+            };
+            let email = text_rect(expected_email);
+            let field = enclosing_input(email).expect("email shows an input outline");
+            assert!((email.center().y - field.center().y).abs() <= 1.0);
+            assert!(email.left() - field.left() >= 8.0);
+            let password = text_rect(expected_password);
+            let password_field =
+                enclosing_input(password).expect("password shows an input outline");
+            assert!(
+                (password.left() - email.left()).abs() <= 0.5,
+                "password content must align with the email content"
+            );
+            assert!((password.center().y - password_field.center().y).abs() <= 1.0);
+            #[cfg(target_os = "macos")]
+            {
+                let vm = text_rect("Choose device…");
+                let host = text_rect(expected_host);
+                assert!((email.left() - vm.left()).abs() <= 1.0);
+                assert!((host.left() - vm.left()).abs() <= 1.0);
+                assert!((host.center().y - text_rect("Remote PC").center().y).abs() <= 1.0);
+                assert!(
+                    enclosing_input(host).is_none(),
+                    "the imported address should appear as a read-only value"
+                );
+                let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+                assert!(tree.nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Label
+                        && node.value() == Some(expected_host)
+                }));
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert!(visible_text_rects(&frame, expected_host).is_empty());
+        }
     }
 
     #[test]

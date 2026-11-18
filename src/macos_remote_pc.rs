@@ -1,5 +1,4 @@
 use super::{
-    macos_identity,
     device_launch::menu_item, device_windows, is_hidden, role_matches, AxElement, AX_BUTTON_ROLE,
     AX_CHILDREN, AX_DESCRIPTION, AX_DIALOG_SUBROLE, AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_SHEETS,
     AX_STATIC_TEXT_ROLE, AX_SUBROLE, AX_TITLE, AX_VALUE, AX_WINDOWS, AX_WINDOW_ROLE,
@@ -14,49 +13,6 @@ pub(crate) enum SessionRemotePc {
     /// Windows App does not expose the owning session of an existing dialog.
     /// Always ask for confirmation before applying this address.
     OpenDialog(String),
-}
-
-#[derive(Clone)]
-pub(crate) enum ConnectionInfo {
-    NoWindow,
-    SeveralWindows,
-    Unreadable,
-    Host(String),
-}
-
-/// Read the address for a preview. The user chooses whether to apply it.
-pub(crate) fn open_connection_remote_pc() -> anyhow::Result<ConnectionInfo> {
-    let mut selected = None;
-    for process in macos_identity::trusted_process_infos(crate::config::TARGET_APP_NAME)? {
-        let app = AxElement::application(process.pid).context("Windows App is unavailable.")?;
-        let windows = app.array_attr_result(AX_WINDOWS)?;
-        ensure!(
-            windows.len() <= 64,
-            "Too many Windows App windows are open."
-        );
-        for window in windows {
-            if window.process_id() != Some(process.pid)
-                || is_hidden(&window)
-                || window.bool_attr("AXMinimized") == Some(true)
-                || window.string_attr(AX_TITLE).as_deref() != Some("Connection Information")
-            {
-                continue;
-            }
-            let identity = window.string_attrs(&[AX_ROLE, AX_SUBROLE]);
-            if identity[0].as_deref() == Some(AX_WINDOW_ROLE)
-                && identity[1].as_deref() == Some(AX_DIALOG_SUBROLE)
-            {
-                if selected.is_some() {
-                    return Ok(ConnectionInfo::SeveralWindows);
-                }
-                selected = Some((window, process.pid));
-            }
-        }
-    }
-    let Some((window, pid)) = selected else {
-        return Ok(ConnectionInfo::NoWindow);
-    };
-    read_host(&window, pid).map(ConnectionInfo::Host)
 }
 
 fn information_windows(app: &AxElement, pid: i32) -> Result<Vec<AxElement>> {
