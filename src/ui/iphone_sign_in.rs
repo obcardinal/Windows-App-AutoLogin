@@ -29,7 +29,7 @@ pub(super) fn provider_picker(
         .id(popup_id)
         .width(response.rect.width())
         .frame(frame)
-        .style(egui::style::StyleModifier::default())
+        .style(theme::picker_popup_style)
         .show(|ui| {
             ui.set_width(content_width);
             if ui.selectable_value(&mut selection, None, "Off").clicked() {
@@ -449,7 +449,7 @@ fn phone_choice(ui: &mut egui::Ui, phones: &[PairedPhone], draft: &mut Option<St
         .id(popup_id)
         .width(response.rect.width())
         .frame(frame)
-        .style(egui::style::StyleModifier::default())
+        .style(theme::picker_popup_style)
         .show(|ui| {
             ui.set_width(width);
             egui::ScrollArea::vertical()
@@ -522,10 +522,37 @@ mod tests {
         vec![egui::Event::PointerMoved(pos), press(true), press(false)]
     }
 
+    fn check_option_hover(
+        open: &egui::FullOutput,
+        label: &str,
+        mut render: impl FnMut(Vec<egui::Event>) -> egui::FullOutput,
+    ) {
+        let idle = text_rect(open, label).expect("option in the open picker");
+        render(vec![egui::Event::PointerMoved(idle.center())]);
+        let hover = render(vec![]);
+        assert_eq!(
+            text_rect(&hover, label),
+            Some(idle),
+            "{label} moved on hover"
+        );
+        let highlighted = |frame: &egui::FullOutput| {
+            frame.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Rect(row)
+                    if row.fill == theme::SURFACE && row.rect.contains_rect(idle))
+            })
+        };
+        assert!(highlighted(&hover), "{label} must be visibly highlighted");
+        render(vec![egui::Event::PointerGone]);
+        let outside = render(vec![]);
+        assert_eq!(text_rect(&outside, label), Some(idle));
+        assert!(!highlighted(&outside));
+    }
+
     #[test]
     fn choosing_a_shared_iphone_requires_an_explicit_selection_and_save() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let phones = [PairedPhone {
             id: "AAAAAAAA-1234567890000001".into(),
             name: "Work iPhone".into(),
@@ -586,6 +613,7 @@ mod tests {
             ctx.global_style().visuals.selection.stroke
         );
         assert!(text_rect(&open, &phones[0].id).is_none());
+        check_option_hover(&open, "Work iPhone", &mut frame);
         frame(click_events(&open, "Work iPhone"));
         let selected = frame(vec![]);
         assert!(text_rect(&selected, "Connected over Wi-Fi").is_some());
@@ -715,6 +743,8 @@ mod tests {
     #[test]
     fn provider_picker_selects_and_restores_the_account_choice() {
         let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let mut account = Account::new("example");
         let render = |account: &mut Account, events| {
             ctx.run_ui(
@@ -763,6 +793,56 @@ mod tests {
         assert_eq!(find(&open, "Off").len(), 2);
         assert_eq!(find(&open, "Microsoft Authenticator").len(), 1);
         assert!(find(&open, "Duo Mobile").is_empty());
+        let selected_option = *find(&open, "Off").last().unwrap();
+        let selected_stroke = |frame: &egui::FullOutput| {
+            frame
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(row)
+                        if row.fill == theme::ACCENT_SOFT
+                            && row.rect.contains_rect(selected_option) =>
+                    {
+                        Some(row.stroke)
+                    }
+                    _ => None,
+                })
+                .expect("selected popup option")
+        };
+        let idle_stroke = selected_stroke(&open);
+        render(
+            &mut account,
+            vec![egui::Event::PointerMoved(selected_option.center())],
+        );
+        let hover = render(&mut account, vec![]);
+        assert_ne!(selected_stroke(&hover), idle_stroke);
+        assert_eq!(find(&hover, "Off").last(), Some(&selected_option));
+        render(&mut account, vec![egui::Event::PointerGone]);
+        assert_eq!(selected_stroke(&render(&mut account, vec![])), idle_stroke);
+        check_option_hover(&open, "Microsoft Authenticator", |events| {
+            render(&mut account, events)
+        });
+        let provider = text_rect(&open, "Microsoft Authenticator").unwrap();
+        let focus_is_visible = (0..5).any(|_| {
+            render(
+                &mut account,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let frame = render(&mut account, vec![]);
+            assert_eq!(text_rect(&frame, "Microsoft Authenticator"), Some(provider));
+            frame.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Rect(row)
+                    if row.rect.contains_rect(provider)
+                        && row.stroke == egui::Stroke::new(1.0, theme::ACCENT))
+            })
+        });
+        assert!(focus_is_visible, "Tab must visibly focus a picker option");
         render(
             &mut account,
             vec![egui::Event::Key {

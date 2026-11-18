@@ -118,6 +118,22 @@ pub fn apply_toolbar_style(ui: &mut egui::Ui) {
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
 }
 
+#[cfg(target_os = "macos")]
+pub fn picker_popup_style(style: &mut egui::Style) {
+    let widgets = &mut style.visuals.widgets;
+    // A selectable button omits its idle frame. Keep its inset identical to
+    // the framed hover state so neither the label nor the following rows move.
+    widgets.inactive.expansion = 0.0;
+    widgets.hovered.expansion = 0.0;
+    widgets.active.expansion = 0.0;
+    widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    widgets.hovered.bg_stroke = egui::Stroke::new(1.0, STROKE);
+    widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    widgets.hovered.weak_bg_fill = SURFACE;
+    widgets.active.weak_bg_fill = ACCENT_SOFT;
+    widgets.active.bg_stroke = style.visuals.selection.stroke;
+}
+
 pub fn content_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)
