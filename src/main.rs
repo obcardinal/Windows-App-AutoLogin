@@ -52,6 +52,8 @@ pub(crate) mod tray;
 pub(crate) mod ui;
 pub(crate) mod user_paths;
 #[cfg(target_os = "windows")]
+pub(crate) mod windows_device_launch;
+#[cfg(target_os = "windows")]
 pub(crate) mod windows_ui;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

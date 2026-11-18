@@ -9,11 +9,10 @@
 mod application;
 
 #[cfg(target_os = "windows")]
-pub(crate) use application::windows_ui;
-#[cfg(target_os = "windows")]
 pub(crate) use application::{
     about, app, app_identity, autologin, autostart, background, config, debug_fill, models,
     monitor, private_permissions, remote_pc, single_instance, storage, tray, ui, user_paths,
+    windows_device_launch, windows_ui,
 };
 
 #[cfg(target_os = "windows")]
