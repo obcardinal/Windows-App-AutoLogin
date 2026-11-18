@@ -35,6 +35,8 @@ mod iphone_sso_ui;
 pub(crate) mod macos_ax;
 pub(crate) mod macos_identity;
 #[cfg(target_os = "macos")]
+pub(crate) mod macos_lock_screen;
+#[cfg(target_os = "macos")]
 pub(crate) mod macos_panel;
 #[cfg(target_os = "macos")]
 mod macos_reopen;

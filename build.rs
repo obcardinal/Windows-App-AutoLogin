@@ -25,12 +25,18 @@ const WINDOWS_AUTHENTICODE_CERT_SHA256_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_CE
 
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let bridge = "src/macos_lock_screen_capture.m";
+        println!("cargo:rerun-if-changed={bridge}");
         println!("cargo:rerun-if-changed=src/macos_masked_field.h");
         println!("cargo:rerun-if-changed=src/macos_masked_field.m");
         cc::Build::new()
+            .file(bridge)
             .file("src/macos_masked_field.m")
             .flag("-fobjc-arc")
+            .flag("-fblocks")
             .compile("waal_lock_screen_capture");
+        println!("cargo:rustc-link-arg=-Wl,-weak_framework,ScreenCaptureKit");
+        println!("cargo:rustc-link-lib=framework=Vision");
     }
     let icon = Path::new("assets/icon.png");
     let tray_icon = Path::new("assets/icon_tray.png");
