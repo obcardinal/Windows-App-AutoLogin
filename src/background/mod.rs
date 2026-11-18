@@ -3,11 +3,12 @@ use crate::debug_fill::{self, FillAttemptReport, FillMethod};
 use crate::models::{Account, AppSettings, LogEntry, LogLevel, WorkerStatus};
 use crate::monitor::{AppMonitor, MonitorObservation, MonitorStatus};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender as StdSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
@@ -204,7 +205,7 @@ impl WorkerPauseLatch {
 }
 
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
-const AUTOMATION_SLEEP: Duration = Duration::from_millis(250);
+const BUSY_PAUSE_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const PROMPT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_FALLBACK_PROMPT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -218,10 +219,6 @@ const MACOS_RETRY_REARM_SHEET_EXIT_OBSERVATIONS: u8 = 3;
 const CONNECTED_POLL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const UNKNOWN_POLL_BACKOFF_MAX: Duration = Duration::from_secs(3);
 const PRE_PASSWORD_REPORT_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
-struct FlagGuard {
-    flag: Arc<AtomicBool>,
-}
 
 #[derive(Clone)]
 struct WorkerActivityTracker {
@@ -336,24 +333,6 @@ impl Drop for WorkerActivityGuard {
     }
 }
 
-impl FlagGuard {
-    fn acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
-        if flag.swap(true, Ordering::SeqCst) {
-            None
-        } else {
-            Some(Self {
-                flag: Arc::clone(flag),
-            })
-        }
-    }
-}
-
-impl Drop for FlagGuard {
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::SeqCst);
-    }
-}
-
 fn log_event(level: LogLevel, message: impl Into<String>) -> WorkerEvent {
     WorkerEvent::Log(LogEntry {
         timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -395,7 +374,7 @@ struct CurrentPromptAttempt {
     settings: AppSettings,
     accounts: Vec<Account>,
     event_tx: Sender<WorkerEvent>,
-    automation_in_progress: Arc<AtomicBool>,
+    automation_slot: Arc<Semaphore>,
     pause_latch: WorkerPauseLatch,
     expected_generation: u64,
     prompt_context: Option<debug_fill::VerifiedPromptContext>,
@@ -1351,7 +1330,7 @@ async fn drain_commands(
 
 #[allow(clippy::too_many_arguments)]
 async fn wait_or_handle_command(
-    duration: Duration,
+    wake: impl std::future::Future,
     cmd_rx: &mut Receiver<WorkerCommand>,
     event_tx: &Sender<WorkerEvent>,
     running: &mut bool,
@@ -1362,7 +1341,7 @@ async fn wait_or_handle_command(
     activity_tracker: &WorkerActivityTracker,
 ) -> bool {
     tokio::select! {
-        _ = sleep(duration) => true,
+        _ = wake => true,
         maybe_cmd = cmd_rx.recv() => {
             let Some(cmd) = maybe_cmd else {
                 return false;
@@ -1403,7 +1382,7 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
         debug!("Fill current prompt skipped; worker is paused or config changed");
         return false;
     }
-    let Some(automation_guard) = FlagGuard::acquire(&job.automation_in_progress) else {
+    let Ok(automation_guard) = job.automation_slot.clone().try_acquire_owned() else {
         debug!("Fill current prompt skipped; UI automation is busy");
         let _ = job.event_tx.try_send(log_event(
             LogLevel::Warn,
@@ -1620,7 +1599,7 @@ struct IphoneProbe {
     accounts: Vec<Account>,
     pause_latch: WorkerPauseLatch,
     expected_generation: u64,
-    automation_in_progress: Arc<AtomicBool>,
+    automation_slot: Arc<Semaphore>,
     activity_tracker: WorkerActivityTracker,
     attempts: Arc<Mutex<IphoneAttemptMemory>>,
     event_tx: Sender<WorkerEvent>,
@@ -1629,7 +1608,7 @@ struct IphoneProbe {
 
 #[cfg(target_os = "macos")]
 fn spawn_iphone_probe(job: IphoneProbe) -> bool {
-    let Some(automation_guard) = FlagGuard::acquire(&job.automation_in_progress) else {
+    let Ok(automation_guard) = job.automation_slot.clone().try_acquire_owned() else {
         return false;
     };
     let Some(activity_guard) = job.activity_tracker.begin_attempt() else {
@@ -1717,7 +1696,7 @@ pub(crate) fn spawn(
         let mut running = false;
         let recent_prompt_attempts =
             Arc::new(Mutex::new(HashMap::<LoginPromptKey, Instant>::new()));
-        let automation_in_progress = Arc::new(AtomicBool::new(false));
+        let automation_slot = Arc::new(Semaphore::new(1));
         let activity_tracker = WorkerActivityTracker::default();
         #[cfg(target_os = "macos")]
         let iphone_attempts = Arc::new(Mutex::new(IphoneAttemptMemory::default()));
@@ -1761,7 +1740,7 @@ pub(crate) fn spawn(
                 }
                 pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
-                    IDLE_SLEEP,
+                    sleep(IDLE_SLEEP),
                     &mut cmd_rx,
                     &event_tx,
                     &mut running,
@@ -1793,10 +1772,12 @@ pub(crate) fn spawn(
                 pre_password_generation = current_generation;
             }
 
-            if automation_in_progress.load(Ordering::SeqCst) {
+            // Completion wakes this worker. The deadline also makes pauses
+            // published outside the command channel visible during long jobs.
+            if automation_slot.available_permits() == 0 {
                 poll_cadence = PollCadence::default();
                 if !wait_or_handle_command(
-                    AUTOMATION_SLEEP,
+                    tokio::time::timeout(BUSY_PAUSE_RECHECK_INTERVAL, automation_slot.acquire()),
                     &mut cmd_rx,
                     &event_tx,
                     &mut running,
@@ -1829,7 +1810,7 @@ pub(crate) fn spawn(
                     accounts: accounts.clone(),
                     pause_latch: pause_latch.clone(),
                     expected_generation: current_generation,
-                    automation_in_progress: automation_in_progress.clone(),
+                    automation_slot: automation_slot.clone(),
                     activity_tracker: activity_tracker.clone(),
                     attempts: iphone_attempts.clone(),
                     event_tx: event_tx.clone(),
@@ -1849,7 +1830,11 @@ pub(crate) fn spawn(
             if !has_enabled_account {
                 pre_password_report_persistence.reset_observed_state();
                 if !wait_or_handle_command(
-                    monitor_wait(fixed_poll_interval(), next_probe, Instant::now()),
+                    sleep(monitor_wait(
+                        fixed_poll_interval(),
+                        next_probe,
+                        Instant::now(),
+                    )),
                     &mut cmd_rx,
                     &event_tx,
                     &mut running,
@@ -2045,7 +2030,7 @@ pub(crate) fn spawn(
                                     settings: settings.clone(),
                                     accounts: accounts.clone(),
                                     event_tx: event_tx.clone(),
-                                    automation_in_progress: automation_in_progress.clone(),
+                                    automation_slot: automation_slot.clone(),
                                     pause_latch: pause_latch.clone(),
                                     expected_generation: current_generation,
                                     prompt_context: Some(prompt_context),
@@ -2185,7 +2170,7 @@ pub(crate) fn spawn(
                                     settings: settings.clone(),
                                     accounts: accounts.clone(),
                                     event_tx: event_tx.clone(),
-                                    automation_in_progress: automation_in_progress.clone(),
+                                    automation_slot: automation_slot.clone(),
                                     pause_latch: pause_latch.clone(),
                                     expected_generation: current_generation,
                                     prompt_context: Some(prompt_context),
@@ -2196,21 +2181,6 @@ pub(crate) fn spawn(
                                     activity_tracker: activity_tracker.clone(),
                                 });
                                 if started {
-                                    if !wait_or_handle_command(
-                                        AUTOMATION_SLEEP,
-                                        &mut cmd_rx,
-                                        &event_tx,
-                                        &mut running,
-                                        &mut settings,
-                                        &mut accounts,
-                                        &generation,
-                                        &pause_latch,
-                                        &activity_tracker,
-                                    )
-                                    .await
-                                    {
-                                        break;
-                                    }
                                     continue;
                                 }
                             }
@@ -2257,30 +2227,15 @@ pub(crate) fn spawn(
 
             #[cfg(target_os = "macos")]
             if prompt_attempt_started {
-                if !wait_or_handle_command(
-                    AUTOMATION_SLEEP,
-                    &mut cmd_rx,
-                    &event_tx,
-                    &mut running,
-                    &mut settings,
-                    &mut accounts,
-                    &generation,
-                    &pause_latch,
-                    &activity_tracker,
-                )
-                .await
-                {
-                    break;
-                }
                 continue;
             }
 
             if !wait_or_handle_command(
-                monitor_wait(
+                sleep(monitor_wait(
                     remaining_tick_delay(tick_start, next_poll_delay),
                     next_probe,
                     Instant::now(),
-                ),
+                )),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -2318,10 +2273,10 @@ mod tests {
     use crate::debug_fill;
     use crate::models::{Account, AppSettings, WorkerStatus};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Semaphore};
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -3448,7 +3403,7 @@ mod tests {
             settings: AppSettings::default(),
             accounts: Vec::new(),
             event_tx,
-            automation_in_progress: Arc::new(AtomicBool::new(false)),
+            automation_slot: Arc::new(Semaphore::new(1)),
             pause_latch,
             expected_generation: post_pause_generation,
             prompt_context: None,
@@ -3695,7 +3650,7 @@ mod tests {
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_secs(60)),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -3871,7 +3826,7 @@ mod tests {
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_secs(60)),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -3907,11 +3862,13 @@ mod tests {
         let mut settings = AppSettings::default();
         let mut accounts = vec![account("account-1", "user@example.com", true)];
 
+        let slot = Semaphore::new(1);
+        let in_progress = slot.try_acquire().unwrap();
         cmd_tx.send(WorkerCommand::Stop).await.unwrap();
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                slot.acquire(),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -3924,6 +3881,8 @@ mod tests {
             .await
         );
 
+        assert!(slot.try_acquire().is_err());
+        drop(in_progress);
         assert!(!running);
         assert_eq!(generation.load(Ordering::SeqCst), 6);
         assert!(recent_prompt_attempts
@@ -3963,7 +3922,7 @@ mod tests {
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_secs(60)),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -4014,7 +3973,7 @@ mod tests {
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_secs(60)),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -4069,7 +4028,7 @@ mod tests {
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_secs(60)),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
@@ -4132,7 +4091,7 @@ mod tests {
 
         assert!(
             wait_or_handle_command(
-                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_secs(60)),
                 &mut cmd_rx,
                 &event_tx,
                 &mut running,
