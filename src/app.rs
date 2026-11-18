@@ -25,6 +25,8 @@ const MAX_LOG_ENTRIES: usize = 200;
 pub(crate) const MAIN_WINDOW_WIDTH: f32 = 548.0;
 pub(crate) const FULL_WINDOW_HEIGHT: f32 = 500.0;
 pub(crate) const MIN_WINDOW_HEIGHT: f32 = 200.0;
+#[cfg(not(target_os = "macos"))]
+const TAB_RESIZE_SECONDS: f64 = 0.18;
 const ACCESSIBILITY_REQUEST_BUTTON_SIZE: [f32; 2] = [278.0, 34.0];
 const ACCESSIBILITY_SETTINGS_BUTTON_SIZE: [f32; 2] = [248.0, 34.0];
 const ACCESSIBILITY_SETTINGS_INSTRUCTIONS: &str =
@@ -459,10 +461,29 @@ where
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+struct TabHeightTransition {
+    from_height: f32,
+    started_at: f64,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl TabHeightTransition {
+    fn height_at(&self, now: f64, target: f32) -> f32 {
+        let progress = ((now - self.started_at) / TAB_RESIZE_SECONDS).clamp(0.0, 1.0) as f32;
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        egui::lerp(self.from_height..=target, eased)
+    }
+}
+
 pub(crate) struct AutoLoginApp {
     pub(crate) config: AppConfig,
     pub(crate) selected_tab: Tab,
     last_requested_window_height: Option<f32>,
+    #[cfg(not(target_os = "macos"))]
+    last_laid_out_tab: Tab,
+    #[cfg(not(target_os = "macos"))]
+    tab_height_transition: Option<TabHeightTransition>,
     pub(crate) logs: VecDeque<LogEntry>,
     pub(crate) worker_status: WorkerStatus,
     bridged_monitor_control_state: MonitorControlState,
@@ -585,6 +606,10 @@ impl AutoLoginApp {
             config,
             selected_tab: initial_tab,
             last_requested_window_height: None,
+            #[cfg(not(target_os = "macos"))]
+            last_laid_out_tab: initial_tab,
+            #[cfg(not(target_os = "macos"))]
+            tab_height_transition: None,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             worker_status,
             bridged_monitor_control_state,
@@ -2649,11 +2674,18 @@ impl AutoLoginApp {
         });
         if managed_by_os {
             self.last_requested_window_height = None;
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.last_laid_out_tab = self.selected_tab;
+                self.tab_height_transition = None;
+            }
             return;
         }
         // On macOS each native resize can temporarily display a Metal drawable
         // from the preceding frame. Request the measured height in one step.
         let height = height.ceil().max(MIN_WINDOW_HEIGHT);
+        #[cfg(not(target_os = "macos"))]
+        let height = self.tab_transition_height(ctx, current_size.y, height);
         let native_height = height * ctx.zoom_factor();
         // Resize on content changes. Repaints should not fight a manual resize or an OS size limit.
         let previous = self.last_requested_window_height.replace(native_height);
@@ -2680,6 +2712,72 @@ impl AutoLoginApp {
                 height,
             )));
         }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn tab_transition_height(
+        &mut self,
+        ctx: &egui::Context,
+        current_height: f32,
+        target: f32,
+    ) -> f32 {
+        let switched = self.last_laid_out_tab != self.selected_tab;
+        self.last_laid_out_tab = self.selected_tab;
+        let now = ctx.input(|i| i.time);
+        if switched {
+            // A native resize can lag a few frames. Reverse an ongoing transition
+            // from the last queued height so those frames still join smoothly.
+            let from_height = match (
+                &self.tab_height_transition,
+                self.last_requested_window_height,
+            ) {
+                (Some(_), Some(queued)) => queued / ctx.zoom_factor(),
+                _ => current_height,
+            };
+            self.tab_height_transition = (self.last_requested_window_height.is_some()
+                && (from_height - target).abs() >= 1.0
+                && !reduce_tab_motion())
+            .then_some(TabHeightTransition {
+                from_height,
+                started_at: now,
+            });
+        }
+        let mut height = target;
+        if let Some(transition) = &self.tab_height_transition {
+            if now - transition.started_at < TAB_RESIZE_SECONDS {
+                height = transition.height_at(now, target).round();
+                ctx.request_repaint();
+            } else {
+                self.tab_height_transition = None;
+            }
+        }
+        height
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reduce_tab_motion() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        };
+        let mut enabled = 1i32;
+        // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL to this local.
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                Some(std::ptr::from_mut(&mut enabled).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        }
+        .is_ok()
+            && enabled == 0
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        false
     }
 }
 
@@ -2806,6 +2904,40 @@ mod tests {
             }
         }
         assert_eq!(heights, [600.0, 280.0]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn tab_height_can_reverse_mid_transition_and_settle_without_overshoot() {
+        use super::{TabHeightTransition, TAB_RESIZE_SECONDS};
+
+        let compact = 260.0;
+        let expanded = 460.0;
+        let opening = TabHeightTransition {
+            from_height: compact,
+            started_at: 0.0,
+        };
+        let switched_at = TAB_RESIZE_SECONDS / 2.0;
+        let displayed = opening.height_at(switched_at, expanded).round();
+        assert!(compact < displayed && displayed < expanded);
+
+        let closing = TabHeightTransition {
+            from_height: displayed,
+            started_at: switched_at,
+        };
+        assert_eq!(closing.height_at(switched_at, compact), displayed);
+        let mut previous = displayed;
+        for step in 1..=8 {
+            let elapsed = TAB_RESIZE_SECONDS * f64::from(step) / 8.0;
+            let height = closing.height_at(switched_at + elapsed, compact).round();
+            assert!(compact <= height && height <= previous);
+            previous = height;
+        }
+        assert_eq!(previous, compact);
+        assert_eq!(
+            closing.height_at(switched_at + 2.0 * TAB_RESIZE_SECONDS, compact),
+            compact
+        );
     }
 
     fn mutation_test_app(settings_window_mode: bool) -> AutoLoginApp {
