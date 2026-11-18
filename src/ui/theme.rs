@@ -1,31 +1,19 @@
 use eframe::egui;
 use std::sync::Arc;
 
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 132, 194);
-pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(226, 241, 252);
-pub const DANGER: egui::Color32 = egui::Color32::from_rgb(190, 55, 55);
-pub const DANGER_SOFT: egui::Color32 = egui::Color32::from_rgb(251, 226, 226);
-pub const MUTED: egui::Color32 = egui::Color32::from_rgb(62, 70, 78);
-pub const TEXT: egui::Color32 = egui::Color32::from_rgb(22, 28, 34);
-pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(248, 250, 252);
-pub const STROKE: egui::Color32 = egui::Color32::from_rgb(214, 222, 230);
-
-const INTER_FONT_NAME: &str = "inter";
-const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(238, 246, 252);
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(54, 87, 198);
+pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(233, 238, 255);
+pub const DANGER: egui::Color32 = egui::Color32::from_rgb(166, 49, 61);
+pub const DANGER_SOFT: egui::Color32 = egui::Color32::from_rgb(252, 235, 238);
+pub const MUTED: egui::Color32 = egui::Color32::from_rgb(84, 96, 114);
+pub const TEXT: egui::Color32 = egui::Color32::from_rgb(29, 38, 54);
+pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(246, 247, 250);
+pub const STROKE: egui::Color32 = egui::Color32::from_rgb(216, 221, 229);
+const TAB_RAIL: egui::Color32 = egui::Color32::from_rgb(238, 240, 245);
+const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(226, 230, 238);
+const SEMIBOLD: &str = "Inter Semibold";
 const SECONDARY_IDLE: egui::Color32 = egui::Color32::from_rgb(246, 249, 252);
 const PRIMARY_OUTLINE: egui::Color32 = egui::Color32::from_rgb(43, 109, 166);
-
-fn glass() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 212)
-}
-
-fn glass_dense() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 236)
-}
-
-fn top_bar() -> egui::Color32 {
-    egui::Color32::from_rgb(250, 252, 255)
-}
 
 pub fn apply(ctx: &egui::Context) {
     apply_fonts(ctx);
@@ -35,7 +23,7 @@ pub fn apply(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::light();
 
     visuals.panel_fill = SURFACE;
-    visuals.window_fill = glass_dense();
+    visuals.window_fill = egui::Color32::WHITE;
     visuals.faint_bg_color = egui::Color32::from_rgb(241, 245, 249);
     visuals.selection.bg_fill = ACCENT_SOFT;
     visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
@@ -46,13 +34,13 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(7);
     visuals.widgets.open.corner_radius = egui::CornerRadius::same(7);
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(248, 250, 252);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(238, 246, 252);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(226, 241, 252);
+    visuals.widgets.hovered.bg_fill = TAB_RAIL;
+    visuals.widgets.active.bg_fill = ACCENT_SOFT;
     visuals.override_text_color = Some(TEXT);
 
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(24.0, 4.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(12.0, 5.0);
     style.spacing.window_margin = egui::Margin::same(12);
     style.spacing.interact_size = egui::vec2(48.0, 28.0);
     style.spacing.text_edit_width = 240.0;
@@ -62,62 +50,67 @@ pub fn apply(ctx: &egui::Context) {
         egui::TextStyle::Small,
         egui::FontId::new(12.5, egui::FontFamily::Proportional),
     );
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::new(15.75, egui::FontFamily::Proportional),
-    );
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
     style.text_styles.insert(
         egui::TextStyle::Button,
-        egui::FontId::new(15.75, egui::FontFamily::Proportional),
+        egui::FontId::new(13.0, egui::FontFamily::Name(SEMIBOLD.into())),
     );
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        egui::FontId::new(21.0, egui::FontFamily::Proportional),
+        egui::FontId::new(24.0, egui::FontFamily::Name(SEMIBOLD.into())),
     );
     style.text_styles.insert(
         egui::TextStyle::Monospace,
         egui::FontId::new(15.75, egui::FontFamily::Monospace),
     );
 
+    // eframe may first report the system appearance after this setup. Install
+    // our light palette in its own slot before the first native frame.
+    ctx.set_theme(egui::Theme::Light);
     ctx.set_global_style(style);
 }
 
 fn apply_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let inter = egui::FontData::from_static(include_bytes!("../../assets/fonts/InterVariable.ttf"))
-        .tweak(egui::FontTweak {
+    let inter = egui::FontData::from_static(include_bytes!("../../assets/fonts/InterVariable.ttf"));
+    let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+    for (name, weight, family) in [
+        ("Inter", 430.0, egui::FontFamily::Proportional),
+        (SEMIBOLD, 620.0, egui::FontFamily::Name(SEMIBOLD.into())),
+    ] {
+        let face = inter.clone().tweak(egui::FontTweak {
             hinting_override: Some(true),
-            coords: egui::epaint::text::VariationCoords::new([(b"wght", 500.0)]),
+            coords: egui::epaint::text::VariationCoords::new([(b"wght", weight)]),
             ..Default::default()
         });
-
-    fonts
-        .font_data
-        .insert(INTER_FONT_NAME.to_owned(), Arc::new(inter));
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, INTER_FONT_NAME.to_owned());
+        fonts.font_data.insert(name.into(), Arc::new(face));
+        let mut faces = fallback.clone();
+        faces.insert(0, name.into());
+        fonts.families.insert(family, faces);
+    }
 
     ctx.set_fonts(fonts);
 }
 
 pub fn top_bar_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(top_bar())
-        .inner_margin(egui::Margin {
-            left: 12,
-            right: 12,
-            top: 7,
-            bottom: 7,
-        })
+        .fill(egui::Color32::WHITE)
+        .inner_margin(egui::Margin::symmetric(18, 7))
+}
+
+pub fn tab_group_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(TAB_RAIL)
+        .corner_radius(8)
+        .inner_margin(3)
 }
 
 pub fn apply_toolbar_style(ui: &mut egui::Ui) {
     let visuals = ui.visuals_mut();
-    visuals.override_text_color = Some(TEXT);
-    visuals.selection.bg_fill = ACCENT_SOFT;
+    visuals.override_text_color = Some(MUTED);
+    visuals.selection.bg_fill = egui::Color32::WHITE;
     visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
@@ -130,12 +123,18 @@ pub fn apply_toolbar_style(ui: &mut egui::Ui) {
 pub fn content_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)
-        .inner_margin(egui::Margin::same(12))
+        .inner_margin(egui::Margin::symmetric(18, 12))
+}
+
+pub fn tab_content_frame() -> egui::Frame {
+    let mut frame = content_frame();
+    frame.inner_margin.bottom = frame.inner_margin.left;
+    frame
 }
 
 pub fn glass_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(glass())
+        .fill(egui::Color32::WHITE)
         .stroke(egui::Stroke::new(1.0, STROKE))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(16, 14))
@@ -143,10 +142,10 @@ pub fn glass_frame() -> egui::Frame {
 
 pub fn compact_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(glass_dense())
+        .fill(egui::Color32::WHITE)
         .stroke(egui::Stroke::new(1.0, STROKE))
-        .corner_radius(egui::CornerRadius::same(7))
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 8))
 }
 
 #[cfg(feature = "diagnostics-ui")]
@@ -195,6 +194,28 @@ pub fn page_header_plain(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.add_space(12.0);
 }
 
+pub fn tab_heading<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    actions: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        ui.set_min_height(36.0);
+        ui.heading(egui::RichText::new(title).color(TEXT));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions)
+            .inner
+    })
+    .inner
+}
+
+pub fn section_label(text: &str) -> egui::RichText {
+    egui::RichText::new(text)
+        .text_style(egui::TextStyle::Button)
+        .size(10.5)
+        .extra_letter_spacing(0.75)
+        .color(MUTED)
+}
+
 pub fn muted(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text)
         .color(MUTED)
@@ -202,7 +223,7 @@ pub fn muted(text: impl Into<String>) -> egui::RichText {
 }
 
 pub fn toolbar_icon(source: egui::ImageSource<'static>) -> egui::Image<'static> {
-    egui::Image::new(source).fit_to_exact_size(egui::vec2(18.0, 18.0))
+    egui::Image::new(source).fit_to_exact_size(egui::vec2(16.0, 16.0))
 }
 
 pub fn status_text(text: impl Into<String>) -> egui::RichText {
