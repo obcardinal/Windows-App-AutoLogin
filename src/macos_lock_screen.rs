@@ -1,7 +1,11 @@
 //! Recognizes the layout of the English Windows password screen. This is
 //! visual evidence only. It does not attest the guest desktop or its identity.
 
-use std::{ffi::c_void, slice, str};
+use std::{
+    ffi::c_void,
+    slice, str,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockScreenObservation {
@@ -15,6 +19,9 @@ pub(crate) enum LockScreenObservation {
 unsafe extern "C" {
     fn waal_lock_capture_supported() -> bool;
     fn waal_lock_capture_allowed() -> bool;
+    fn waal_lock_capture_request() -> bool;
+    fn waal_record_capture_request() -> bool;
+    fn waal_open_capture_preferences() -> bool;
     fn waal_observe_lock_screen(
         pid: i32,
         window_id: u32,
@@ -31,6 +38,58 @@ pub(crate) fn supported() -> bool {
 pub(crate) fn screen_recording_allowed() -> bool {
     // Preflight never displays the system permission dialog.
     unsafe { waal_lock_capture_allowed() }
+}
+
+pub(crate) fn request_screen_recording() -> bool {
+    // Called at startup when a linked desktop is eligible for automatic reconnect.
+    static STARTUP_REQUESTED: AtomicBool = AtomicBool::new(false);
+    if STARTUP_REQUESTED.swap(true, Ordering::Relaxed) {
+        return screen_recording_allowed();
+    }
+    request_access(false)
+}
+
+pub(crate) fn request_screen_recording_on_opt_in() -> bool {
+    request_access(true)
+}
+
+pub(crate) fn open_screen_recording_settings() -> bool {
+    supported() && unsafe { waal_open_capture_preferences() }
+}
+
+fn request_access(user_action: bool) -> bool {
+    supported()
+        && request_permission(
+            user_action,
+            screen_recording_allowed,
+            || unsafe { waal_record_capture_request() },
+            || unsafe { waal_lock_capture_request() },
+            || {
+                open_screen_recording_settings();
+            },
+        )
+}
+
+fn request_permission(
+    user_action: bool,
+    allowed: impl Fn() -> bool,
+    record_attempt: impl FnOnce() -> bool,
+    request: impl FnOnce() -> bool,
+    open_preferences: impl FnOnce(),
+) -> bool {
+    if allowed() {
+        return true;
+    }
+    let previously_requested = record_attempt();
+    if request() || allowed() {
+        return true;
+    }
+    // macOS may suppress a second system prompt. An explicit retry should
+    // still give the user a way to grant access. Startup never opens Settings.
+    if user_action && previously_requested {
+        open_preferences();
+    }
+    false
 }
 
 pub(crate) fn observe(pid: i32, window_id: u32) -> LockScreenObservation {
@@ -245,6 +304,63 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn repeated_opt_in_checks_access_requests_again_and_opens_the_pane_if_still_denied() {
+        let requested = Cell::new(false);
+        let checks = Cell::new(0);
+        let requests = Cell::new(0);
+        let opens = Cell::new(0);
+        let attempt = |user_action| {
+            request_permission(
+                user_action,
+                || {
+                    checks.set(checks.get() + 1);
+                    false
+                },
+                || requested.replace(true),
+                || {
+                    requests.set(requests.get() + 1);
+                    false
+                },
+                || opens.set(opens.get() + 1),
+            )
+        };
+        assert!(!attempt(true));
+        assert_eq!((requests.get(), opens.get()), (1, 0));
+        assert!(!attempt(true));
+        assert_eq!((requests.get(), opens.get()), (2, 1));
+        assert!(!attempt(false));
+        assert_eq!((requests.get(), opens.get(), checks.get()), (3, 1, 6));
+    }
+
+    #[test]
+    fn granted_access_and_a_new_grant_after_a_request_skip_settings() {
+        assert!(request_permission(
+            true,
+            || true,
+            || panic!("attempt"),
+            || panic!("request"),
+            || panic!("settings")
+        ));
+        assert!(request_permission(
+            true,
+            || false,
+            || true,
+            || true,
+            || panic!("settings")
+        ));
+        let already_checked = Cell::new(false);
+        assert!(request_permission(
+            true,
+            || already_checked.replace(true),
+            || true,
+            || false,
+            || panic!("settings")
+        ));
+    }
+
     fn line(text: &str, x: f64, y: f64, height: f64) -> Line {
         Line {
             label: label(text),

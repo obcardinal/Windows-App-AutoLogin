@@ -19,6 +19,30 @@ bool waal_lock_capture_allowed(void) {
     return waal_lock_capture_supported() && CGPreflightScreenCaptureAccess();
 }
 
+bool waal_lock_capture_request(void) {
+    return waal_lock_capture_supported() && CGRequestScreenCaptureAccess();
+}
+
+bool waal_record_capture_request(void) {
+    @autoreleasepool {
+        // The UI and supervisor run in the same app bundle. Store only whether
+        // the app has requested access; macOS is the authority on its status.
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSString *key = @"WAALLockedVMHasRequestedScreenCapture";
+        bool previous = [defaults boolForKey:key];
+        [defaults setBool:YES forKey:key];
+        return previous;
+    }
+}
+
+bool waal_open_capture_preferences(void) {
+    @autoreleasepool {
+        NSURL *pane = [NSURL URLWithString:
+            @"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"];
+        return pane && [NSWorkspace.sharedWorkspace openURL:pane];
+    }
+}
+
 static bool isFrontmost(pid_t pid) {
     NSRunningApplication *app = NSWorkspace.sharedWorkspace.frontmostApplication;
     return app.processIdentifier == pid && [app.bundleIdentifier isEqualToString:@"com.microsoft.rdc.macos"];

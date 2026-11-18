@@ -3140,6 +3140,10 @@ impl ApplicationHandler<SupervisorEvent> for LightweightSupervisor {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         if matches!(cause, StartCause::Init) {
             self.ensure_tray();
+            #[cfg(target_os = "macos")]
+            if self.config.accounts.iter().any(models::Account::locked_vm_reconnect_enabled) {
+                macos_lock_screen::request_screen_recording();
+            }
         }
     }
 
