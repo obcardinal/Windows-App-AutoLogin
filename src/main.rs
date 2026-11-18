@@ -350,8 +350,19 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let (_worker_event_tx, worker_event_rx) = tokio_channel::<background::WorkerEvent>(100);
     let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
 
+    // Seed the native window before its first layout. The UI then measures the
+    // actual heading, card, status messages, and platform fonts on each frame.
+    let initial_height = if initial_tab == models::Tab::Accounts {
+        let card_bottom = match config.accounts.len() {
+            0 => 258.0,
+            count => 154.0 + ui::accounts::visible_account_rows_height(count),
+        };
+        card_bottom + ui::theme::tab_content_frame().total_margin().bottom
+    } else {
+        app::FULL_WINDOW_HEIGHT
+    };
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([app::MAIN_WINDOW_WIDTH, app::FULL_WINDOW_HEIGHT])
+        .with_inner_size([app::MAIN_WINDOW_WIDTH, initial_height])
         .with_min_inner_size([app::MAIN_WINDOW_WIDTH, app::MIN_WINDOW_HEIGHT])
         .with_icon(load_icon()?)
         .with_visible(true)

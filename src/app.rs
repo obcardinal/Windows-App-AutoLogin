@@ -462,6 +462,7 @@ where
 pub(crate) struct AutoLoginApp {
     pub(crate) config: AppConfig,
     pub(crate) selected_tab: Tab,
+    last_requested_window_height: Option<f32>,
     pub(crate) logs: VecDeque<LogEntry>,
     pub(crate) worker_status: WorkerStatus,
     bridged_monitor_control_state: MonitorControlState,
@@ -583,6 +584,7 @@ impl AutoLoginApp {
         let mut app = Self {
             config,
             selected_tab: initial_tab,
+            last_requested_window_height: None,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             worker_status,
             bridged_monitor_control_state,
@@ -2499,7 +2501,7 @@ impl eframe::App for AutoLoginApp {
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let accessibility_ready = self.accessibility_ready();
 
@@ -2580,6 +2582,13 @@ impl eframe::App for AutoLoginApp {
             egui::Stroke::new(1.0, theme::STROKE),
         );
 
+        let content_frame =
+            if accessibility_ready && matches!(self.selected_tab, Tab::Accounts | Tab::Settings) {
+                theme::tab_content_frame()
+            } else {
+                theme::content_frame()
+            };
+        let vertical_margins = content_frame.total_margin().sum().y;
         #[cfg(target_os = "macos")]
         if self.selected_tab != Tab::Settings || !accessibility_ready {
             self.telegram_settings.leave();
@@ -2588,29 +2597,71 @@ impl eframe::App for AutoLoginApp {
         if self.selected_tab != Tab::Settings {
             crate::ui::iphone_sign_in::close_details(&ctx);
         }
-        egui::CentralPanel::default()
-            .frame(theme::content_frame())
+        let content = egui::CentralPanel::default()
+            .frame(content_frame)
             .show_inside(ui, |ui| {
                 if !accessibility_ready {
                     show_accessibility_onboarding(ui, self);
-                    return;
+                    return None;
                 }
                 match self.selected_tab {
                     Tab::Accounts => {
-                        crate::ui::accounts::show(ui, self);
+                        let height = crate::ui::accounts::show(ui, self);
+                        self.confirm_delete_account.is_none().then_some(height)
                     }
-                    Tab::Settings => {
-                        crate::ui::settings::show(ui, self);
-                    }
+                    Tab::Settings => Some(crate::ui::settings::show(ui, self)),
                     #[cfg(feature = "diagnostics-ui")]
-                    Tab::Diagnose => crate::ui::diagnose::show(ui, self),
+                    Tab::Diagnose => {
+                        crate::ui::diagnose::show(ui, self);
+                        None
+                    }
                 }
             });
+        let height = content.inner.map_or(FULL_WINDOW_HEIGHT, |tab_height| {
+            toolbar.response.rect.height() + vertical_margins + tab_height
+        });
+        self.fit_window_height(&ctx, frame, height);
 
         // `logic` runs before `ui`. Keep a presentation request visible for
         // this entire UI pass so a simultaneous Save cannot schedule Close,
         // then release the guard for ordinary saves in later passes.
         self.keep_settings_window_open_through_ui_pass = false;
+    }
+}
+
+impl AutoLoginApp {
+    fn fit_window_height(&mut self, ctx: &egui::Context, _frame: &eframe::Frame, height: f32) {
+        if ctx.will_discard() {
+            return;
+        }
+        let (current_size, managed_by_os) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (
+                i.viewport_rect().size(),
+                viewport.maximized == Some(true)
+                    || viewport.fullscreen == Some(true)
+                    || viewport.minimized == Some(true),
+            )
+        });
+        if managed_by_os {
+            self.last_requested_window_height = None;
+            return;
+        }
+        // On macOS each native resize can temporarily display a Metal drawable
+        // from the preceding frame. Request the measured height in one step.
+        let height = height.ceil().max(MIN_WINDOW_HEIGHT);
+        let native_height = height * ctx.zoom_factor();
+        // Resize on content changes. Repaints should not fight a manual resize or an OS size limit.
+        let previous = self.last_requested_window_height.replace(native_height);
+        if previous == Some(native_height) {
+            return;
+        }
+        if previous.is_some() || (current_size.y - height).abs() >= 0.5 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                current_size.x,
+                height,
+            )));
+        }
     }
 }
 
@@ -2704,6 +2755,39 @@ mod tests {
 
     fn test_pause_latch() -> WorkerPauseLatch {
         WorkerInvalidator::new().pause_latch()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tab_switch_requests_only_the_final_height_even_when_native_resize_lags() {
+        let mut app = mutation_test_app(true);
+        let ctx = egui::Context::default();
+        let frame = eframe::Frame::_new_kittest();
+        let mut heights = Vec::new();
+        for (tab, measured, viewport) in [
+            (Tab::Accounts, 280.0, 280.0),
+            (Tab::Settings, 600.0, 280.0),
+            (Tab::Settings, 600.0, 280.0),
+            (Tab::Accounts, 280.0, 600.0),
+            (Tab::Accounts, 280.0, 600.0),
+        ] {
+            app.selected_tab = tab;
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(super::MAIN_WINDOW_WIDTH, viewport),
+                )),
+                ..Default::default()
+            });
+            app.fit_window_height(&ctx, &frame, measured);
+            let output = ctx.end_pass();
+            for cmd in &output.viewport_output[&egui::ViewportId::ROOT].commands {
+                if let egui::ViewportCommand::InnerSize(size) = cmd {
+                    heights.push(size.y);
+                }
+            }
+        }
+        assert_eq!(heights, [600.0, 280.0]);
     }
 
     fn mutation_test_app(settings_window_mode: bool) -> AutoLoginApp {

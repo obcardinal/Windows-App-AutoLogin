@@ -130,20 +130,21 @@ enum SettingsSaveCompletion {
     },
 }
 
-pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
+pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
+    let content_top = ui.cursor().top();
     #[cfg(target_os = "macos")]
-    if crate::ui::iphone_sign_in::show_if_open(ui).is_some() {
+    if let Some(height) = crate::ui::iphone_sign_in::show_if_open(ui) {
         app.telegram_settings.leave();
-        return;
+        return height;
     }
     let settings_before_input = app.settings_draft.clone();
     let mut settings_changed = false;
     let disabled_reason = settings_disabled_reason(app);
     theme::tab_heading(ui, "Settings", |_| {});
 
-    egui::ScrollArea::vertical()
+    let sections = egui::ScrollArea::vertical()
         .id_salt("settings_scroll")
-        .auto_shrink([false; 2])
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             if let Some(reason) = disabled_reason.as_deref() {
                 ui.label(egui::RichText::new(reason).small().color(theme::MUTED));
@@ -221,6 +222,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     if settings_changed {
         queue_or_start_background_save(app, ui.ctx(), &settings_before_input);
     }
+    sections.inner_rect.top() - content_top + sections.content_size.y
 }
 
 fn preference_hint(ui: &mut egui::Ui, hint: &str) {
