@@ -1,4 +1,4 @@
-//! Select a Windows App account only for an explicit Enter action.
+//! Resolve a Windows App profile by its unique email before using its Devices view.
 use super::*;
 
 struct ProfileRow<T> {
@@ -110,23 +110,11 @@ fn inspect_selector<T>(
     result
 }
 
-pub(super) fn verify_selected_owner(
+pub(super) fn prepare_profile_devices(
     app: &AxElement,
-    center: &AxElement,
     email: &str,
-) -> Result<String> {
-    inspect_selector(app, center, |sheet, active| {
-        let rows = wait_for(|| profile_rows(sheet)).context(PROFILE_ERROR)?;
-        let (_, selected) = target_profile(&rows, active, email)?;
-        ensure!(
-            selected,
-            "The selected desktop could not be verified under this Windows App account."
-        );
-        Ok(active.to_owned())
-    })
-}
-
-pub(super) fn prepare_enter_devices(app: &AxElement, email: &str) -> Result<(DeviceList, String)> {
+    before_switch: impl FnOnce() -> Result<()>,
+) -> Result<(DeviceList, String)> {
     let center = devices_window(app)?;
     let (label, switched) = inspect_selector(app, &center, |sheet, active| {
         let rows = wait_for(|| profile_rows(sheet)).context(PROFILE_ERROR)?;
@@ -147,7 +135,7 @@ pub(super) fn prepare_enter_devices(app: &AxElement, email: &str) -> Result<(Dev
                         && fresh.controls.email_text.same_element(text),
                     PROFILE_ERROR
                 );
-                Ok(())
+                before_switch()
             })?;
             // The selector can stay open while the Devices view switches account.
             // Some builds update the accessible toolbar only after dismissal.

@@ -16,9 +16,9 @@ mod catalog;
 mod connected;
 #[path = "macos_enter_profile.rs"]
 mod enter_profile;
-use enter_profile::prepare_enter_devices;
 pub(super) use catalog::verify_card_identity_in;
 pub(crate) use catalog::{saved_devices, saved_remote_pc, SavedDevice};
+use enter_profile::prepare_profile_devices;
 
 const READ_ERROR: &str = "Could not read the Windows App Devices view.";
 const SELECTION_ERROR: &str = "Windows App could not select the saved device.";
@@ -35,7 +35,7 @@ struct DeviceList {
 pub(crate) fn open_saved_device(device: &SavedDevice) -> Result<()> {
     if device.id.starts_with("workspace:") && !device.owner.trim().is_empty() {
         let app = trusted_app()?;
-        let (list, profile) = prepare_enter_devices(&app, &device.owner)?;
+        let (list, profile) = prepare_profile_devices(&app, &device.owner, || Ok(()))?;
         catalog::verify_card_identity(device)?;
         return list.connect(&device.name, || {
             list.ensure_profile(&profile)?;
@@ -69,7 +69,7 @@ pub(crate) fn reconnect_window_device(
         !name.trim().is_empty(),
         "Choose a desktop in the account editor."
     );
-    let (list, profile) = prepare_enter_devices(&app, account_email)?;
+    let (list, profile) = prepare_profile_devices(&app, account_email, || Ok(()))?;
     let selected = launch_card_name(&list.devices, name, host, |card| {
         list.ensure_profile(&profile)?;
         connected::cloud_pc_device_name(&app, &list.window, card)
@@ -132,21 +132,23 @@ fn launch_card_name<'a, T>(
 }
 
 /// Preflight a window-only binding through the client's current Devices view
-/// before disconnecting. Reading the profile selector never changes its account.
+/// before disconnecting. Only a verified endpoint can authorize a profile switch.
 pub(super) fn verify_window_device(
     app: &AxElement,
     name: &str,
     email: &str,
     only_open_session: bool,
+    before_switch: impl FnOnce() -> Result<()>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<VerifiedWindowDevice> {
     ensure!(
         !cancelled() && app.bool_attr(AX_FRONTMOST) == Some(true),
         "The active desktop changed."
     );
-    let center = devices_window(app)?;
-    let profile = enter_profile::verify_selected_owner(app, &center, email)?;
-    let list = devices_from_window(app.clone(), center)?;
+    let (list, profile) = prepare_profile_devices(app, email, || {
+        ensure!(!cancelled(), "Cancelled.");
+        before_switch()
+    })?;
     let check_center = || {
         ensure!(
             !cancelled()

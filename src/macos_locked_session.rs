@@ -97,12 +97,8 @@ fn account_for_endpoint<'a>(
     if !can_match_by_endpoint(accounts, title) {
         return None;
     }
-    let mut matching = accounts
-        .iter()
-        .filter(|a| a.enabled && canonical_remote_pc(&a.remote_pc).as_deref() == Some(host));
-    let account = matching.next()?;
-    if matching.next().is_some()
-        || !eligible_endpoint_binding(account)
+    let account = unique_endpoint_owner(accounts, host)?;
+    if !eligible_endpoint_binding(account)
         || other_sessions
             .iter()
             .any(|s| s.eq_ignore_ascii_case(&account.vm_target) || s.eq_ignore_ascii_case(title))
@@ -118,6 +114,28 @@ fn account_for_endpoint<'a>(
         return None;
     }
     Some(account)
+}
+
+fn unique_endpoint_owner<'a>(accounts: &'a [Account], host: &str) -> Option<&'a Account> {
+    let mut matching = accounts
+        .iter()
+        .filter(|a| a.enabled && canonical_remote_pc(&a.remote_pc).as_deref() == Some(host));
+    let owner = matching.next()?;
+    matching.next().is_none().then_some(owner)
+}
+
+fn verify_profile_switch(
+    accounts: &[Account],
+    account_id: &str,
+    verified_host: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        verified_host
+            .and_then(|host| unique_endpoint_owner(accounts, host))
+            .is_some_and(|owner| owner.id == account_id),
+        "Select this desktop’s account in Windows App to reconnect it."
+    );
+    Ok(())
 }
 
 fn account_for_observed_session<'a>(
@@ -418,17 +436,19 @@ fn preflight_reconnect<'a>(
     accounts: &[Account],
     app: &AxElement,
     original: &AxElement,
+    verified_host: Option<&str>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<ReconnectTarget<'a>> {
     let verified = match &session.device {
         BoundDevice::Window(title) => {
-            account_for_observed_session(accounts, session)
+            let account = account_for_observed_session(accounts, session)
                 .context("The selected session or account changed.")?;
             device_launch::verify_window_device(
                 app,
                 title,
                 &session.username,
                 session.other_sessions.is_empty(),
+                || verify_profile_switch(accounts, &account.id, verified_host),
                 cancelled,
             )
             .map(ReconnectTarget::Window)
@@ -463,19 +483,16 @@ pub(crate) fn reconnect(
     ensure!(!cancelled(), "Cancelled.");
     let app = device_windows::running_app()?.context("Windows App closed.")?;
     let window = same_focused_session(session, &app)?;
-    if let Some(expected_host) = session
-        .remote_pc
-        .as_ref()
-        .filter(|_| !session.endpoint_already_verified())
-    {
+    let verified_host = session.remote_pc.as_deref();
+    if let Some(expected_host) = verified_host.filter(|_| !session.endpoint_already_verified()) {
         let endpoint =
             remote_pc_info::read_focused_session(&app, &window, session.title(), &cancelled)?;
         ensure!(
-            matches!(endpoint, remote_pc_info::SessionRemotePc::Selected(host) if &host == expected_host),
+            matches!(endpoint, remote_pc_info::SessionRemotePc::Selected(host) if host == expected_host),
             "The active Remote PC could not be matched to this account."
         );
     }
-    let target = preflight_reconnect(session, accounts, &app, &window, &cancelled)?;
+    let target = preflight_reconnect(session, accounts, &app, &window, verified_host, &cancelled)?;
     let close = device_launch::menu_item(&app, &["Window", "窗口"], &["Close", "关闭"])
         .filter(|item| {
             item.process_id() == Some(session.pid) && item.bool_attr(AX_ENABLED) == Some(true)
@@ -697,6 +714,25 @@ mod tests {
         assert!(resolve_binding(&[a, second], "Desktop", never)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn reconnect_can_switch_away_from_another_profile_only_for_the_verified_endpoint_owner() {
+        let mut target = account();
+        target.remote_pc = "CLOUD-A.example.test.".into();
+        let mut other = Account::new("other@example.test");
+        other.remote_pc = "cloud-b.example.test".into();
+        let mut accounts = [target, other];
+        let target_id = accounts[0].id.clone();
+        assert!(verify_profile_switch(&accounts, &target_id, Some("cloud-a.example.test")).is_ok());
+        assert!(
+            verify_profile_switch(&accounts, &target_id, Some("cloud-b.example.test")).is_err()
+        );
+        assert!(verify_profile_switch(&accounts, &target_id, None).is_err());
+        accounts[1].remote_pc = "cloud-a.example.test".into();
+        assert!(
+            verify_profile_switch(&accounts, &target_id, Some("cloud-a.example.test")).is_err()
+        );
     }
 
     #[test]
