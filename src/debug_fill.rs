@@ -749,7 +749,15 @@ pub(crate) fn fill_current_prompt_once_guarded(
     method: FillMethod,
     guard: impl Fn() -> anyhow::Result<()>,
 ) -> FillAttemptReport {
-    fill_current_prompt_once_guarded_with_context(settings, accounts, method, None, guard)
+    fill_current_prompt_once_guarded_with_context(
+        settings,
+        accounts,
+        method,
+        None,
+        guard,
+        #[cfg(target_os = "macos")]
+        |_| {},
+    )
 }
 
 pub(crate) fn fill_current_prompt_once_guarded_with_context(
@@ -758,10 +766,18 @@ pub(crate) fn fill_current_prompt_once_guarded_with_context(
     method: FillMethod,
     verified_prompt: Option<VerifiedPromptContext>,
     guard: impl Fn() -> anyhow::Result<()>,
+    #[cfg(target_os = "macos")] on_password_written: impl FnOnce(bool),
 ) -> FillAttemptReport {
     #[cfg(target_os = "macos")]
     {
-        fill_current_prompt_once_macos(settings, accounts, method, verified_prompt.as_ref(), &guard)
+        fill_current_prompt_once_macos(
+            settings,
+            accounts,
+            method,
+            verified_prompt.as_ref(),
+            &guard,
+            on_password_written,
+        )
     }
     #[cfg(target_os = "windows")]
     {
@@ -800,6 +816,7 @@ fn fill_current_prompt_once_macos(
     method: FillMethod,
     verified_prompt: Option<&VerifiedPromptContext>,
     guard: &dyn Fn() -> anyhow::Result<()>,
+    on_password_written: impl FnOnce(bool),
 ) -> FillAttemptReport {
     let mut log = DebugLog::new(make_attempt_id());
 
@@ -1024,10 +1041,6 @@ fn fill_current_prompt_once_macos(
     };
     record_password_write_completed(&mut log);
     log.set(
-        "iphone_authenticator_enabled",
-        selected_account.iphone_authenticator_enabled.to_string(),
-    );
-    log.set(
         "fill_duration_ms",
         fill_start.elapsed().as_millis().to_string(),
     );
@@ -1037,6 +1050,7 @@ fn fill_current_prompt_once_macos(
         return log.fail("password_field_not_detected_in_verified_prompt");
     }
 
+    on_password_written(selected_account.iphone_authenticator_enabled);
     let submit_start = Instant::now();
     let submit_result = match crate::macos_ax::submit_prompt_after_fill(
         app_name,

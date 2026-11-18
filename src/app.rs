@@ -2022,6 +2022,8 @@ impl AutoLoginApp {
                 WorkerEvent::Log(entry) => {
                     self.add_log(entry);
                 }
+                #[cfg(target_os = "macos")]
+                WorkerEvent::PasswordWritten { .. } => {} // The supervisor owns iPhone preparation.
                 WorkerEvent::FillAttemptReport(report) => {
                     self.last_fill_report = Some(report);
                 }

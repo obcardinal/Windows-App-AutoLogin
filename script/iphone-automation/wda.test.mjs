@@ -65,8 +65,8 @@ test('WDA test launch binds only the tunnel address and deletes diagnostic attac
   assert.deepEqual(value.WebDriverAgentRunner.EnvironmentVariables, {
     KEEP: 'unchanged', USE_IP: 'fd00::1', USE_PORT: '8100', MJPEG_SERVER_PORT: '0',
   });
-  assert.equal(value.WebDriverAgentRunner.UserAttachmentLifetime, 'deleteAlways');
-  assert.equal(value.WebDriverAgentRunner.SystemAttachmentLifetime, 'deleteAlways');
+  assert.equal(value.WebDriverAgentRunner.UserAttachmentLifetime, 'keepNever');
+  assert.equal(value.WebDriverAgentRunner.SystemAttachmentLifetime, 'keepNever');
   assert.throws(() => configureTestRun(original, '0.0.0.0'), { code: 'wda_build_failed' });
 });
 

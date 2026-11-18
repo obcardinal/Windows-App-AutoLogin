@@ -23,8 +23,8 @@ export function configureTestRun(document, tunnelAddress) {
     // WDA must not listen on all phone Wi-Fi interfaces.
     USE_IP: tunnelAddress, USE_PORT: '8100', MJPEG_SERVER_PORT: '0',
   });
-  result.WebDriverAgentRunner.SystemAttachmentLifetime = 'deleteAlways';
-  result.WebDriverAgentRunner.UserAttachmentLifetime = 'deleteAlways';
+  result.WebDriverAgentRunner.SystemAttachmentLifetime = 'keepNever';
+  result.WebDriverAgentRunner.UserAttachmentLifetime = 'keepNever';
   return result;
 }
 

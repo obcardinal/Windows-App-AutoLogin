@@ -44,6 +44,11 @@ pub(crate) enum WorkerEvent {
     StatusChanged(WorkerStatus),
     Log(LogEntry),
     FillAttemptReport(FillAttemptReport),
+    #[cfg(target_os = "macos")]
+    PasswordWritten {
+        generation: u64,
+        warm_wifi: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -162,7 +167,7 @@ impl WorkerPauseLatch {
         self.pause_state.load(Ordering::SeqCst) & 1 == 1
     }
 
-    fn stable_unpaused_generation(&self) -> Option<u64> {
+    pub(crate) fn stable_unpaused_generation(&self) -> Option<u64> {
         if self.is_paused() {
             return None;
         }
@@ -1474,6 +1479,13 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                             expected_generation,
                             "accounts/settings changed",
                         )
+                    },
+                    #[cfg(target_os = "macos")]
+                    |warm_wifi| {
+                        let _ = event_tx.try_send(WorkerEvent::PasswordWritten {
+                            generation: expected_generation,
+                            warm_wifi,
+                        });
                     },
                 )
             };

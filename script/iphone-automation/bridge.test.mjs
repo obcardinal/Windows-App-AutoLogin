@@ -12,7 +12,7 @@ const config = { device_udid: udid, development_team: '76C2QW8JV3', wda_bundle_i
 mock.module('./support.mjs', { namedExports: {
   AUTHENTICATOR_BUNDLE: 'com.microsoft.azureauthenticator', AutomationError,
   acquireSessionLock: async () => { state.acquired++; return async () => { state.released++; }; },
-  cleanEnvironment: () => ({}), deviceLockState: async () => false,
+  cleanEnvironment: () => ({}), deviceLockState: async () => state.onLockCheck?.() ?? false,
   listPhysicalDevices: async () => [{ udid, paired: true, connected: true, developerMode: true,
     transport: state.transport, tunnelAddress: 'fd00::1', osVersion: '27.2' }],
   probePhysicalDevice: async device => device,
@@ -79,6 +79,30 @@ test('abort while reserving ports never starts an orphan server or leaks ownersh
   assert.equal(state.acquired, 1);
   assert.equal(state.released, 1);
   assert.equal(state.wdaStopped, 0);
+});
+
+test('an unlock retry counts Wi-Fi time and still requires a fresh unlocked response', async t => {
+  initialize(t);
+  let now = 0;
+  const starts = [];
+  const sleeps = [];
+  t.mock.method(performance, 'now', () => now);
+  t.mock.module('node:timers/promises', { namedExports: {
+    setTimeout: async ms => { sleeps.push(ms); now += ms; },
+  } });
+  state.onLockCheck = () => {
+    starts.push(now);
+    assert.equal(state.spawned, 0);
+    if (starts.length === 1) { now += 400; return true; }
+    if (starts.length === 2) { now += 1800; return true; }
+    return false;
+  };
+  const { createIphoneSession } = await import('./bridge.mjs?unlock-retry');
+  const session = await createIphoneSession();
+  await session.close();
+  assert.deepEqual(starts, [0, 1500, 3300]);
+  assert.deepEqual(sleeps, [1100]);
+  assert.equal(state.spawned, 1);
 });
 
 test('local server boots during runner startup and attaches only after both are ready', async t => {

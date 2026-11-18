@@ -1394,14 +1394,18 @@ impl LightweightSupervisor {
                     self.worker_status = status;
                     self.update_tray_status();
                 }
-                background::WorkerEvent::FillAttemptReport(report) => {
-                    #[cfg(target_os = "macos")]
-                    if report.field("password_write_state") == Some("completed") {
-                        let warm_wifi = report.field("iphone_authenticator_enabled") == Some("true");
+                #[cfg(target_os = "macos")]
+                background::WorkerEvent::PasswordWritten {
+                    generation,
+                    warm_wifi,
+                } => {
+                    if self.worker_pause_latch.stable_unpaused_generation() == Some(generation) {
                         self.poll_iphone_preparation(iphone_preparation::Trigger::PasswordWritten {
                             warm_wifi,
                         });
                     }
+                }
+                background::WorkerEvent::FillAttemptReport(report) => {
                     if let Some(tray) = &self.tray {
                         tray.set_last_result(&fill_result_label(&report));
                     }

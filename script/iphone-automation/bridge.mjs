@@ -150,6 +150,7 @@ export async function createIphoneSession({ signal, timeoutMs = 150000, onStatus
     activeSignal.throwIfAborted();
     let selectedDevice;
     for (;;) {
+      const pollStarted = performance.now();
       const devices = await listPhysicalDevices({ signal: activeSignal });
       const candidate = devices.find(item => item.udid === config.device_udid);
       const device = await probePhysicalDevice(candidate, { signal: activeSignal });
@@ -160,7 +161,11 @@ export async function createIphoneSession({ signal, timeoutMs = 150000, onStatus
         if (locked === false) { selectedDevice = device; break; }
         status(locked === true ? 'waiting_for_unlock' : 'lock_state_unavailable');
       }
-      await delay(1500, undefined, { signal: activeSignal });
+      // A Wi-Fi probe can itself take longer than the retry interval.
+      // Keep one probe in flight and check cancellation even if no sleep is due.
+      activeSignal.throwIfAborted();
+      const remaining = Math.ceil(pollStarted + 1500 - performance.now());
+      if (remaining > 0) await delay(remaining, undefined, { signal: activeSignal });
     }
     activeSignal.throwIfAborted();
     tunnelEndpoint(selectedDevice, config.device_udid);
