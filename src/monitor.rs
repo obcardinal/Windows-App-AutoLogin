@@ -31,6 +31,7 @@ pub(crate) struct MacosMonitorSnapshot {
     pub(crate) target_window_title: Option<String>,
     pub(crate) target_frontmost: Option<bool>,
     pub(crate) target_window_observed: bool,
+    pub(crate) session_presentation: Option<crate::macos_ax::SessionPresentation>,
     pub(crate) selected_prompt_present: bool,
     pub(crate) prompt_candidate_count: usize,
 }
@@ -247,6 +248,7 @@ fn macos_monitor_snapshot(inspection: &crate::macos_ax::MacosInspection) -> Maco
         target_window_title: target.map(|target| target.window_title.clone()),
         target_frontmost: target.map(|target| target.frontmost),
         target_window_observed,
+        session_presentation: inspection.foreground_session_presentation(),
         selected_prompt_present: inspection.prompt.is_some(),
         prompt_candidate_count: inspection.prompts.len(),
     }
@@ -458,6 +460,7 @@ mod tests {
                 target_window_title: None,
                 target_frontmost: None,
                 target_window_observed: false,
+                session_presentation: None,
                 selected_prompt_present: false,
                 prompt_candidate_count: 0,
             })

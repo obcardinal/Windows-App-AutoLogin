@@ -2567,6 +2567,7 @@ mod tests {
             target_window_title: Some("Sign in".to_string()),
             target_frontmost: Some(true),
             target_window_observed: true,
+            session_presentation: None,
             selected_prompt_present: false,
             prompt_candidate_count: 0,
         };

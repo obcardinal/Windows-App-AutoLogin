@@ -121,7 +121,7 @@ fn scoped_account<'a, 'c>(
     endpoint_allowed(account, accounts.len()).then_some((account, device))
 }
 
-fn window_id(window: &AxElement) -> Option<u32> {
+pub(super) fn window_id(window: &AxElement) -> Option<u32> {
     // Resolve at runtime so unsupported OS versions simply skip reconnect.
     // The ID belongs to the exact AX object, even for identically titled windows.
     let function = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_AXUIElementGetWindow".as_ptr()) };

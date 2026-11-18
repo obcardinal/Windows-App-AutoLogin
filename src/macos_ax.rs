@@ -103,6 +103,30 @@ pub(crate) struct MacosWindowTitle {
     window: Option<AxElement>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionPresentation {
+    pub(crate) window_id: u32,
+    pub(crate) fullscreen: Option<bool>,
+}
+
+impl MacosInspection {
+    pub(crate) fn foreground_session_presentation(&self) -> Option<SessionPresentation> {
+        let target = self.target.as_ref().filter(|t| t.frontmost)?;
+        let mut matching = self.session_windows.iter().filter(|entry| {
+            entry.process_id == target.process_id && entry.title == target.window_title
+        });
+        let entry = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let window = entry.window.as_ref()?;
+        Some(SessionPresentation {
+            window_id: locked_session::window_id(window)?,
+            fullscreen: window.bool_attr("AXFullScreen"),
+        })
+    }
+}
+
 impl fmt::Debug for MacosWindowTitle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MacosWindowTitle")
