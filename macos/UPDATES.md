@@ -13,8 +13,8 @@ account; these scripts never export it or accept a private key argument.
 | Production | `com.obcardinal.WindowsAppAutoLogin` | `https://obcardinal.com/assets/downloads/windows-app-autologin/macos/appcast.xml` |
 | Development | `obcardinal.windows-app-autologin` | `https://obcardinal.com/assets/downloads/windows-app-autologin/macos/development/appcast.xml` |
 
-The feeds initially contain no update items. Creating them does not publish a
-release. Development builds must use their own identity and feed, including
+Each feed lists only releases for its channel. Development builds use their
+own identity and feed, including
 when signed with Developer ID. Instance Control's feed, signing account and
 release metadata are independent and must not be reused.
 
@@ -52,51 +52,36 @@ dedicated Keychain account's public key for comparison, and uses the official
 length and generated version/URL fields are checked again before publication.
 It never contacts the hosting server or modifies an installed app.
 
-## Production builder boundary
+## Build and sign a production release
 
-The existing local `script/package_macos.sh` deliberately produces only
-nonpublishable local artifacts. Its output is not eligible for the production
-feed, even when it uses the production runtime bundle identifier and carries a
-Developer ID signature. Current source-controlled build metadata explicitly
-marks local artifacts nonpublishable; this utility does not rewrite it or
-provide an override.
-
-A production pipeline must first obtain an artifact from a separately
-authenticated, isolated builder and verify its detached provenance through
-that builder's trusted release process. That infrastructure is a prerequisite,
-not supplied by this local preparation utility. Signing and metadata checks
-alone do not authenticate a build producer. The production preparation gate
-requires an admitted release record (`artifact-kind=release`,
-`publishable=true`, production identity, and authenticated provenance fields),
-plus valid Apple notarization, a stapled ticket and Gatekeeper acceptance.
-
-Within that trusted builder, stage Sparkle **before** the final app signature:
+Dispatch the **macOS release build** workflow on `main`. The GitHub-hosted Apple
+silicon runner builds the executable from that revision. A separate job issues
+its GitHub artifact attestation. Download the `macos-arm64-executable` artifact
+after both jobs succeed and check out the same commit locally.
 
 ```sh
-source script/macos_sparkle.sh
-waal_stage_sparkle "$SOURCE_ROOT" "$APP_BUNDLE"
-waal_sign_sparkle "$APP_BUNDLE" "$WAAL_CODESIGN_IDENTITY" --timestamp
-codesign --force --options runtime --timestamp \
-  --sign "$WAAL_CODESIGN_IDENTITY" \
-  --identifier com.obcardinal.WindowsAppAutoLogin "$APP_BUNDLE"
-codesign --verify --deep --strict "$APP_BUNDLE"
+gh workflow run macos-release.yml --ref main
+gh run download "$RUN_ID" -n macos-arm64-executable -D "$RELEASE_DIR/input"
+WAAL_CODESIGN_IDENTITY="$DEVELOPER_ID" WAAL_NOTARY_PROFILE="$NOTARY_PROFILE" \
+  script/sign_hosted_macos_release.sh "$RELEASE_DIR/input/windows-app-autologin" "$FINAL_ARCHIVE"
 ```
 
-Submit an archive through the builder's existing `notarytool` Keychain profile,
-then staple and validate the resulting bundle before creating the **final**
-archive. Do not sign an archive and subsequently modify/staple its contents.
+The signing script verifies GitHub's detached attestation against the executable,
+repository, workflow, hosted runner and exact commit. It assembles the bundle
+from that commit, signs Sparkle and the app with Developer ID, submits the app
+to Apple, staples the accepted ticket and checks Gatekeeper before creating the
+final ZIP. Apple signing and notarization credentials stay on the signing Mac.
+The separate local development packager produces artifacts for local use.
+
+Use the same final ZIP for GitHub and Sparkle. Write plain-text release notes and
+pass the current public feed to retain its earlier entries. The notes are signed
+as part of the new appcast.
 
 ```sh
-xcrun stapler staple "$APP_BUNDLE"
-xcrun stapler validate "$APP_BUNDLE"
-spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
-ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$FINAL_ARCHIVE"
 python3 script/prepare_sparkle_update.py --channel production \
-  --existing-appcast "$PREVIOUS_APPCAST" "$FINAL_ARCHIVE" "$NEW_OUTPUT_DIRECTORY"
+  --existing-appcast "$PREVIOUS_APPCAST" --release-notes "$RELEASE_NOTES" \
+  "$FINAL_ARCHIVE" "$NEW_OUTPUT_DIRECTORY"
 ```
-
-The destination archive and output directory must be new. Never manufacture
-production provenance by changing the metadata marker of a local executable.
 
 ## Hosting and publication
 
