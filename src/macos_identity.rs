@@ -159,6 +159,27 @@ fn trusted_bundle_candidates(app_name: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // Also compiled by the diagnostics-only library.
+pub(crate) fn start_windows_app_in_background() -> anyhow::Result<()> {
+    let name = "Windows App";
+    let identity = trusted_identity(name).context("Windows App identity is unavailable.")?;
+    let path = trusted_bundle_candidates(name)
+        .pop()
+        .context("Windows App is unavailable.")?;
+    anyhow::ensure!(
+        trusted_bundle_candidate_is_usable(&path)?
+            && verify_bundle_designated_requirement(&path, identity.bundle_id, identity.team_id)?,
+        "Install the Microsoft-signed Windows App in Applications."
+    );
+    let result = run_command_with_timeout(
+        Command::new("/usr/bin/open").arg("-g").arg(&path),
+        Duration::from_secs(5),
+    )?;
+    anyhow::ensure!(result.status.success(), "Windows App could not be opened.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn bundle_path_is_trusted_location(path: &Path, app_name: &str) -> anyhow::Result<bool> {
     for candidate in trusted_bundle_candidates(app_name) {
         if path == candidate {
