@@ -2,6 +2,8 @@
 
 Windows App AutoLogin fills the password prompt when you reconnect to a work desktop in Microsoft Windows App. It runs in the macOS menu bar or Windows system tray. You choose which accounts it can use and can pause autofill with **Stop Monitor**.
 
+<img src="docs/images/accounts-screen.webp" width="586" alt="Accounts window with two example accounts. A checkmark shows which email was just copied.">
+
 ## How your password is protected
 
 ### Where passwords are stored
