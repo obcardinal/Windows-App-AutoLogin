@@ -1654,6 +1654,9 @@ fn spawn_iphone_probe(job: IphoneProbe) -> bool {
             crate::iphone_sso::Outcome::SubmittedUnverified => {
                 "iPhone number submitted; desktop authentication result is not verified"
             }
+            crate::iphone_sso::Outcome::ManualApprovalRequired => {
+                "Number entered; review the sign-in request on your iPhone"
+            }
             crate::iphone_sso::Outcome::Cancelled => "iPhone assistance cancelled",
             crate::iphone_sso::Outcome::Unavailable => {
                 "iPhone assistance unavailable; complete this sign-in manually"

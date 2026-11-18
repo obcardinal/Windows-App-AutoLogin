@@ -203,6 +203,76 @@ test('cancellation before submit and stale parent permissions prevent the click'
   assert.equal(second.state.clicks, 0);
 });
 
+function delayedFieldCheck(duration, onManualPermit) {
+  const { state, run } = fixture();
+  let clock = 0;
+  state.onPermit = action => {
+    if (action === 'enter_number') {
+      state.beforeRead = () => {
+        clock += duration;
+        state.beforeRead = null;
+      };
+    } else if (action === 'enter_number_for_manual_approval') {
+      onManualPermit?.(state, milliseconds => { clock += milliseconds; });
+    }
+  };
+  return { state, run: () => run({ now: () => clock, request: { ...request(), expires_in_ms: 120000 } }) };
+}
+
+test('a slow field check allows one verified entry for personal approval through ten seconds', async () => {
+  for (const duration of [2001, 5100, 10000]) {
+    const { state, run } = delayedFieldCheck(duration);
+    assert.equal(await run(), 'manual_approval_required');
+    assert.deepEqual(state.permits, ['open_authenticator', 'enter_number', 'enter_number_for_manual_approval']);
+    assert.deepEqual(state.mutations, ['open', 'write']);
+  }
+  const fast = delayedFieldCheck(2000);
+  await fast.run();
+  assert.deepEqual(fast.state.permits, ['open_authenticator', 'enter_number', 'submit_number']);
+  const expired = delayedFieldCheck(10001);
+  await assert.rejects(expired.run(), { code: 'field_verification_timeout' });
+  assert.deepEqual(expired.state.mutations, ['open']);
+});
+
+test('slow entry stops if the phone or desktop check becomes stale or changes', async () => {
+  for (const [change, code] of [
+    [state => { state.accounts = 0; }, 'screen_changed'],
+    [state => { state.value = 'already filled'; }, 'screen_changed'],
+    [state => { state.locked = true; }, 'phone_locked'],
+    [state => { state.activeBundle = 'com.apple.springboard'; }, 'screen_changed'],
+    [(_state, advance) => advance(2001), 'authorization_expired'],
+    [() => { throw new AutomationError('cancelled', 'cancelled'); }, 'cancelled'],
+  ]) {
+    const { state, run } = delayedFieldCheck(4500, change);
+    await assert.rejects(run(), { code });
+    assert.deepEqual(state.mutations, ['open']);
+  }
+});
+
+test('a field read that hangs for ten seconds cannot write when it eventually returns', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { state, session, run } = fixture();
+  const blocked = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const original = session.execute;
+  state.onPermit = action => {
+    if (action === 'enter_number') {
+      session.execute = async (...args) => {
+        blocked.resolve();
+        await release.promise;
+        return original(...args);
+      };
+    }
+  };
+  const attempt = run({ request: { ...request(), expires_in_ms: 120000 } });
+  await blocked.promise;
+  t.mock.timers.tick(10000);
+  await assert.rejects(attempt, { code: 'field_verification_timeout' });
+  release.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(state.mutations, ['open']);
+});
+
 test('ambiguous network failure after approval click is not retried', async () => {
   const { state, run } = fixture();
   state.clickFailure = true;

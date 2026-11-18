@@ -19,6 +19,7 @@ pub(crate) enum Stage {
     OpeningAuthenticator,
     WaitingForRequest,
     VerifyingNumberField,
+    RecheckingManualEntry,
     EnteringNumber,
     SubmittingNumber,
     WaitingForConfirmation,
@@ -32,6 +33,7 @@ pub(crate) enum Outcome {
     Failed,
     Cancelled,
     SubmittedUnverified,
+    ManualApprovalRequired,
 }
 
 /// No payload strings: an unrecognized helper error cannot put its message,
@@ -86,6 +88,7 @@ pub(crate) enum Reason {
     PhoneLocked,
     AccountMismatch,
     NumberFieldNotEmpty,
+    FieldVerificationTimeout,
     ScreenChanged,
     NumberEntryUnconfirmed,
     UnsafeStorage,

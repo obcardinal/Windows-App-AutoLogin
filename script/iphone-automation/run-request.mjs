@@ -6,13 +6,13 @@ import { assistNumberMatch, verifiedAuthenticatorLayout } from './authenticator.
 import { AutomationError } from './support.mjs';
 
 const MAX_LINE_BYTES = 4096;
-const ACTIONS = ['open_authenticator', 'enter_number', 'submit_number'];
+const ACTIONS_BY_STEP = [['open_authenticator'], ['enter_number'], ['submit_number', 'enter_number_for_manual_approval']];
 const PHASES = new Set(['waiting_for_device', 'waiting_for_unlock', 'lock_state_unavailable',
   'preparing_iphone_runner', 'starting_iphone_runner', 'starting_iphone_connection', 'iphone_connected', 'waiting_for_authenticator',
   'manual_confirmation_required', 'waiting_for_number_request', 'entering_number',
   'complete_confirmation_on_iphone']);
 const ERROR_CODES = new Set(['invalid_request', 'invalid_protocol', 'request_too_large', 'parent_disconnected',
-  'authorization_timeout', 'authorization_expired', 'cancelled', 'challenge_expired', 'helper_failed',
+  'authorization_timeout', 'authorization_expired', 'field_verification_timeout', 'cancelled', 'challenge_expired', 'helper_failed',
   'unsupported_authenticator_layout', 'invalid_device_response', 'ambiguous_authenticator_screen',
   'phone_locked', 'account_mismatch', 'number_field_not_empty', 'screen_changed', 'number_entry_unconfirmed',
   'unsafe_storage', 'unsafe_configuration', 'invalid_configuration', 'not_configured', 'runtime_missing',
@@ -125,8 +125,9 @@ export class RequestProtocol {
 
   authorize(action) {
     if (this.failure) return Promise.reject(this.failure);
-    if (this.state !== 'running' || ACTIONS[this.sequence] !== action) return Promise.reject(error('invalid_protocol'));
+    if (this.state !== 'running' || !ACTIONS_BY_STEP[this.sequence]?.includes(action)) return Promise.reject(error('invalid_protocol'));
     this.sequence++;
+    this.lastAction = action;
     this.state = 'permission';
     const promise = new Promise((resolve, reject) => { this.resolvePermit = resolve; this.rejectPermit = reject; });
     this.permissionTimer = setTimeout(() => this.fail('authorization_timeout'), 5000);
@@ -134,9 +135,14 @@ export class RequestProtocol {
     return promise;
   }
 
-  submitted() {
+  complete(result) {
     if (this.failure) return Promise.reject(this.failure);
     if (this.state !== 'running' || this.sequence !== 3) return Promise.reject(error('invalid_protocol'));
+    if (this.lastAction === 'enter_number_for_manual_approval' && result === 'manual_approval_required') {
+      this.state = 'manual_cleanup';
+      return;
+    }
+    if (this.lastAction !== 'submit_number' || result !== undefined) return Promise.reject(error('invalid_protocol'));
     this.state = 'submitted';
     const promise = new Promise((resolve, reject) => { this.resolveFinish = resolve; this.rejectFinish = reject; });
     this.emit({ type: 'submitted' });
@@ -191,9 +197,9 @@ export async function runRequest({ input = process.stdin, output = process.stdou
       onStatus: ({ phase }) => protocol.status(phase) });
     const remaining = Math.floor(deadline - performance.now());
     if (remaining < 1000 || protocol.failure) throw protocol.failure ?? error('challenge_expired');
-    await assist({ session, layout, request: { ...request, expires_in_ms: remaining },
+    const result = await assist({ session, layout, request: { ...request, expires_in_ms: remaining },
       authorize: action => protocol.authorize(action), onStatus: phase => protocol.status(phase), signal: controller.signal });
-    await protocol.submitted();
+    await protocol.complete(result);
   } catch (cause) {
     const code = protocol.failure?.code ?? cause?.code;
     terminalError = ERROR_CODES.has(code) ? code : 'helper_failed';
@@ -209,6 +215,9 @@ export async function runRequest({ input = process.stdin, output = process.stdou
     // earlier request failure for confirmation that the phone runner stopped.
     if (terminalError) {
       protocol.emit({ type: 'error', code: terminalError });
+    } else if (protocol.state === 'manual_cleanup') {
+      protocol.state = 'finished';
+      protocol.emit({ type: 'manual_approval_required' });
     } else if (protocol.state === 'finished') {
       protocol.emit({ type: 'closed' });
     }

@@ -5,7 +5,7 @@ use crate::ui::theme;
 use eframe::egui;
 use std::sync::{Arc, OnceLock};
 
-pub(super) const ACCOUNT_HELP: &str = "When Windows App shows a sign-in number for this account, Monitor opens Microsoft Authenticator on your unlocked iPhone over Wi-Fi, enters the number and taps Approve. Complete Face ID if prompted. Choose Off to approve sign-ins manually.";
+pub(super) const ACCOUNT_HELP: &str = "When Windows App shows a sign-in number, Monitor enters it in Authenticator on your unlocked iPhone over Wi-Fi. If the field check is slow, tap Approve yourself. Complete Face ID if prompted.";
 
 pub(super) fn provider_picker(
     ui: &mut egui::Ui,
@@ -237,7 +237,7 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
                 let steps = [
                     ("Before sign-in", "Unlock your iPhone on the same Wi-Fi as your Mac."),
                     ("On your Mac", "Monitor reads the number in Windows App."),
-                    ("On your iPhone", "AutoLogin opens Authenticator, enters the number and taps Approve. Use Face ID if asked."),
+                    ("On your iPhone", "AutoLogin fills the number. Tap Approve if asked, then use Face ID if prompted."),
                 ];
                 let column_gap = 14.0;
                 let description_width = (ui.available_width() - 106.0 - column_gap).max(1.0);

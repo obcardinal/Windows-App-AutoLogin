@@ -2,6 +2,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { AUTHENTICATOR_BUNDLE, AutomationError } from './support.mjs';
 
 const ELEMENT_KEY = 'element-6066-11e4-a52e-4f735466cecf';
+const PERMIT_MAX_AGE_MS = 2000;
+const FIELD_VERIFICATION_LIMIT_MS = 10000;
 
 // Observed on a physical iPhone on 2026-11-17. The account is exposed as one
 // accessibility group, labelled "<organization>, <email>". The organization's
@@ -125,6 +127,18 @@ function sameControls(before, after) {
   return after.kind === 'number_match' && before.field === after.field && before.submit === after.submit;
 }
 
+async function verifyFieldBeforeEntry(session, layout, account) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(failure('field_verification_timeout')), FIELD_VERIFICATION_LIMIT_MS);
+  });
+  try {
+    return await Promise.race([observeNumberMatch(session, layout, account), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** A single attempt. Mutating operations are never automatically retried. */
 export async function assistNumberMatch({ session, layout, request, authorize, onStatus = () => {}, signal,
   now = () => performance.now(), wait = milliseconds => delay(milliseconds, undefined, { signal }) }) {
@@ -137,7 +151,7 @@ export async function assistNumberMatch({ session, layout, request, authorize, o
   const permit = async action => { current(); await authorize(action); current(); return now(); };
   const freshPermit = grantedAt => {
     current();
-    if (now() - grantedAt > 2000) throw failure('authorization_expired');
+    if (now() - grantedAt > PERMIT_MAX_AGE_MS) throw failure('authorization_expired');
   };
   current();
   await unlocked(session);
@@ -156,15 +170,38 @@ export async function assistNumberMatch({ session, layout, request, authorize, o
   }
   if (!layout.empty_values.includes(screen.value)) throw failure('number_field_not_empty');
   const writePermit = await permit('enter_number');
-  const beforeWrite = await observeNumberMatch(session, layout, request.account);
+  const beforeWrite = await verifyFieldBeforeEntry(session, layout, request.account);
   current();
+  const fieldVerifiedAt = now();
+  const fieldCheckMs = fieldVerifiedAt - writePermit;
+  if (fieldCheckMs > FIELD_VERIFICATION_LIMIT_MS) throw failure('field_verification_timeout');
   if (!sameControls(screen, beforeWrite) || !layout.empty_values.includes(beforeWrite.value)) throw failure('screen_changed');
-  freshPermit(writePermit);
+  const manualApproval = fieldCheckMs > PERMIT_MAX_AGE_MS;
+  if (manualApproval) {
+    // The earlier permit expired during a read. Bind entry to a new desktop
+    // check and to the recently observed phone controls. This branch can only
+    // hand off to the person using the phone.
+    await permit('enter_number_for_manual_approval');
+    await unlocked(session);
+    const [active, value, accounts] = await Promise.all([
+      session.execute('mobile: activeAppInfo'),
+      session.request('GET', `/element/${beforeWrite.field}/attribute/value`),
+      matches(session, accountSelector(layout, request.account)),
+    ]);
+    if (active?.bundleId !== AUTHENTICATOR_BUNDLE || !layout.empty_values.includes(value) || accounts.length !== 1) {
+      throw failure('screen_changed');
+    }
+    freshPermit(fieldVerifiedAt);
+  } else {
+    freshPermit(writePermit);
+  }
   onStatus('entering_number');
   await session.request('POST', `/element/${beforeWrite.field}/value`, { text: request.number });
   current();
   const afterWrite = await observeNumberMatch(session, layout, request.account);
+  current();
   if (!sameControls(beforeWrite, afterWrite) || afterWrite.value !== request.number) throw failure('number_entry_unconfirmed');
+  if (manualApproval) return 'manual_approval_required';
   const submitPermit = await permit('submit_number');
   const beforeSubmit = await observeNumberMatch(session, layout, request.account);
   current();

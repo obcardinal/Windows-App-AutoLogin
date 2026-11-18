@@ -46,9 +46,8 @@ pub(crate) struct ProgressUi {
 
 impl ProgressUi {
     pub(crate) fn update(&mut self, event: Event) {
-        // A cleanup error can arrive after Cancel. The operation has ended;
-        // retain the error panel until its Close button is pressed.
-        if event.phase.is_failure() {
+        // Keep final errors and the manual approval instructions visible until dismissed.
+        if event.phase.needs_close_button() {
             event.cancelled.store(false, Ordering::SeqCst);
         }
         if matches!(event.phase, Phase::Finished | Phase::Cancelled) {
@@ -102,7 +101,7 @@ impl ProgressUi {
                 panel.alert.layout();
                 panel.phase = event.phase;
             }
-            if event.phase.is_failure() {
+            if event.phase.needs_close_button() {
                 panel
                     .alert
                     .buttons()

@@ -76,6 +76,74 @@ test('separate permits are required and session stays open until desktop explici
   assertPrivate(h.state);
 });
 
+const manualEntryActions = ['open_authenticator', 'enter_number', 'enter_number_for_manual_approval'];
+
+function scriptedAssist(actions, result) {
+  return async ({ authorize }) => {
+    for (const action of actions) await authorize(action);
+    return result;
+  };
+}
+
+test('manual approval handoff requires its own final grant and emits only after cleanup', async () => {
+  const cleanupStarted = Promise.withResolvers();
+  const cleanupDone = Promise.withResolvers();
+  const h = harness({
+    assist: scriptedAssist(manualEntryActions, 'manual_approval_required'),
+    sessionFactory: async () => ({ close: () => { cleanupStarted.resolve(); return cleanupDone.promise; } }),
+  });
+  h.state.onMessage = message => { if (message.type === 'authorize') h.send({ permit: message.sequence }); };
+  h.send(request());
+  await cleanupStarted.promise;
+  assert.deepEqual(h.state.messages, manualEntryActions.map((action, index) => ({ type: 'authorize', sequence: index + 1, action })));
+  cleanupDone.resolve();
+  assert.equal(await h.result, 0);
+  assert.deepEqual(h.state.messages.slice(3), [{ type: 'manual_approval_required' }]);
+  assertPrivate(h.state);
+});
+
+test('invalid branch completions and follow-up actions fail without a submission or handoff', async () => {
+  for (const [actions, result] of [
+    [manualEntryActions.slice(0, 2), 'manual_approval_required'],
+    [['open_authenticator', 'enter_number', 'submit_number'], 'manual_approval_required'],
+    [manualEntryActions, undefined],
+    [[...manualEntryActions, 'submit_number'], undefined],
+    [[...manualEntryActions, 'enter_number_for_manual_approval'], 'manual_approval_required'],
+  ]) {
+    const h = harness({ assist: scriptedAssist(actions, result) });
+    h.state.onMessage = message => { if (message.type === 'authorize') h.send({ permit: message.sequence }); };
+    h.send(request());
+    assert.equal(await h.result, 1);
+    assert.deepEqual(h.state.messages.filter(message => message.type !== 'authorize'),
+      [{ type: 'error', code: 'invalid_protocol' }]);
+    assert.equal(h.state.closed, 1);
+  }
+});
+
+test('manual handoff reports disconnect, cancellation, protocol errors, or cleanup failure before handing control back', async () => {
+  for (const code of ['parent_disconnected', 'cancelled', 'invalid_protocol', 'wda_cleanup_unverified']) {
+    const controller = new AbortController();
+    const h = harness({
+      signal: controller.signal,
+      assist: scriptedAssist(manualEntryActions, 'manual_approval_required'),
+      sessionFactory: async () => ({ close: async () => {
+        switch (code) {
+          case 'parent_disconnected': h.input.end(); break;
+          case 'cancelled': controller.abort(); break;
+          case 'invalid_protocol': h.send({ finish: true }); break;
+          case 'wda_cleanup_unverified': throw new Error('private-server-body');
+        }
+        await turn();
+      } }),
+    });
+    h.state.onMessage = message => { if (message.type === 'authorize') h.send({ permit: message.sequence }); };
+    h.send(request());
+    assert.equal(await h.result, 1);
+    assert.deepEqual(h.state.messages.filter(message => message.type !== 'authorize'), [{ type: 'error', code }]);
+    assertPrivate(h.state);
+  }
+});
+
 test('permits cannot be sent in advance with the initial request', async () => {
   const h = harness();
   h.input.write(`${JSON.stringify(request())}\n{"permit":1}\n`);
