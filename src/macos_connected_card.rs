@@ -1,5 +1,4 @@
-//! Read the connection state from the menu of a verified Windows App device
-//! card. None of the menu's connection commands is invoked.
+//! Read the connection state and Cloud PC Details of a verified Windows App card.
 use super::*;
 use crate::macos_ax::{
     locked_session::window_id, AXUIElementRef, AXValueGetTypeID, AXValueGetValue,
@@ -8,6 +7,7 @@ use core_foundation::base::{CFType, CFTypeRef};
 
 const UNAVAILABLE: &str = "Could not verify this device’s connection state in Windows App.";
 const MENU_DISMISSED: &str = "Windows App did not dismiss the device menu.";
+const DETAILS_ERROR: &str = "Could not verify the Cloud PC Details for this Windows App device.";
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -97,11 +97,22 @@ fn popup_at(system: &AxElement, anchor: Point, pid: i32) -> Option<AxElement> {
     None
 }
 
-fn mouse_event(kind: u32, at: Point) -> Result<CFType> {
-    // kCGMouseButtonRight. AppKit's card does not publish AXShowMenu.
-    let raw = unsafe { CGEventCreateMouseEvent(std::ptr::null(), kind, at, 1) };
-    ensure!(!raw.is_null(), UNAVAILABLE);
+fn mouse_event(kind: u32, at: Point, button: u32) -> Result<CFType> {
+    let raw = unsafe { CGEventCreateMouseEvent(std::ptr::null(), kind, at, button) };
+    ensure!(
+        !raw.is_null(),
+        "Could not create the Windows App mouse event."
+    );
     Ok(unsafe { TCFType::wrap_under_create_rule(raw) })
+}
+
+fn element_midpoint(node: &AxElement) -> Option<Point> {
+    let origin = geometry(node, "AXPosition", 1)?;
+    let size = geometry(node, "AXSize", 2)?;
+    (size.x > 0. && size.y > 0.).then(|| Point {
+        x: origin.x + size.x / 2.,
+        y: origin.y + size.y / 2.,
+    })
 }
 
 fn card_state(commands: &[(String, Option<bool>)]) -> Result<bool> {
@@ -119,11 +130,12 @@ fn card_state(commands: &[(String, Option<bool>)]) -> Result<bool> {
     Ok(connected)
 }
 
-pub(super) fn connected_card(
+fn with_card_menu<T>(
     app: &AxElement,
     center: &AxElement,
     card: &AxElement,
-) -> Result<bool> {
+    read: impl FnOnce(&AxElement, &str, i32) -> Result<T>,
+) -> Result<T> {
     let pid = app.process_id().context(UNAVAILABLE)?;
     let center_id = window_id(center).context(UNAVAILABLE)?;
     let center_focused = || {
@@ -156,6 +168,7 @@ pub(super) fn connected_card(
             && t.string_attr(AX_DESCRIPTION).is_some()
     });
     let tile = labelled.next().context(UNAVAILABLE)?;
+    let label = tile.string_attr(AX_DESCRIPTION).context(UNAVAILABLE)?;
     ensure!(
         labelled.next().is_none()
             && tile
@@ -163,18 +176,12 @@ pub(super) fn connected_card(
                 .is_some_and(|w| w.same_element(center)),
         UNAVAILABLE
     );
-    let origin = geometry(tile, "AXPosition", 1).context(UNAVAILABLE)?;
-    let size = geometry(tile, "AXSize", 2).context(UNAVAILABLE)?;
-    ensure!(size.x > 0. && size.y > 0., UNAVAILABLE);
-    let anchor = Point {
-        x: origin.x + size.x / 2.,
-        y: origin.y + size.y / 2.,
-    };
+    let anchor = element_midpoint(tile).context(UNAVAILABLE)?;
     let raw = unsafe { AXUIElementCreateSystemWide() };
     ensure!(!raw.is_null(), UNAVAILABLE);
     let system = AxElement { raw };
-    let down = mouse_event(3, anchor)?;
-    let up = mouse_event(4, anchor)?;
+    let down = mouse_event(3, anchor, 1)?;
+    let up = mouse_event(4, anchor, 1)?;
     ensure!(
         popup_at(&system, anchor, pid).is_none()
             && center_focused()
@@ -193,29 +200,227 @@ pub(super) fn connected_card(
             app.bool_attr(AX_FRONTMOST) == Some(true) && window_id(center) == Some(center_id),
             UNAVAILABLE
         );
-        let mut commands = Vec::new();
-        for item in children(&menu)? {
-            ensure!(
-                item.process_id() == Some(pid) && role_matches(&item, "AXMenuItem"),
-                UNAVAILABLE
-            );
-            if let Some(title) = item.string_attr(AX_TITLE) {
-                commands.push((title, item.bool_attr(AX_ENABLED)));
-            }
-        }
-        card_state(&commands)
+        read(&menu, &label, pid)
     })();
     // Cancel only this observed popup. Escape or a click outside it could
     // affect an unrelated prompt if focus moves while the menu is open.
-    menu.perform_action("AXCancel");
+    if popup_at(&system, anchor, pid).is_some_and(|current| current.same_element(&menu)) {
+        menu.perform_action("AXCancel");
+    }
     wait_for(|| (popup_at(&system, anchor, pid).is_none() && center_focused()).then_some(()))
         .context(MENU_DISMISSED)?;
     result
 }
 
+fn menu_commands(menu: &AxElement, pid: i32) -> Result<Vec<(String, AxElement)>> {
+    let mut commands = Vec::new();
+    for item in children(menu)? {
+        ensure!(
+            item.process_id() == Some(pid) && role_matches(&item, "AXMenuItem"),
+            UNAVAILABLE
+        );
+        if let Some(title) = item.string_attr(AX_TITLE) {
+            commands.push((title, item));
+        }
+    }
+    Ok(commands)
+}
+
+pub(super) fn connected_card(
+    app: &AxElement,
+    center: &AxElement,
+    card: &AxElement,
+) -> Result<bool> {
+    with_card_menu(app, center, card, |menu, _, pid| {
+        let commands = menu_commands(menu, pid)?
+            .into_iter()
+            .map(|(title, item)| (title, item.bool_attr(AX_ENABLED)))
+            .collect::<Vec<_>>();
+        card_state(&commands)
+    })
+}
+
+fn is_details_window(window: &AxElement, pid: i32) -> bool {
+    window.process_id() == Some(pid)
+        && role_matches(window, "AXWindow")
+        && matches!(
+            window.string_attr(AX_TITLE).as_deref(),
+            Some("Cloud PC Details" | "云电脑详细信息")
+        )
+}
+
+// The native panel publishes a group with four consecutive static texts:
+// Cloud PC Name, the selected card's name, Device Name, and its hostname.
+// Preserve sibling positions (including non-text controls) and reject
+// duplicate or partial sections instead of matching text anywhere in a window.
+fn device_row<'a>(rows: &[Option<&'a str>], card: &str) -> Result<Option<&'a str>> {
+    let labels = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, text)| match text {
+            Some("Cloud PC Name" | "云电脑名称") => Some((i, true)),
+            Some("Device Name" | "设备名") => Some((i, false)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return Ok(None);
+    }
+    let [(cloud, true), (device, false)] = labels.as_slice() else {
+        anyhow::bail!(DETAILS_ERROR)
+    };
+    ensure!(
+        cloud + 2 == *device && rows[cloud + 1] == Some(card),
+        DETAILS_ERROR
+    );
+    let host = rows
+        .get(device + 1)
+        .copied()
+        .flatten()
+        .context(DETAILS_ERROR)?;
+    ensure!(
+        crate::models::canonical_remote_pc(host).is_some(),
+        DETAILS_ERROR
+    );
+    Ok(Some(host))
+}
+
+fn device_name_in_dialog(dialog: &AxElement, pid: i32, card: &str) -> Result<String> {
+    let mut hostname = None;
+    let traversal = collect_descendants_bounded(dialog, 6, 200, &mut |node| {
+        if !node.same_element(dialog) && !role_matches(node, "AXGroup") {
+            return Ok(Vec::new());
+        }
+        let items = children(node)?;
+        ensure!(
+            items.iter().all(|i| i.process_id() == Some(pid)),
+            DETAILS_ERROR
+        );
+        let texts: Vec<_> = items
+            .iter()
+            .map(|i| {
+                if role_matches(i, "AXStaticText") {
+                    i.string_attr(AX_VALUE)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let values: Vec<_> = texts.iter().map(Option::as_deref).collect();
+        if let Some(name) = device_row(&values, card)? {
+            ensure!(hostname.is_none(), DETAILS_ERROR);
+            hostname = Some(name.to_owned());
+        }
+        Ok(items)
+    });
+    traversal.into_complete_elements().context(DETAILS_ERROR)?;
+    hostname.context(DETAILS_ERROR)
+}
+
+pub(super) fn cloud_pc_device_name(
+    app: &AxElement,
+    center: &AxElement,
+    card: &AxElement,
+) -> Result<Option<String>> {
+    with_card_menu(app, center, card, |menu, label, pid| {
+        let mut items = menu_commands(menu, pid)?
+            .into_iter()
+            .filter(|(title, _)| matches!(title.as_str(), "View Details" | "查看详细信息"));
+        let Some((_, command)) = items.next() else {
+            return Ok(None);
+        };
+        ensure!(items.next().is_none(), DETAILS_ERROR);
+        if !command.bool_attr(AX_ENABLED).context(DETAILS_ERROR)? {
+            return Ok(None);
+        }
+        let previous = app.array_attr_result(AX_WINDOWS)?;
+        ensure!(
+            !previous.iter().any(|w| is_details_window(w, pid)),
+            DETAILS_ERROR
+        );
+        ensure!(
+            app.bool_attr(AX_FRONTMOST) == Some(true)
+                && command.bool_attr(AX_ENABLED) == Some(true),
+            DETAILS_ERROR
+        );
+        // A press can time out after AppKit accepted it. Observe the result once.
+        command.perform_action(AX_PRESS);
+        let dialog = wait_for(|| {
+            let windows = app.array_attr_checked(AX_WINDOWS)?;
+            let mut candidates = windows.into_iter().filter(|w| is_details_window(w, pid));
+            let window = candidates.next()?;
+            let id = window_id(&window)?;
+            (candidates.next().is_none()
+                && !previous
+                    .iter()
+                    .any(|w| w.same_element(&window) || window_id(w) == Some(id))
+                && app.bool_attr(AX_FRONTMOST) == Some(true)
+                && app
+                    .element_attr("AXFocusedWindow")
+                    .is_some_and(|w| w.same_element(&window))
+                && window
+                    .optional_relationship_array_attr_result("AXSheets")
+                    .is_ok_and(|s| s.is_empty()))
+            .then_some(window)
+        })
+        .context(DETAILS_ERROR)?;
+        let close = dialog
+            .element_attr("AXCloseButton")
+            .context(DETAILS_ERROR)?;
+        ensure!(
+            close.process_id() == Some(pid)
+                && role_matches(&close, "AXButton")
+                && close.bool_attr(AX_ENABLED) == Some(true),
+            DETAILS_ERROR
+        );
+        let result = device_name_in_dialog(&dialog, pid, label);
+        close.perform_action(AX_PRESS);
+        wait_for(|| {
+            app.array_attr_checked(AX_WINDOWS)?
+                .iter()
+                .all(|w| !w.same_element(&dialog))
+                .then_some(())
+        })
+        .context("Windows App did not close its Cloud PC Details window.")?;
+        result.map(Some)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_only_the_verified_cards_adjacent_device_name() {
+        let english = [
+            Some("Cloud PC Name"),
+            Some("Dev VM"),
+            Some("Device Name"),
+            Some("CPC-HOST"),
+        ];
+        let chinese = [
+            Some("云电脑名称"),
+            Some("Dev VM"),
+            Some("设备名"),
+            Some("CPC-HOST"),
+        ];
+        for rows in [english, chinese] {
+            assert_eq!(device_row(&rows, "Dev VM").unwrap(), Some("CPC-HOST"));
+            assert!(device_row(&rows, "Different VM").is_err());
+            assert!(device_row(&rows, "dev vm").is_err());
+        }
+        assert_eq!(device_row(&[None, Some("Status")], "Dev VM").unwrap(), None);
+        for rows in [
+            vec![english[0], english[1]],
+            vec![english[2], english[3]],
+            vec![english[0], None, english[2], english[3]],
+            vec![english[0], english[1], None, english[2], english[3]],
+            vec![english[0], english[1], english[2], None],
+            vec![english[0], english[1], english[2], Some("host name")],
+            vec![english[0], english[1], english[2], english[3], english[2]],
+        ] {
+            assert!(device_row(&rows, "Dev VM").is_err());
+        }
+    }
     #[test]
     fn only_one_enabled_card_connection_command_confirms_state() {
         let menu = |pairs: &[(&str, Option<bool>)]| {
