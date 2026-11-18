@@ -14,39 +14,30 @@ pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Respo
     });
 
     if ui.is_rect_visible(rect) {
-        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(34.0, 20.0));
-        let hovered = response.hovered() && ui.is_enabled();
+        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(32.0, 18.0));
+        let emphasized = response.enabled() && (response.hovered() || response.has_focus());
         let fill = if *checked {
-            if hovered {
-                egui::Color32::from_rgb(43, 109, 166)
+            if emphasized {
+                egui::Color32::from_rgb(44, 70, 163)
             } else {
                 theme::ACCENT
             }
-        } else if hovered {
-            egui::Color32::from_rgb(151, 164, 177)
+        } else if emphasized {
+            egui::Color32::from_rgb(128, 141, 159)
         } else {
-            egui::Color32::from_rgb(177, 188, 199)
+            egui::Color32::from_rgb(158, 168, 185)
         };
         ui.painter()
             .rect_filled(track, egui::CornerRadius::same(10), fill);
-        let thumb_x = if *checked {
-            track.right() - 10.0
-        } else {
-            track.left() + 10.0
-        };
+        let thumb_x = egui::lerp(
+            (track.left() + 9.0)..=(track.right() - 9.0),
+            ui.ctx().animate_bool_responsive(response.id, *checked),
+        );
         ui.painter().circle_filled(
             egui::pos2(thumb_x, track.center().y),
             7.0,
             egui::Color32::WHITE,
         );
-        if response.has_focus() {
-            ui.painter().rect_stroke(
-                track.expand(3.0),
-                egui::CornerRadius::same(13),
-                egui::Stroke::new(1.5, theme::ACCENT),
-                egui::StrokeKind::Outside,
-            );
-        }
     }
 
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -136,6 +127,41 @@ mod tests {
             assert!(activated.changed());
             assert!(activated.has_focus());
             assert_eq!(activated.id, first.id);
+        }
+    }
+
+    #[test]
+    fn focused_switch_changes_track_color_without_painting_an_outer_ring() {
+        for mut checked in [false, true] {
+            let ctx = egui::Context::default();
+            let mut render = || {
+                let mut response = None;
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    response = Some(switch(ui, &mut checked, "Reconnect when locked"));
+                });
+                let response = response.unwrap();
+                let track =
+                    egui::Rect::from_center_size(response.rect.center(), egui::vec2(32.0, 18.0));
+                let mut painted = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.rect.intersects(track)
+                            && response.rect.contains_rect(rect.rect) =>
+                    {
+                        Some(rect)
+                    }
+                    _ => None,
+                });
+                let only_track = painted.next().unwrap();
+                assert_eq!(only_track.rect, track);
+                assert_eq!(only_track.stroke, egui::Stroke::NONE);
+                assert!(painted.next().is_none());
+                (response, only_track.fill)
+            };
+            let (idle, idle_fill) = render();
+            idle.request_focus();
+            let (focused, focused_fill) = render();
+            assert!(focused.has_focus());
+            assert_ne!(focused_fill, idle_fill);
         }
     }
 
