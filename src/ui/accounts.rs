@@ -48,7 +48,7 @@ const ACCOUNT_TRANSACTION_IN_PROGRESS_REASON: &str =
 const STATE_COLUMN_WIDTH: f32 = 68.0;
 const TABLE_SPACING: f32 = 8.0;
 const ACTION_BUTTON_SIZE: f32 = 30.0;
-const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 2.0 + TABLE_SPACING;
+const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 3.0 + TABLE_SPACING * 2.0;
 const ACCOUNT_ROW_HEIGHT: f32 = 49.0;
 const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
 const MAX_VISIBLE_ACCOUNT_ROWS: usize = 5;
@@ -68,6 +68,7 @@ const ACCOUNT_TOGGLE_BURST_QUIET_PERIOD: Duration = Duration::from_millis(75);
 const ACCOUNT_TOGGLE_BURST_MAX_COALESCE_PERIOD: Duration = Duration::from_millis(250);
 const ACCOUNT_TOGGLE_START_RETRY_DELAY: Duration = Duration::from_secs(1);
 const ACCOUNT_TOGGLE_INTENT_QUEUE_CAPACITY: usize = 16;
+const OPEN_DESKTOP_ICON: &[u8] = include_bytes!("../../assets/icons/open-desktop.svg");
 const PENCIL_ICON: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
 const REMOVE_ACCOUNT_ICON: &[u8] = include_bytes!("../../assets/icons/x.svg");
 const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
@@ -85,11 +86,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
     let mut account_to_delete: Option<AccountId> = None;
     let modal_open = app.editing_account.is_some() || app.confirm_delete_account.is_some();
     let availability = account_control_availability(app);
+    let device_launch_busy = poll_device_launch(ui.ctx(), app);
     let toggle_controls_enabled = !modal_open && availability.toggle_controls_ready;
     let launch_controls_enabled = !modal_open && availability.launch_controls_ready;
     let projected_enabled_states = projected_account_enabled_states(app);
     let row_controls = AccountRowControls {
         toggle: toggle_controls_enabled,
+        enter: !modal_open && !device_launch_busy,
         edit: launch_controls_enabled,
         delete: launch_controls_enabled,
         edit_disabled_reason: launch_controls_disabled_reason(&availability),
@@ -196,6 +199,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
 
     if let Some(account) = row_actions.edit_account.take() {
         open_account_editor(ui.ctx(), app, account);
+    }
+
+    if let Some(id) = row_actions.enter_account.take() {
+        enter_account(ui.ctx(), app, &id);
     }
 
     if let Some(account_id) = row_actions.confirm_delete_account.take() {
@@ -2004,6 +2011,7 @@ fn show_accounts_header(ui: &mut egui::Ui) {
 struct AccountRowActions {
     toggle_enabled: Vec<(AccountId, bool)>,
     edit_account: Option<Account>,
+    enter_account: Option<AccountId>,
     confirm_delete_account: Option<String>,
 }
 
@@ -2036,9 +2044,95 @@ impl<T: Send + Sync + 'static> DeviceTask<T> {
     }
 }
 
+#[derive(Clone)]
+struct PendingDeviceLaunch {
+    task: DeviceTask<()>,
+    started: Instant,
+}
+
+fn poll_device_launch(ctx: &egui::Context, app: &mut AutoLoginApp) -> bool {
+    let id = egui::Id::new("open_windows_app_device");
+    let Some(pending) = ctx.data_mut(|data| data.get_temp::<PendingDeviceLaunch>(id)) else {
+        return false;
+    };
+    let Some(result) = pending.task.0.get() else {
+        return true;
+    };
+    if let Err(message) = result {
+        app.set_status(message);
+        ctx.request_repaint();
+    } else {
+        // A launcher can accept the request before the second click of a double-click.
+        let remaining = Duration::from_secs(1).saturating_sub(pending.started.elapsed());
+        if !remaining.is_zero() {
+            ctx.request_repaint_after(remaining);
+            return true;
+        }
+    }
+    ctx.data_mut(|data| data.remove::<PendingDeviceLaunch>(id));
+    false
+}
+
+fn device_needs_setup(account: &Account) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        !crate::windows_device_launch::validate_target(&account.vm_target)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        account.vm_target.trim().is_empty()
+            || (cfg!(target_os = "macos")
+                && account.vm_device_id.is_empty()
+                && account.vm_profile.trim().is_empty())
+    }
+}
+
+fn enter_account(ctx: &egui::Context, app: &mut AutoLoginApp, id: &str) {
+    let Some(account) = app.config.accounts.iter().find(|account| account.id == id) else {
+        return;
+    };
+    if device_needs_setup(account) {
+        #[cfg(target_os = "macos")]
+        {
+            let focus_request = egui::Id::new(("focus_vm_target", &account.id));
+            open_account_editor(ctx, app, account.clone());
+            ctx.data_mut(|data| data.insert_temp(focus_request, true));
+        }
+        return;
+    }
+    let target = account.vm_target.clone();
+    #[cfg(target_os = "macos")]
+    let profile = account.vm_profile.clone();
+    #[cfg(target_os = "macos")]
+    let device_id = account.vm_device_id.clone();
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let username = account.username.clone();
+    let task = DeviceTask::start(ctx, move || {
+        #[cfg(target_os = "macos")]
+        return crate::macos_ax::desktops::open_desktop(&device_id, &target, &profile, &username);
+        #[cfg(target_os = "windows")]
+        return crate::windows_device_launch::open_device(&target, &username);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = target;
+            anyhow::bail!("Opening a device requires Windows App for macOS or Windows.")
+        }
+    });
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("open_windows_app_device"),
+            PendingDeviceLaunch {
+                task,
+                started: Instant::now(),
+            },
+        )
+    });
+}
+
 #[derive(Clone, Copy)]
 struct AccountRowControls<'a> {
     toggle: bool,
+    enter: bool,
     edit: bool,
     delete: bool,
     edit_disabled_reason: Option<&'a str>,
@@ -2098,6 +2192,9 @@ fn show_account_row(
             cells.actions,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
+                if open_desktop_button(ui, account, controls) {
+                    actions.enter_account = Some(account.id.clone());
+                }
                 if with_transaction_disabled_reason(
                     account_action_button(ui, AccountActionIcon::Edit, controls.edit)
                         .on_hover_text("Edit account"),
@@ -2119,6 +2216,36 @@ fn show_account_row(
             },
         );
     });
+}
+
+fn open_desktop_button(
+    ui: &mut egui::Ui,
+    account: &Account,
+    controls: AccountRowControls<'_>,
+) -> bool {
+    let needs_setup = device_needs_setup(account);
+    if !cfg!(target_os = "macos") && needs_setup {
+        // Keep the edit and delete columns aligned with already linked accounts.
+        ui.add_space(ACTION_BUTTON_SIZE + ui.spacing().item_spacing.x);
+        return false;
+    }
+    let tip = if needs_setup {
+        "Choose the Windows App device for this account"
+    } else {
+        "Open desktop in Windows App"
+    };
+    account_action_button(
+        ui,
+        AccountActionIcon::OpenDesktop,
+        controls.enter && (!needs_setup || controls.edit),
+    )
+    .on_hover_text(tip)
+    .on_disabled_hover_text(if controls.enter {
+        controls.edit_disabled_reason.unwrap_or(tip)
+    } else {
+        "Finish the current action before opening a device"
+    })
+    .clicked()
 }
 
 fn account_initials(email: &str) -> String {
@@ -2789,6 +2916,7 @@ fn account_editor_contents(
         );
         for message in [
             "Match the active remote desktop session to this account.",
+            "Open the VM when you click the Open desktop arrow in Accounts.",
         ] {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -3155,6 +3283,7 @@ fn account_editor_field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 #[derive(Clone, Copy)]
 enum AccountActionIcon {
+    OpenDesktop,
     Edit,
     Delete,
 }
@@ -3165,6 +3294,13 @@ fn account_action_button(
     enabled: bool,
 ) -> egui::Response {
     let (uri, bytes, label, accent, soft) = match icon {
+        AccountActionIcon::OpenDesktop => (
+            "bytes://icons/open-desktop.svg",
+            OPEN_DESKTOP_ICON,
+            "Open desktop",
+            theme::ACCENT,
+            theme::ACCENT_SOFT,
+        ),
         AccountActionIcon::Edit => (
             "bytes://icons/pencil.svg",
             PENCIL_ICON,
@@ -4247,6 +4383,169 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn enter_click_routes_by_row_and_setup_opens_the_selected_account() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::theme::apply(&ctx);
+        let mut config = AppConfig::default();
+        let mut configured = Account::new("first@example.test");
+        configured.vm_target = "Work desktop".into();
+        configured.vm_profile = "First profile".into();
+        configured.enabled = false;
+        config.accounts.push(configured);
+        let legacy = Account {
+            vm_target: "Unscoped desktop".into(),
+            ..Account::new("second@example.test")
+        };
+        config.accounts.push(legacy);
+        let mut app = account_test_app(config);
+        let mut actions = super::AccountRowActions::default();
+        let render = |events, allow_enter, actions: &mut super::AccountRowActions| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 450.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                for account in &app.config.accounts {
+                    ui.push_id(&account.id, |ui| {
+                        super::show_account_row(
+                            ui,
+                            account,
+                            account.enabled,
+                            super::AccountRowControls {
+                                toggle: false,
+                                enter: allow_enter,
+                                edit: true,
+                                delete: true,
+                                edit_disabled_reason: None,
+                            },
+                            actions,
+                        );
+                    });
+                }
+            })
+        };
+        let output = render(vec![], true, &mut actions);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let button_bounds = |label| {
+            let mut rects: Vec<_> = nodes
+                .iter()
+                .map(|(_, node)| node)
+                .filter(|node| {
+                    node.role() == egui::accesskit::Role::Button && node.label() == Some(label)
+                })
+                .map(|node| {
+                    let rect = node.bounds().unwrap();
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.x0 as f32, rect.y0 as f32),
+                        egui::pos2(rect.x1 as f32, rect.y1 as f32),
+                    )
+                })
+                .collect();
+            rects.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            assert_eq!(rects.len(), 2);
+            rects
+        };
+        let [open, edit, delete] =
+            ["Open desktop", "Edit account", "Delete account"].map(button_bounds);
+        for ((open, edit), delete) in open.iter().zip(&edit).zip(&delete) {
+            assert_eq!(open.size(), egui::Vec2::splat(super::ACTION_BUTTON_SIZE));
+            assert_eq!(open.size(), edit.size());
+            assert_eq!(open.size(), delete.size());
+            assert_eq!(open.top(), edit.top());
+            assert_eq!(open.top(), delete.top());
+            assert_eq!(edit.left() - open.right(), super::TABLE_SPACING);
+            assert_eq!(delete.left() - edit.right(), super::TABLE_SPACING);
+            assert!(delete.right() <= crate::app::MAIN_WINDOW_WIDTH);
+        }
+        render(click(open[0].center()), true, &mut actions);
+        assert_eq!(
+            actions.enter_account.take().unwrap(),
+            app.config.accounts[0].id
+        );
+        render(vec![], false, &mut actions);
+        render(click(open[0].center()), false, &mut actions);
+        assert!(actions.enter_account.is_none());
+        render(vec![], true, &mut actions);
+        render(click(open[1].center()), true, &mut actions);
+        let id = actions.enter_account.take().unwrap();
+        assert_eq!(id, app.config.accounts[1].id);
+        super::enter_account(&ctx, &mut app, &id);
+        assert_eq!(app.editing_account.as_ref().unwrap().id, id);
+        assert!(!super::poll_device_launch(&ctx, &mut app));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn only_a_saved_valid_desktop_id_enables_open_desktop_on_windows() {
+        for (target, can_open) in [
+            ("7527e219-c1c6-4983-8f45-da55db2fc376", true),
+            ("", false),
+            ("Legacy desktop name", false),
+            ("00000000-0000-0000-0000-000000000000", false),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::theme::apply(&ctx);
+            let mut account = Account::new("user@example.test");
+            account.vm_target = target.into();
+            let mut actions = super::AccountRowActions::default();
+            let render = |events, actions: &mut super::AccountRowActions| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 450.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| {
+                    super::show_account_row(
+                        ui,
+                        &account,
+                        true,
+                        super::AccountRowControls {
+                            toggle: true,
+                            enter: true,
+                            edit: true,
+                            delete: true,
+                            edit_disabled_reason: None,
+                        },
+                        actions,
+                    );
+                })
+            };
+            let frame = render(vec![], &mut actions);
+            let tree = frame.platform_output.accesskit_update.unwrap();
+            let open = tree.nodes.iter().map(|(_, node)| node).find(|node| {
+                node.role() == egui::accesskit::Role::Button && node.label() == Some("Open desktop")
+            });
+            assert_eq!(
+                open.is_some_and(|node| !node.is_disabled()),
+                can_open,
+                "{target}"
+            );
+            if let Some(bounds) = open.and_then(|node| node.bounds()) {
+                let center = egui::pos2(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                );
+                render(click(center), &mut actions);
+            }
+            assert_eq!(
+                actions.enter_account.as_ref(),
+                can_open.then_some(&account.id)
+            );
+            assert!(actions.edit_account.is_none());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn device_picker_shows_the_full_error_after_a_pending_lookup() {
         let ctx = egui::Context::default();
         crate::ui::theme::apply(&ctx);
@@ -4408,6 +4707,34 @@ mod tests {
         assert!(draft.remote_pc.is_empty());
         assert!(app.config.accounts[0].vm_profile.is_empty());
         assert!(app.config.accounts[0].vm_target.is_empty());
+    }
+
+    #[test]
+    fn pending_device_launch_reports_failures_and_debounces_accepted_requests() {
+        let ctx = egui::Context::default();
+        let mut app = account_test_app(AppConfig::default());
+        let id = egui::Id::new("open_windows_app_device");
+        let task = super::DeviceTask(Arc::new(std::sync::OnceLock::new()));
+        let mut pending = super::PendingDeviceLaunch {
+            task: task.clone(),
+            started: Instant::now(),
+        };
+        ctx.data_mut(|data| data.insert_temp(id, pending.clone()));
+        assert!(super::poll_device_launch(&ctx, &mut app));
+        task.0
+            .set(Err("The device is unavailable.".into()))
+            .unwrap();
+        assert!(!super::poll_device_launch(&ctx, &mut app));
+        assert_eq!(
+            app.status_message.as_ref().unwrap().0,
+            "The device is unavailable."
+        );
+        pending.task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(()))));
+        ctx.data_mut(|data| data.insert_temp(id, pending.clone()));
+        assert!(super::poll_device_launch(&ctx, &mut app));
+        pending.started -= Duration::from_secs(2);
+        ctx.data_mut(|data| data.insert_temp(id, pending));
+        assert!(!super::poll_device_launch(&ctx, &mut app));
     }
 
     #[test]
@@ -6720,6 +7047,7 @@ mod tests {
             "Import",
             "With a linked VM, AutoLogin can:",
             "Match the active remote desktop session to this account.",
+            "Open the VM when you click the Open desktop arrow in Accounts.",
             "2FA",
             "iPhone app",
             "Off",
