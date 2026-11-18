@@ -1,12 +1,17 @@
 use anyhow::Context;
+use block2::RcBlock;
+use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
 use eframe::egui;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSColor, NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem, NSView, NSWindow,
+    NSApplication, NSColor, NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{MainThreadMarker, NSPoint, NSSize};
+use objc2_foundation::{
+    MainThreadMarker, NSPoint, NSRect, NSRunLoop, NSSize,
+};
 use objc2_quartz_core::{kCAGravityBottomLeft, CALayer, CAMetalLayer};
+use std::cell::Cell;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const MAX_WIRE_BYTES: usize = 240;
@@ -33,6 +38,19 @@ pub(crate) struct PanelAnchor {
 pub(crate) enum Presentation {
     Window,
     Panel(PanelAnchor),
+}
+
+#[derive(Clone, Copy)]
+struct PendingPanelResize {
+    window_number: isize,
+    anchor: PanelAnchor,
+    height: f64,
+}
+
+thread_local! {
+    // Each UI process owns one root window. A newer layout supersedes a resize
+    // requested before AppKit returned to its main run loop.
+    static PENDING_PANEL_RESIZE: Cell<Option<PendingPanelResize>> = const { Cell::new(None) };
 }
 
 impl Presentation {
@@ -172,6 +190,74 @@ pub(crate) fn apply(
     apply_to_window(&window, presentation)
 }
 
+pub(crate) fn resize_anchored_panel(
+    handle: &impl HasWindowHandle,
+    anchor: PanelAnchor,
+    height: f32,
+    zoom_factor: f32,
+) -> anyhow::Result<()> {
+    let window = native_window(handle)?;
+    anyhow::ensure!(
+        !window
+            .styleMask()
+            .intersects(NSWindowStyleMask::Titled | NSWindowStyleMask::FullScreen),
+        "anchored resizing requires a borderless panel"
+    );
+    let height = f64::from(height) * f64::from(zoom_factor);
+    anyhow::ensure!(
+        anchor.is_valid() && height.is_finite() && height > 0.0,
+        "invalid panel geometry"
+    );
+    let pending = PendingPanelResize {
+        window_number: window.windowNumber(),
+        anchor,
+        height,
+    };
+    if PENDING_PANEL_RESIZE.replace(Some(pending)).is_none() {
+        // The renderer still has to present this frame at its original size.
+        // winit can draw from a before-wait observer; wake the loop so the
+        // deferred resize does not have to wait for another input event.
+        // SAFETY: The block captures nothing and CFRunLoopGetMain returns
+        // the process's live main run loop.
+        unsafe {
+            NSRunLoop::mainRunLoop().performBlock(&RcBlock::new(apply_pending_panel_resize));
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
+    }
+    Ok(())
+}
+
+fn apply_pending_panel_resize() {
+    let Some(pending) = PENDING_PANEL_RESIZE.take() else {
+        return;
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(window) =
+        NSApplication::sharedApplication(mtm).windowWithWindowNumber(pending.window_number)
+    else {
+        return;
+    };
+    if !window.isVisible()
+        || window.isMiniaturized()
+        || window
+            .styleMask()
+            .intersects(NSWindowStyleMask::Titled | NSWindowStyleMask::FullScreen)
+    {
+        return;
+    }
+    // setContentSize keeps the bottom edge of a borderless window fixed. Move
+    // and size it together so the top stays beneath the icon as the content grows.
+    let current = window.frame();
+    let size = NSSize::new(current.size.width, pending.height);
+    let frame = NSRect::new(pending.anchor.origin_for_size(size), size);
+    if frame != current {
+        window.setFrame_display(frame, false);
+        window.invalidateShadow();
+    }
+}
+
 pub(crate) fn is_fullscreen(handle: &impl HasWindowHandle) -> anyhow::Result<bool> {
     Ok(native_window(handle)?
         .styleMask()
@@ -215,6 +301,12 @@ fn pin_metal_drawable(layer: &CALayer) {
 }
 
 fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Result<()> {
+    if let Some(mut pending) = PENDING_PANEL_RESIZE.take() {
+        if let Presentation::Panel(anchor) = presentation {
+            pending.anchor = anchor;
+            PENDING_PANEL_RESIZE.set(Some(pending));
+        }
+    }
     if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
         // AppKit owns the asynchronous fullscreen transition. The UI requests
         // its exit before retrying Panel; rewriting the style mask here would
@@ -346,6 +438,16 @@ mod tests {
     fn panel_placement_is_below_icon_and_clamped_at_right_edge() {
         let origin = anchor().origin_for_size(NSSize::new(640.0, 420.0));
         assert_eq!(origin, NSPoint::new(794.0, 450.0));
+    }
+
+    #[test]
+    fn changing_panel_height_keeps_the_same_top_edge_under_the_icon() {
+        let anchor = anchor();
+        for height in [420.0, 240.0, 580.0] {
+            let origin = anchor.origin_for_size(NSSize::new(640.0, height));
+            assert_eq!(origin.x, 794.0);
+            assert_eq!(origin.y + height, anchor.icon_y - PANEL_GAP);
+        }
     }
 
     #[test]

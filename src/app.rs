@@ -1875,6 +1875,10 @@ impl AutoLoginApp {
         self.selected_tab = tab;
         #[cfg(target_os = "macos")]
         {
+            if !self.macos_window_visible {
+                // The native panel can skip a queued resize while hidden.
+                self.last_requested_window_height = None;
+            }
             self.macos_window_visible = true;
             self.macos_panel_acquired_focus = false;
             self.macos_presentation_requested_this_pass = true;
@@ -2655,6 +2659,20 @@ impl AutoLoginApp {
         let previous = self.last_requested_window_height.replace(native_height);
         if previous == Some(native_height) {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        if let crate::macos_panel::Presentation::Panel(anchor) = self.macos_presentation {
+            match crate::macos_panel::resize_anchored_panel(
+                _frame,
+                anchor,
+                height,
+                ctx.zoom_factor(),
+            ) {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "Could not resize the anchored menu bar panel")
+                }
+            }
         }
         if previous.is_some() || (current_size.y - height).abs() >= 0.5 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
