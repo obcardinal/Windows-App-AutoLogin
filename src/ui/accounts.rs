@@ -48,7 +48,7 @@ const ACCOUNT_TRANSACTION_IN_PROGRESS_REASON: &str =
 const STATE_COLUMN_WIDTH: f32 = 68.0;
 const TABLE_SPACING: f32 = 8.0;
 const ACTION_BUTTON_SIZE: f32 = 30.0;
-const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 3.0 + TABLE_SPACING * 2.0;
+const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 4.0 + TABLE_SPACING * 3.0;
 const ACCOUNT_ROW_HEIGHT: f32 = 49.0;
 const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
 const MAX_VISIBLE_ACCOUNT_ROWS: usize = 5;
@@ -69,6 +69,8 @@ const ACCOUNT_TOGGLE_BURST_MAX_COALESCE_PERIOD: Duration = Duration::from_millis
 const ACCOUNT_TOGGLE_START_RETRY_DELAY: Duration = Duration::from_secs(1);
 const ACCOUNT_TOGGLE_INTENT_QUEUE_CAPACITY: usize = 16;
 const OPEN_DESKTOP_ICON: &[u8] = include_bytes!("../../assets/icons/open-desktop.svg");
+const COPY_EMAIL_ICON: &[u8] = include_bytes!("../../assets/icons/copy.svg");
+const CHECK_ICON: &[u8] = include_bytes!("../../assets/icons/check.svg");
 const PENCIL_ICON: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
 const REMOVE_ACCOUNT_ICON: &[u8] = include_bytes!("../../assets/icons/x.svg");
 const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
@@ -2195,6 +2197,7 @@ fn show_account_row(
                 if open_desktop_button(ui, account, controls) {
                     actions.enter_account = Some(account.id.clone());
                 }
+                copy_email_button(ui, &account.id, email);
                 if with_transaction_disabled_reason(
                     account_action_button(ui, AccountActionIcon::Edit, controls.edit)
                         .on_hover_text("Edit account"),
@@ -2218,6 +2221,29 @@ fn show_account_row(
     });
 }
 
+fn copy_email_button(ui: &mut egui::Ui, account_id: &str, email: &str) {
+    let feedback_id = egui::Id::new(("account_email_copied", account_id));
+    let now = ui.input(|input| input.time);
+    let expires_at = ui.data(|data| data.get_temp::<f64>(feedback_id));
+    let (icon, tooltip) = match expires_at.filter(|until| *until > now && !email.is_empty()) {
+        Some(until) => {
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(until - now));
+            (AccountActionIcon::EmailCopied, "Email copied")
+        }
+        None => (AccountActionIcon::CopyEmail, "Copy email"),
+    };
+    if account_action_button(ui, icon, !email.is_empty())
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text("No email to copy")
+        .clicked()
+    {
+        ui.ctx().copy_text(email.to_owned());
+        ui.data_mut(|data| data.insert_temp(feedback_id, now + 2.0));
+        ui.ctx().request_repaint();
+    }
+}
+
 fn open_desktop_button(
     ui: &mut egui::Ui,
     account: &Account,
@@ -2225,7 +2251,7 @@ fn open_desktop_button(
 ) -> bool {
     let needs_setup = device_needs_setup(account);
     if !cfg!(target_os = "macos") && needs_setup {
-        // Keep the edit and delete columns aligned with already linked accounts.
+        // Keep the remaining actions aligned with those of linked accounts.
         ui.add_space(ACTION_BUTTON_SIZE + ui.spacing().item_spacing.x);
         return false;
     }
@@ -3379,6 +3405,8 @@ fn account_editor_field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
 #[derive(Clone, Copy)]
 enum AccountActionIcon {
     OpenDesktop,
+    CopyEmail,
+    EmailCopied,
     Edit,
     Delete,
 }
@@ -3393,6 +3421,20 @@ fn account_action_button(
             "bytes://icons/open-desktop.svg",
             OPEN_DESKTOP_ICON,
             "Open desktop",
+            theme::ACCENT,
+            theme::ACCENT_SOFT,
+        ),
+        AccountActionIcon::CopyEmail => (
+            "bytes://icons/copy.svg",
+            COPY_EMAIL_ICON,
+            "Copy email",
+            theme::ACCENT,
+            theme::ACCENT_SOFT,
+        ),
+        AccountActionIcon::EmailCopied => (
+            "bytes://icons/check.svg",
+            CHECK_ICON,
+            "Email copied",
             theme::ACCENT,
             theme::ACCENT_SOFT,
         ),
@@ -4448,6 +4490,80 @@ mod tests {
     }
 
     #[test]
+    fn copy_email_copies_the_selected_row_and_briefly_shows_confirmation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::theme::apply(&ctx);
+        let mut app = account_test_app(AppConfig {
+            accounts: vec![
+                Account::new("first@example.test"),
+                Account {
+                    enabled: false,
+                    ..Account::new("  second@example.test  ")
+                },
+                Account::new(" "),
+            ],
+            ..Default::default()
+        });
+        let mut render = |time, events| {
+            let input = egui::RawInput {
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                super::show(ui, &mut app);
+            })
+        };
+        let button_centers = |frame: &egui::FullOutput, label: &str| {
+            let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+            let mut centers: Vec<_> = tree
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.label() == Some(label))
+                .filter_map(|(_, node)| node.bounds())
+                .map(|bounds| {
+                    egui::pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    )
+                })
+                .collect();
+            centers.sort_by(|a, b| a.y.total_cmp(&b.y));
+            centers
+        };
+        let clipboard = |frame: egui::FullOutput| {
+            frame
+                .platform_output
+                .commands
+                .into_iter()
+                .find_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text),
+                    _ => None,
+                })
+        };
+        let idle = button_centers(&render(0.0, vec![]), "Copy email");
+        assert_eq!(idle.len(), 3);
+        assert_eq!(clipboard(render(0.2, click(idle[2]))), None);
+        let selected = idle[1];
+        for time in [1.0, 2.5] {
+            assert_eq!(
+                clipboard(render(time, click(selected))).as_deref(),
+                Some("second@example.test")
+            );
+            assert_eq!(
+                button_centers(&render(time + 0.1, vec![]), "Email copied"),
+                [selected]
+            );
+        }
+        assert_eq!(
+            button_centers(&render(4.4, vec![]), "Email copied"),
+            [selected]
+        );
+        assert_eq!(button_centers(&render(4.6, vec![]), "Copy email"), idle);
+    }
+
+    #[test]
     fn action_hover_starts_at_the_edge_of_the_painted_button() {
         let ctx = egui::Context::default();
         crate::ui::theme::apply(&ctx);
@@ -4546,17 +4662,23 @@ mod tests {
             assert_eq!(rects.len(), 2);
             rects
         };
-        let [open, edit, delete] =
-            ["Open desktop", "Edit account", "Delete account"].map(button_bounds);
-        for ((open, edit), delete) in open.iter().zip(&edit).zip(&delete) {
-            assert_eq!(open.size(), egui::Vec2::splat(super::ACTION_BUTTON_SIZE));
-            assert_eq!(open.size(), edit.size());
-            assert_eq!(open.size(), delete.size());
-            assert_eq!(open.top(), edit.top());
-            assert_eq!(open.top(), delete.top());
-            assert_eq!(edit.left() - open.right(), super::TABLE_SPACING);
-            assert_eq!(delete.left() - edit.right(), super::TABLE_SPACING);
-            assert!(delete.right() <= crate::app::MAIN_WINDOW_WIDTH);
+        let [open, copy, edit, delete] = [
+            "Open desktop",
+            "Copy email",
+            "Edit account",
+            "Delete account",
+        ]
+        .map(button_bounds);
+        for row in 0..open.len() {
+            let buttons = [open[row], copy[row], edit[row], delete[row]];
+            for button in buttons {
+                assert_eq!(button.size(), egui::Vec2::splat(super::ACTION_BUTTON_SIZE));
+                assert_eq!(button.top(), open[row].top());
+            }
+            for pair in buttons.windows(2) {
+                assert_eq!(pair[1].left() - pair[0].right(), super::TABLE_SPACING);
+            }
+            assert!(delete[row].right() <= crate::app::MAIN_WINDOW_WIDTH);
         }
         render(click(open[0].center()), true, &mut actions);
         assert_eq!(

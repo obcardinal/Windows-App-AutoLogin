@@ -22,7 +22,7 @@ use tokio::sync::mpsc::Sender as TokioSender;
 use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
-pub(crate) const MAIN_WINDOW_WIDTH: f32 = 548.0;
+pub(crate) const MAIN_WINDOW_WIDTH: f32 = 586.0;
 pub(crate) const FULL_WINDOW_HEIGHT: f32 = 500.0;
 pub(crate) const MIN_WINDOW_HEIGHT: f32 = 200.0;
 #[cfg(not(target_os = "macos"))]
