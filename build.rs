@@ -45,12 +45,29 @@ fn main() {
         println!("cargo:rerun-if-changed={bridge}");
         println!("cargo:rerun-if-changed=src/macos_masked_field.h");
         println!("cargo:rerun-if-changed=src/macos_masked_field.m");
-        cc::Build::new()
+        let mut native = cc::Build::new();
+        native
             .file(bridge)
             .file("src/macos_masked_field.m")
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .compile("waal_lock_screen_capture");
+        // Rust's final link omits Clang's default libraries. The bridge's
+        // @available checks need compiler-rt on older deployment targets.
+        let output = native
+            .get_compiler()
+            .to_command()
+            .arg("-print-file-name=libclang_rt.osx.a")
+            .output()
+            .expect("locate the macOS Clang runtime");
+        let runtime = std::str::from_utf8(&output.stdout)
+            .expect("Clang runtime path")
+            .trim();
+        assert!(
+            output.status.success() && Path::new(runtime).is_file(),
+            "Clang macOS runtime not found"
+        );
+        println!("cargo:rustc-link-arg={runtime}");
         println!("cargo:rustc-link-arg=-Wl,-weak_framework,ScreenCaptureKit");
         println!("cargo:rustc-link-lib=framework=Vision");
     }
