@@ -22,6 +22,9 @@ use tokio::sync::mpsc::Sender as TokioSender;
 use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
+pub(crate) const MAIN_WINDOW_WIDTH: f32 = 548.0;
+pub(crate) const FULL_WINDOW_HEIGHT: f32 = 500.0;
+pub(crate) const MIN_WINDOW_HEIGHT: f32 = 200.0;
 const ACCESSIBILITY_REQUEST_BUTTON_SIZE: [f32; 2] = [278.0, 34.0];
 const ACCESSIBILITY_SETTINGS_BUTTON_SIZE: [f32; 2] = [248.0, 34.0];
 const ACCESSIBILITY_SETTINGS_INSTRUCTIONS: &str =
@@ -2592,8 +2595,12 @@ impl eframe::App for AutoLoginApp {
                     return;
                 }
                 match self.selected_tab {
-                    Tab::Accounts => crate::ui::accounts::show(ui, self),
-                    Tab::Settings => crate::ui::settings::show(ui, self),
+                    Tab::Accounts => {
+                        crate::ui::accounts::show(ui, self);
+                    }
+                    Tab::Settings => {
+                        crate::ui::settings::show(ui, self);
+                    }
                     #[cfg(feature = "diagnostics-ui")]
                     Tab::Diagnose => crate::ui::diagnose::show(ui, self),
                 }

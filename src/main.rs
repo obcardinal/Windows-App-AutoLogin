@@ -351,8 +351,8 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
 
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([640.0, 420.0])
-        .with_min_inner_size([560.0, 360.0])
+        .with_inner_size([app::MAIN_WINDOW_WIDTH, app::FULL_WINDOW_HEIGHT])
+        .with_min_inner_size([app::MAIN_WINDOW_WIDTH, app::MIN_WINDOW_HEIGHT])
         .with_icon(load_icon()?)
         .with_visible(true)
         .with_active(true);
