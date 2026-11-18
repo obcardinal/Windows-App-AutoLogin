@@ -1,479 +1,56 @@
 # Windows App AutoLogin
 
-![Accounts screen](docs/images/accounts-screen.webp)
+<img src="assets/icon.png" align="right" width="72" height="72" alt="">
 
-Windows App AutoLogin is a small desktop tray/menu-bar utility for macOS and Windows that fills Microsoft Windows App credential prompts only when the visible prompt clearly belongs to one saved account.
+Windows App AutoLogin fills the password prompt when you reconnect to a work desktop in Microsoft Windows App. It runs in the macOS menu bar or Windows system tray. You choose which accounts it can use and can pause autofill with **Stop Monitor**.
 
-It is designed for the narrow case where Windows App shows a password prompt with a visible email address. The app verifies the running Microsoft client, reads the visible email, matches exactly one enabled account, loads only that account's password, fills the password field, and submits the prompt.
+## How your password is protected
 
-This project is not affiliated with Microsoft.
+### Where passwords are stored
 
-## What It Does
+AutoLogin stores passwords in **macOS Keychain** or **Windows Credential Manager** by default. On Windows, DPAPI ties each new credential to your Windows user. Account emails, desktop links and preferences are saved separately in the local settings file.
 
-- Runs as a lightweight tray/menu-bar app by default.
-- Opens the full settings window only on demand.
-- Stores account metadata in a local config file.
-- Stores passwords in the system secure store by default: macOS Keychain on macOS, Windows Credential Manager on Windows.
-- Detects Windows App credential prompts.
-- Auto-fills password prompts only after a visible email matches exactly one enabled account.
-- Handles native secure password fields only inside a verified credential prompt.
-- Keeps internal diagnostic logs bounded and redacted.
-- Provides a standalone sanitized macOS UI diagnostic tool for development.
+If you choose encrypted file storage, AutoLogin encrypts each password with AES-256-GCM and generates a fresh key each time you save it. The key stays in the system credential store, so a copy of the file alone is insufficient to read the passwords.
 
-## Safety Model
+### Which window can receive a password
 
-The app is intentionally conservative. It should do nothing unless the current state is unambiguous.
+1. **Verify the client.** AutoLogin checks the running application's Microsoft signature and installation path, and locates its foreground credential prompt.
+2. **Match the account.** The email shown in the prompt must match exactly one enabled account. Only then does AutoLogin retrieve that account's password. If the email is missing or ambiguous, the prompt stays open for you.
+3. **Verify the field.** Just before entry, AutoLogin rechecks the prompt and the field identified as secure by the operating system. It sends the password directly to the Microsoft client, keeping it out of the clipboard and diagnostic reports.
 
-Before loading a password, it requires:
+These checks run on your computer. The Microsoft client handles authentication. [Credential storage implementation](src/storage/mod.rs) · [Autofill checks](src/debug_fill.rs)
 
-1. Platform automation access for the exact running app: macOS Accessibility, or the current Windows desktop UI Automation session.
-2. A trusted Windows App process/window.
-3. The expected Microsoft app/process identity.
-4. The target app to be frontmost.
-5. A visible credential prompt.
-6. A visible email address in that prompt.
-7. Exactly one enabled saved account matching that email.
+## Get started
 
-Before typing or submitting, it revalidates the target process, PID/window context, prompt contents, visible email, and password field.
-
-Diagnostics use the same trusted target constraints as autofill: supported Microsoft identity, expected install path, signing identity, and verified live PID. App names, process names, and window titles are labels, not sufficient authority for diagnostic traversal.
-
-The app does not:
-
-- preload all saved passwords;
-- cache decrypted passwords long-term;
-- type when the email is missing, mismatched, duplicated, or ambiguous;
-- type into an untrusted or background app;
-- use the clipboard for password insertion;
-- expose secrets through argv, environment variables, temp files, sockets, or HTTP APIs;
-- log passwords, OTPs, tokens, recovery codes, clipboard contents, or raw secure-field values.
-
-## Supported Target App
-
-The runtime trust check currently supports:
-
-- `Windows App`
-
-On Windows, the native implementation uses Windows UI Automation and targets the known Microsoft Windows App process identity.
-
-On macOS, the trusted Microsoft app identity is:
-
-- Bundle ID: `com.microsoft.rdc.macos`
-- Microsoft Team ID: `UBF8T346G9`
-
-On macOS, the app expects the Microsoft client bundle to be installed in `/Applications`:
-
-- `/Applications/Windows App.app`
-
-Other app names, copied bundles, unsigned bundles, modified bundles, or unexpected Windows process/path identities are rejected.
-
-## Requirements
-
-- macOS 11 or newer, or Windows 10/11.
-- Rust matching the version in `Cargo.toml` (`rust-version = "1.93"`).
-- Windows App installed on the same desktop session.
-- macOS Accessibility permission for the exact app or binary you launch on macOS.
-- macOS may also ask for Automation permission to control System Events; approve it only for the expected Windows App AutoLogin bundle.
-- For macOS bundle creation: `sips` and `iconutil`.
-- For the non-publishable local signed macOS artifact: a Developer ID Application signing identity available to `codesign`, plus a `notarytool` keychain profile.
-- For the unsigned Windows VM-test artifact: an x64 MSVC Rust toolchain and a Visual Studio Developer PowerShell environment with `cl.exe`, `lib.exe`, `link.exe`, and `rc.exe`.
-
-## Build
-
-Create a non-publishable local macOS ZIP with a release-profile app bundle that uses the production bundle identity and is Developer ID signed, notarized, and stapled:
-
-```bash
-RELEASE_CARGO="$(rustup which cargo)"
-RELEASE_RUSTC="$(rustup which rustc)"
-RELEASE_SYSROOT="$($RELEASE_RUSTC --print sysroot)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-XCODE_TOOLCHAIN="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain"
-MACOS_SDKROOT="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
-CLANG_RESOURCE_DIR="$($XCODE_TOOLCHAIN/usr/bin/clang -print-resource-dir)"
-export WAAL_RELEASE_CARGO_PATH="$RELEASE_CARGO"
-export WAAL_RELEASE_RUSTC_PATH="$RELEASE_RUSTC"
-export WAAL_RELEASE_RUST_SYSROOT="$RELEASE_SYSROOT"
-export WAAL_MACOS_DEVELOPER_DIR="$DEVELOPER_DIR"
-export WAAL_MACOS_SDKROOT="$MACOS_SDKROOT"
-export WAAL_MACOS_CLANG_RESOURCE_DIR="$CLANG_RESOURCE_DIR"
-# Load these values from a separately reviewed, versioned toolchain-pin
-# manifest. Hashing the live tools and immediately trusting those hashes is
-# only candidate generation; it is not release verification.
-export WAAL_RELEASE_EXPECTED_GIT_SHA256=<reviewed-xcode-git-sha256>
-export WAAL_RELEASE_EXPECTED_CARGO_SHA256=<reviewed-cargo-sha256>
-export WAAL_RELEASE_EXPECTED_RUSTC_SHA256=<reviewed-rustc-sha256>
-export WAAL_RELEASE_EXPECTED_CLANG_SHA256=<reviewed-clang-sha256>
-export WAAL_RELEASE_EXPECTED_CLANGXX_SHA256=<reviewed-clangxx-sha256>
-export WAAL_RELEASE_EXPECTED_AR_SHA256=<reviewed-ar-sha256>
-export WAAL_RELEASE_EXPECTED_LD_SHA256=<reviewed-ld-sha256>
-export WAAL_RELEASE_EXPECTED_LD_TAPI_SHA256=<reviewed-libtapi-sha256>
-export WAAL_RELEASE_EXPECTED_LD_CODEDIRECTORY_SHA256=<reviewed-libcodedirectory-sha256>
-export WAAL_RELEASE_EXPECTED_LD_LTO_SHA256=<reviewed-liblto-sha256>
-export WAAL_RELEASE_EXPECTED_LD_SWIFT_DEMANGLE_SHA256=<reviewed-libswift-demangle-sha256>
-export WAAL_RELEASE_EXPECTED_NOTARYTOOL_SHA256=<reviewed-notarytool-sha256>
-export WAAL_RELEASE_EXPECTED_STAPLER_SHA256=<reviewed-stapler-sha256>
-export WAAL_RELEASE_EXPECTED_RUST_SYSROOT_SHA256=<reviewed-sysroot-tree-sha256>
-export WAAL_RELEASE_EXPECTED_MACOS_SDK_SHA256=<reviewed-sdk-tree-sha256>
-export WAAL_RELEASE_EXPECTED_CLANG_RESOURCE_DIR_SHA256=<reviewed-clang-resource-tree-sha256>
-export WAAL_RELEASE_EXPECTED_NATIVE_TOOLCHAIN_SHA256=<reviewed-native-aggregate-sha256>
-WAAL_RELEASE_BUNDLE_ID=com.obcardinal.WindowsAppAutoLogin \
-WAAL_MACOS_TEAM_ID=ABCDE12345 \
-WAAL_CODESIGN_IDENTITY="Developer ID Application: Example Corp (ABCDE12345)" \
-WAAL_NOTARY_PROFILE=your-notary-profile \
-script/package_macos.sh --local-signed-release
-```
-
-The files are written as `dist/WindowsAppAutoLogin-macos-local-signed-<40-hex-captured-commit>.zip` and a matching `*.zip.sha256` sidecar. The commit and tree are captured for traceability, but the local shared user security context cannot prove that Cargo produced the Mach-O from that commit before the Developer ID signer signed it. The bundle therefore records `publishable=false`, `attestation=none-local-shared-security-context`, and `producer-attribution=unavailable-local-shared-security-context` in its executable metadata and `Contents/Resources/BUILD-INFO.txt`. Do not publish it as a release.
-
-Local invocations with `--release` or `--release-diagnostics-artifact` fail closed. The only local signed packaging entry point is `--local-signed-release`. A future publishable macOS artifact must be produced by a separately isolated builder and returned over an authenticated channel. Local publication still uses a same-volume atomic no-replace APFS clone followed by descriptor-bound verification and candidate cleanup: an existing artifact is never unlinked or overwritten, and older commit-labelled artifacts are preserved. These controls protect the selected package bytes; they do not provide producer attribution.
-
-For a local macOS development bundle, use `./script/build_and_run.sh --verify` instead. When exactly one `Developer ID Application` identity is available, the script uses it automatically so Accessibility and other TCC approvals survive rebuilds. Set `WAAL_DEVELOPMENT_CODESIGN_IDENTITY=-` to force the older cdhash-bound ad-hoc behavior, or set it to a specific Developer ID identity when more than one is installed. This remains a local development artifact, not a publishable release.
-
-Build-check the Windows implementation from another host when the target is installed:
-
-```bash
-cargo check --target x86_64-pc-windows-gnu --all-targets --all-features
-```
-
-Local publishable Windows packaging is intentionally disabled. Cargo and path-based signing tools running under the same Windows security context cannot prove which process produced the bytes or prevent use of the signer as an oracle. An invocation without `-Development`, or with any certificate or timestamp input, therefore fails before Git, Cargo, certificates, or native tools are resolved.
-
-For an optimized unsigned local VM-test artifact, opt in explicitly from a Visual Studio Developer PowerShell prompt:
-
-```powershell
-.\script\build_windows_dist.ps1 -Development
-```
-
-The development package is commit-addressed for traceability, but it is not an attested release. `BUILD-METADATA.txt` records `publishable=false`, `attestation=none-local-shared-security-context`, the captured commit/tree, observed tool hashes, and payload hashes; `SHA256SUMS.txt` protects the selected package bytes. Do not publish this artifact. A future publishable Windows pipeline must run in a separately isolated builder and return output over an authenticated channel.
-
-The Windows packager still uses a clean PowerShell child, an isolated Cargo home, a freshly materialized committed source snapshot, retained directory/file handles, and no-replace publication for the development package. Cargo is allowed to create and uplift its normal executable destination; after Cargo exits, the packager opens the exact child relative to the retained output directory, verifies that it is a non-empty regular single-link file, and denies further writes or replacement while copying it. These controls keep the selected VM-test payload internally consistent; they deliberately do not claim producer attribution against another process running as the same user.
-
-Build and launch the local macOS development app bundle. This path uses the separate development bundle identity and prefers the stable local Developer ID signer described below, with a cdhash-bound ad-hoc fallback; it is not a production release build:
-
-```bash
-./script/build_and_run.sh --verify
-```
-
-The bundle is created at:
-
-```text
-dist/WindowsAppAutoLogin.app
-```
-
-For a permanent local install, copy the built app to `/Applications` and launch that copy:
-
-```bash
-cp -R dist/WindowsAppAutoLogin.app /Applications/
-open /Applications/WindowsAppAutoLogin.app
-```
-
-macOS grants Accessibility and Keychain access to a specific app identity/path. If you grant access to the app in `dist/` and later move it to `/Applications`, you may need to grant permission again.
-
-## First Run
-
-1. Build and open the app bundle.
-2. Use the menu-bar icon and choose **Accounts**.
-3. If Accessibility is missing, the app requests it once at startup and again when you choose **Start Monitor**. If macOS does not show the system prompt again, use **Open Accessibility Settings** on the permission screen inside the app. That screen also retains **Request Accessibility Access** for a manual retry.
-4. Enable Windows App AutoLogin in:
-
-```text
-System Settings -> Privacy & Security -> Accessibility
-```
-
-5. Return to the app. It checks Accessibility status every second without repeating the prompt. The requested Monitor start resumes after permission is granted; **Stop Monitor** cancels that pending start.
-6. If macOS prompts for Automation permission to control System Events, approve it for the expected Windows App AutoLogin bundle. The app uses that only for Open at Login cleanup and guarded diagnostics/prompt inspection.
-7. Add an account in the **Accounts** tab.
-8. Save the email and password.
-9. Keep the account enabled.
-10. Start the monitor from the menu-bar item if it is not already running.
-
-When the matching Windows App credential prompt is visible and Windows App is frontmost, the background worker attempts one guarded fill and submit sequence.
-
-In **Add Account** or **Edit Account**, **Remote PC** is the hostname or IP address from **Connection Information → Remote PC**. On macOS, select **Import address…** in the editor. In the intended desktop’s Windows App window, choose **Connections → Show Connection Information**. Leave that window open, return to AutoLogin, and select **Use this address** after reviewing the detected hostname. When a native sign-in prompt identifies the remote PC, AutoLogin checks this address along with the visible email. For a single saved account the address can be blank. If the initial prompt identifies only a Microsoft RD Gateway, AutoLogin uses the existing email check.
-
-## Menu-Bar App
-
-The app keeps a lightweight supervisor running in the background. On a fresh launch it opens Accounts unless **Hide main window at launch** is enabled.
-
-On macOS, left-clicking the visible menu-bar icon opens Accounts in a fixed panel anchored below the icon. The panel hides when it loses focus and preserves unfinished edits and pending saves. Right-click the icon for the native menu described below. With **Hide menu bar icon** enabled, opening the app from Finder or Spotlight instead shows a normal movable, resizable window. Changing icon visibility switches the existing UI between these two modes without restarting it. Windows continues to use the normal application window and tray menu.
-
-Under **Settings → System**, **Hide menu bar icon** (macOS) or **Hide system tray icon** (Windows) hides the icon without stopping the app. This option is off by default, is saved automatically, and takes effect without restarting. Open Windows App AutoLogin again from Finder or Spotlight on macOS, or launch its shortcut or main executable again on Windows, to return to the window and restore the icon in Settings. Both platforms store this preference as `hide_menu_bar_icon` in the configuration.
-
-**Show diagnostic info in menu** controls the gray status lines: Accessibility (macOS), password storage, and the last fill result. It is off by default on both platforms, including configurations that do not yet contain this setting. An explicitly saved preference is preserved. Changes save automatically and apply without restarting. Turning it off hides only those lines and their separator; menu actions remain available.
-
-The menu follows these groups, separated by native menu dividers:
-
-- **Accounts** and **Start Monitor** / **Stop Monitor**, followed by the optional diagnostic block: Accessibility (macOS), password storage, and last fill result.
-- **About Windows App AutoLogin**: application icon, version, release date, author, and contact links.
-- **Settings…** (`⌘,` on macOS), followed by **Check for Updates…** on macOS.
-- **Quit Windows App AutoLogin** (`⌘Q` on macOS).
-
-The heavier settings UI is launched only when needed. Closing a normal settings window returns the app to the lightweight menu-bar process. Dismissing the macOS panel keeps its UI process available so reopening it restores unfinished edits; monitoring continues according to the selected Start/Stop state.
-
-**About** opens a separate native window and remains available when diagnostic info is hidden. On macOS it uses the same standard About panel and spacing as Instance Control: bundle icon, version, localized release date, author link, and contact icons. Windows uses a native modeless About window with the same information. The release date is tied to the published version; an unknown version does not inherit an older release's date. Opening or closing About does not stop the monitor or open the Accounts/Settings window.
-
-### macOS software updates
-
-The packaged macOS app uses Sparkle 2.9.4 with its standard update windows, like Instance Control. **Check for Updates…** is available immediately after **Settings…** in both compact and diagnostic menus. Checking does not pause monitoring or open Accounts. Installing an update stops automation and lets the settings process finish pending saves before Sparkle replaces and relaunches the app. Cancelling installation restores normal operation.
-
-Production builds check every six hours and ask before installing. Local development bundles use a separate feed and manual checks by default. The two bundle identities cannot receive each other's releases:
-
-| Build | Bundle identifier | Feed |
+| Platform | Download | Install |
 | --- | --- | --- |
-| Production | `com.obcardinal.WindowsAppAutoLogin` | `https://obcardinal.com/assets/downloads/windows-app-autologin/macos/appcast.xml` |
-| Development | `obcardinal.windows-app-autologin` | `https://obcardinal.com/assets/downloads/windows-app-autologin/macos/development/appcast.xml` |
+| macOS 11+, Apple silicon | [macOS v0.4.1](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.1) | Extract the ZIP and move `WindowsAppAutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
+| Windows 10/11, x64 | [Windows v0.4.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.0) | Extract the ZIP and run `WindowsAppAutoLogin.exe`. Keep `WindowsAppAutoLoginUI.exe` in the same folder. Both executables are unsigned. |
 
-The feeds are served by the existing HTTPS website on Mac mini. Updates require a signature matching `macos/SparklePublicKey.txt`; the dedicated signing key stays in the login Keychain under account `windows-app-autologin`. Framework downloads are pinned by SHA-256, and the complete framework and its helpers are signed with the application before launch. `script/build_and_run.sh` includes this setup. A raw `cargo run` without a configured bundle shows an explanatory message when an update check is requested. The existing local-only release packager remains non-publishable; see [macos/UPDATES.md](macos/UPDATES.md) for producing update archives with an isolated builder and preparing a signed appcast.
+1. Open AutoLogin. On macOS, grant it **Accessibility** under **System Settings → Privacy & Security** so it can read and fill the sign-in prompt.
+2. In **Accounts**, click **+** (Add Account). Save the email that Windows App shows at sign-in and the password for that account.
+3. If monitoring is paused, choose **Start Monitor**. Open the remote desktop and leave its sign-in prompt in front. Enable **Settings → System → Open at Login** if you want AutoLogin to start with your computer.
 
-Companion applications can invoke `windows-app-autologin://check-for-updates` when the installed bundle advertises boolean `WAALSupportsCheckForUpdatesURL=true` in `Info.plist`. Use `NSWorkspace.open(_:withApplicationAt:configuration:completionHandler:)` with the exact installed application URL, so another development copy is not selected. Only that fixed URL is accepted; paths, query parameters, fragments, credentials and alternate feeds are rejected. Both a cold launch and an already-running UI child forward the action to the supervisor's updater.
+The Windows version also recognizes Microsoft Remote Desktop and the built-in Remote Desktop Connection client.
 
-## Settings Window
+## Linked desktops and two-factor sign-in on macOS
 
-The settings window includes:
+These features are in the current source and were added after the v0.4.1 release.
 
-- **Accounts**: add, edit, pause, enable, or delete saved accounts.
-- **Settings**: adjust Open at Login, launch window visibility, menu-bar or system-tray icon visibility, diagnostic info in the menu, and storage mode.
-- **Diagnose**: only when built with development diagnostics features.
+### Reconnect to a locked desktop
 
-Existing accounts can be edited without re-entering a password. Leave the password field blank to keep the saved password.
+Choose the desktop under **Connection → VM device** in the account editor. With multiple accounts, use **Import** to match the Remote PC address to the account. With one account, the address is optional.
 
-Enabled accounts must have:
+**Reconnect when locked** is on by default for linked desktops on macOS 14+. It uses **Screen Recording** to recognize the English Windows password screen in the foreground VM window. The image is processed in memory on your Mac and discarded. Recognition triggers a reconnect. Password entry takes place in Windows App's verified credential prompt.
 
-- a non-empty email;
-- a saved password;
-- no other enabled account with the same email, ignoring case and surrounding whitespace.
+### Confirm a sign-in on your iPhone
 
-## Configuration
+Select your Xcode-paired phone in **Settings → iPhone Authentication**. For each participating account, choose **Microsoft Authenticator** under **2FA → iPhone app**. AutoLogin enters the sign-in number for the matching request on your unlocked iPhone over Wi-Fi. You complete Face ID on the phone if prompted. Setup requires Developer Mode and a signed local helper. [iPhone requirements and setup](docs/iphone-authenticator.md#host-setup)
 
-The app stores configuration in the user's macOS config directory, typically:
+**Optional Telegram reminder.** Select **Settings → 2FA Notifications → Link Telegram…** and tap **Start** in the bot chat. Only a matching two-factor request triggers a reminder, which can wake the phone if lock-screen notifications are enabled. The notification service sees when a reminder is requested and uses a link token to reach your chat. The request excludes your work email, password, sign-in number and screen contents.
 
-```text
-~/Library/Application Support/WindowsAppAutoLogin/config.json
-```
+## Development
 
-The file contains account metadata and settings only. It does not contain plaintext passwords.
+Use Rust 1.93 or later. On macOS, `./script/build_and_run.sh` builds and opens the local app. On Windows, run `.\script\build_windows_dist.ps1 -Development` from a clean checkout in x64 Visual Studio Developer PowerShell. Run the Rust tests with `cargo test --locked`.
 
-Example:
-
-```json
-{
-  "accounts": [],
-  "settings": {
-    "auto_start": false,
-    "start_minimized": false,
-    "hide_menu_bar_icon": false,
-    "show_menu_diagnostics": false,
-    "use_keyring": true
-  }
-}
-```
-
-Password records are keyed by account ID and bound to account metadata. Manually editing account IDs or email can disconnect metadata from the saved password and fail closed.
-
-## Password Storage
-
-By default, passwords are stored in the system secure store:
-
-- Service: `WindowsAppAutoLogin`
-- Account: the saved account ID
-
-If **Use system secure storage** is disabled, passwords are stored in an encrypted local fallback file:
-
-```text
-passwords.json
-```
-
-That fallback uses AES-256-GCM. Every account and every saved password revision receives a fresh independent 256-bit key. The scoped keys are stored in the system secure store under:
-
-- Service: `WindowsAppAutoLoginFallbackKey`
-- Account: `fallback-account-key:<random-key-id>`
-
-The former shared `fallback-encryption-key` entry is accepted only while migrating legacy records and is retired after the independently keyed ciphertext map is durably committed. The fallback file is not independent of Keychain or Credential Manager: if a referenced scoped key cannot be created or read from the current user's system secure store, fallback password save/load will fail. On Windows, each key is stored in Credential Manager and protected by user-bound DPAPI. The key envelope binds its random key ID to the account ID; the service name, account metadata, purpose, and normalized email hash are validation and routing metadata, not a guarantee that only this executable can decrypt it. Manual metadata edits fail closed.
-
-Recent builds migrate saved passwords when switching storage mode. The app copies and verifies passwords in the new storage before saving the setting, then attempts to remove old copies from the previous backend. If copying or verification fails, the setting is left unchanged. If only old-copy cleanup fails after a save or migration succeeds, passwords remain available in the selected storage and cleanup remains pending for the next launch instead of being forgotten.
-
-During storage-mode and account metadata changes, the app writes a private pending-operation journal so a restart can finish cleanup or restore a consistent config after a crash. A separate durable staged-key journal is committed before a new scoped fallback key is created; startup reconciliation preserves keys referenced by committed `passwords.json` records and removes only uncommitted crash orphans. Cleanup warnings mean a migration target was verified or an account save completed in the selected backend, but stale old material may remain until recovery succeeds. While a pending operation exists, stored credential changes are blocked and the app retries cleanup on startup. Manual cleanup targets, if the warning persists, are the old `WindowsAppAutoLogin` account-ID secure-store entries, stale `passwords.json` records, and retired fallback key material under `WindowsAppAutoLoginFallbackKey`, including legacy `fallback-encryption-key` or `fallback.key` material. Do not manually delete a scoped or legacy fallback key while a fallback password record may still reference it.
-
-If Keychain asks for permission repeatedly, make sure you are launching the same app bundle each time and choose **Always Allow** only for the intended app identity. Local ad-hoc development signatures are intentionally bound to the executable cdhash, so rebuilding the development bundle changes its identity and can require a new prompt. A stable Developer ID release identity is the appropriate choice when permissions must survive rebuilds.
-
-## How Autofill Works
-
-The autofill path is shared by the background worker and the one-shot debug command.
-
-At a high level:
-
-1. Resolve trusted Windows App processes.
-2. Verify bundle ID, Team ID, path, and code signature.
-3. Require the target app to be frontmost.
-4. Detect the visible credential prompt.
-5. Collect visible prompt text while excluding secure/password-like fields.
-6. Extract the visible email.
-7. Match that email against enabled accounts.
-8. Revalidate the same frontmost prompt and target process before password load.
-9. Load only the matching account password.
-10. Detect the intended password field.
-11. Focus the field and set the password on that exact AX element with a target-bound `AXValue` update after fresh prompt/focus checks.
-12. Submit only with a bounded `AXPress` action on the verified submit button.
-13. Post-check whether the app reached an authenticated/normal state, still shows the prompt, or ended in an unknown state.
-
-For password insertion, the app requires a native secure password field: macOS `AXSecureTextField` or Windows UI Automation `IsPassword`. Password-like plain text controls such as macOS `AXTextField` or Windows plain `Edit` are not accepted as insertion targets, even inside a verified Windows App prompt.
-
-## Diagnostics
-
-Run a sanitized macOS UI diagnostic report:
-
-```bash
-cargo run --quiet --features diagnostics-ui --bin diagnose-macos-ui
-```
-
-The diagnostic binary prints JSON describing visible target processes, windows, controls, and selected system dialogs. Sensitive values are redacted. Raw AppleScript output is not printed.
-
-Diagnostic target discovery uses the same trusted-target constraints as autofill: supported Microsoft identity, expected install path, signing identity, and verified live PID. App names, process names, and window titles are treated only as report labels; they are not enough to select or traverse an arbitrary process.
-
-`release-diagnostics` is reserved for a future intentional support artifact produced by an isolated authenticated builder, not for the local packager or general releases. Diagnostic output is redacted and capped; signing identities, signing identifiers, Team IDs, and app bundle IDs are reduced to coarse status values before display or export. It can still include process IDs and timing data; review it before sharing with support.
-
-Run one guarded fill attempt from a development build compiled with `debug-fill` or `dev-tools` and launched from the trusted app bundle:
-
-```bash
-/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin --debug-fill-once
-```
-
-The one-shot command is intended for development and troubleshooting. It is available only in debug builds with the explicit debug-fill feature enabled and requires Accessibility permission for the trusted `/Applications/WindowsAppAutoLogin.app` bundle identity. Do not package, distribute, or leave a debug-fill build installed as the production app.
-
-## Development Features
-
-Default features:
-
-```text
-none
-```
-
-Optional features:
-
-```text
-debug-fill
-diagnostics-ui
-dev-tools (enables debug-fill and diagnostics-ui)
-release-diagnostics (reserved for isolated release support-artifact builders)
-```
-
-Build a debug-only local bundle and launch its full UI with diagnostics enabled:
-
-```bash
-./script/build_and_run.sh --dev-ui
-```
-
-Start the packaged supervisor and have it open an authorized full settings UI:
-
-```bash
-./script/build_and_run.sh --full-ui
-```
-
-## Test And Verification
-
-Common local gates:
-
-```bash
-cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test
-./script/build_and_run.sh --verify
-```
-
-Additional feature coverage:
-
-```bash
-cargo check --all-targets --all-features
-```
-
-The test suite covers the main safety decisions: visible-email matching, missing/mismatched/duplicate accounts, disabled accounts, PID/window drift, settings-generation cancellation, bounded logs, redaction, diagnostic output caps, diagnostics name-spoof rejection, and target identity checks.
-
-## Packaging Notes
-
-`script/build_and_run.sh` creates a local app bundle and, when exactly one `Developer ID Application` identity is available, uses that stable identity so Accessibility, Automation, and Keychain approval can survive rebuilds. The result still contains development build metadata and the development bundle ID; it is not a publishable or notarized release. If no unique Developer ID identity is available, or `WAAL_DEVELOPMENT_CODESIGN_IDENTITY=-` is set, the script falls back to the default cdhash-bound ad-hoc signature. That fallback does not trust every ad-hoc application that copies the public bundle identifier, but its identity changes after every rebuild and macOS permissions may need to be granted again.
-
-Current development bundle ID:
-
-```text
-obcardinal.windows-app-autologin
-```
-
-The development script does not perform release packaging or notarization. Even when it uses a local Developer ID identity for stable TCC behavior, it opts into `WAAL_DEVELOPMENT_RELEASE=1` and retains the separate development bundle identity.
-
-Local `script/package_macos.sh --release` and `script/package_macos.sh --release-diagnostics-artifact` invocations fail closed because this packager cannot create a publishable or producer-attested macOS artifact. Use `script/package_macos.sh --local-signed-release` only for the explicitly non-publishable local signed ZIP.
-
-The local signed path requires the Git checkout to have no tracked, non-ignored untracked, assume-unchanged, or skip-worktree changes; captures the exact 40-hex `HEAD` commit and tree IDs; materializes an isolated source snapshot from that commit; verifies every materialized file byte and executable mode against its Git blob before and after Cargo and bundle assembly; and rechecks the checkout, snapshot, and embedded observations before writing the package. Git uses the explicitly pinned physical Xcode executable with ambient Git configuration, replacement refs, hooks, and local filesystem-monitor execution disabled; tracked archive attributes remain harmless because the extracted file set and every byte are compared with the Git tree. Cargo runs with a new packager-owned `HOME`, `CARGO_HOME`, temporary directory, target directory, fixed system-tool path, explicit `DEVELOPER_DIR` and `SDKROOT`, and no Cargo configuration in its working-directory ancestors. The dependency graph must contain only the archived root package and locked crates.io packages—external path, Git, alternate-registry, and source-replacement inputs are rejected. Cargo, rustc, the complete Rust sysroot, physical Xcode Git, `clang`, `clang++`, `ar`, `ld`, the four Xcode linker runtime libraries, the selected macOS SDK tree, Clang resource directory, `notarytool`, and `stapler` must match separately reviewed SHA-256 pins; `/usr/bin` developer-tool shims are not packaging inputs. The Rust/native build inputs are copied into a private single-link snapshot, made read-only and immutable, and checked by exact tree identity before and after Cargo. Their observed hashes and the captured source identifiers are recorded in the executable metadata and signed `BUILD-INFO.txt`.
-
-Before signing, the packager captures a canonical digest of the full bundle payload; the main Mach-O digest normalizes only the terminal code-signature blob and its corresponding load-command/`__LINKEDIT` size fields. That payload digest is rechecked around `codesign`, notarization, stapling, final verification, and archive creation. The script uses the production bundle identity and release Cargo profile, signs with `WAAL_CODESIGN_IDENTITY`, notarizes with `WAAL_NOTARY_PROFILE`, staples the ticket, and zips only the selected staged bundle. Pre-existing `dist/*.app` bundles and ignored working-copy files are excluded as inputs, and `dist` must be a real directory rather than a symlink. These checks establish package consistency and record observed inputs, but a process running as the same user can still substitute Cargo output before signing. The local signature, notarization, commit-labelled filename, captured identifiers, and payload hashes therefore do not attest which producer created the Mach-O or prove a producer-attested relationship to the commit.
-
-The Rust sysroot tree digest is SHA-256 over ordinal byte-sorted regular-file entries encoded as `relative/path`, NUL, lowercase file SHA-256, NUL; symbolic links and special nodes are rejected. The Xcode SDK/resource-tree digest additionally supports only non-broken symbolic links whose resolved targets remain inside the same pinned root; it encodes each ordinal byte-sorted regular file as `relative/path`, NUL, `file`, NUL, lowercase file SHA-256, NUL and each link as `relative/path`, NUL, `link`, NUL, exact link text, NUL. The macOS native aggregate is SHA-256 over NUL-terminated lowercase hashes, in this exact order: `clang`, `clang++`, `ar`, `ld`, `libtapi.dylib`, `libcodedirectory.dylib`, `libLTO.dylib`, `libswiftDemangle.dylib`, the macOS SDK tree, and the Clang resource directory. The macOS observed-materials aggregate applies the same rule in this exact order: physical Xcode Git, Cargo, rustc, the Rust sysroot aggregate, the native-toolchain aggregate, `notarytool`, and `stapler`. Windows development metadata likewise records observed deterministic hashes for local tool and directory inputs. These local observations are not a producer attestation or a publishable release-materials claim.
-
-The current local signed macOS path intentionally produces an ARM64 binary. `CFBundleVersion` defaults to the numeric Cargo package version and can be overridden with a valid one-to-three-component `WAAL_BUILD_VERSION`.
-
-Local signed packaging refuses to continue unless `WAAL_RELEASE_BUNDLE_ID`, `WAAL_MACOS_TEAM_ID`, `WAAL_CODESIGN_IDENTITY`, and `WAAL_NOTARY_PROFILE` are set, the source checkout is clean and unchanged throughout packaging, the production bundle ID is a reverse-DNS identifier that differs from the development bundle ID, the executable metadata contains the same expected bundle ID, Team ID, captured source commit/tree, target, observed toolchain hashes, and observed materials aggregate, and the bundle passes production identity checks: expected production bundle ID, Developer ID Application signature, matching Team ID, hardened runtime, empty release entitlements, non-diagnostics build metadata, Gatekeeper assessment, and stapled notarization. It strips `.DS_Store`, AppleDouble `._*`, and `__MACOSX` entries from the staged copy, validates the staged bundle and extracted ZIP, writes the ZIP and SHA-256 sidecar under immutable commit-labelled names without replacing prior files, then re-hashes and verifies the final destination archive. Those labels and metadata remain traceability observations, not producer attribution.
-
-The project previously used development bundle ID `dev.codex.windows-app-autologin`; the current ID is `obcardinal.windows-app-autologin`. Release and development scripts do not reset privacy databases or alter Keychain access lists automatically. If an obsolete grant remains, remove only the old app entry from **System Settings → Privacy & Security → Accessibility** and **Automation**. If you deliberately want command-line cleanup, run the bundle-scoped `tccutil reset Accessibility dev.codex.windows-app-autologin` and `tccutil reset AppleEvents dev.codex.windows-app-autologin` yourself after reviewing the target. In Keychain Access, inspect the `WindowsAppAutoLogin` and `WindowsAppAutoLoginFallbackKey` items and remove only a stale application entry from Access Control; do not delete password items or the fallback key while fallback records exist. When migrating from an older or explicitly forced ad-hoc development build, remove and re-add the exact rebuilt app in System Settings once; the default stable development signature then lets that approval survive later rebuilds.
-
-`script/package_macos.sh --release-diagnostics-artifact` is intentionally disabled locally and fails closed, just like `--release`. `script/build_and_run.sh --dev-ui` remains a local development diagnostics path; it builds `dev-tools`, includes `debug-fill`, uses the development identity, and must not be treated as a signed support or release artifact. Any future publishable diagnostics artifact must use a separate diagnostics identity and be produced by the isolated authenticated builder.
-
-The app bundle sets `LSUIElement=true`, so it behaves like a menu-bar utility rather than a Dock-first application.
-
-On macOS, Open at Login is trusted only for the exact canonical bundle path `/Applications/WindowsAppAutoLogin.app` with the expected bundle identifier; the app intentionally refuses autostart from other bundle locations, including transient build locations such as `target/`, `dist/`, `/tmp`, and `/var/folders`. On Windows, Open at Login registers the current executable path wherever the user runs it from; the app still requires the saved Startup command to exactly match the command it generated, with no extra arguments.
-
-## Troubleshooting
-
-### Autofill does not run
-
-Check:
-
-- The exact launched app has Accessibility permission.
-- Windows App is installed in `/Applications`.
-- Windows App is frontmost.
-- The credential prompt contains a visible email.
-- Exactly one enabled saved account matches that email.
-- The matching account has a saved password.
-- There is no duplicate enabled account with the same email.
-- The Microsoft app bundle has not been copied, modified, or re-signed.
-
-### Keychain is slow or prompts every time
-
-Keychain approval time is counted as password load time. If macOS prompts, approve the intended app and choose **Always Allow**.
-
-Repeated prompts usually mean macOS sees a different client identity, for example:
-
-- launching from `target/debug` instead of the `.app`;
-- rebuilding an ad-hoc signed bundle repeatedly;
-- moving the app after granting permission;
-- granting permission to Terminal instead of the bundled app.
-
-### Prompt is visible but password is not typed
-
-The app fails closed if:
-
-- the email is hidden;
-- the prompt email does not match an enabled account;
-- multiple enabled accounts match;
-- the target app is not frontmost;
-- the target PID/window changed;
-- the platform exposes the password box only as a non-secure plain text field;
-- the password field cannot be verified or focused;
-- Accessibility returns an error or times out.
-
-### Diagnosis times out
-
-The diagnostic tool uses bounded Accessibility traversal and discards raw output on timeout. A timeout should not expose field values. Try closing unrelated modal dialogs and rerun:
-
-```bash
-cargo run --quiet --features diagnostics-ui --bin diagnose-macos-ui
-```
-
-## Limitations
-
-- Supports only the Microsoft Windows App identity.
-- UI detection depends on macOS Accessibility data on macOS and Windows UI Automation data on Windows.
-- Prompts with hidden emails, unusual localization, MFA-only flows, SSO web views, or nonstandard controls may not be fillable.
-- The app intentionally prefers doing nothing over guessing.
-
-## License
-
-MIT
+Independent open-source project. [MIT license](LICENSE)
