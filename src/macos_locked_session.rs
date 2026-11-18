@@ -2,8 +2,8 @@
 //! is only a reason to reconnect; this module never retrieves or sends a password.
 use super::{
     device_launch::{self, SavedDevice},
-    device_windows, remote_pc_info, role_matches, usernames_match, AXUIElementRef, AxElement,
-    AX_BUTTON_ROLE, AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_SHEETS, AX_TITLE, AX_WINDOWS,
+    device_windows, remote_pc_info, usernames_match, AXUIElementRef, AxElement,
+    AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_SHEETS, AX_TITLE, AX_WINDOWS,
 };
 use crate::models::{canonical_remote_pc, Account};
 use anyhow::{ensure, Context, Result};
@@ -210,52 +210,59 @@ fn same_focused_session(session: &LockedSession, app: &AxElement) -> Result<AxEl
     Ok(window)
 }
 
+fn restore_after_card_check(
+    session: &LockedSession,
+    app: &AxElement,
+    original: &AxElement,
+) -> Result<()> {
+    // Return only from Windows App's own Connection Center to the exact
+    // original VM. Never reactivate the app after the user leaves it.
+    let Some(center) = device_launch::center_window(app) else {
+        return Ok(());
+    };
+    if app.bool_attr(AX_FRONTMOST) == Some(true)
+        && app
+            .element_attr("AXFocusedWindow")
+            .is_some_and(|w| w.same_element(&center))
+    {
+        let restored = device_windows::focus_session_in_app(
+            app,
+            session.title(),
+            &|| {
+                app.bool_attr(AX_FRONTMOST) != Some(true)
+                    || app
+                        .element_attr("AXFocusedWindow")
+                        .is_some_and(|w| !w.same_element(original) && !w.same_element(&center))
+            },
+            || {},
+        )?;
+        ensure!(
+            restored.is_some_and(|w| w.same_element(original)),
+            "The original desktop could not be restored."
+        );
+    }
+    Ok(())
+}
+
 fn preflight_reconnect(
     session: &LockedSession,
     accounts: &[Account],
     app: &AxElement,
     original: &AxElement,
     cancelled: &impl Fn() -> bool,
-) -> Result<()> {
-    match &session.device {
+) -> Result<BoundDevice> {
+    let verified = match &session.device {
         BoundDevice::Window(title) => {
-            ensure!(
-                native_account(accounts, title).is_some_and(|a| a.id == session.account_id
-                    && a.username == session.username
-                    && canonical_remote_pc(&a.remote_pc) == session.remote_pc),
-                "The selected session or account changed."
-            );
-            let verified =
-                device_launch::verify_window_device(app, title, &session.username, cancelled);
-            // Restore only our own handoff to Connection Center. Switching to
-            // another app or desktop at any time belongs to the user.
-            let center = device_launch::center_window(app);
-            if app.bool_attr(AX_FRONTMOST) == Some(true)
-                && center.as_ref().is_some_and(|center| {
-                    app.element_attr("AXFocusedWindow")
-                        .is_some_and(|focused| focused.same_element(center))
-                })
-            {
-                let restored = device_windows::focus_session_in_app(
-                    app,
-                    title,
-                    &|| {
-                        app.bool_attr(AX_FRONTMOST) != Some(true)
-                            || !app.element_attr("AXFocusedWindow").is_some_and(|w| {
-                                w.same_element(original)
-                                    || center.as_ref().is_some_and(|c| w.same_element(c))
-                            })
-                    },
-                    || {},
-                )?;
-                ensure!(
-                    restored.is_some_and(|w| w.same_element(original)),
-                    "The original desktop could not be restored."
-                );
-            }
-            verified?;
-            same_focused_session(session, app)?;
-            Ok(())
+            native_account(accounts, title).filter(|a| a.id == session.account_id && a.username == session.username && canonical_remote_pc(&a.remote_pc) == session.remote_pc)
+                .context("The selected session or account changed.")?;
+            device_launch::verify_window_device(
+                app,
+                title,
+                &session.username,
+                session.other_sessions.is_empty(),
+                cancelled,
+            )
+            .map(BoundDevice::Window)
         }
         BoundDevice::Saved(device) => {
             let catalog = device_launch::saved_devices()?;
@@ -268,15 +275,14 @@ fn preflight_reconnect(
                 "The selected session or account changed."
             );
             device_launch::verify_card_identity_in(&catalog, device)?;
-            let center = device_launch::center_window(app).context(
-                "Open the Devices view in Windows App so AutoLogin can reconnect this desktop.",
-            )?;
-            let (_, cards) = device_launch::read_cards(&center)?
-                .context("The saved desktop is unavailable in the Windows App Devices view.")?;
-            device_launch::exact_device(&cards, session.title())?;
-            Ok(())
+            device_launch::verify_saved_card(app, device, cancelled)
+                .map(|()| session.device.clone())
         }
-    }
+    };
+    restore_after_card_check(session, app, original)?;
+    let target = verified?;
+    same_focused_session(session, app)?;
+    Ok(target)
 }
 
 pub(crate) fn reconnect(
@@ -295,18 +301,14 @@ pub(crate) fn reconnect(
             "The active Remote PC could not be matched to this account."
         );
     }
-    preflight_reconnect(session, accounts, &app, &window, &cancelled)?;
-    let current = same_focused_session(session, &app)?;
-    let close = current
-        .element_attr("AXCloseButton")
-        .filter(|b| {
-            b.process_id() == Some(session.pid)
-                && role_matches(b, AX_BUTTON_ROLE)
-                && b.bool_attr(AX_ENABLED) == Some(true)
+    let target = preflight_reconnect(session, accounts, &app, &window, &cancelled)?;
+    let close = device_launch::menu_item(&app, &["Window", "窗口"], &["Close", "关闭"])
+        .filter(|item| {
+            item.process_id() == Some(session.pid) && item.bool_attr(AX_ENABLED) == Some(true)
         })
-        .context("This desktop does not have an enabled close button.")?;
+        .context("Windows App’s Window → Close command is unavailable.")?;
     ensure!(
-        current.same_element(&window) && !cancelled(),
+        same_focused_session(session, &app)?.same_element(&window) && !cancelled(),
         "The selected desktop changed."
     );
     // AX can time out after accepting a press. Observe the exact window and its
@@ -327,10 +329,11 @@ pub(crate) fn reconnect(
     can_reopen()?;
     // A successful native Connect action only means the client accepted the
     // request. Release Monitor immediately so it can handle any credential prompt.
-    match &session.device {
+    match &target {
         BoundDevice::Saved(device) => device_launch::open_saved_device_if(device, can_reopen),
         BoundDevice::Window(title) => device_launch::reconnect_window_device_if(&app, title, &session.username, can_reopen),
-    }.context("The desktop disconnected, but Windows App could not reopen it. Open the selected desktop again.")
+    }.context("The desktop disconnected, but Windows App could not reopen it. Open the selected desktop again.")?;
+    Ok(())
 }
 
 fn wait_for_disconnect(session: &LockedSession, app: &AxElement, window: &AxElement) -> Result<()> {

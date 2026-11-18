@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 #[path = "macos_device_catalog.rs"]
 mod catalog;
+#[path = "macos_connected_card.rs"]
+mod connected;
 pub(super) use catalog::verify_card_identity_in;
 pub(crate) use catalog::{saved_devices, saved_remote_pc, SavedDevice};
 
@@ -77,25 +79,93 @@ pub(super) fn verify_window_device(
     app: &AxElement,
     name: &str,
     email: &str,
+    only_open_session: bool,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    ensure!(
+        !cancelled() && app.bool_attr(AX_FRONTMOST) == Some(true),
+        "The active desktop changed."
+    );
+    let list = devices_in_app(app.clone())?;
+    list.verify_profile(email)?;
+    let check_center = || {
+        ensure!(
+            !cancelled()
+                && app.bool_attr(AX_FRONTMOST) == Some(true)
+                && app
+                    .element_attr("AXFocusedWindow")
+                    .is_some_and(|w| w.same_element(&list.window)),
+            "The Windows App Devices view lost focus."
+        );
+        Ok(())
+    };
+    check_center()?;
+    let card = reconnect_card(&list.devices, name, only_open_session, |item| {
+        check_center()?;
+        let entries = super::device_windows::session_entries(app)?;
+        ensure!(
+            matches!(entries.as_slice(), [(title, _)] if title == name),
+            "The connected desktop changed."
+        );
+        connected::connected_card(app, &list.window, item)
+    })?;
+    check_center()?;
+    Ok(card.to_owned())
+}
+
+fn reconnect_card<'a, T>(
+    cards: &'a [(String, T)],
+    title: &str,
+    only_open_session: bool,
+    mut connected: impl FnMut(&T) -> Result<bool>,
+) -> Result<&'a str> {
+    if let Some((name, _)) = cards.iter().find(|(name, _)| name == title) {
+        exact_device(cards, name)?;
+        return Ok(name);
+    }
+    // Windows App may keep the original title in the open window. When
+    // exactly one session is open, its connected card identifies that VM.
+    if only_open_session {
+        let mut matched = None;
+        for (name, item) in cards {
+            if connected(item)? {
+                ensure!(
+                    matched.is_none(),
+                    "Windows App shows several connected desktops."
+                );
+                exact_device(cards, name)?;
+                matched = Some(name.as_str());
+            }
+        }
+        if let Some(name) = matched {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("Windows App could not identify the connected desktop in Devices.")
+}
+
+pub(super) fn verify_saved_card(
+    app: &AxElement,
+    device: &SavedDevice,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
     ensure!(
         !cancelled() && app.bool_attr(AX_FRONTMOST) == Some(true),
         "The active desktop changed."
     );
-    let list = devices_in_app(app.clone())?;
-    exact_device(&list.devices, name)?;
-    ensure!(
-        !cancelled()
-            && app.bool_attr(AX_FRONTMOST) == Some(true)
-            && app
-                .element_attr("AXFocusedWindow")
-                .is_some_and(|w| w.same_element(&list.window)),
-        "The Windows App Devices view lost focus."
-    );
-    list.verify_profile(email)?;
-    ensure!(!cancelled(), "Cancelled.");
-    Ok(())
+    if let Some(cards) = center_window(app)
+        .map(|center| read_cards(&center))
+        .transpose()?
+        .flatten()
+    {
+        exact_device(&cards.1, &device.name)?;
+    } else {
+        // AXWindows only contains windows on the active fullscreen Space.
+        // Open the native Devices view to verify the card before closing the VM.
+        let list = devices_in_app(app.clone())?;
+        exact_device(&list.devices, &device.name)?;
+    }
+    catalog::verify_card_identity(device)
 }
 
 pub(super) fn exact_device<'a, T>(devices: &'a [(String, T)], name: &str) -> Result<&'a T> {
@@ -502,6 +572,32 @@ pub(super) fn menu_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_uses_the_connected_card_for_a_single_renamed_session() {
+        let cards = vec![("Offline".to_owned(), false), ("New name".to_owned(), true)];
+        assert_eq!(
+            reconnect_card(&cards, "Old name", true, |state| Ok(*state)).unwrap(),
+            "New name"
+        );
+        assert!(
+            reconnect_card(&cards, "Old name", false, |_| panic!("ambiguous session")).is_err()
+        );
+        assert!(reconnect_card(&cards[..1], "Old name", true, |state| Ok(*state)).is_err());
+        assert_eq!(
+            reconnect_card(&cards, "New name", false, |_| panic!("exact name")).unwrap(),
+            "New name"
+        );
+        assert!(reconnect_card(&cards, "Old name", true, |_| Ok(true)).is_err());
+        let duplicate = vec![
+            ("Duplicate".to_owned(), true),
+            ("Duplicate".to_owned(), false),
+        ];
+        assert!(reconnect_card(&duplicate, "Old name", true, |state| Ok(*state)).is_err());
+        assert!(
+            reconnect_card(&duplicate, "Duplicate", true, |_| panic!("ambiguous name")).is_err()
+        );
+    }
 
     #[test]
     fn connects_only_by_unique_exact_device_name() {
