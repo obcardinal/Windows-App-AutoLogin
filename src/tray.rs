@@ -20,6 +20,10 @@ pub(crate) enum TrayCommand {
     PresentSettings(Sender<()>),
     #[cfg(target_os = "macos")]
     SetMacosPresentation(crate::macos_panel::Presentation),
+    #[cfg(target_os = "macos")]
+    OpenMacosContextMenu,
+    #[cfg(target_os = "macos")]
+    ToggleMacosPanel(u64, Option<crate::macos_panel::PanelAnchor>),
     ToggleMonitor,
     Exit,
 }
@@ -47,23 +51,7 @@ impl AppTray {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn take_panel_click(&self) -> bool {
-        // Drain the queue even after finding a click: move/enter/leave events
-        // must not accumulate while the supervisor is running.
-        let mut clicked = false;
-        let mut menu_clicked = false;
-        for event in tray_icon::TrayIconEvent::receiver().try_iter() {
-            clicked |= is_panel_click(&event, self._tray.id());
-            menu_clicked |= is_menu_click(&event, self._tray.id());
-        }
-        if menu_clicked {
-            self.show_context_menu();
-        }
-        clicked
-    }
-
-    #[cfg(target_os = "macos")]
-    fn show_context_menu(&self) {
+    pub(crate) fn show_context_menu(&self) {
         use objc2_app_kit::NSMenu;
         use objc2_foundation::MainThreadMarker;
         use tray_icon::menu::ContextMenu;
@@ -236,9 +224,16 @@ pub(crate) fn setup_tray(tx: Sender<TrayCommand>) -> anyhow::Result<AppTray> {
     #[cfg(not(target_os = "macos"))]
     let tray_builder = tray_builder.with_menu(Box::new(compact_menu.clone()));
     #[cfg(target_os = "macos")]
-    let tray_builder = tray_builder
-        .with_menu_on_left_click(false)
-        .with_menu_on_right_click(false);
+    let tray_builder = {
+        // tray-icon fixes its process-wide handler on the first event. Install
+        // it before creating the status item and keep its ID stable on retries.
+        let builder = tray_builder
+            .with_id("windows-app-autologin")
+            .with_menu_on_left_click(false)
+            .with_menu_on_right_click(false);
+        register_macos_tray_clicks(builder.id().clone(), tx.clone());
+        builder
+    };
     let tray = tray_builder.build()?;
     #[cfg(target_os = "windows")]
     let windows_visibility = windows_visibility::WindowsTrayVisibility::new(tray.clone());
@@ -393,106 +388,113 @@ fn tray_icon_uses_template_rendering() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn is_panel_click(event: &tray_icon::TrayIconEvent, tray_id: &tray_icon::TrayIconId) -> bool {
-    matches!(
-        event,
-        tray_icon::TrayIconEvent::Click {
-            id,
-            button: tray_icon::MouseButton::Left,
-            button_state: tray_icon::MouseButtonState::Up,
-            ..
-        } if id == tray_id
-    )
+fn register_macos_tray_clicks(tray_id: tray_icon::TrayIconId, tx: Sender<TrayCommand>) {
+    use std::sync::atomic::AtomicU64;
+    use tray_icon::TrayIconEvent;
+
+    let pending_press_id = AtomicU64::new(0);
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if let Some(command) = macos_tray_click(
+            &event,
+            &tray_id,
+            &pending_press_id,
+            crate::macos_panel::left_mouse_press_id,
+        ) {
+            tracing::debug!(target: "waal::panel", ?command, "Status item released");
+            let _ = tx.send(command);
+        }
+    }));
 }
 
 #[cfg(target_os = "macos")]
-fn is_menu_click(event: &tray_icon::TrayIconEvent, tray_id: &tray_icon::TrayIconId) -> bool {
-    matches!(
-        event,
-        tray_icon::TrayIconEvent::Click {
-            id,
-            button: tray_icon::MouseButton::Right,
-            button_state: tray_icon::MouseButtonState::Up,
-            ..
-        } if id == tray_id
-    )
+fn macos_tray_click(
+    event: &tray_icon::TrayIconEvent,
+    tray_id: &tray_icon::TrayIconId,
+    pending_press_id: &std::sync::atomic::AtomicU64,
+    press_id: impl FnOnce() -> u64,
+) -> Option<TrayCommand> {
+    use std::sync::atomic::Ordering;
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+
+    let TrayIconEvent::Click {
+        id,
+        button,
+        button_state,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if id != tray_id {
+        return None;
+    }
+    match (button, button_state) {
+        (MouseButton::Left, MouseButtonState::Down) => {
+            // Clicking the status item can blur the panel before mouse-up.
+            pending_press_id.store(press_id(), Ordering::Relaxed);
+            None
+        }
+        (MouseButton::Left, MouseButtonState::Up) => {
+            let down = pending_press_id.swap(0, Ordering::Relaxed);
+            let press = if down == 0 { press_id() } else { down };
+            Some(TrayCommand::ToggleMacosPanel(press, None))
+        }
+        (MouseButton::Right, MouseButtonState::Up) => Some(TrayCommand::OpenMacosContextMenu),
+        _ => None,
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{is_menu_click, is_panel_click};
+    use super::{macos_tray_click, TrayCommand};
+    use std::sync::atomic::AtomicU64;
     use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
 
     #[test]
-    fn own_left_and_right_releases_have_separate_actions() {
+    fn each_own_left_release_preserves_its_press_id_and_right_click_opens_the_menu() {
         let own_id = TrayIconId::new("autologin");
-        for (id, button, button_state, panel_expected, menu_expected) in [
-            (
-                own_id.clone(),
-                MouseButton::Left,
-                MouseButtonState::Up,
-                true,
-                false,
-            ),
-            (
-                own_id.clone(),
-                MouseButton::Left,
-                MouseButtonState::Down,
-                false,
-                false,
-            ),
-            (
-                own_id.clone(),
-                MouseButton::Right,
-                MouseButtonState::Up,
-                false,
-                true,
-            ),
-            (
-                own_id.clone(),
-                MouseButton::Right,
-                MouseButtonState::Down,
-                false,
-                false,
-            ),
-            (
-                own_id.clone(),
-                MouseButton::Middle,
-                MouseButtonState::Up,
-                false,
-                false,
-            ),
-            (
-                TrayIconId::new("another-app"),
-                MouseButton::Left,
-                MouseButtonState::Up,
-                false,
-                false,
-            ),
-            (
-                TrayIconId::new("another-app"),
-                MouseButton::Right,
-                MouseButtonState::Up,
-                false,
-                false,
-            ),
-        ] {
+        let other_id = TrayIconId::new("another-app");
+        let pending_press_id = AtomicU64::new(0);
+        let click = |id: &TrayIconId, button, button_state, press_id| {
             let event = TrayIconEvent::Click {
-                id,
+                id: id.clone(),
                 position: Default::default(),
                 rect: Rect::default(),
                 button,
                 button_state,
             };
-            assert_eq!(is_panel_click(&event, &own_id), panel_expected);
-            assert_eq!(is_menu_click(&event, &own_id), menu_expected);
-        }
+            macos_tray_click(&event, &own_id, &pending_press_id, || press_id)
+        };
+        use MouseButton::{Left, Middle, Right};
+        use MouseButtonState::{Down, Up};
+        assert!(click(&own_id, Left, Down, 100).is_none());
+        assert!(click(&other_id, Left, Down, 110).is_none());
+        assert!(click(&other_id, Left, Up, 120).is_none());
+        assert!(matches!(
+            click(&own_id, Left, Up, 300),
+            Some(TrayCommand::ToggleMacosPanel(100, None))
+        ));
+        assert!(click(&own_id, Left, Down, 310).is_none());
+        assert!(matches!(
+            click(&own_id, Left, Up, 312),
+            Some(TrayCommand::ToggleMacosPanel(310, None))
+        ));
+        assert!(matches!(
+            click(&own_id, Left, Up, 315),
+            Some(TrayCommand::ToggleMacosPanel(315, None))
+        ));
+        assert!(click(&own_id, Right, Down, 320).is_none());
+        assert!(matches!(
+            click(&own_id, Right, Up, 321),
+            Some(TrayCommand::OpenMacosContextMenu)
+        ));
+        assert!(click(&other_id, Right, Up, 330).is_none());
+        assert!(click(&own_id, Middle, Up, 340).is_none());
         let movement = TrayIconEvent::Move {
             id: own_id.clone(),
             position: Default::default(),
             rect: Rect::default(),
         };
-        assert!(!is_panel_click(&movement, &own_id));
-        assert!(!is_menu_click(&movement, &own_id));
+        assert!(macos_tray_click(&movement, &own_id, &pending_press_id, || 350).is_none());
     }
 }

@@ -418,7 +418,10 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
             #[cfg(target_os = "macos")]
             let app = app
                 .with_macos_presentation(presentation)
-                .with_macos_reopen_registration(reopen_registration);
+                .with_macos_window_observers(
+                    reopen_registration,
+                    macos_panel::PanelFocusObserver::install(cc, cc.egui_ctx.clone())?,
+                );
             Ok(Box::new(app))
         }),
     );
@@ -448,6 +451,8 @@ enum FullUiControlRead {
     Show(models::Tab),
     #[cfg(target_os = "macos")]
     MacosPresentation(macos_panel::Presentation),
+    #[cfg(target_os = "macos")]
+    ToggleMacosPanel(u64, Option<macos_panel::PanelAnchor>),
 }
 
 fn full_ui_control_message(initial_tab: models::Tab) -> anyhow::Result<&'static [u8]> {
@@ -471,6 +476,22 @@ fn parse_full_ui_control_line(line: &[u8]) -> FullUiControlRead {
         b"show:accounts" => FullUiControlRead::Show(models::Tab::Accounts),
         b"show:settings" => FullUiControlRead::Show(models::Tab::Settings),
         _ => {
+            #[cfg(target_os = "macos")]
+            if let Some(click) = line
+                .strip_prefix(b"toggle-panel:")
+                .and_then(|value| std::str::from_utf8(value).ok())
+            {
+                let (time, anchor) = match click.split_once(' ') {
+                    Some((time, geometry)) => match macos_panel::Presentation::decode(geometry) {
+                        Some(macos_panel::Presentation::Panel(anchor)) => (time, Some(anchor)),
+                        _ => return FullUiControlRead::Invalid,
+                    },
+                    None => (click, None),
+                };
+                if let Ok(press) = time.parse::<u64>() {
+                    return FullUiControlRead::ToggleMacosPanel(press, anchor);
+                }
+            }
             #[cfg(target_os = "macos")]
             if let Some(presentation) = line
                 .strip_prefix(b"mode:")
@@ -536,6 +557,16 @@ fn spawn_full_ui_control_reader(
             let mut writer = std::io::stdout();
             loop {
                 match read_full_ui_control_command(&mut reader) {
+                    #[cfg(target_os = "macos")]
+                    Ok(FullUiControlRead::ToggleMacosPanel(press, anchor)) => {
+                        if tray_tx
+                            .send(tray::TrayCommand::ToggleMacosPanel(press, anchor))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        egui_ctx.request_repaint();
+                    }
                     #[cfg(target_os = "macos")]
                     Ok(FullUiControlRead::MacosPresentation(presentation)) => {
                         if tray_tx
@@ -642,25 +673,6 @@ fn send_full_ui_presentation(child: &mut Child, tab: models::Tab) -> anyhow::Res
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("full UI control channel is unavailable"))?;
     stdin.write_all(message)?;
-    stdin.flush()?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn send_macos_ui_presentation(
-    child: &mut Child,
-    presentation: macos_panel::Presentation,
-) -> anyhow::Result<()> {
-    let message = format!("mode:{}\n", presentation.encode());
-    anyhow::ensure!(
-        message.len() <= FULL_UI_CONTROL_MAX_LINE_BYTES,
-        "presentation exceeds control channel limit"
-    );
-    let stdin = child
-        .stdin
-        .as_mut()
-        .context("full UI control channel is unavailable")?;
-    stdin.write_all(message.as_bytes())?;
     stdin.flush()?;
     Ok(())
 }
@@ -943,6 +955,8 @@ fn publish_initial_monitor_status(
 struct PendingSettingsLaunch {
     request_id: u64,
     initial_tab: models::Tab,
+    #[cfg(target_os = "macos")]
+    dismissed: bool,
     pause_monitor: bool,
     acknowledgement: StdReceiver<background::WorkerQuiescenceAck>,
     deadline: Instant,
@@ -952,6 +966,8 @@ struct PendingSettingsLaunch {
 struct PendingSettingsPresentation {
     in_flight_tab: models::Tab,
     requested_tab: models::Tab,
+    #[cfg(target_os = "macos")]
+    panel_click_after_show: Option<u64>,
     phase: SettingsPresentationPhase,
 }
 
@@ -1185,21 +1201,23 @@ impl LightweightSupervisor {
     }
 
     fn process_tray_commands(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        #[cfg(target_os = "macos")]
-        if self
-            .tray
-            .as_ref()
-            .is_some_and(|tray| tray.take_panel_click())
-            && !self.exit_requested
-            && !self.config.settings.hide_menu_bar_icon
-        {
-            self.open_accounts_window();
-        }
         while let Ok(command) = self.tray_rx.try_recv() {
             if self.exit_requested && !matches!(&command, tray::TrayCommand::Exit) {
                 continue;
             }
             match command {
+                #[cfg(target_os = "macos")]
+                tray::TrayCommand::ToggleMacosPanel(press, _) => {
+                    if !self.config.settings.hide_menu_bar_icon {
+                        self.handle_macos_panel_click(press);
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                tray::TrayCommand::OpenMacosContextMenu => {
+                    if let Some(tray) = &self.tray {
+                        tray.show_context_menu();
+                    }
+                }
                 tray::TrayCommand::OpenAccounts => self.open_accounts_window(),
                 tray::TrayCommand::OpenSettings => self.open_settings_window(),
                 tray::TrayCommand::OpenAbout => {
@@ -2170,6 +2188,31 @@ impl LightweightSupervisor {
     }
 
     #[cfg(target_os = "macos")]
+    fn handle_macos_panel_click(&mut self, press: u64) {
+        self.poll_settings_window();
+        if let Some(pending) = self.pending_settings_launch.as_mut() {
+            pending.dismissed = !pending.dismissed;
+        } else if let Some(pending) = self.pending_settings_presentation.as_mut() {
+            // Apply an unmatched click after the latest requested tab is shown.
+            // Pairs of clicks cancel without changing the chosen tab.
+            if pending.panel_click_after_show.take().is_none() {
+                pending.panel_click_after_show = Some(press);
+            }
+        } else if self.settings_child.is_some() {
+            self.send_macos_panel_toggle(press);
+        } else {
+            self.open_accounts_window();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_macos_panel_toggle(&mut self, press: u64) {
+        if let Err(error) = self.sync_macos_ui_presentation(Some(press)) {
+            tracing::warn!(%error, "Could not toggle the menu bar panel");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn macos_ui_presentation(&self) -> macos_panel::Presentation {
         if self.config.settings.hide_menu_bar_icon {
             return macos_panel::Presentation::Window;
@@ -2182,11 +2225,30 @@ impl LightweightSupervisor {
     }
 
     #[cfg(target_os = "macos")]
-    fn sync_macos_ui_presentation(&mut self) -> anyhow::Result<()> {
+    fn sync_macos_ui_presentation(&mut self, panel_click: Option<u64>) -> anyhow::Result<()> {
         let presentation = self.macos_ui_presentation();
-        if let Some(child) = self.settings_child.as_mut() {
-            send_macos_ui_presentation(child, presentation)?;
-        }
+        let Some(child) = self.settings_child.as_mut() else {
+            return Ok(());
+        };
+        // A click is one UI operation. Looking up the status item's position
+        // must not independently show, hide, or convert an existing window.
+        let message = match (panel_click, presentation) {
+            (Some(press), macos_panel::Presentation::Panel(_)) => {
+                format!("toggle-panel:{press} {}\n", presentation.encode())
+            }
+            (Some(press), macos_panel::Presentation::Window) => format!("toggle-panel:{press}\n"),
+            (None, _) => format!("mode:{}\n", presentation.encode()),
+        };
+        anyhow::ensure!(
+            message.len() <= FULL_UI_CONTROL_MAX_LINE_BYTES,
+            "presentation exceeds control channel limit"
+        );
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("full UI control channel is unavailable")?;
+        stdin.write_all(message.as_bytes())?;
+        stdin.flush()?;
         Ok(())
     }
 
@@ -2210,6 +2272,10 @@ impl LightweightSupervisor {
     ) -> bool {
         if let Some(pending) = self.pending_settings_launch.as_mut() {
             pending.initial_tab = initial_tab;
+            #[cfg(target_os = "macos")]
+            {
+                pending.dismissed = false;
+            }
             return true;
         }
 
@@ -2219,6 +2285,10 @@ impl LightweightSupervisor {
             // never be mistaken for a newer request. Only the latest tab
             // matters; it is sent as soon as the in-flight request completes.
             pending.requested_tab = initial_tab;
+            #[cfg(target_os = "macos")]
+            {
+                pending.panel_click_after_show = None;
+            }
             return true;
         }
 
@@ -2271,6 +2341,8 @@ impl LightweightSupervisor {
         self.pending_settings_launch = Some(PendingSettingsLaunch {
             request_id,
             initial_tab,
+            #[cfg(target_os = "macos")]
+            dismissed: false,
             pause_monitor,
             acknowledgement: acknowledgement_receiver,
             deadline,
@@ -2316,10 +2388,12 @@ impl LightweightSupervisor {
         self.pending_settings_presentation = Some(PendingSettingsPresentation {
             in_flight_tab: tab,
             requested_tab: tab,
+            #[cfg(target_os = "macos")]
+            panel_click_after_show: None,
             phase: SettingsPresentationPhase::AwaitingAcknowledgement,
         });
         #[cfg(target_os = "macos")]
-        if let Err(error) = self.sync_macos_ui_presentation() {
+        if let Err(error) = self.sync_macos_ui_presentation(None) {
             tracing::warn!(%error, "Could not update the requested window presentation");
             self.mark_settings_child_control_broken();
             return false;
@@ -2397,6 +2471,15 @@ impl LightweightSupervisor {
                     self.pending_settings_presentation = None;
                     if pending.requested_tab != acknowledged_tab {
                         let _ = self.queue_settings_child_presentation(pending.requested_tab);
+                        #[cfg(target_os = "macos")]
+                        if let Some(next) = self.pending_settings_presentation.as_mut() {
+                            next.panel_click_after_show = pending.panel_click_after_show;
+                        }
+                        continue;
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Some(press) = pending.panel_click_after_show {
+                        self.send_macos_panel_toggle(press);
                     }
                 }
                 Ok(Ok(FullUiControlRead::Invalid | FullUiControlRead::Exit)) => {
@@ -2407,9 +2490,12 @@ impl LightweightSupervisor {
                     return;
                 }
                 #[cfg(target_os = "macos")]
-                Ok(Ok(FullUiControlRead::MacosPresentation(_))) => {
+                Ok(Ok(
+                    FullUiControlRead::MacosPresentation(_)
+                    | FullUiControlRead::ToggleMacosPanel(..),
+                )) => {
                     tracing::warn!(
-                        "Settings presentation protocol returned an unsolicited window mode"
+                        "Settings presentation protocol returned a panel command instead of an acknowledgement"
                     );
                     self.mark_settings_child_control_broken();
                     return;
@@ -2521,6 +2607,17 @@ impl LightweightSupervisor {
 
         // Re-read intent only after quiescence. An explicit Stop while waiting
         // must never be overwritten by the older request's resume policy.
+        #[cfg(target_os = "macos")]
+        if pending.dismissed {
+            if self.desired_monitor_running
+                && self.storage_recovery_ready
+                && !self.storage_recovery_sticky_blocked
+                && self.accessibility_ready_for_start()
+            {
+                self.queue_fresh_config_and_start();
+            }
+            return;
+        }
         self.resume_monitor_after_settings = pending.pause_monitor && self.desired_monitor_running;
         let session = self.prepare_settings_session_for_spawn();
         let (session_lease, session_token) = match session {
@@ -2698,10 +2795,10 @@ impl LightweightSupervisor {
                 // ambiguously (including panic=abort release builds), so the
                 // supervisor must make the pause sticky before any reload.
                 let mutation_was_active = self.settings_mutation_active;
-                let requested_replacement_tab = self
-                    .pending_settings_presentation
-                    .take()
-                    .map(|pending| pending.requested_tab);
+                let pending = self.pending_settings_presentation.take();
+                #[cfg(target_os = "macos")]
+                let pending = pending.filter(|request| request.panel_click_after_show.is_none());
+                let requested_replacement_tab = pending.map(|request| request.requested_tab);
                 self.settings_child = None;
                 self.settings_child_acknowledgements = None;
                 self.settings_child_control_broken = false;
@@ -2948,7 +3045,7 @@ impl LightweightSupervisor {
         self.update_tray_status();
         #[cfg(target_os = "macos")]
         if presentation_changed {
-            if let Err(error) = self.sync_macos_ui_presentation() {
+            if let Err(error) = self.sync_macos_ui_presentation(None) {
                 tracing::warn!(%error, "Could not switch the saved menu bar presentation");
             }
         }
@@ -3890,13 +3987,18 @@ mod tests {
     fn macos_mode_control_is_bounded_and_preserves_show_order() {
         use crate::macos_panel::Presentation;
         let presentation = Presentation::decode("panel:1200,876,28,24,0,0,1440,876").unwrap();
+        let Presentation::Panel(anchor) = presentation else {
+            unreachable!()
+        };
         let input = format!(
-            "mode:{}\nshow:accounts\nmode:window\nshow:settings\n",
+            "mode:{0}\ntoggle-panel:123 {0}\ntoggle-panel:124\nshow:accounts\nmode:window\nshow:settings\n",
             presentation.encode()
         );
         let mut reader = BufReader::with_capacity(3, Cursor::new(input.into_bytes()));
         for expected in [
             FullUiControlRead::MacosPresentation(presentation),
+            FullUiControlRead::ToggleMacosPanel(123, Some(anchor)),
+            FullUiControlRead::ToggleMacosPanel(124, None),
             FullUiControlRead::Show(crate::models::Tab::Accounts),
             FullUiControlRead::MacosPresentation(Presentation::Window),
             FullUiControlRead::Show(crate::models::Tab::Settings),
@@ -3908,6 +4010,11 @@ mod tests {
             b"mode:panel:NaN,0,28,24,0,0,1440,876".as_slice(),
             b"mode:panel:0,0,28,24,0,0,1440,876,extra",
             b"mode:window unexpected",
+            b"toggle-panel:",
+            b"toggle-panel:-1",
+            b"toggle-panel:18446744073709551616",
+            b"toggle-panel:123 window",
+            b"toggle-panel:123 panel:0,0",
         ] {
             assert_eq!(
                 super::parse_full_ui_control_line(invalid),
@@ -3923,6 +4030,97 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == super::MACOS_UI_PRESENTATION_ENV && value.is_none()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn second_menu_bar_click_during_launch_dismisses_without_changing_monitor_intent() {
+        for running in [false, true] {
+            let (worker_tx, mut worker_rx) = tokio_channel(8);
+            let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+            let (tray_tx, tray_rx) = std_channel();
+            let mut supervisor = LightweightSupervisor::new(
+                worker_tx,
+                worker_event_rx,
+                tray_tx,
+                tray_rx,
+                WorkerInvalidator::new(),
+                AppConfig::default(),
+                None,
+            );
+            supervisor.desired_monitor_running = running;
+            supervisor.accessibility_trusted = true;
+            supervisor.handle_macos_panel_click(10);
+            assert!(matches!(worker_rx.try_recv(), Ok(WorkerCommand::Stop)));
+            let (request_id, ack) = take_quiescence_request(&mut worker_rx);
+            supervisor.handle_macos_panel_click(20);
+            ack.send(WorkerQuiescenceAck { request_id }).unwrap();
+            supervisor.poll_pending_settings_launch_with(std::time::Instant::now(), |_, _| {
+                panic!("dismissed panel should not launch")
+            });
+            assert!(supervisor.pending_settings_launch.is_none());
+            assert_eq!(supervisor.desired_monitor_running, running);
+            if running {
+                assert!(matches!(
+                    worker_rx.try_recv(),
+                    Ok(WorkerCommand::ApplyConfigAndReleasePause { .. })
+                ));
+            }
+            assert!(worker_rx.try_recv().is_err());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_clicks_preserve_the_requested_tab_during_launch() {
+        let (mut supervisor, _worker_rx) = permission_request_supervisor(true);
+        supervisor.open_settings_window();
+        supervisor.handle_macos_panel_click(10);
+        let launch = supervisor.pending_settings_launch.as_ref().unwrap();
+        assert!(launch.dismissed);
+
+        supervisor.handle_macos_panel_click(20);
+        let launch = supervisor.pending_settings_launch.as_ref().unwrap();
+        assert!(!launch.dismissed);
+        assert_eq!(launch.initial_tab, crate::models::Tab::Settings);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_clicks_wait_for_the_latest_requested_tab() {
+        use crate::models::Tab;
+
+        for clicks in [2, 3] {
+            let (mut supervisor, _worker_rx) = permission_request_supervisor(true);
+            let (ack, receiver) = std_channel();
+            supervisor.settings_child = Some(spawn_test_control_child());
+            supervisor.settings_child_acknowledgements = Some(receiver);
+            supervisor.open_accounts_window();
+            supervisor.open_settings_window();
+            for press in 1..=clicks {
+                supervisor.handle_macos_panel_click(press);
+            }
+
+            ack.send(Ok(FullUiControlRead::Show(Tab::Accounts)))
+                .unwrap();
+            supervisor.poll_settings_presentation_acknowledgements();
+            let pending = supervisor.pending_settings_presentation.unwrap();
+            assert_eq!(pending.in_flight_tab, Tab::Settings);
+            assert_eq!(pending.panel_click_after_show, (clicks == 3).then_some(3));
+
+            ack.send(Ok(FullUiControlRead::Show(Tab::Settings)))
+                .unwrap();
+            supervisor.poll_settings_presentation_acknowledgements();
+            assert!(supervisor.pending_settings_presentation.is_none());
+            let child = supervisor.settings_child.take().unwrap();
+            let output = child.wait_with_output().unwrap();
+            let expected = if clicks == 3 {
+                "show:accounts\nshow:settings\ntoggle-panel:3\n"
+            } else {
+                "show:accounts\nshow:settings\n"
+            };
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
     }
 
     #[test]

@@ -2,16 +2,18 @@ use anyhow::Context;
 use block2::RcBlock;
 use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
 use eframe::egui;
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{
-    NSApplication, NSColor, NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSColor, NSEvent, NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem,
+    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDidResignKeyNotification,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSPoint, NSRect, NSRunLoop, NSSize,
+    MainThreadMarker, NSNotificationCenter, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSSize,
 };
 use objc2_quartz_core::{kCAGravityBottomLeft, CALayer, CAMetalLayer};
 use std::cell::Cell;
+use std::sync::{Arc, Mutex};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const MAX_WIRE_BYTES: usize = 240;
@@ -19,6 +21,77 @@ const MAX_COORDINATE: f64 = 100_000.0;
 const MAX_SCREEN_SIZE: f64 = 32_768.0;
 const PANEL_GAP: f64 = 6.0;
 const PANEL_CORNER_RADIUS: f64 = 12.0;
+
+/// WindowServer counts each mouse-down once for the entire login session. AppKit
+/// can deliver the resulting focus loss and status-item action in either process first.
+pub(crate) fn left_mouse_press_id() -> u64 {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceCounterForEventType(state: i32, event_type: u32) -> u32;
+    }
+    // SAFETY: Both constants are public CoreGraphics values, and no pointers cross FFI.
+    const COMBINED_SESSION_STATE: i32 = 0;
+    const LEFT_MOUSE_DOWN: u32 = 1;
+    u64::from(unsafe { CGEventSourceCounterForEventType(COMBINED_SESSION_STATE, LEFT_MOUSE_DOWN) })
+        + 1
+}
+
+pub(crate) struct PanelFocusObserver {
+    window: Retained<NSWindow>,
+    token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    focus_loss: Arc<Mutex<Option<(u64, Option<NSPoint>)>>>,
+}
+
+impl PanelFocusObserver {
+    pub(crate) fn install(
+        handle: &impl HasWindowHandle,
+        ctx: egui::Context,
+    ) -> anyhow::Result<Self> {
+        let window = native_window(handle)?;
+        let focus_loss = Arc::new(Mutex::new(None));
+        let loss = focus_loss.clone();
+        let callback = RcBlock::new(move |_| {
+            let press_id = left_mouse_press_id();
+            // AppKit can deactivate the panel before delivering mouseDown to
+            // the status item. Capture the pointer here, before a later UI
+            // frame or a mouse-up changes the state of the gesture.
+            let mouse_down = (NSEvent::pressedMouseButtons() & 1 != 0).then(NSEvent::mouseLocation);
+            tracing::debug!(target: "waal::panel", press_id, left_button_down = mouse_down.is_some(), "Panel resigned key");
+            *loss.lock().unwrap_or_else(|e| e.into_inner()) = Some((press_id, mouse_down));
+            ctx.request_repaint();
+        });
+        // SAFETY: Observe only our root NSWindow. The synchronous block captures
+        // thread-safe state, and Drop unregisters this exact token.
+        let token = unsafe {
+            NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                Some(NSWindowDidResignKeyNotification),
+                Some(&window),
+                None,
+                &callback,
+            )
+        };
+        Ok(Self {
+            window,
+            token,
+            focus_loss,
+        })
+    }
+
+    pub(crate) fn take_focus_loss(&self) -> Option<(u64, Option<NSPoint>)> {
+        self.focus_loss
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .filter(|_| !self.window.isKeyWindow())
+    }
+}
+
+impl Drop for PanelFocusObserver {
+    fn drop(&mut self) {
+        // SAFETY: token was returned by this notification center during install.
+        unsafe { NSNotificationCenter::defaultCenter().removeObserver((*self.token).as_ref()) };
+    }
+}
 
 /// Geometry remains in AppKit screen points from capture through placement.
 /// Scaling a global screen origin by one display's DPI breaks mixed-DPI layouts.
@@ -136,6 +209,11 @@ impl Presentation {
 }
 
 impl PanelAnchor {
+    pub(crate) fn contains_status_point(self, point: NSPoint) -> bool {
+        (self.icon_x..self.icon_x + self.icon_width).contains(&point.x)
+            && (self.icon_y..self.icon_y + self.icon_height).contains(&point.y)
+    }
+
     fn is_valid(self) -> bool {
         [self.icon_x, self.icon_y, self.screen_x, self.screen_y]
             .into_iter()
@@ -355,7 +433,9 @@ fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Res
             window.setMovable(false);
             window.setMovableByWindowBackground(false);
             window.setLevel(NSFloatingWindowLevel);
-            window.setHidesOnDeactivate(true);
+            // The UI orders the root out on focus loss. AppKit's automatic
+            // hiding can order it back in on activation after an explicit toggle.
+            window.setHidesOnDeactivate(false);
             window.setCollectionBehavior(
                 NSWindowCollectionBehavior::MoveToActiveSpace
                     | NSWindowCollectionBehavior::FullScreenAuxiliary
