@@ -17,4 +17,8 @@ typedef enum {
 // Ambiguous and unavailable scans must stop recognition for this frame.
 WaalFieldKind waal_password_field(CGImageRef image, CGRect *normalizedField);
 
+// Measure the unfocused editor around an independently verified Password word.
+// The normalized result is CGRectNull when the outline is incomplete or ambiguous.
+CGRect waal_neutral_password_field(CGImageRef image, CGRect verifiedPassword);
+
 #endif

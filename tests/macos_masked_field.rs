@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Box2d {
     x: f64,
     y: f64,
@@ -23,8 +23,10 @@ enum FieldKind {
 }
 
 #[link(name = "waal_lock_screen_capture", kind = "static")]
+#[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     fn waal_password_field(image: *const c_void, result: *mut Box2d) -> FieldKind;
+    fn waal_neutral_password_field(image: *const c_void, verified_password: Box2d) -> Box2d;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -102,8 +104,7 @@ impl Fixture {
         }
     }
 
-    fn detect(&mut self) -> (FieldKind, Box2d) {
-        let mut result = Box2d::default();
+    fn with_image<T>(&mut self, inspect: impl FnOnce(*const c_void) -> T) -> T {
         unsafe {
             let space = CGColorSpaceCreateDeviceRGB();
             assert!(!space.is_null());
@@ -120,11 +121,19 @@ impl Fixture {
             assert!(!bitmap.is_null());
             let image = CGBitmapContextCreateImage(bitmap);
             assert!(!image.is_null());
-            let kind = waal_password_field(image, &mut result);
+            let result = inspect(image);
             CGImageRelease(image);
             CGContextRelease(bitmap);
-            (kind, result)
+            result
         }
+    }
+
+    fn detect(&mut self) -> (FieldKind, Box2d) {
+        self.with_image(|image| {
+            let mut result = Box2d::default();
+            let kind = unsafe { waal_password_field(image, &mut result) };
+            (kind, result)
+        })
     }
 }
 
@@ -284,4 +293,58 @@ fn an_unavailable_frame_is_distinct_from_a_completed_scan_with_no_field() {
     let kind = unsafe { waal_password_field(std::ptr::null(), &mut field) };
     assert_eq!(kind, FieldKind::Unavailable);
     assert_eq!(Fixture::new(500, 350).detect().0, FieldKind::None);
+}
+
+#[test]
+fn measures_shifted_unfocused_editor_only_when_all_four_sides_enclose_the_word() {
+    let (w, h) = (1280, 960);
+    let (left, right, top, bottom) = (430, 970, 564, 636);
+    let password = Box2d {
+        x: 448. / w as f64,
+        y: 1. - 612. / h as f64,
+        w: 116. / w as f64,
+        h: 24. / h as f64,
+    };
+    for (missing, softened) in [
+        (None, false),
+        (None, true),
+        (Some(0), false),
+        (Some(1), false),
+        (Some(2), false),
+        (Some(3), false),
+    ] {
+        let mut frame = Fixture::new(w, h);
+        for y in top..bottom {
+            for x in left..right {
+                if (x == left && missing != Some(0))
+                    || (x + 1 == right && missing != Some(1) && !softened)
+                    || (y == top && missing != Some(2))
+                    || (y + 1 == bottom && missing != Some(3))
+                {
+                    frame.data[y * w + x] = [90, 93, 98, 255];
+                }
+            }
+        }
+        if softened {
+            // The upper and lower lines terminate at the same side. Its color
+            // transition is too gradual to identify from two adjacent pixels.
+            for y in top + 3..bottom - 3 {
+                for x in right - 12..w {
+                    let delta = (x + 12 - right).min(24) as u8 * 2;
+                    frame.data[y * w + x] = [27 + delta, 38 + delta, 89 + delta, 255];
+                }
+            }
+        }
+        let rect =
+            frame.with_image(|image| unsafe { waal_neutral_password_field(image, password) });
+        if missing.is_some() {
+            assert!(
+                rect.x.is_infinite(),
+                "partial outline admitted: {missing:?}"
+            );
+        } else {
+            assert!((rect.x * w as f64 - left as f64).abs() < 3.);
+            assert!((rect.w * w as f64 - (right - left) as f64).abs() <= 5.);
+        }
+    }
 }

@@ -273,3 +273,111 @@ WaalFieldKind waal_password_field(CGImageRef image, CGRect *normalizedField) {
     }
     return match.kind;
 }
+
+// A small desktop may place the sign-in controls to one side to leave room for
+// user tiles. Measure the unfocused control's outline around the native word
+// before using that offset. Edges are read from original guest pixels.
+static int edgeContrast(Pixel a, Pixel b) {
+    return abs(a.r - b.r) + abs(a.g - b.g) + abs(a.b - b.b);
+}
+
+static bool continuousEdge(Frame frame, bool vertical, int edge, int start, int end, int span) {
+    int hits = 0, samples = 0, missed = 0;
+    int step = (int)fmax(1, (end - start) / 48);
+    for (int pos = start; pos <= end; pos += step) {
+        Pixel a = *at(frame, vertical ? edge + span - 1 : pos, vertical ? pos : edge + span - 1);
+        Pixel b = *at(frame, vertical ? edge - span : pos, vertical ? pos : edge - span);
+        if (edgeContrast(a, b) >= 18) {
+            hits++;
+            missed = 0;
+        } else if (++missed > 5) return false;
+        samples++;
+    }
+    return hits >= samples * .80;
+}
+
+// Find one border in its word-relative band. A parallel inner border is
+// common. Reject separate outlines instead of selecting either rectangle.
+static int findEdge(Frame frame, bool vertical, int first, int last, int start, int end, int thickness, bool preferLast) {
+    int firstHit = 0, lastHit = 0;
+    for (int edge = first; edge <= last; edge++) {
+        if (!continuousEdge(frame, vertical, edge, start, end, 1)) continue;
+        if (!firstHit) firstHit = edge;
+        if (edge - firstHit > thickness) return 0;
+        lastHit = edge;
+    }
+    return preferLast ? lastHit : firstHit;
+}
+
+// Compression can soften a side into the wallpaper. Locate both corners at
+// the ends of the independent horizontal borders and verify the vertical
+// transition between them at the same position with a wider pixel baseline.
+static int horizontalEnd(Frame frame, int row, int start, int last, int step) {
+    for (int x = start; x + 2 * step <= last; x += step) {
+        int hits = 0;
+        for (int i = 0; i < 2 * step; i++) {
+            if (edgeContrast(*at(frame, x + i, row), *at(frame, x + i, row - 1)) >= 18) hits++;
+        }
+        if (hits < step / 2) return x;
+    }
+    return 0;
+}
+
+CGRect waal_neutral_password_field(CGImageRef image, CGRect verifiedPassword) {
+    if (!image || CGRectIsEmpty(verifiedPassword) ||
+        !CGRectContainsRect(CGRectMake(0, 0, 1, 1), verifiedPassword)) return CGRectNull;
+    size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    if (w < 160 || h < 85 || w > 16384 || h > 16384 || w * h > 8192u * 4320u ||
+        verifiedPassword.size.width < .045 || verifiedPassword.size.width > .20) return CGRectNull;
+    double textX = verifiedPassword.origin.x * w, textW = verifiedPassword.size.width * w;
+    double mid = (1.0 - CGRectGetMidY(verifiedPassword)) * h, textH = verifiedPassword.size.height * h;
+    if (textH < 5 || textH > 128 || textW < 3 * textH || textW > 10 * textH) return CGRectNull;
+    int y0 = (int)floor(mid - 2.4 * textH) - 1, y1 = (int)ceil(mid + 2.4 * textH) + 1;
+    int firstLeft = (int)floor(textX - .29 * textW), lastRight = (int)ceil(textX + 6.1 * textW);
+    if (y0 < 0 || y1 >= (int)h || firstLeft < 1) return CGRectNull;
+    lastRight = (int)fmin(lastRight, w - 1);
+    CGImageRef strip = CGImageCreateWithImageInRect(image, CGRectMake(0, y0, w, y1 - y0 + 1));
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = strip && space ? CGBitmapContextCreate(NULL, w, y1 - y0 + 1, 8,
+        w * sizeof(Pixel), space, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big) : NULL;
+    if (space) CGColorSpaceRelease(space);
+    CGRect result = CGRectNull;
+    if (ctx && CGBitmapContextGetData(ctx)) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, y1 - y0 + 1), strip);
+        Frame frame = {CGBitmapContextGetData(ctx), (int)w, y1 - y0 + 1};
+        mid -= y0;
+        int thickness = (int)fmax(3, .32 * textH);
+        int top = findEdge(frame, false, 1, (int)(mid - .77 * textH), (int)textX,
+                           (int)fmin(lastRight, textX + 3.5 * textW), thickness, true);
+        int bottom = findEdge(frame, false, (int)ceil(mid + .77 * textH), frame.height - 1,
+                              (int)textX, (int)fmin(lastRight, textX + 3.5 * textW), thickness, false);
+        if (top && bottom && fabs((top + bottom) * .5 - mid) <= textH * .34) {
+            int inset = (int)ceil((bottom - top) * .20);
+            int left = findEdge(frame, true, firstLeft, (int)(textX - .025 * textW),
+                                top + inset, bottom - inset, thickness, false);
+            int right = findEdge(frame, true, (int)ceil(textX + 3.7 * textW), lastRight,
+                                 top + inset, bottom - inset, thickness, false);
+            if (!right && left) {
+                int step = (int)fmax(2, lround((bottom - top) * .07));
+                int scan = (int)ceil(textX + 3.1 * textW);
+                int upper = horizontalEnd(frame, top, scan, lastRight, step);
+                int lower = horizontalEnd(frame, bottom, scan, lastRight, step);
+                int side = (upper + lower) / 2, span = (int)fmax(2, lround((bottom - top) * .12));
+                if (upper && lower && abs(upper - lower) <= 3 * step && side > span &&
+                    side + span < frame.width && continuousEdge(frame, true, side,
+                        (int)(mid - .65 * textH), (int)(mid + .65 * textH), span)) right = side;
+            }
+            double width = right - left, height = bottom - top;
+            if (left && right && width >= 90 && width <= w * .85 && height >= .095 * width &&
+                height <= .15 * width && fabs((left + right) * .5 / w - .5) <= .08 &&
+                continuousEdge(frame, false, top, left + inset, right - inset, 1) &&
+                continuousEdge(frame, false, bottom, left + inset, right - inset, 1)) {
+                result = CGRectMake(left / (double)w, 1.0 - (y0 + bottom) / (double)h,
+                                    width / w, height / h);
+            }
+        }
+    }
+    if (ctx) CGContextRelease(ctx);
+    if (strip) CGImageRelease(strip);
+    return result;
+}
