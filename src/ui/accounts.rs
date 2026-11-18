@@ -8,7 +8,9 @@ use crate::app::{
     AutoLoginApp, BackgroundMutationExecutor, SettingsMutationGuard,
     CONFIG_MUTATION_RECOVERY_REASON,
 };
-use crate::models::{canonical_remote_pc, Account, AccountId, AppConfig};
+#[cfg(target_os = "macos")]
+use crate::models::canonical_remote_pc;
+use crate::models::{Account, AccountId, AppConfig};
 use crate::single_instance;
 use crate::storage::{
     begin_account_config_save_journal_with_revision, begin_account_delete_journal,
@@ -48,8 +50,11 @@ const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 2.0 + TABLE_SPACING;
 const ACCOUNT_ROW_HEIGHT: f32 = 49.0;
 const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
 const MAX_VISIBLE_ACCOUNT_ROWS: usize = 5;
-const ACCOUNT_EDITOR_WIDTH: f32 = 430.0;
+const ACCOUNT_EDITOR_WIDTH: f32 = 480.0;
+const ACCOUNT_EDITOR_MARGIN: i8 = 18;
 const ACCOUNT_EDITOR_LABEL_WIDTH: f32 = 82.0;
+const ACCOUNT_EDITOR_COLUMN_GAP: f32 = 12.0;
+#[cfg(test)]
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
 const ACCOUNT_EDITOR_CONTROL_HEIGHT: f32 = 28.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
@@ -88,7 +93,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
         edit_disabled_reason: launch_controls_disabled_reason(&availability),
     };
 
-    let add_account = show_accounts_page_header(ui, launch_controls_enabled);
+    let adding_account = app
+        .editing_account
+        .as_ref()
+        .is_some_and(|draft| !app.config.accounts.iter().any(|saved| saved.id == draft.id));
+    let add_account = show_accounts_page_header(ui, launch_controls_enabled || adding_account);
     if with_transaction_disabled_reason(add_account, launch_controls_disabled_reason(&availability))
         .clicked()
     {
@@ -146,7 +155,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
                                 ui,
                                 account,
                                 displayed_enabled,
-                                row_controls,
+                                AccountRowControls {
+                                    edit: row_controls.edit
+                                        || app
+                                            .editing_account
+                                            .as_ref()
+                                            .is_some_and(|draft| draft.id == account.id),
+                                    ..row_controls
+                                },
                                 &mut row_actions,
                             );
                         });
@@ -206,7 +222,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
         app.confirm_delete_account = None;
     }
 
-    show_account_editor(ui, app);
     content_height
 }
 
@@ -2204,13 +2219,25 @@ fn account_columns(width: f32) -> AccountColumns {
     }
 }
 
+pub(crate) fn focus_account_editor(ctx: &egui::Context) {
+    let editor = account_editor_viewport_id();
+    ctx.send_viewport_cmd_to(editor, egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd_to(editor, egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd_to(editor, egui::ViewportCommand::Focus);
+}
+
 fn open_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp, account: Account) {
+    // Queue presentation only for an explicit Add/Edit action. The backend
+    // applies these commands after it creates the child window.
+    focus_account_editor(ctx);
+    if app.editing_account.is_some() {
+        return;
+    }
     tracing::info!("Opening account editor");
     #[cfg(target_os = "macos")]
-    ctx.data_mut(|data| data.remove_by_type::<RemotePcLookup>());
-    if let Some(previous_account) = app.editing_account.as_ref() {
-        forget_password_editor_state(ctx, password_editor_id(&previous_account.id));
-    }
+    ctx.data_mut(|data| {
+        data.remove_by_type::<RemotePcLookup>();
+    });
     forget_password_editor_state(ctx, password_editor_id(&account.id));
     app.editing_account = Some(account);
     clear_temp_password(app);
@@ -2235,7 +2262,10 @@ fn password_editor_id(account_id: &str) -> egui::Id {
 fn forget_password_editor_state(ctx: &egui::Context, id: egui::Id) {
     ctx.memory_mut(|memory| memory.surrender_focus(id));
     ctx.memory_mut(|memory| memory.surrender_focus(password_visibility_id(id)));
-    ctx.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id));
+    ctx.data_mut(|data| {
+        data.remove::<egui::text_edit::TextEditState>(id);
+        data.remove::<String>(id.with("validation"));
+    });
 }
 
 fn password_visibility_id(password_id: egui::Id) -> egui::Id {
@@ -2549,179 +2579,250 @@ fn show_delete_confirmation(
     }
 }
 
-fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
-    let mut editing = app.editing_account.clone();
-    let Some(ref account_snapshot) = editing else {
+pub(crate) fn account_editor_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("account_editor_window")
+}
+
+pub(crate) fn show_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp) {
+    let Some(mut account) = app.editing_account.take() else {
         return;
     };
-
     let is_existing = app
         .config
         .accounts
         .iter()
-        .any(|account| account.id == account_snapshot.id);
+        .any(|saved| saved.id == account.id);
     let title = if is_existing {
         "Edit Account"
     } else {
         "Add Account"
     };
+    let initial_height = if cfg!(target_os = "macos") {
+        428.0
+    } else {
+        173.0
+    };
+    let height = app.account_editor_height.unwrap_or(initial_height);
+    let viewport = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size([ACCOUNT_EDITOR_WIDTH, height])
+        .with_clamp_size_to_monitor_size(true)
+        .with_resizable(false)
+        .with_maximize_button(false)
+        .with_active(true);
 
-    let mut open = true;
     let mut close_editor = false;
-    let mut account_to_save: Option<Account> = None;
-    let account_transaction_ready = app.account_transaction_ready();
-    let password_editor_id = password_editor_id(&account_snapshot.id);
-    egui::Window::new(title)
-        .open(&mut open)
-        .resizable(false)
-        .default_width(ACCOUNT_EDITOR_WIDTH)
-        .show(ui.ctx(), |ui| {
-            ui.set_width(ACCOUNT_EDITOR_WIDTH);
-            if let Some(ref mut account) = editing {
-                #[cfg(target_os = "macos")]
-                if remote_pc_import::show_if_open(ui, account) {
-                    return;
-                }
-                account_editor_input_scope(ui, |ui| {
-                    egui::Grid::new("account_editor_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 10.0])
+    ctx.show_viewport_immediate(account_editor_viewport_id(), viewport, |ui, class| {
+        if close_editor {
+            return;
+        }
+        close_editor = class == egui::ViewportClass::Immediate
+            && ui.input(|input| input.viewport().close_requested());
+        if !close_editor {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .inner_margin(ACCOUNT_EDITOR_MARGIN),
+                )
+                .show_inside(ui, |ui| {
+                    let body = egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            account_editor_field_label(ui, "Email");
-                            ui.add_sized(
-                                [ACCOUNT_EDITOR_FIELD_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT],
-                                egui::TextEdit::singleline(&mut account.username)
-                                    .hint_text("user@domain.com"),
-                            );
-                            ui.end_row();
-
-                            account_editor_field_label(ui, "Password");
-                            let password_response = secure_password_editor(
-                                ui,
-                                &mut app.temp_password,
-                                password_editor_id,
-                                if is_existing {
-                                    "Leave blank to keep saved password"
-                                } else {
-                                    "Password"
-                                },
-                                app.show_password,
-                                ACCOUNT_EDITOR_FIELD_WIDTH,
-                            );
-                            let tooltip = if app.show_password {
-                                "Hide password"
-                            } else {
-                                "Show password"
-                            };
-                            if password_response
-                                .visibility
-                                .on_hover_text(tooltip)
-                                .clicked()
-                            {
-                                app.show_password = !app.show_password;
-                                password_response.field.request_focus();
-                                ui.ctx().request_repaint();
-                            }
-                            ui.end_row();
-
-                            let label = account_editor_field_label(ui, "Remote PC");
-                            ui.add_sized(
-                                [ACCOUNT_EDITOR_FIELD_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT],
-                                egui::TextEdit::singleline(&mut account.remote_pc)
-                                    .hint_text("Hostname or IP address"),
-                            )
-                            .labelled_by(label.id);
-                            ui.end_row();
-                            #[cfg(target_os = "macos")]
-                            {
-                                ui.label("");
-                                remote_pc_import::import_button(ui, account);
-                                ui.end_row();
-                            }
+                            close_editor =
+                                account_editor_contents(ui, app, &mut account, is_existing);
                         });
+                    // Keep room for inline validation, including wrapped messages.
+                    let measured =
+                        (body.content_size.y + 2.0 * f32::from(ACCOUNT_EDITOR_MARGIN)).ceil();
+                    if !close_editor && !ui.ctx().will_discard() && measured != height {
+                        app.account_editor_height = Some(measured);
+                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                    }
                 });
-                ui.add(
-                    egui::Label::new(theme::muted(
-                        "Remote PC matches this account to its desktop for automatic sign-in. Leave it blank if this is your only account.",
-                    ))
-                    .wrap(),
-                );
-
-                #[cfg(target_os = "macos")]
-                {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("2FA").strong());
-                    account_editor_input_scope(ui, |ui| {
-                        egui::Grid::new("account_2fa_fields")
-                            .num_columns(2)
-                            .spacing([16.0, 10.0])
-                            .show(ui, |ui| {
-                                let label = account_editor_field_label(ui, "iPhone app");
-                                crate::ui::iphone_sign_in::provider_picker(
-                                    ui, account, ACCOUNT_EDITOR_FIELD_WIDTH,
-                                )
-                                .labelled_by(label.id);
-                                ui.end_row();
-                            });
-                    });
-                    ui.add(
-                        egui::Label::new(theme::muted(crate::ui::iphone_sign_in::ACCOUNT_HELP)).wrap(),
-                    );
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_sized([104.0, 28.0], theme::secondary_button("Cancel"))
-                            .clicked()
-                        {
-                            close_editor = true;
-                        }
-
-                        let save = ui.add_enabled(
-                            account_transaction_ready,
-                            theme::primary_button("Save").min_size(egui::vec2(92.0, 28.0)),
-                        );
-                        let save = with_transaction_disabled_reason(
-                            save,
-                            (!account_transaction_ready)
-                                .then(|| app.config_mutations_disabled_reason())
-                                .flatten(),
-                        );
-                        if save.clicked() {
-                            account_to_save = Some(account.clone());
-                        }
-                    });
-                });
-            }
-        });
-
-    if let Some(account) = account_to_save {
-        close_editor = save_edited_account(app, ui.ctx(), &account, is_existing);
-    }
-
-    if !open {
-        close_editor = true;
-    }
+        }
+        if close_editor {
+            #[cfg(target_os = "macos")]
+            ui.ctx().data_mut(|data| {
+                data.remove_by_type::<RemotePcLookup>();
+            });
+            forget_password_editor_state(ui.ctx(), password_editor_id(&account.id));
+            clear_temp_password(app);
+            app.show_password = false;
+        }
+    });
 
     if close_editor {
-        editing = None;
+        // Omitting the child on the next root pass destroys its native window.
+        app.account_editor_height = None;
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    } else {
+        app.editing_account = Some(account);
+    }
+}
+
+fn account_editor_contents(
+    ui: &mut egui::Ui,
+    app: &mut AutoLoginApp,
+    account: &mut Account,
+    is_existing: bool,
+) -> bool {
+    if !egui::Popup::is_any_open(ui.ctx())
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        return true;
     }
 
-    let was_editing = app.editing_account.is_some();
-    app.editing_account = editing;
-    if was_editing && app.editing_account.is_none() {
-        #[cfg(target_os = "macos")]
-        ui.ctx()
-            .data_mut(|data| data.remove_by_type::<RemotePcLookup>());
-        forget_password_editor_state(ui.ctx(), password_editor_id);
-        clear_temp_password(app);
-        app.show_password = false;
-        // Ensure an unused follow-up frame can evict any plaintext galley
-        // created while the user explicitly revealed the password.
-        ui.ctx().request_repaint();
+    #[cfg(target_os = "macos")]
+    if remote_pc_import::show_if_open(ui, account) {
+        return false;
     }
+
+    let password_editor_id = password_editor_id(&account.id);
+    account_editor_card(ui, "SIGN-IN", |ui| {
+        let field_width =
+            ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - ACCOUNT_EDITOR_COLUMN_GAP;
+        account_editor_input_scope(ui, |ui| {
+            egui::Grid::new("account_sign_in_fields")
+                .num_columns(2)
+                .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
+                .show(ui, |ui| {
+                    let label = account_editor_field_label(ui, "Email");
+                    ui.add_sized(
+                        [field_width, ACCOUNT_EDITOR_CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut account.username)
+                            .margin(egui::Margin::symmetric(
+                                ui.spacing().button_padding.x as i8,
+                                2,
+                            ))
+                            .vertical_align(egui::Align::Center)
+                            .hint_text("user@domain.com"),
+                    )
+                    .labelled_by(label.id);
+                    ui.end_row();
+
+                    let label = account_editor_field_label(ui, "Password");
+                    let mut password_response = secure_password_editor(
+                        ui,
+                        &mut app.temp_password,
+                        password_editor_id,
+                        if is_existing {
+                            "Leave blank to keep saved password"
+                        } else {
+                            "Password"
+                        },
+                        app.show_password,
+                        field_width,
+                    );
+                    password_response.field = password_response.field.labelled_by(label.id);
+                    let tooltip = if app.show_password {
+                        "Hide password"
+                    } else {
+                        "Show password"
+                    };
+                    if password_response
+                        .visibility
+                        .on_hover_text(tooltip)
+                        .clicked()
+                    {
+                        app.show_password = !app.show_password;
+                        password_response.field.request_focus();
+                        ui.ctx().request_repaint();
+                    }
+                    ui.end_row();
+                });
+        });
+    });
+
+    #[cfg(target_os = "macos")]
+    account_editor_card(ui, "CONNECTION", |ui| {
+        let field_width =
+            ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - ACCOUNT_EDITOR_COLUMN_GAP;
+        account_editor_input_scope(ui, |ui| {
+            egui::Grid::new("account_connection_fields")
+                .num_columns(2)
+                .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
+                .show(ui, |ui| {
+                    let label = account_editor_field_label(ui, "Remote PC");
+                    ui.add_sized(
+                        [field_width, ACCOUNT_EDITOR_CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut account.remote_pc)
+                            .hint_text("Hostname or IP address"),
+                    )
+                    .labelled_by(label.id);
+                    ui.end_row();
+                    ui.label("");
+                    remote_pc_import::import_button(ui, account);
+                    ui.end_row();
+                });
+        });
+    });
+
+    #[cfg(target_os = "macos")]
+    account_editor_card(ui, "2FA", |ui| {
+        let field_width =
+            ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - ACCOUNT_EDITOR_COLUMN_GAP;
+        account_editor_input_scope(ui, |ui| {
+            egui::Grid::new("account_2fa_fields")
+                .num_columns(2)
+                .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
+                .show(ui, |ui| {
+                    let label = account_editor_field_label(ui, "iPhone app");
+                    crate::ui::iphone_sign_in::provider_picker(ui, account, field_width)
+                        .labelled_by(label.id);
+                    ui.end_row();
+                });
+        });
+        account_editor_help(ui, crate::ui::iphone_sign_in::ACCOUNT_HELP);
+    });
+
+    let feedback_id = password_editor_id.with("validation");
+    if let Some(message) = ui.ctx().data(|data| data.get_temp::<String>(feedback_id)) {
+        ui.add(egui::Label::new(egui::RichText::new(message).color(theme::DANGER)).wrap());
+    }
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let ready = app.account_transaction_ready();
+            let save = ui.add_enabled(
+                ready,
+                theme::primary_button("Save").min_size(egui::vec2(82.0, 30.0)),
+            );
+            let save = with_transaction_disabled_reason(
+                save,
+                (!ready)
+                    .then(|| app.config_mutations_disabled_reason())
+                    .flatten(),
+            );
+            let cancel = ui.add_sized([82.0, 30.0], theme::secondary_button("Cancel"));
+            if save.clicked() {
+                match save_edited_account(app, ui.ctx(), account, is_existing) {
+                    Ok(()) => return true,
+                    Err(message) => {
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(feedback_id, message));
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+            cancel.clicked()
+        })
+        .inner
+    })
+    .inner
+}
+
+fn account_editor_card(ui: &mut egui::Ui, section: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    theme::compact_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.label(theme::section_label(section));
+        contents(ui);
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn account_editor_help(ui: &mut egui::Ui, message: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(message).small().color(theme::MUTED)).wrap());
 }
 
 #[cfg(target_os = "macos")]
@@ -2892,14 +2993,25 @@ fn rebase_editor_enabled_state(
     editor_snapshot: &Account,
     existing_account: Option<&Account>,
 ) -> Account {
-    let mut account = editor_snapshot.clone();
-    // Enabled is controlled by the row switch, not by this editor. If the
-    // switch completed while the editor was open, keep the authoritative
-    // value instead of writing the stale snapshot back with the email.
-    if let Some(existing) = existing_account {
-        account.enabled = existing.enabled;
+    let Some(existing) = existing_account else {
+        return editor_snapshot.clone();
+    };
+    #[cfg(target_os = "macos")]
+    {
+        Account {
+            enabled: existing.enabled,
+            ..editor_snapshot.clone()
+        }
     }
-    account
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Only the email is editable here. Keep connection, authentication and
+        // row switch settings from the latest saved account.
+        Account {
+            username: editor_snapshot.username.clone(),
+            ..existing.clone()
+        }
+    }
 }
 
 fn save_edited_account(
@@ -2907,21 +3019,20 @@ fn save_edited_account(
     ctx: &egui::Context,
     account: &Account,
     is_existing: bool,
-) -> bool {
-    if !app.account_transaction_ready() {
-        return false;
+) -> Result<(), String> {
+    if let Some(reason) = app.config_mutations_disabled_reason() {
+        return Err(reason.to_owned());
     }
     if account.username.trim().is_empty() {
-        app.set_status("Email is required");
-        return false;
+        return Err("Email is required".to_owned());
     }
+    #[cfg(target_os = "macos")]
     let remote_pc = if account.remote_pc.trim().is_empty() {
         String::new()
     } else if let Some(host) = canonical_remote_pc(&account.remote_pc) {
         host
     } else {
-        app.set_status("Enter a Remote PC hostname or IP address, without a URL or port");
-        return false;
+        return Err("Enter a valid Remote PC hostname or IP address.".to_owned());
     };
     let effective_enabled = app
         .config
@@ -2934,8 +3045,7 @@ fn save_edited_account(
     if effective_enabled
         && projected_enabled_email_conflict(app, &account.id, account.username.trim())
     {
-        app.set_status("An enabled account with this email already exists");
-        return false;
+        return Err("An enabled account with this email already exists".to_owned());
     }
     let previous_password_saved = app
         .config
@@ -2947,8 +3057,7 @@ fn save_edited_account(
     if (!is_existing || (effective_enabled && !previous_password_saved))
         && app.temp_password.is_empty()
     {
-        app.set_status("Password is required");
-        return false;
+        return Err("Password is required".to_owned());
     }
 
     let password = if app.temp_password.is_empty() {
@@ -2964,6 +3073,7 @@ fn save_edited_account(
         .push_back(AccountTransactionIntent::Save {
             sequence,
             account: Account {
+                #[cfg(target_os = "macos")]
                 remote_pc,
                 ..account.clone()
             },
@@ -2972,7 +3082,7 @@ fn save_edited_account(
         });
     ctx.request_repaint();
     let _ = start_queued_background_account_work(app, ctx, false, false);
-    true
+    Ok(())
 }
 
 struct AccountSaveTransactionState {
@@ -3788,6 +3898,30 @@ mod tests {
 
     fn account_test_app(config: AppConfig) -> AutoLoginApp {
         account_test_app_with_mode(config, false)
+    }
+
+    fn visible_text_rects(frame: &egui::FullOutput, text: &str) -> Vec<egui::Rect> {
+        frame
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.text() == text => {
+                    let rect = label.visual_bounding_rect();
+                    shape.clip_rect.contains_rect(rect).then_some(rect)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![egui::Event::PointerMoved(pos), button(true), button(false)]
     }
 
     #[test]
@@ -5487,20 +5621,102 @@ mod tests {
     }
 
     #[test]
-    fn successful_account_save_closes_only_the_editor() {
-        let implementation = include_str!("accounts.rs");
-        let editor = implementation
-            .split_once("fn show_account_editor(")
-            .expect("account editor must exist")
-            .1
-            .split_once("enum AccountActionIcon")
-            .expect("account editor boundary must exist")
-            .0;
+    fn account_editor_save_cancel_and_native_close_target_only_the_child() {
+        use std::rc::Rc;
 
-        assert!(editor
-            .contains("close_editor = save_edited_account(app, ui.ctx(), &account, is_existing);"));
-        assert!(editor.contains("if close_editor {\n        editing = None;\n    }"));
-        assert!(!editor.contains("ViewportCommand::Close"));
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        ctx.set_embed_viewports(false);
+        let editor_id = super::account_editor_viewport_id();
+        let close_requested = Rc::new(Cell::new(false));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let child_frame = Rc::new(RefCell::new(egui::FullOutput::default()));
+        egui::Context::set_immediate_viewport_renderer({
+            let close_requested = Rc::clone(&close_requested);
+            let events = Rc::clone(&events);
+            let child_frame = Rc::clone(&child_frame);
+            move |ctx, mut viewport| {
+                assert_eq!(viewport.ids.this, editor_id);
+                assert_eq!(viewport.ids.parent, egui::ViewportId::ROOT);
+                let mut input = egui::RawInput {
+                    viewport_id: editor_id,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        viewport.builder.inner_size.unwrap(),
+                    )),
+                    events: events.take(),
+                    ..Default::default()
+                };
+                let child = input.viewports.entry(editor_id).or_default();
+                child.parent = Some(egui::ViewportId::ROOT);
+                if close_requested.replace(false) {
+                    child.events.push(egui::ViewportEvent::Close);
+                }
+                *child_frame.borrow_mut() = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
+            }
+        });
+        let config = config_with_account(true);
+        let account = config.accounts[0].clone();
+        let mut app = account_test_app(config.clone());
+        // Hold the mutation queue in memory so no worker touches storage.
+        app.pending_account_toggle = Some(PendingAccountToggle::inert_for_test(config));
+        let render = |app: &mut AutoLoginApp| {
+            ctx.run_ui(Default::default(), |ui| {
+                super::show_account_editor(ui.ctx(), app)
+            })
+        };
+        for action in ["Cancel", "Close", "Save"] {
+            super::open_account_editor(&ctx, &mut app, account.clone());
+            assert_eq!(
+                ctx.viewport_for(editor_id, |viewport| viewport.commands.clone()),
+                [
+                    egui::ViewportCommand::Visible(true),
+                    egui::ViewportCommand::Minimized(false),
+                    egui::ViewportCommand::Focus,
+                ]
+            );
+            app.temp_password.push_str("test-only");
+            let root = render(&mut app);
+            assert_eq!(
+                root.viewport_output[&editor_id].builder.title.as_deref(),
+                Some("Edit Account")
+            );
+            assert!(visible_text_rects(&root, "Save").is_empty());
+            render(&mut app);
+            if action == "Close" {
+                close_requested.set(true);
+            } else {
+                let rect = visible_text_rects(&child_frame.borrow(), action)[0];
+                events.replace(click(rect.center()));
+            }
+            if action == "Close" {
+                // eframe runs only logic() when the root is fully obscured.
+                app.accessibility_status.trusted = true;
+                let mut root_input = egui::RawInput::default();
+                root_input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .occluded = Some(true);
+                let _ = ctx.run_ui(root_input, |ui| {
+                    eframe::App::logic(&mut app, ui.ctx(), &mut eframe::Frame::_new_kittest());
+                });
+            } else {
+                render(&mut app);
+            }
+            assert!(app.editing_account.is_none(), "{action}");
+            assert!(app.temp_password.is_empty());
+            assert!(!app.show_password);
+            assert_eq!(
+                app.queued_account_transactions.len(),
+                usize::from(action == "Save")
+            );
+            let root = render(&mut app);
+            assert!(!root.viewport_output.contains_key(&editor_id));
+            assert!(!root.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close));
+        }
     }
 
     #[test]
@@ -5513,16 +5729,70 @@ mod tests {
         let mut stale_editor_snapshot = authoritative.clone();
         stale_editor_snapshot.username = "new@example.com".to_string();
         stale_editor_snapshot.remote_pc = "desktop.example.com".to_string();
+        stale_editor_snapshot.vm_target = "Finance desktop".to_string();
+        stale_editor_snapshot.vm_profile = "Work profile".to_string();
         stale_editor_snapshot.enabled = true;
         stale_editor_snapshot.iphone_authenticator_enabled = true;
 
         let rebased = rebase_editor_enabled_state(&stale_editor_snapshot, Some(&authoritative));
 
         assert_eq!(rebased.username, "new@example.com");
-        assert_eq!(rebased.remote_pc, "desktop.example.com");
         assert!(!rebased.enabled);
         assert!(rebased.has_saved_password);
-        assert!(rebased.iphone_authenticator_enabled);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(rebased.remote_pc, "desktop.example.com");
+            assert_eq!(rebased.vm_target, "Finance desktop");
+            assert_eq!(rebased.vm_profile, "Work profile");
+            assert!(rebased.iphone_authenticator_enabled);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sign_in_edit_preserves_hidden_legacy_values_through_the_save_queue() {
+        let ctx = egui::Context::default();
+        let mut config = config_with_account(true);
+        let saved = &mut config.accounts[0];
+        saved.remote_pc = " https://legacy.example:3389 ".into();
+        saved.vm_target = " Legacy desktop name ".into();
+        saved.vm_profile = " Old profile ".into();
+        saved.iphone_authenticator_enabled = true;
+        let mut draft = saved.clone();
+        draft.username = "updated@example.test".into();
+        let mut app = account_test_app(config.clone());
+        app.pending_account_transaction =
+            Some(super::PendingAccountTransaction::inert_for_test(config));
+        super::save_edited_account(&mut app, &ctx, &draft, true).unwrap();
+        let Some(AccountTransactionIntent::Save {
+            account,
+            was_existing,
+            password,
+            ..
+        }) = app.queued_account_transactions.pop_front()
+        else {
+            panic!("the edited sign-in should be queued for saving");
+        };
+        assert!(was_existing);
+        assert!(password.is_none());
+        assert_eq!(account, draft);
+
+        let authoritative = Account {
+            remote_pc: "latest.example.test".into(),
+            vm_target: "7527e219-c1c6-4983-8f45-da55db2fc376".into(),
+            vm_profile: "New profile".into(),
+            iphone_authenticator_enabled: false,
+            enabled: false,
+            ..app.config.accounts[0].clone()
+        };
+        let rebased = rebase_editor_enabled_state(&account, Some(&authoritative));
+        assert_eq!(
+            rebased,
+            Account {
+                username: draft.username,
+                ..authoritative
+            }
+        );
     }
 
     #[test]
@@ -6133,7 +6403,8 @@ mod tests {
         assert!(editor.contains("app.show_password = !app.show_password;"));
         assert!(editor.contains("password_response.field.request_focus();"));
         assert!(editor.contains("ui.ctx().request_repaint();"));
-        assert!(editor.contains("forget_password_editor_state(ui.ctx(), password_editor_id);"));
+        assert!(editor
+            .contains("forget_password_editor_state(ui.ctx(), password_editor_id(&account.id));"));
         assert!(editor.contains("clear_temp_password(app);"));
         assert!(editor.contains("app.show_password = false;"));
 

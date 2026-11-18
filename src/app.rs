@@ -500,6 +500,7 @@ pub(crate) struct AutoLoginApp {
     pub(crate) worker_event_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
 
     pub(crate) editing_account: Option<Account>,
+    pub(crate) account_editor_height: Option<f32>,
     pub(crate) confirm_delete_account: Option<AccountId>,
     pub(crate) settings_draft: AppSettings,
     #[cfg(target_os = "macos")]
@@ -629,6 +630,7 @@ impl AutoLoginApp {
             tray_rx,
             worker_event_rx,
             editing_account: None,
+            account_editor_height: None,
             confirm_delete_account: None,
             settings_draft,
             #[cfg(target_os = "macos")]
@@ -912,6 +914,25 @@ impl AutoLoginApp {
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
+    }
+
+    fn focus_editor_on_root_close(&self, ctx: &egui::Context) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.is_macos_panel() {
+            return false;
+        }
+        if self.editing_account.is_none()
+            || !self.accessibility_ready()
+            || self.window_closing_mutations_disabled_reason().is_some()
+            || self.keep_settings_window_open_through_ui_pass
+            || !ctx.input(|i| i.viewport().close_requested())
+        {
+            return false;
+        }
+        // Closing eframe's root would destroy the independent editor as well.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        crate::ui::accounts::focus_account_editor(ctx);
+        true
     }
 
     fn automation_start_ready(&self) -> bool {
@@ -2602,15 +2623,26 @@ impl eframe::App for AutoLoginApp {
         self.close_after_quit_when_settings_saves_are_drained(ctx);
         #[cfg(target_os = "macos")]
         self.poll_macos_panel_focus(ctx);
-        self.keep_window_open_for_pending_settings_save(ctx);
-        if !self.settings_window_mode
+        if !self.focus_editor_on_root_close(ctx) {
+            self.keep_window_open_for_pending_settings_save(ctx);
+            if !self.settings_window_mode
+                && !self.quit_requested
+                && ctx.input(|input| input.viewport().close_requested())
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                #[cfg(target_os = "macos")]
+                self.telegram_settings.leave();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+        // eframe skips root ui() when the root is occluded or minimized. An
+        // immediate native child still needs its own pass to receive events.
+        if !ctx.embed_viewports()
+            && ctx.input(|i| i.viewport().visible() == Some(false))
             && !self.quit_requested
-            && ctx.input(|input| input.viewport().close_requested())
+            && self.accessibility_ready()
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            #[cfg(target_os = "macos")]
-            self.telegram_settings.leave();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            crate::ui::accounts::show_account_editor(ctx, self);
         }
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -2735,6 +2767,9 @@ impl eframe::App for AutoLoginApp {
             toolbar.response.rect.height() + vertical_margins + tab_height
         });
         self.fit_window_height(&ctx, frame, height);
+        if accessibility_ready && !self.quit_requested {
+            crate::ui::accounts::show_account_editor(&ctx, self);
+        }
 
         // `logic` runs before `ui`. Keep a presentation request visible for
         // this entire UI pass so a simultaneous Save cannot schedule Close,
@@ -3038,6 +3073,42 @@ mod tests {
             settings_window_mode,
             Tab::Accounts,
         )
+    }
+
+    #[test]
+    fn regular_root_close_focuses_the_existing_editor_unless_quitting() {
+        let mut app = mutation_test_app(true);
+        app.editing_account = Some(crate::models::Account::new("draft@example.invalid"));
+        app.accessibility_status.trusted = true;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        ctx.begin_pass(input.clone());
+        assert!(app.focus_editor_on_root_close(&ctx));
+        let editor = crate::ui::accounts::account_editor_viewport_id();
+        assert_eq!(
+            ctx.viewport_for(editor, |v| v.commands.clone()),
+            vec![
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus
+            ]
+        );
+        let output = ctx.end_pass();
+        assert_eq!(
+            output.viewport_output[&egui::ViewportId::ROOT].commands,
+            vec![egui::ViewportCommand::CancelClose]
+        );
+
+        app.quit_requested = true;
+        ctx.begin_pass(input);
+        assert!(!app.focus_editor_on_root_close(&ctx));
+        let _ = ctx.end_pass();
     }
 
     #[cfg(target_os = "macos")]
