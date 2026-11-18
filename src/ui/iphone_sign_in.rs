@@ -367,7 +367,7 @@ fn show_setup(ui: &mut egui::Ui) {
         }
     }
 
-    ui.add(egui::Label::new("Choose the iPhone to use for all accounts. Install and open Xcode on this Mac to find paired iPhones.").wrap());
+    ui.label("All accounts on this Mac share the iPhone you select here.");
     ui.add_space(4.0);
     let busy = form.save.is_some();
     let mut can_save = false;
@@ -421,7 +421,7 @@ fn show_setup(ui: &mut egui::Ui) {
     }
     let snapshot = DeviceSnapshot::get(ui.ctx());
     if matches!(snapshot.0.get(), Some(SetupInfo::SelectedNeedsSetup { .. })) {
-        ui.add(egui::Label::new("Your iPhone is selected. Finish installing the local helper on this Mac using Setup instructions.").wrap());
+        ui.label("iPhone saved. To install the Mac helper, see step 3 below.");
     }
     ui.ctx().data_mut(|d| d.insert_temp(id, form));
 }
@@ -437,12 +437,15 @@ fn phone_choice(ui: &mut egui::Ui, phones: &[PairedPhone], draft: &mut Option<St
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let label = ui.label("Paired iPhone");
-                super::accounts::account_picker_button(
-                    ui,
-                    popup_id,
-                    chosen.map_or("Choose iPhone…", |p| p.name.as_str()),
-                    ui.available_width(),
-                )
+                super::accounts::account_editor_input_scope(ui, |ui| {
+                    super::accounts::account_picker_button(
+                        ui,
+                        popup_id,
+                        chosen.map_or("Choose iPhone…", |p| p.name.as_str()),
+                        ui.available_width(),
+                    )
+                })
+                .inner
                 .labelled_by(label.id)
             },
         )
@@ -461,7 +464,11 @@ fn phone_choice(ui: &mut egui::Ui, phones: &[PairedPhone], draft: &mut Option<St
                 .show(ui, |ui| {
                     for phone in phones {
                         let selected = chosen.is_some_and(|chosen| chosen.id == phone.id);
-                        if ui.selectable_label(selected, &phone.name).clicked() {
+                        if ui
+                            .add(egui::Button::selectable(selected, &phone.name).truncate())
+                            .on_hover_text(&phone.name)
+                            .clicked()
+                        {
                             *draft = Some(phone.id.clone());
                             ui.close();
                         }
@@ -525,6 +532,7 @@ mod tests {
     #[test]
     fn choosing_a_shared_iphone_requires_an_explicit_selection_and_save() {
         let ctx = egui::Context::default();
+        theme::apply(&ctx);
         let phones = [PairedPhone {
             id: "AAAAAAAA-1234567890000001".into(),
             name: "Work iPhone".into(),
@@ -552,6 +560,21 @@ mod tests {
         let initial = frame(vec![]);
         let field_label = text_rect(&initial, "Paired iPhone").unwrap();
         let field = text_rect(&initial, "Choose iPhone…").unwrap();
+        let field_outline = |frame: &egui::FullOutput| {
+            frame.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.rect.contains_rect(field)
+                        && (rect.rect.height() - 28.0).abs() < 1.0 =>
+                {
+                    Some((rect.fill, rect.stroke))
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            field_outline(&initial),
+            Some((egui::Color32::WHITE, egui::Stroke::new(1.0, theme::STROKE)))
+        );
         assert!(
             (field_label.center().y - field.center().y).abs() < 2.0
                 && field_label.right() < field.left(),
@@ -565,6 +588,10 @@ mod tests {
         frame(click_events(&initial, "Save iPhone"));
         frame(click_events(&initial, "Choose iPhone…"));
         let open = frame(vec![]);
+        assert_eq!(
+            field_outline(&open).unwrap().1,
+            ctx.global_style().visuals.selection.stroke
+        );
         assert!(text_rect(&open, &phones[0].id).is_none());
         frame(click_events(&open, "Work iPhone"));
         let selected = frame(vec![]);
@@ -574,11 +601,84 @@ mod tests {
     }
 
     #[test]
+    fn setup_guide_shows_one_step_and_copies_its_command() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_width(400.0);
+                    super::super::iphone_setup_guide::show(ui);
+                },
+            )
+        };
+        let click = |screen: &egui::FullOutput, label| {
+            frame(click_events(screen, label));
+            frame(vec![])
+        };
+        frame(vec![]);
+        let pair = frame(vec![]);
+        assert!(text_rect(&pair, "Step 1 of 4").is_some());
+        assert!(text_rect(&pair, "Get Xcode").is_some());
+        assert!(text_rect(&pair, "Previous step").is_none());
+        assert!(text_rect(&pair, "Copy").is_none());
+        let phone = click(&pair, "Next step");
+        assert!(text_rect(&phone, "Set up your iPhone").is_some());
+        assert!(text_rect(&phone, "Get Xcode").is_none());
+
+        let install = click(&phone, "Next step");
+        assert!(text_rect(&install, "npm 10 or later").is_none());
+        let requirements = click(&install, "Mac requirements");
+        assert!(text_rect(&requirements, "npm 10 or later").is_some());
+        let check_copy = |screen: &egui::FullOutput, command: &str| {
+            assert!(text_rect(screen, command).is_some());
+            let copied = frame(click_events(screen, "Copy"));
+            assert!(copied.platform_output.commands.iter().any(
+                |output| matches!(output, egui::OutputCommand::CopyText(text) if text == command)
+            ));
+        };
+        check_copy(&requirements, "node script/iphone-automation/cli.mjs setup");
+        let prepare = click(&frame(vec![]), "Next step");
+        assert!(text_rect(&prepare, "Next step").is_none());
+        assert!(text_rect(&prepare, "Mac requirements").is_none());
+        check_copy(
+            &prepare,
+            "node script/iphone-automation/cli.mjs prepare-device",
+        );
+        let previous = click(&frame(vec![]), "Previous step");
+        assert!(text_rect(&previous, "Install the Mac helper").is_some());
+    }
+
+    #[test]
     fn first_run_settings_link_and_setup_statuses_explain_the_next_step() {
         let cases = [
-            (SetupInfo::NotConfigured, Ok(vec![]), "No iPhone selected", "Requires Xcode on this Mac", "No paired iPhones found. Pair your iPhone with Xcode, then refresh the list."),
-            (SetupInfo::NoDeviceSelected, Err("Open Xcode on this Mac.".into()), "No iPhone selected", "Requires Xcode on this Mac", "Open Xcode on this Mac."),
-            (SetupInfo::SelectedNeedsSetup { name: Some("Work iPhone".into()) }, Ok(vec![]), "Work iPhone", "Mac helper setup required", "Your iPhone is selected. Finish installing the local helper on this Mac using Setup instructions."),
+            (
+                SetupInfo::NotConfigured,
+                Ok(vec![]),
+                "No iPhone selected",
+                "Requires Xcode on this Mac",
+                "No paired iPhones found. Pair your iPhone with Xcode, then refresh the list.",
+            ),
+            (
+                SetupInfo::NoDeviceSelected,
+                Err("Open Xcode on this Mac.".into()),
+                "No iPhone selected",
+                "Requires Xcode on this Mac",
+                "Open Xcode on this Mac.",
+            ),
+            (
+                SetupInfo::SelectedNeedsSetup {
+                    name: Some("Work iPhone".into()),
+                },
+                Ok(vec![]),
+                "Work iPhone",
+                "Mac helper setup required",
+                "iPhone saved. To install the Mac helper, see step 3 below.",
+            ),
         ];
         for (info, scan, title, caption, status) in cases {
             let ctx = egui::Context::default();

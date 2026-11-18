@@ -2137,15 +2137,24 @@ fn password_visibility_id(password_id: egui::Id) -> egui::Id {
     password_id.with("visibility")
 }
 
-fn account_editor_input_scope<R>(
+pub(super) fn account_editor_input_scope<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     ui.scope(|ui| {
         // Text inputs keep a stable outline while the pointer moves across
         // them. Keyboard focus remains distinct through `selection.stroke`.
-        let idle_stroke = ui.visuals().widgets.inactive.bg_stroke;
-        ui.visuals_mut().widgets.hovered.bg_stroke = idle_stroke;
+        let idle_stroke = egui::Stroke::new(1.0, theme::STROKE);
+        let visuals = ui.visuals_mut();
+        visuals.text_edit_bg_color = Some(egui::Color32::WHITE);
+        visuals.widgets.inactive.weak_bg_fill = egui::Color32::WHITE;
+        visuals.widgets.hovered.weak_bg_fill = theme::SURFACE;
+        visuals.widgets.active.weak_bg_fill = theme::SURFACE;
+        visuals.widgets.active.bg_stroke = visuals.selection.stroke;
+        visuals.widgets.open.weak_bg_fill = theme::SURFACE;
+        visuals.widgets.open.bg_stroke = visuals.selection.stroke;
+        visuals.widgets.inactive.bg_stroke = idle_stroke;
+        visuals.widgets.hovered.bg_stroke = idle_stroke;
         add_contents(ui)
     })
 }
