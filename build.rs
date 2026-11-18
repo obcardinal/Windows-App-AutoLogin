@@ -22,6 +22,22 @@ const RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV: &str = "WAAL_RELEASE_NATIVE_TOOLCHAIN
 const RELEASE_MATERIALS_SHA256_ENV: &str = "WAAL_RELEASE_MATERIALS_SHA256";
 const WINDOWS_AUTHENTICODE_PUBLISHER_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_PUBLISHER";
 const WINDOWS_AUTHENTICODE_CERT_SHA256_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256";
+const MACOS_RELEASE_WORKFLOW: &str =
+    "obcardinal/Windows-App-AutoLogin/.github/workflows/macos-release.yml@refs/heads/main";
+const HOSTED_BUILD_ENV: &[(&str, &str)] = &[
+    ("GITHUB_ACTIONS", "true"),
+    ("GITHUB_EVENT_NAME", "workflow_dispatch"),
+    ("GITHUB_WORKFLOW_REF", MACOS_RELEASE_WORKFLOW),
+    ("RUNNER_ENVIRONMENT", "github-hosted"),
+    ("RUNNER_OS", "macOS"),
+    ("RUNNER_ARCH", "ARM64"),
+    ("CARGO_CFG_TARGET_ARCH", "aarch64"),
+    (
+        "WAAL_RELEASE_BUNDLE_ID",
+        "com.obcardinal.WindowsAppAutoLogin",
+    ),
+    ("WAAL_MACOS_TEAM_ID", "76C2QW8JV3"),
+];
 
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
@@ -61,6 +77,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed={RELEASE_NATIVE_TOOLCHAIN_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed={RELEASE_MATERIALS_SHA256_ENV}");
     println!("cargo:rerun-if-env-changed=WAAL_PUBLISHABLE_RELEASE");
+    println!("cargo:rerun-if-env-changed=WAAL_GITHUB_RELEASE_BUILD");
+    println!("cargo:rerun-if-env-changed=GITHUB_WORKFLOW_SHA");
+    for (name, _) in HOSTED_BUILD_ENV {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
     println!("cargo:rerun-if-env-changed=WAAL_LOCAL_SIGNED_RELEASE");
     println!("cargo:rerun-if-env-changed={WINDOWS_UIACCESS_MANIFEST_ENV}");
     println!("cargo:rerun-if-env-changed={WINDOWS_AUTHENTICODE_PUBLISHER_ENV}");
@@ -237,15 +258,23 @@ fn build_metadata(
 ) -> String {
     let publishable_release = publishable_release_requested();
     let local_signed_release = local_signed_release_requested();
-    let artifact_kind = if env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some() {
+    let artifact_kind = if publishable_release {
+        "release"
+    } else if env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some() {
         "release-diagnostics"
     } else if local_signed_release && !macos_identity.non_production_identity {
         "local-signed-release"
     } else {
         "development"
     };
-    let attestation = "none-local-shared-security-context";
-    let producer_attribution = "unavailable-local-shared-security-context";
+    let (attestation, producer_attribution) = if publishable_release {
+        ("github-artifact-attestation", "github-hosted-actions")
+    } else {
+        (
+            "none-local-shared-security-context",
+            "unavailable-local-shared-security-context",
+        )
+    };
     format!(
         "WAAL_BUILD_METADATA_V1;artifact-kind={};publishable={};attestation={};producer-attribution={};profile={};target-os={};target-arch={};debug-assertions={};debug-fill={};dev-tools={};diagnostics-ui={};release-diagnostics={};macos-bundle-id={};production-macos-bundle-id={};non-production-macos-identity={};macos-team-id={};windows-authenticode-publisher={};windows-authenticode-cert-sha256={};source-git-commit={};source-git-tree={};release-cargo-version={};release-rustc-version={};release-cargo-sha256={};release-rustc-sha256={};release-rust-sysroot-sha256={};release-native-toolchain-sha256={};release-materials-sha256={};",
         artifact_kind,
@@ -476,7 +505,25 @@ fn publishable_release_requested() -> bool {
             "WAAL_PUBLISHABLE_RELEASE is disabled: source-controlled build metadata cannot authenticate its own producer; publishability requires detached verification from an isolated authenticated builder"
         );
     }
-    false
+    if !truthy_env("WAAL_GITHUB_RELEASE_BUILD") {
+        return false;
+    }
+    // These checks identify the intended build mode. The release signer must
+    // independently authenticate the executable digest and workflow commit.
+    let commit = trimmed_env(RELEASE_GIT_COMMIT_ENV);
+    if !is_macos_release_profile()
+        || commit.as_ref().is_none_or(|value| !valid_git_sha1(value))
+        || commit != trimmed_env("GITHUB_WORKFLOW_SHA")
+        || HOSTED_BUILD_ENV
+            .iter()
+            .any(|(name, value)| env::var(name).as_deref() != Ok(*value))
+        || env::vars_os().any(|(name, _)| {
+            name.to_string_lossy().starts_with("CARGO_FEATURE_") && name != "CARGO_FEATURE_DEFAULT"
+        })
+    {
+        panic!("WAAL_GITHUB_RELEASE_BUILD requires the main macOS release workflow, an Apple silicon runner, and the production configuration");
+    }
+    true
 }
 
 fn local_signed_release_requested() -> bool {
