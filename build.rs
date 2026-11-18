@@ -24,6 +24,14 @@ const WINDOWS_AUTHENTICODE_PUBLISHER_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_PUBL
 const WINDOWS_AUTHENTICODE_CERT_SHA256_ENV: &str = "WAAL_WINDOWS_AUTHENTICODE_CERT_SHA256";
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=src/macos_masked_field.h");
+        println!("cargo:rerun-if-changed=src/macos_masked_field.m");
+        cc::Build::new()
+            .file("src/macos_masked_field.m")
+            .flag("-fobjc-arc")
+            .compile("waal_lock_screen_capture");
+    }
     let icon = Path::new("assets/icon.png");
     let tray_icon = Path::new("assets/icon_tray.png");
     let inter_font = Path::new("assets/fonts/InterVariable.ttf");

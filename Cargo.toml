@@ -104,6 +104,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSAttributedString", "NSBundle", "NSCalendar", "NSData", "NSDate", "NSDateFormatter", "NSDictionary", "NSError", "NSGeometry", "NSLocale", "NSProcessInfo", "NSRunLoop", "NSTimeZone", "NSValue", "NSRange", "NSString", "NSURL", "block2", "objc2-core-services"] }
 
 [build-dependencies]
+cc = "1.2"
 embed-resource = "3.0.9"
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 
