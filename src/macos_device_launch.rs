@@ -81,23 +81,32 @@ pub(crate) fn reconnect_window_device(
     list.connect(selected, || list.ensure_profile(&profile))
 }
 
-pub(super) fn reconnect_window_device_if(
-    app: &AxElement,
-    name: &str,
-    account_email: &str,
-    before_connect: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    ensure!(
-        !name.trim().is_empty() && !account_email.trim().is_empty(),
-        PROFILE_ERROR
-    );
-    let list = devices_in_app(app.clone())?;
-    exact_device(&list.devices, name)?;
-    let profile = list.verify_profile(account_email.trim())?;
-    list.connect(name, || {
-        list.ensure_profile(&profile)?;
-        before_connect()
-    })
+pub(super) struct VerifiedWindowDevice {
+    center: AxElement,
+    profile: String,
+    card: String,
+}
+
+impl VerifiedWindowDevice {
+    pub(super) fn reconnect(
+        self,
+        app: &AxElement,
+        before_connect: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let center = devices_window(app)?;
+        ensure!(
+            center.same_element(&self.center),
+            "The Windows App Connection Center changed."
+        );
+        // Closing a VM can rebuild the Devices list. Resolve its card again under
+        // the profile whose unique toolbar label we matched to the email before Close.
+        let list = devices_from_window(app.clone(), center)?;
+        list.ensure_profile(&self.profile)?;
+        list.connect(&self.card, || {
+            before_connect()?;
+            list.ensure_profile(&self.profile)
+        })
+    }
 }
 
 fn launch_card_name<'a, T>(
@@ -130,13 +139,14 @@ pub(super) fn verify_window_device(
     email: &str,
     only_open_session: bool,
     cancelled: &impl Fn() -> bool,
-) -> Result<String> {
+) -> Result<VerifiedWindowDevice> {
     ensure!(
         !cancelled() && app.bool_attr(AX_FRONTMOST) == Some(true),
         "The active desktop changed."
     );
-    let list = devices_in_app(app.clone())?;
-    list.verify_profile(email)?;
+    let center = devices_window(app)?;
+    let profile = enter_profile::verify_selected_owner(app, &center, email)?;
+    let list = devices_from_window(app.clone(), center)?;
     let check_center = || {
         ensure!(
             !cancelled()
@@ -146,9 +156,8 @@ pub(super) fn verify_window_device(
                     .is_some_and(|w| w.same_element(&list.window)),
             "The Windows App Devices view lost focus."
         );
-        Ok(())
+        list.ensure_profile(&profile)
     };
-    check_center()?;
     let card = reconnect_card(&list.devices, name, only_open_session, |item| {
         check_center()?;
         let entries = super::device_windows::session_entries(app)?;
@@ -159,7 +168,12 @@ pub(super) fn verify_window_device(
         connected::connected_card(app, &list.window, item)
     })?;
     check_center()?;
-    Ok(card.to_owned())
+    ensure!(!card.trim().is_empty(), SELECTION_ERROR);
+    Ok(VerifiedWindowDevice {
+        center: list.window,
+        profile,
+        card: card.to_owned(),
+    })
 }
 
 fn reconnect_card<'a, T>(
@@ -250,10 +264,6 @@ impl DeviceList {
             "Windows App could not start the connection."
         );
         Ok(())
-    }
-
-    fn verify_profile(&self, email: &str) -> Result<String> {
-        enter_profile::verify_selected_owner(&self.app, &self.window, email)
     }
 
     fn select(&self, item: &AxElement) -> Result<()> {

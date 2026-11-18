@@ -408,13 +408,18 @@ fn restore_after_card_check(
     Ok(())
 }
 
-fn preflight_reconnect(
-    session: &LockedSession,
+enum ReconnectTarget<'a> {
+    Saved(&'a SavedDevice),
+    Window(device_launch::VerifiedWindowDevice),
+}
+
+fn preflight_reconnect<'a>(
+    session: &'a LockedSession,
     accounts: &[Account],
     app: &AxElement,
     original: &AxElement,
     cancelled: &impl Fn() -> bool,
-) -> Result<BoundDevice> {
+) -> Result<ReconnectTarget<'a>> {
     let verified = match &session.device {
         BoundDevice::Window(title) => {
             account_for_observed_session(accounts, session)
@@ -426,7 +431,7 @@ fn preflight_reconnect(
                 session.other_sessions.is_empty(),
                 cancelled,
             )
-            .map(BoundDevice::Window)
+            .map(ReconnectTarget::Window)
         }
         BoundDevice::Saved(device) => {
             let catalog = device_launch::saved_devices()?;
@@ -440,7 +445,7 @@ fn preflight_reconnect(
             );
             device_launch::verify_card_identity_in(&catalog, device)?;
             device_launch::verify_saved_card(app, device, cancelled)
-                .map(|()| session.device.clone())
+                .map(|()| ReconnectTarget::Saved(device))
         }
     };
     restore_after_card_check(session, app, original)?;
@@ -499,10 +504,11 @@ pub(crate) fn reconnect(
     can_reopen()?;
     // A successful native Connect action only means the client accepted the
     // request. Release Monitor immediately so it can handle any credential prompt.
-    match &target {
-        BoundDevice::Saved(device) => device_launch::open_saved_device_if(device, can_reopen),
-        BoundDevice::Window(title) => device_launch::reconnect_window_device_if(&app, title, &session.username, can_reopen),
-    }.context("The desktop disconnected, but Windows App could not reopen it. Open the selected desktop again.")?;
+    match target {
+        ReconnectTarget::Saved(device) => device_launch::open_saved_device_if(device, can_reopen),
+        ReconnectTarget::Window(device) => device.reconnect(&app, can_reopen),
+    }
+    .context("The desktop disconnected, but Windows App could not reopen it. Open the selected desktop again.")?;
     Ok(())
 }
 
