@@ -199,15 +199,6 @@ pub fn page_header(
     ui.add_space(12.0);
 }
 
-pub fn page_header_plain(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    glass_frame().show(ui, |ui| {
-        ui.heading(title);
-        ui.add_space(4.0);
-        ui.add(egui::Label::new(muted(subtitle)).wrap());
-    });
-    ui.add_space(12.0);
-}
-
 pub fn tab_heading<R>(
     ui: &mut egui::Ui,
     title: &str,

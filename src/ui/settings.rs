@@ -10,7 +10,7 @@ use crate::storage::{
     pending_storage_recovery_user_status, storage_mode_migration_error_requires_recovery,
     StorageModeMigration,
 };
-use crate::ui::theme;
+use crate::ui::{theme, toggle::labeled_switch};
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
@@ -139,118 +139,79 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let settings_before_input = app.settings_draft.clone();
     let mut settings_changed = false;
     let disabled_reason = settings_disabled_reason(app);
-    let settings_ready = disabled_reason.is_none();
-    theme::page_header_plain(
-        ui,
-        "Settings",
-        "Adjust login behavior and system integration.",
-    );
+    theme::tab_heading(ui, "Settings", |_| {});
 
     egui::ScrollArea::vertical()
         .id_salt("settings_scroll")
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-            section(ui, "System", |ui| {
-                let open_at_login = ui
-                    .add_enabled(
-                        settings_ready,
-                        egui::Checkbox::new(
-                            &mut app.settings_draft.auto_start,
-                            "Open at Login",
-                        ),
+            if let Some(reason) = disabled_reason.as_deref() {
+                ui.label(egui::RichText::new(reason).small().color(theme::MUTED));
+            }
+            let controls = ui.add_enabled_ui(disabled_reason.is_none(), |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                section(ui, "SYSTEM", |ui| {
+                    settings_changed |= labeled_switch(
+                        ui,
+                        &mut app.settings_draft.auto_start,
+                        "Open at Login",
+                        "Start Windows App AutoLogin when you sign in.",
                     );
-                settings_changed |= add_setting_description(
-                    open_at_login,
-                    settings_ready,
-                    "Start Windows App AutoLogin after signing in.",
-                    disabled_reason.as_deref(),
-                );
-                let start_minimized = ui
-                    .add_enabled(
-                        settings_ready,
-                        egui::Checkbox::new(
-                            &mut app.settings_draft.start_minimized,
-                            "Hide main window at launch",
-                        ),
+                    row_divider(ui);
+                    settings_changed |= labeled_switch(
+                        ui,
+                        &mut app.settings_draft.start_minimized,
+                        "Hide main window at launch",
+                        "Start in the background when you open the app.",
                     );
-                settings_changed |= add_setting_description(
-                    start_minimized,
-                    settings_ready,
-                    "The app keeps running in the background.",
-                    disabled_reason.as_deref(),
-                );
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                {
-                    let icon_visibility_label = if cfg!(target_os = "windows") {
-                        "Hide system tray icon"
-                    } else {
-                        "Hide menu bar icon"
-                    };
-                    let hide_menu_bar_icon = ui.add_enabled(
-                        settings_ready,
-                        egui::Checkbox::new(
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    {
+                        row_divider(ui);
+                        let label = if cfg!(target_os = "windows") {
+                            "Hide system tray icon"
+                        } else {
+                            "Hide menu bar icon"
+                        };
+                        let restore_hint = "To restore the icon, reopen the app and turn this off.";
+                        settings_changed |= labeled_switch(
+                            ui,
                             &mut app.settings_draft.hide_menu_bar_icon,
-                            icon_visibility_label,
-                        ),
-                    );
-                    settings_changed |= add_setting_description(
-                        hide_menu_bar_icon,
-                        settings_ready,
-                        "Hide the icon while the app keeps running in the background.",
-                        disabled_reason.as_deref(),
-                    );
-                    ui.label(theme::muted(
-                        "Open Windows App AutoLogin again, then choose Settings to restore the icon.",
-                    ));
-                }
-                let menu_diagnostics = ui.add_enabled(
-                    settings_ready,
-                    egui::Checkbox::new(
+                            label,
+                            restore_hint,
+                        );
+                        preference_hint(ui, restore_hint);
+                    }
+                    row_divider(ui);
+                    settings_changed |= labeled_switch(
+                        ui,
                         &mut app.settings_draft.show_menu_diagnostics,
                         "Show diagnostic info in menu",
-                    ),
-                );
-                settings_changed |= add_setting_description(
-                    menu_diagnostics,
-                    settings_ready,
-                    "Show status information in the app menu, including password storage and the last fill result.",
-                    disabled_reason.as_deref(),
-                );
-                if let Some(reason) = disabled_reason.as_deref() {
-                    ui.add_space(4.0);
-                    ui.label(theme::muted(reason));
-                }
-            });
-
-            section(ui, "Security", |ui| {
-                let secure_storage = ui
-                    .add_enabled(
-                        settings_ready,
-                        egui::Checkbox::new(
-                            &mut app.settings_draft.use_keyring,
-                            "Use system secure storage",
-                        ),
+                        "Include password storage status and the last fill result in the menu.",
                     );
-                settings_changed |= add_setting_description(
-                    secure_storage,
-                    settings_ready,
-                    "Recommended. If disabled, password ciphertext is stored locally and its encryption key is still kept in the system credential store.",
-                    disabled_reason.as_deref(),
-                );
-                if let Some(reason) = disabled_reason.as_deref() {
-                    ui.add_space(4.0);
-                    ui.label(theme::muted(
-                        reason,
-                    ));
-                }
+                });
+
+                ui.add_space(12.0);
+                section(ui, "SECURITY", |ui| {
+                    let storage_hint = "When off, passwords use an encrypted local file. Its key stays in the system credential store.";
+                    settings_changed |= labeled_switch(
+                        ui,
+                        &mut app.settings_draft.use_keyring,
+                        "Use system secure storage",
+                        storage_hint,
+                    );
+                    preference_hint(ui, storage_hint);
+                });
             });
+            if let Some(reason) = disabled_reason.as_deref() {
+                controls.response.on_disabled_hover_text(reason);
+            }
 
             #[cfg(target_os = "macos")]
             {
                 ui.add_space(12.0);
-                section(ui, "iPhone Authentication", crate::ui::iphone_sign_in::summary);
+                section(ui, "IPHONE AUTHENTICATION", crate::ui::iphone_sign_in::summary);
                 ui.add_space(12.0);
-                section(ui, "2FA Notifications", |ui| {
+                section(ui, "2FA NOTIFICATIONS", |ui| {
                     let closing = app.window_closing_mutations_disabled_reason().is_some();
                     ui.add_enabled_ui(!closing, |ui| app.telegram_settings.show(ui));
                 });
@@ -262,19 +223,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     }
 }
 
-fn add_setting_description(
-    response: egui::Response,
-    enabled: bool,
-    enabled_description: &str,
-    disabled_reason: Option<&str>,
-) -> bool {
-    let changed = response.changed();
-    if enabled {
-        response.on_hover_text(enabled_description);
-    } else if let Some(reason) = disabled_reason {
-        response.on_hover_text(reason);
-    }
-    changed
+fn preference_hint(ui: &mut egui::Ui, hint: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(hint).small().color(theme::MUTED)).wrap());
+}
+
+fn row_divider(ui: &mut egui::Ui) {
+    ui.add(egui::Separator::default().spacing(8.0));
 }
 
 fn settings_disabled_reason(app: &AutoLoginApp) -> Option<String> {
@@ -1028,13 +982,16 @@ fn storage_cleanup_warning(from_use_keyring: bool, to_use_keyring: bool) -> Stri
 }
 
 pub(super) fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-    theme::compact_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(egui::RichText::new(title).strong());
-        ui.add_space(4.0);
-        add_contents(ui);
-    });
-    ui.add_space(6.0);
+    ui.label(theme::section_label(title));
+    theme::compact_frame()
+        .inner_margin(egui::Margin::symmetric(20, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.visuals_mut().widgets.noninteractive.bg_stroke.color =
+                theme::STROKE.gamma_multiply(0.70);
+            add_contents(ui);
+        });
 }
 
 #[cfg(test)]
@@ -1057,6 +1014,53 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc::channel as tokio_channel;
+
+    #[test]
+    fn preference_label_and_switch_each_toggle_once_and_respect_disabled_state() {
+        for enabled in [true, false] {
+            for click_label in [true, false] {
+                let ctx = egui::Context::default();
+                let mut checked = false;
+                let mut frame = |events| {
+                    let mut result = None;
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(320.0, 100.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    };
+                    let _ = ctx.run_ui(input, |ui| {
+                        let row = ui.add_enabled_ui(enabled, |ui| {
+                            super::labeled_switch(ui, &mut checked, "Open at Login", "")
+                        });
+                        result = Some((row.response.rect, row.inner, checked));
+                    });
+                    result.unwrap()
+                };
+                let (rect, _, _) = frame(vec![]);
+                let x = if click_label {
+                    rect.left() + 8.0
+                } else {
+                    rect.right() - 20.0
+                };
+                let pos = egui::pos2(x, rect.center().y);
+                let button = |pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let (_, changed, value) = frame(vec![egui::Event::PointerMoved(pos), button(true)]);
+                assert!(!changed && !value);
+                let (_, changed, value) = frame(vec![button(false)]);
+                assert_eq!((changed, value), (enabled, enabled));
+                let (_, changed, value) = frame(vec![]);
+                assert_eq!((changed, value), (false, enabled));
+            }
+        }
+    }
 
     #[test]
     fn checkbox_save_path_is_background_and_has_no_close_policy() {

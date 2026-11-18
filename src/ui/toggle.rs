@@ -43,6 +43,46 @@ pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Respo
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+pub(super) fn labeled_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    label: impl Into<egui::WidgetText>,
+    hint: &str,
+) -> bool {
+    let label = label.into();
+    let (label_response, switch_response) = egui::containers::Sides::new()
+        .height(36.0)
+        .shrink_left()
+        .wrap()
+        .show(
+            ui,
+            |ui| {
+                let visuals = ui.visuals_mut();
+                visuals.override_text_color = None;
+                visuals.widgets.inactive.fg_stroke.color = theme::TEXT;
+                visuals.widgets.hovered.fg_stroke.color = theme::ACCENT;
+                visuals.widgets.active.fg_stroke.color = theme::ACCENT;
+                ui.add(
+                    egui::Label::new(label.clone())
+                        .selectable(false)
+                        .sense(egui::Sense::CLICK),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(hint)
+            },
+            |ui| switch(ui, value, label.text()).on_hover_text(hint),
+        );
+    // The switch provides a single named keyboard and accessibility target.
+    if label_response.clicked() {
+        *value = !*value;
+        switch_response.request_focus();
+        ui.ctx().request_repaint();
+        true
+    } else {
+        switch_response.changed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +127,59 @@ mod tests {
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clickable_setting_label_changes_ink_only_while_enabled_and_hovered() {
+        for enabled in [true, false] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut checked = false;
+            let mut render = |events| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(280.0, 80.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        labeled_switch(ui, &mut checked, "Open at Login", "");
+                    });
+                });
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "Open at Login" => {
+                            let ink = text.galley.job.sections[0].format.color;
+                            Some((
+                                text.visual_bounding_rect(),
+                                if ink == egui::Color32::PLACEHOLDER {
+                                    text.fallback_color
+                                } else {
+                                    ink
+                                },
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .expect("setting label must be painted")
+            };
+            let (rect, idle) = render(vec![]);
+            let (hover_rect, hover) = render(vec![egui::Event::PointerMoved(rect.center())]);
+            assert_eq!(hover_rect, rect);
+            assert_eq!(idle != hover, enabled);
+            assert_eq!(
+                render(vec![egui::Event::PointerMoved(
+                    rect.right_center() + egui::vec2(12.0, 0.0)
+                )]),
+                (rect, idle)
+            );
+            assert!(!checked);
         }
     }
 
