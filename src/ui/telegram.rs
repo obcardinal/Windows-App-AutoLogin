@@ -129,7 +129,7 @@ impl TelegramSettings {
                     if operation.is_some() {
                         ui.spinner();
                     } else if self.code.is_some() {
-                        if ui.add(theme::secondary_button("Cancel")).clicked() {
+                        if theme::settings_button(ui, "Cancel").clicked() {
                             self.clear_code(ui.ctx());
                             self.code = None;
                             self.error = None;
@@ -137,19 +137,19 @@ impl TelegramSettings {
                     } else {
                         match self.linked {
                             Some(true) => {
-                                if ui.add(theme::secondary_button("Unlink")).clicked() {
+                                if theme::settings_button(ui, "Unlink").clicked() {
                                     self.start(ui.ctx(), Operation::Unlink, || {
                                         telegram_notifications::unlink().map(|()| false)
                                     });
                                 }
                             }
                             Some(false) => {
-                                if ui.add(theme::secondary_button("Link Telegram…")).clicked() {
+                                if theme::settings_button(ui, "Link Telegram…").clicked() {
                                     self.code = Some(accounts::empty_password_buffer());
                                 }
                             }
                             None => {
-                                if ui.add(theme::secondary_button("Retry")).clicked() {
+                                if theme::settings_button(ui, "Retry").clicked() {
                                     self.start(
                                         ui.ctx(),
                                         Operation::Check,
@@ -311,5 +311,103 @@ mod tests {
         settings.poll();
         assert_eq!(settings.linked, Some(false));
         assert!(settings.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod settings_button_tests {
+    use super::{egui, theme};
+
+    #[derive(Debug, PartialEq)]
+    struct ButtonFrame {
+        hit: egui::Rect,
+        background: egui::Rect,
+        label: egui::Rect,
+        fill: egui::Color32,
+        cursor: egui::CursorIcon,
+        clicked: bool,
+    }
+
+    #[test]
+    fn settings_actions_show_hover_without_moving() {
+        for label in ["Sign-in details…", "Unlink"] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let frame = |enabled, events| {
+                let mut response = None;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        response = Some(ui.add_enabled(enabled, |ui: &mut egui::Ui| {
+                            theme::settings_button(ui, label)
+                        }));
+                    },
+                );
+                let response = response.unwrap();
+                let background = output
+                    .shapes
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.shape {
+                        egui::Shape::Rect(rect) if rect.rect.contains(response.rect.center()) => {
+                            Some(rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("painted button background");
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|item| match &item.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.visual_bounding_rect())
+                        }
+                        _ => None,
+                    })
+                    .expect("painted button label");
+                ButtonFrame {
+                    hit: response.interact_rect,
+                    background: background.rect,
+                    label: text,
+                    fill: background.fill,
+                    cursor: output.platform_output.cursor_icon,
+                    clicked: response.clicked(),
+                }
+            };
+
+            let idle = frame(true, vec![]);
+            let pos = egui::pos2(idle.hit.right() - 1.0, idle.hit.center().y);
+            let outside = egui::Event::PointerMoved(pos + egui::vec2(20.0, 0.0));
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let hover = frame(true, vec![egui::Event::PointerMoved(pos)]);
+            assert_ne!(hover.fill, idle.fill, "{label} hover fill");
+            assert_eq!(hover.cursor, egui::CursorIcon::PointingHand);
+            assert_eq!(frame(true, vec![outside.clone()]), idle);
+            let pressed = frame(true, vec![egui::Event::PointerMoved(pos), press(true)]);
+            let released = frame(true, vec![press(false)]);
+            assert_ne!(pressed.fill, hover.fill, "{label} pressed fill");
+            assert!(released.clicked);
+            for state in [&hover, &pressed, &released] {
+                assert_eq!(
+                    (state.hit, state.background, state.label),
+                    (idle.hit, idle.background, idle.label)
+                );
+            }
+
+            let disabled = frame(false, vec![outside]);
+            assert_ne!(disabled.cursor, egui::CursorIcon::PointingHand);
+            assert!(!disabled.clicked);
+            for event in [egui::Event::PointerMoved(pos), press(true), press(false)] {
+                assert_eq!(frame(false, vec![event]), disabled);
+            }
+        }
     }
 }

@@ -167,11 +167,12 @@ pub(super) fn summary(ui: &mut egui::Ui) {
                 });
             },
             |ui| {
-                ui.add(theme::secondary_button(if needs_setup {
+                let label = if needs_setup {
                     "Set up iPhone…"
                 } else {
                     "Sign-in details…"
-                }))
+                };
+                theme::settings_button(ui, label)
             },
         );
     if details.clicked() {

@@ -241,6 +241,35 @@ fn style_primary_button(button: egui::Button<'static>) -> egui::Button<'static> 
         .min_size(egui::vec2(0.0, 28.0))
 }
 
+#[cfg(target_os = "macos")]
+pub fn settings_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.scope(|ui| {
+        if !ui.is_enabled() {
+            return ui.add(secondary_button(label));
+        }
+        apply_toolbar_style(ui);
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = egui::Color32::WHITE;
+        let outline = egui::Stroke::new(1.0, STROKE);
+        widgets.inactive.bg_stroke = outline;
+        widgets.hovered.bg_stroke = outline;
+        for state in [
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+        ] {
+            state.expansion = 0.0;
+        }
+        ui.add(
+            egui::Button::new(egui::RichText::new(label).color(TEXT))
+                .corner_radius(7)
+                .min_size(egui::vec2(0.0, 28.0)),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    })
+    .inner
+}
+
 pub fn secondary_button(text: impl Into<String>) -> egui::Button<'static> {
     style_secondary_button(egui::Button::new(
         egui::RichText::new(text.into()).color(TEXT),
