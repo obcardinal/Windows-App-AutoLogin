@@ -1,4 +1,6 @@
 #[cfg(target_os = "macos")]
+mod locked_vm;
+#[cfg(target_os = "macos")]
 mod window_hints;
 
 use crate::config::Config;
@@ -1738,6 +1740,8 @@ pub(crate) fn spawn(
         let mut iphone_probe_cadence = IphoneProbeCadence::default();
         #[cfg(target_os = "macos")]
         let mut window_hints = window_hints::WindowHints::default();
+        #[cfg(target_os = "macos")]
+        let mut locked_vm = locked_vm::ReturnMonitor::default();
         let generation = invalidator.generation;
         #[cfg(target_os = "macos")]
         let mut last_macos_prompt_probe: Option<Instant> = None;
@@ -1771,6 +1775,7 @@ pub(crate) fn spawn(
                 no_prompt_tracker.reset();
                 #[cfg(target_os = "macos")]
                 {
+                    locked_vm.reset_focus();
                     window_hints.set_target(None);
                     process_exit_tracker.reset();
                     sheet_exit_tracker.reset();
@@ -1802,6 +1807,7 @@ pub(crate) fn spawn(
                 no_prompt_tracker.reset();
                 #[cfg(target_os = "macos")]
                 {
+                    locked_vm.reset_focus();
                     window_hints.set_target(None);
                     process_exit_tracker.reset();
                     sheet_exit_tracker.reset();
@@ -2304,6 +2310,19 @@ pub(crate) fn spawn(
 
             #[cfg(target_os = "macos")]
             if prompt_attempt_started {
+                continue;
+            }
+
+            #[cfg(target_os = "macos")]
+            if locked_vm.poll(
+                macos_monitor_snapshot_this_tick.as_ref(),
+                &accounts,
+                &automation_slot,
+                &activity_tracker,
+                &pause_latch,
+                current_generation,
+                &event_tx,
+            ) {
                 continue;
             }
 
