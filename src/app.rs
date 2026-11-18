@@ -1981,7 +1981,7 @@ impl AutoLoginApp {
 
     #[cfg(target_os = "macos")]
     fn hide_macos_panel(&mut self, ctx: &egui::Context) {
-        self.telegram_settings.clear_code(ctx);
+        self.telegram_settings.leave();
         self.macos_window_visible = false;
         self.macos_panel_acquired_focus = false;
         self.close_settings_window_after_sync = false;
@@ -2468,7 +2468,11 @@ impl eframe::App for AutoLoginApp {
         crate::ui::accounts::poll_background_account_toggle(self, ctx);
         crate::ui::settings::poll_background_save(self, ctx);
         #[cfg(target_os = "macos")]
-        self.telegram_settings.poll();
+        {
+            let closing = self.window_closing_mutations_disabled_reason().is_some()
+                || ctx.input(|input| input.viewport().close_requested());
+            self.telegram_settings.poll(ctx, closing);
+        }
         crate::ui::accounts::poll_background_account_transaction(self, ctx);
         self.poll_background_storage_recovery_signal(ctx);
         self.close_settings_window_after_successful_sync(ctx);
@@ -2486,7 +2490,7 @@ impl eframe::App for AutoLoginApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             #[cfg(target_os = "macos")]
-            self.telegram_settings.clear_code(ctx);
+            self.telegram_settings.leave();
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -2574,7 +2578,7 @@ impl eframe::App for AutoLoginApp {
 
         #[cfg(target_os = "macos")]
         if self.selected_tab != Tab::Settings || !accessibility_ready {
-            self.telegram_settings.leave(&ctx);
+            self.telegram_settings.leave();
         }
         #[cfg(target_os = "macos")]
         if self.selected_tab != Tab::Settings {

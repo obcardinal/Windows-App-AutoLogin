@@ -133,7 +133,7 @@ enum SettingsSaveCompletion {
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     #[cfg(target_os = "macos")]
     if crate::ui::iphone_sign_in::show_if_open(ui).is_some() {
-        app.telegram_settings.leave(ui.ctx());
+        app.telegram_settings.leave();
         return;
     }
     let settings_before_input = app.settings_draft.clone();

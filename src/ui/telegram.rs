@@ -1,113 +1,219 @@
-use super::{accounts, theme};
-use crate::telegram_notifications::{self, BOT_URL};
+use super::theme;
+use crate::telegram_notifications::{self, LinkState};
 use eframe::egui;
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSString, NSURL};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use zeroize::{Zeroize, Zeroizing};
+use std::time::{Duration, Instant};
 
 const WORKER_ERROR: &str = "Couldn’t finish the Telegram request. Try again.";
-type LinkResult = Result<bool, &'static str>;
+const OPEN_ERROR: &str = "Couldn’t open Telegram. Click Open Telegram to try again.";
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const FAILED_POLL_INTERVAL: Duration = Duration::from_secs(15);
+// Let an accepted mutation finish its bounded HTTP requests, even if the
+// window closes. A system Keychain prompt can outlive those request timeouts.
+const MAX_MUTATION_WAIT: Duration = Duration::from_secs(25);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+type LinkResult = Result<LinkState, &'static str>;
+
+#[derive(Clone)]
 enum Operation {
     Check,
-    Link,
+    Begin,
+    Refresh,
+    Cancel(String),
     Unlink,
+}
+
+impl Operation {
+    fn run(&self) -> LinkResult {
+        match self {
+            Self::Check => telegram_notifications::link_state(),
+            Self::Begin => telegram_notifications::begin_link(),
+            Self::Refresh => telegram_notifications::refresh_link(),
+            Self::Cancel(url) => telegram_notifications::cancel_pending(url),
+            Self::Unlink => telegram_notifications::unlink().map(|()| LinkState::Unlinked),
+        }
+    }
+
+    fn changes_link(&self) -> bool {
+        matches!(self, Self::Begin | Self::Cancel(_) | Self::Unlink)
+    }
+}
+
+struct Worker {
+    operation: Operation,
+    receiver: Receiver<LinkResult>,
+    started_at: Instant,
 }
 
 #[derive(Default)]
 pub(crate) struct TelegramSettings {
-    linked: Option<bool>,
-    code: Option<Zeroizing<String>>,
-    pending: Option<(Operation, Receiver<LinkResult>)>,
-    error: Option<&'static str>,
+    state: Option<LinkState>,
+    worker: Option<Worker>,
+    failure: Option<(Operation, &'static str)>,
+    next_refresh: Option<Instant>,
+    queued_cancel: Option<String>,
+    reload_on_show: bool,
+    open_failed: bool,
 }
 
-fn code_id() -> egui::Id {
-    egui::Id::new("telegram_link_code")
+fn open_telegram(link: &str) -> bool {
+    // The client constructs this URL from the fixed bot address and a
+    // validated start payload. LaunchServices keeps it off the command line.
+    NSURL::URLWithString(&NSString::from_str(link))
+        .is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url))
 }
 
 impl TelegramSettings {
     pub(crate) fn change_in_progress(&self) -> bool {
-        matches!(self.pending, Some((Operation::Link | Operation::Unlink, _)))
+        self.worker.as_ref().is_some_and(|worker| {
+            (worker.operation.changes_link() || self.queued_cancel.is_some())
+                && worker.started_at.elapsed() < MAX_MUTATION_WAIT
+        })
     }
 
-    pub(crate) fn clear_code(&mut self, ctx: &egui::Context) {
-        if let Some(code) = self.code.as_mut() {
-            code.zeroize();
-            ctx.memory_mut(|memory| memory.surrender_focus(code_id()));
-        }
+    pub(crate) fn leave(&mut self) {
+        self.reload_on_show = true;
     }
 
-    pub(crate) fn leave(&mut self, ctx: &egui::Context) {
-        self.clear_code(ctx);
-        self.code = None;
-        self.linked = None;
-        self.error = None;
-    }
-
-    fn start(
-        &mut self,
-        ctx: &egui::Context,
-        operation: Operation,
-        work: impl FnOnce() -> LinkResult + Send + 'static,
-    ) {
+    fn start(&mut self, ctx: &egui::Context, operation: Operation) {
         let (sender, receiver) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
         let viewport = ctx.viewport_id();
-        self.error = None;
+        let task = operation.clone();
         let spawn = std::thread::Builder::new()
             .name("telegram-settings".into())
             .spawn(move || {
-                let _ = sender.send(work());
+                let _ = sender.send(task.run());
                 repaint.request_repaint_of(viewport);
             });
         if spawn.is_ok() {
-            self.pending = Some((operation, receiver));
+            self.worker = Some(Worker {
+                operation,
+                receiver,
+                started_at: Instant::now(),
+            });
         } else {
-            self.error = Some(WORKER_ERROR);
+            self.failure = Some((operation, WORKER_ERROR));
         }
+        self.next_refresh = None;
     }
 
-    pub(crate) fn poll(&mut self) {
-        let Some((_, receiver)) = &self.pending else {
-            return;
-        };
-        let result = match receiver.try_recv() {
+    fn finish_work(&mut self, closing: bool, open: impl FnOnce(&str) -> bool) {
+        let Some(worker) = &self.worker else { return };
+        let result = match worker.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => Err(WORKER_ERROR),
         };
-        self.pending = None;
+        let operation = self.worker.take().unwrap().operation;
         match result {
-            Ok(linked) => {
-                self.linked = Some(linked);
-                self.code = None;
-                self.error = None;
+            Ok(state) => {
+                if let LinkState::Pending { url } = &state {
+                    // Only the original button click opens Telegram. Loading a
+                    // saved link, background refreshes, and reopening Settings
+                    // must all leave the foreground application alone.
+                    if matches!(operation, Operation::Begin) && !self.reload_on_show && !closing {
+                        self.open_failed = !open(url);
+                    }
+                } else {
+                    self.open_failed = false;
+                }
+                self.state = Some(state);
+                self.failure = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.failure = Some((operation, error)),
+        }
+        if matches!(self.state, Some(LinkState::Pending { .. })) {
+            let interval = if self.failure.is_some() {
+                FAILED_POLL_INTERVAL
+            } else {
+                POLL_INTERVAL
+            };
+            self.next_refresh = Some(Instant::now() + interval);
+        }
+    }
+
+    pub(crate) fn poll(&mut self, ctx: &egui::Context, closing: bool) {
+        self.finish_work(closing, open_telegram);
+        if self.worker.is_some() {
+            return;
+        }
+        if let Some(url) = self.queued_cancel.take() {
+            self.start(ctx, Operation::Cancel(url));
+        } else if let Some(next) = self.next_refresh.filter(|_| !closing) {
+            let wait = next.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                self.start(ctx, Operation::Refresh);
+            } else {
+                ctx.request_repaint_after(wait);
+            }
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if self.queued_cancel.is_some() {
+            return "Canceling…";
+        }
+        match self.worker.as_ref().map(|w| &w.operation) {
+            Some(Operation::Begin) => return "Creating link…",
+            Some(Operation::Cancel(_)) => return "Canceling…",
+            Some(Operation::Unlink) => return "Unlinking…",
+            Some(Operation::Check) if self.state.is_none() => return "Checking link…",
+            _ => {}
+        }
+        match self.state {
+            Some(LinkState::Linked) => "Linked",
+            Some(LinkState::Unlinked) => "Not linked",
+            Some(LinkState::Pending { .. }) => "Waiting for Start",
+            Some(LinkState::Expired) => "Link expired",
+            None => "Link status unavailable",
+        }
+    }
+
+    fn actions(&mut self, ui: &mut egui::Ui) {
+        if self.queued_cancel.is_some()
+            || self.worker.as_ref().is_some_and(|w| {
+                w.operation.changes_link() || !matches!(self.state, Some(LinkState::Pending { .. }))
+            })
+        {
+            ui.spinner();
+            return;
+        }
+        if let Some(LinkState::Pending { url }) = &self.state {
+            if theme::settings_button(ui, "Cancel").clicked() {
+                // A status request might already be promoting this generation.
+                // Serialize cancellation with it and keep the identity clicked.
+                self.queued_cancel = Some(url.clone());
+                ui.ctx().request_repaint();
+            }
+            if theme::settings_button(ui, "Open Telegram").clicked() {
+                self.open_failed = !open_telegram(url);
+            }
+        } else if let Some((operation, _)) = &self.failure {
+            if theme::settings_button(ui, "Retry").clicked() {
+                self.start(ui.ctx(), operation.clone());
+            }
+        } else if self.state == Some(LinkState::Linked) {
+            if theme::settings_button(ui, "Unlink").clicked() {
+                self.start(ui.ctx(), Operation::Unlink);
+            }
+        } else if theme::settings_button(ui, "Link Telegram…").clicked() {
+            self.start(ui.ctx(), Operation::Begin);
         }
     }
 
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
-        if self.linked.is_none() && self.pending.is_none() && self.error.is_none() {
-            self.start(
-                ui.ctx(),
-                Operation::Check,
-                telegram_notifications::is_linked,
-            );
+        if ui.is_enabled()
+            && self.worker.is_none()
+            && self.queued_cancel.is_none()
+            && (self.reload_on_show || (self.state.is_none() && self.failure.is_none()))
+        {
+            self.reload_on_show = false;
+            self.start(ui.ctx(), Operation::Check);
         }
-        let operation = self.pending.as_ref().map(|(operation, _)| *operation);
-        let status = match operation {
-            Some(Operation::Check) => "Checking link…",
-            Some(Operation::Link) => "Linking…",
-            Some(Operation::Unlink) => "Unlinking…",
-            None => match self.linked {
-                Some(true) => "Linked",
-                Some(false) => "Not linked",
-                None => "Link status unavailable",
-            },
-        };
-        let form_was_closed = self.code.is_none();
+        let status = self.status();
         let (title_left, _) = egui::containers::Sides::new()
             .height(ui.spacing().interact_size.y)
             .shrink_left()
@@ -125,41 +231,7 @@ impl TelegramSettings {
                     })
                     .inner
                 },
-                |ui| {
-                    if operation.is_some() {
-                        ui.spinner();
-                    } else if self.code.is_some() {
-                        if theme::settings_button(ui, "Cancel").clicked() {
-                            self.clear_code(ui.ctx());
-                            self.code = None;
-                            self.error = None;
-                        }
-                    } else {
-                        match self.linked {
-                            Some(true) => {
-                                if theme::settings_button(ui, "Unlink").clicked() {
-                                    self.start(ui.ctx(), Operation::Unlink, || {
-                                        telegram_notifications::unlink().map(|()| false)
-                                    });
-                                }
-                            }
-                            Some(false) => {
-                                if theme::settings_button(ui, "Link Telegram…").clicked() {
-                                    self.code = Some(accounts::empty_password_buffer());
-                                }
-                            }
-                            None => {
-                                if theme::settings_button(ui, "Retry").clicked() {
-                                    self.start(
-                                        ui.ctx(),
-                                        Operation::Check,
-                                        telegram_notifications::is_linked,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                },
+                |ui| self.actions(ui),
             );
         let indent = title_left - ui.next_widget_position().x;
         ui.horizontal_top(|ui| {
@@ -167,63 +239,39 @@ impl TelegramSettings {
             ui.add_space(indent);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                for line in [
-                    "Can wake your iPhone for faster sign-in.",
-                    "Only for Microsoft Authenticator 2FA requests.",
-                ] {
+                let pending = matches!(self.state, Some(LinkState::Pending { .. }));
+                let lines: &[&str] = if pending {
+                    &["Open Telegram and tap Start to connect."]
+                } else {
+                    &[
+                        "Can wake your iPhone for faster sign-in.",
+                        "Only for Microsoft Authenticator 2FA requests.",
+                    ]
+                };
+                for line in lines {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(line).small().color(theme::MUTED))
+                        egui::Label::new(egui::RichText::new(*line).small().color(theme::MUTED))
                             .wrap(),
                     );
                 }
-            });
-        });
-
-        if let Some(error) = self.error {
-            ui.add(
-                egui::Label::new(egui::RichText::new(error).small().color(theme::DANGER)).wrap(),
-            );
-        }
-        if self.pending.is_some() {
-            return;
-        }
-        let Some(code) = self.code.as_mut() else {
-            return;
-        };
-        ui.add(egui::Separator::default().spacing(12.0));
-        ui.horizontal_wrapped(|ui| {
-            ui.label("For a pairing code, send /link to");
-            ui.hyperlink_to("@windows_app_autologin_bot", BOT_URL);
-        });
-        let submit = ui
-            .horizontal(|ui| {
-                let width = (ui.available_width() - 80.0).clamp(1.0, 200.0);
-                let field = accounts::account_editor_input_scope(ui, |ui| {
-                    accounts::masked_code_editor(ui, code, code_id(), width)
-                })
-                .inner;
-                if form_was_closed {
-                    field.request_focus();
+                if let Some((_, error)) = &self.failure {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(*error).small().color(theme::DANGER))
+                            .wrap(),
+                    );
+                    if pending && self.worker.is_none() && self.queued_cancel.is_none() {
+                        let retry = theme::settings_button(ui, "Retry");
+                        if retry.clicked() {
+                            let (operation, _) = self.failure.take().unwrap();
+                            self.start(ui.ctx(), operation);
+                        }
+                    }
                 }
-                let has_code = !code.trim().is_empty();
-                let enter = field.has_focus()
-                    && has_code
-                    && ui.input_mut(|input| {
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                    });
-                ui.add_enabled(has_code, theme::primary_button("Link"))
-                    .clicked()
-                    || enter
-            })
-            .inner;
-        if submit {
-            let submitted = std::mem::replace(code, accounts::empty_password_buffer());
-            ui.ctx()
-                .memory_mut(|memory| memory.surrender_focus(code_id()));
-            self.start(ui.ctx(), Operation::Link, move || {
-                telegram_notifications::pair(submitted.trim()).map(|()| true)
+                if pending && self.open_failed {
+                    ui.label(egui::RichText::new(OPEN_ERROR).small().color(theme::DANGER));
+                }
             });
-        }
+        });
     }
 }
 
@@ -231,86 +279,164 @@ impl TelegramSettings {
 mod tests {
     use super::*;
 
+    fn pending_state() -> LinkState {
+        LinkState::Pending {
+            url: "https://t.me/test_bot?start=test".into(),
+        }
+    }
+
+    fn worker(operation: Operation) -> (Worker, mpsc::SyncSender<LinkResult>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (
+            Worker {
+                operation,
+                receiver,
+                started_at: Instant::now(),
+            },
+            sender,
+        )
+    }
+
     #[test]
-    fn link_form_masks_pasted_codes_and_drops_them_on_cancel() {
-        let ctx = egui::Context::default();
-        theme::apply(&ctx);
+    fn only_a_new_link_opens_telegram_once_and_pending_polls_do_not_hold_quit() {
+        for (operation, left, closing, should_open) in [
+            (Operation::Begin, false, false, true),
+            (Operation::Begin, true, false, false),
+            (Operation::Begin, false, true, false),
+            (Operation::Check, false, false, false),
+            (Operation::Refresh, false, false, false),
+        ] {
+            let (worker, sender) = worker(operation);
+            let mut settings = TelegramSettings {
+                worker: Some(worker),
+                ..Default::default()
+            };
+            if left {
+                settings.leave();
+            }
+            sender.send(Ok(pending_state())).unwrap();
+            let mut opened = false;
+            settings.finish_work(closing, |_| {
+                opened = true;
+                true
+            });
+            settings.finish_work(closing, |_| panic!("opened twice"));
+            assert_eq!(opened, should_open);
+            assert!(settings.state == Some(pending_state()));
+            assert!(settings.next_refresh.is_some());
+            assert!(!settings.change_in_progress());
+        }
+    }
+
+    #[test]
+    fn refresh_failure_preserves_the_pending_actions_and_recovery_stops_polling() {
+        let (request, sender) = worker(Operation::Refresh);
         let mut settings = TelegramSettings {
-            linked: Some(false),
+            state: Some(pending_state()),
+            worker: Some(request),
             ..Default::default()
         };
-        let render = |settings: &mut TelegramSettings, events| {
+        assert!(!settings.change_in_progress());
+        sender.send(Err(WORKER_ERROR)).unwrap();
+        settings.finish_work(false, |_| panic!("refresh opened Telegram"));
+        assert!(settings.next_refresh.is_some());
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let frame = || egui::RawInput::default();
+        let _ = ctx.run_ui(frame(), |ui| settings.show(ui));
+        let output = ctx.run_ui(frame(), |ui| settings.show(ui));
+        for label in [
+            "Open Telegram",
+            "Cancel",
+            "Retry",
+            "Open Telegram and tap Start to connect.",
+        ] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == label)),
+                "{label}"
+            );
+        }
+        for final_state in [LinkState::Linked, LinkState::Expired] {
+            let (request, sender) = worker(Operation::Refresh);
+            settings.worker = Some(request);
+            settings.next_refresh = None;
+            sender.send(Ok(final_state.clone())).unwrap();
+            settings.finish_work(false, |_| panic!("refresh opened Telegram"));
+            assert!(settings.state == Some(final_state));
+            assert!(settings.failure.is_none());
+            assert!(settings.next_refresh.is_none());
+        }
+    }
+
+    #[test]
+    fn accepted_mutations_have_a_bounded_shutdown_wait() {
+        let (mut request, _sender) = worker(Operation::Unlink);
+        request.started_at = Instant::now() - MAX_MUTATION_WAIT;
+        let mut settings = TelegramSettings {
+            worker: Some(request),
+            ..Default::default()
+        };
+        assert!(!settings.change_in_progress());
+        settings.worker.as_mut().unwrap().started_at = Instant::now();
+        assert!(settings.change_in_progress());
+    }
+
+    #[test]
+    fn cancel_during_refresh_keeps_the_link_the_user_clicked() {
+        let (request, sender) = worker(Operation::Refresh);
+        let mut settings = TelegramSettings {
+            state: Some(pending_state()),
+            worker: Some(request),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut render = |events| {
             ctx.run_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
                 },
-                |ui| {
-                    ui.set_width(320.0);
-                    settings.show(ui);
-                },
+                |ui| settings.show(ui),
             )
         };
-        let text_rect = |output: &egui::FullOutput, text: &str| {
-            output
-                .shapes
-                .iter()
-                .find_map(|clipped| match &clipped.shape {
-                    egui::Shape::Text(label) if label.galley.text() == text => {
-                        Some(label.visual_bounding_rect())
-                    }
-                    _ => None,
-                })
+        render(vec![]);
+        let output = render(vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Cancel" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
         };
-        let click = |frame: &egui::FullOutput, label| {
-            let pos = text_rect(frame, label).unwrap().center();
-            let press = |pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: Default::default(),
-            };
-            vec![egui::Event::PointerMoved(pos), press(true), press(false)]
-        };
-        render(&mut settings, vec![]);
-        let home = render(&mut settings, vec![]);
-        render(&mut settings, click(&home, "Link Telegram…"));
-        let sample = "sample-pair-code";
-        let form = render(&mut settings, vec![egui::Event::Paste(sample.into())]);
-        let mask = egui::epaint::text::PASSWORD_REPLACEMENT_CHAR
-            .to_string()
-            .repeat(sample.len());
-        assert!(text_rect(&form, "@windows_app_autologin_bot").is_some());
-        assert!(text_rect(&form, &mask).is_some());
-        assert!(text_rect(&form, sample).is_none());
-        assert!(settings.code.as_ref().unwrap().as_str() == sample);
-        render(&mut settings, click(&form, "Cancel"));
-        assert!(settings.code.is_none());
-        assert!(!ctx.memory(|memory| memory.has_focus(code_id())));
-    }
-
-    #[test]
-    fn connection_changes_wait_for_the_worker_and_allow_retry_after_failure() {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let mut settings = TelegramSettings {
-            linked: Some(true),
-            pending: Some((Operation::Unlink, receiver)),
-            ..Default::default()
-        };
-        settings.poll();
+        render(vec![
+            egui::Event::PointerMoved(pos),
+            button(true),
+            button(false),
+        ]);
         assert!(settings.change_in_progress());
-        assert_eq!(settings.linked, Some(true));
-        sender.send(Err(WORKER_ERROR)).unwrap();
-        settings.poll();
-        assert!(!settings.change_in_progress());
-        assert_eq!(settings.linked, Some(true));
-        assert_eq!(settings.error, Some(WORKER_ERROR));
-        let (sender, receiver) = mpsc::sync_channel(1);
-        settings.pending = Some((Operation::Unlink, receiver));
-        sender.send(Ok(false)).unwrap();
-        settings.poll();
-        assert_eq!(settings.linked, Some(false));
-        assert!(settings.error.is_none());
+        sender
+            .send(Ok(LinkState::Pending {
+                url: "replacement".into(),
+            }))
+            .unwrap();
+        settings.finish_work(false, |_| panic!("refresh opened Telegram"));
+        let LinkState::Pending { url: original } = pending_state() else {
+            unreachable!()
+        };
+        assert_eq!(settings.queued_cancel.as_deref(), Some(original.as_str()));
     }
 }
 
