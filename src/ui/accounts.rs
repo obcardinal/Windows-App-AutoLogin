@@ -46,6 +46,8 @@ const TABLE_SPACING: f32 = 8.0;
 const ACTION_BUTTON_SIZE: f32 = 30.0;
 const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 2.0 + TABLE_SPACING;
 const ACCOUNT_ROW_HEIGHT: f32 = 49.0;
+const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
+const MAX_VISIBLE_ACCOUNT_ROWS: usize = 5;
 const ACCOUNT_EDITOR_WIDTH: f32 = 430.0;
 const ACCOUNT_EDITOR_LABEL_WIDTH: f32 = 82.0;
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
@@ -64,7 +66,14 @@ const REMOVE_ACCOUNT_ICON: &[u8] = include_bytes!("../../assets/icons/x.svg");
 const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
 const EYE_OFF_ICON: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
 
-pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
+pub(crate) fn visible_account_rows_height(count: usize) -> f32 {
+    let rows = count.min(MAX_VISIBLE_ACCOUNT_ROWS);
+    rows as f32 * ACCOUNT_ROW_HEIGHT + rows.saturating_sub(1) as f32 * ACCOUNT_ROW_DIVIDER_HEIGHT
+}
+
+pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
+    let content_top = ui.cursor().top();
+    let mut clipped_rows_height = 0.0;
     let mut row_actions = AccountRowActions::default();
     let mut account_to_delete: Option<AccountId> = None;
     let modal_open = app.editing_account.is_some() || app.confirm_delete_account.is_some();
@@ -72,6 +81,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let toggle_controls_enabled = !modal_open && availability.toggle_controls_ready;
     let launch_controls_enabled = !modal_open && availability.launch_controls_ready;
     let projected_enabled_states = projected_account_enabled_states(app);
+    let row_controls = AccountRowControls {
+        toggle: toggle_controls_enabled,
+        edit: launch_controls_enabled,
+        delete: launch_controls_enabled,
+        edit_disabled_reason: launch_controls_disabled_reason(&availability),
+    };
 
     let add_account = show_accounts_page_header(ui, launch_controls_enabled);
     if with_transaction_disabled_reason(add_account, launch_controls_disabled_reason(&availability))
@@ -106,16 +121,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
             });
         });
     } else {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                theme::compact_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.visuals_mut().widgets.noninteractive.bg_stroke =
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 235, 240));
-                    show_accounts_header(ui);
-                    ui.separator();
+        let count = app.config.accounts.len();
+        let desired_rows_height = visible_account_rows_height(count);
+        theme::compact_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(TABLE_SPACING, 0.0);
+            show_accounts_header(ui);
+            ui.add(egui::Separator::default().spacing(1.0));
 
+            ui.visuals_mut().clip_rect_margin = 0.0;
+            let rows = egui::ScrollArea::vertical()
+                .id_salt("account_rows")
+                .max_height(desired_rows_height)
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
                     for (idx, account) in app.config.accounts.iter().enumerate() {
                         let displayed_enabled = projected_enabled_states
                             .get(&account.id)
@@ -126,21 +146,24 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                                 ui,
                                 account,
                                 displayed_enabled,
-                                AccountRowControls {
-                                    toggle: toggle_controls_enabled,
-                                    edit: launch_controls_enabled,
-                                    delete: launch_controls_enabled,
-                                    edit_disabled_reason: launch_controls_disabled_reason(&availability),
-                                },
+                                row_controls,
                                 &mut row_actions,
                             );
                         });
-                        if idx + 1 < app.config.accounts.len() {
-                            ui.separator();
+                        if idx + 1 < count {
+                            ui.scope(|ui| {
+                                ui.multiply_opacity(0.45);
+                                ui.add(
+                                    egui::Separator::default().spacing(ACCOUNT_ROW_DIVIDER_HEIGHT),
+                                );
+                            });
                         }
                     }
                 });
-            });
+            // A short window clips the table on this pass. Its ideal height
+            // still includes every row up to the cap so the window can grow.
+            clipped_rows_height = (desired_rows_height - rows.inner_rect.height()).max(0.0);
+        });
     }
 
     if !availability.toggle_controls_ready {
@@ -149,6 +172,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
             ui.label(theme::muted(reason));
         }
     }
+
+    let content_height =
+        ui.cursor().top() - ui.spacing().item_spacing.y - content_top + clipped_rows_height;
 
     if let Some(account) = row_actions.edit_account.take() {
         open_account_editor(ui.ctx(), app, account);
@@ -181,6 +207,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     }
 
     show_account_editor(ui, app);
+    content_height
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3791,6 +3818,99 @@ mod tests {
             });
             assert_eq!(painted, expected_hover);
         }
+    }
+
+    #[test]
+    fn account_table_grows_to_five_rows_even_from_a_short_viewport() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut app = account_test_app(AppConfig::default());
+        let mut heights = Vec::new();
+        for count in 0..=6 {
+            if count > 0 {
+                app.config
+                    .accounts
+                    .push(Account::new(format!("row{count}@example.test")));
+            }
+            let mut height_at = |viewport_height| {
+                let mut measured = 0.0;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(560.0, viewport_height),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| measured = super::show(ui, &mut app));
+                measured
+            };
+            let full = height_at(600.0);
+            assert!((full - height_at(150.0)).abs() < 1.0, "count={count}");
+            heights.push(full);
+        }
+        assert!(heights[0] > 0.0 && heights[0] < heights[5]);
+        for row_count in 2..=5 {
+            assert_eq!(heights[row_count] - heights[row_count - 1], 50.0);
+        }
+        assert_eq!(heights[5], heights[6]);
+    }
+
+    #[test]
+    fn scrolling_the_account_rows_preserves_the_header_and_reaches_the_last_account() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut config = AppConfig::default();
+        config.accounts = (1..=9)
+            .map(|idx| Account::new(format!("row{idx}@example.test")))
+            .collect();
+        let mut app = account_test_app(config);
+        let mut render = |events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(560.0, 430.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                super::show(ui, &mut app);
+            })
+        };
+        let visible_text = |output: &egui::FullOutput, label: &str| {
+            output.shapes.iter().find_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape {
+                    let rect = text.visual_bounding_rect();
+                    if text.galley.text() == label && clipped.clip_rect.contains_rect(rect) {
+                        return Some(rect);
+                    }
+                }
+                None
+            })
+        };
+        let first_frame = render(vec![]);
+        let header = visible_text(&first_frame, "EMAIL ADDRESS").unwrap();
+        let first_row = visible_text(&first_frame, "row1@example.test").unwrap();
+        assert!(visible_text(&first_frame, "row5@example.test").is_some());
+        assert!(visible_text(&first_frame, "row6@example.test").is_none());
+        render(vec![
+            egui::Event::PointerMoved(first_row.center()),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Page,
+                delta: egui::vec2(0.0, -4.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let mut last_frame = render(vec![]);
+        for _ in 0..20 {
+            if visible_text(&last_frame, "row9@example.test").is_some() {
+                break;
+            }
+            last_frame = render(vec![]);
+        }
+        assert_eq!(visible_text(&last_frame, "EMAIL ADDRESS"), Some(header));
+        assert!(visible_text(&last_frame, "row9@example.test").is_some());
     }
 
     fn account_test_app_with_mode(config: AppConfig, settings_window_mode: bool) -> AutoLoginApp {
