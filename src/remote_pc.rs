@@ -107,7 +107,7 @@ fn remote_pc_label_value(tokens: &[&str]) -> Option<String> {
     canonical_remote_pc(first)
 }
 
-fn is_cloud_pc_gateway(host: &str) -> bool {
+pub(crate) fn is_cloud_pc_gateway(host: &str) -> bool {
     let (label, domain) = host.split_once('.').unwrap_or((host, ""));
     matches!(
         domain,
