@@ -539,6 +539,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn password_only_page_does_not_qualify_as_an_authenticator_challenge() {
+        let controls = [
+            ("displayName", "AXGroup"),
+            ("i0118", "AXTextField"),
+            ("idSIButton9", "AXButton"),
+        ];
+        let page = controls
+            .into_iter()
+            .map(|(id, role)| Ok((Some(id.to_owned()), Some(role.to_owned()))));
+        assert_eq!(page_control_indices(page).unwrap(), None);
+    }
+
+    #[test]
     fn a_complete_set_of_controls_cannot_hide_a_later_alert_error_or_duplicate() {
         let controls = [
             ("idRichContext_DisplaySign", "AXGroup"),

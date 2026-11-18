@@ -116,10 +116,16 @@ impl TelegramSettings {
             .show(
                 ui,
                 |ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label("Telegram wake-up notification");
-                        ui.label(egui::RichText::new(status).small().color(theme::MUTED));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add(theme::toolbar_icon(egui::include_image!(
+                            "../../assets/about/contact-telegram.svg"
+                        )));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label("Telegram wake-up notification");
+                            ui.label(egui::RichText::new(status).small().color(theme::MUTED));
+                        });
                     });
                 },
                 |ui| {
@@ -159,7 +165,7 @@ impl TelegramSettings {
                 },
             );
         ui.add(egui::Label::new(egui::RichText::new(
-            "Send a Telegram reminder when AutoLogin fills the password for a Microsoft Authenticator account.",
+            "Telegram can wake your iPhone for faster sign-in. You’ll get an alert only when Windows App asks for two-factor authentication with Microsoft Authenticator.",
         ).small().color(theme::MUTED)).wrap());
 
         if let Some(error) = self.error {

@@ -1686,6 +1686,12 @@ fn spawn_iphone_probe(job: IphoneProbe) -> bool {
                 return;
             }
         }
+        if account.authenticator_provider
+            == crate::models::AuthenticatorProvider::MicrosoftAuthenticator
+            && guard().is_ok()
+        {
+            crate::telegram_notifications::schedule_reminder();
+        }
         let pending = crate::iphone_sso_ui::PendingProgress::default();
         let outcome =
             crate::iphone_sso::assist(&challenge, account, detection_time, &guard, |event| {

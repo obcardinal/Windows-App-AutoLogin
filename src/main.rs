@@ -1422,9 +1422,6 @@ impl LightweightSupervisor {
                     microsoft_authenticator_enabled,
                 } => {
                     if self.worker_pause_latch.stable_unpaused_generation() == Some(generation) {
-                        if microsoft_authenticator_enabled && !self.exit_requested {
-                            telegram_notifications::schedule_reminder();
-                        }
                         self.poll_iphone_preparation(iphone_preparation::Trigger::PasswordWritten {
                             warm_wifi: microsoft_authenticator_enabled,
                         });
