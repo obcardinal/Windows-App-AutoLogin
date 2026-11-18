@@ -19,6 +19,8 @@ pub(crate) mod desktops;
 pub(crate) mod device_launch;
 #[path = "macos_device_windows.rs"]
 pub(crate) mod device_windows;
+#[path = "macos_locked_session.rs"]
+pub(crate) mod locked_session;
 #[path = "macos_remote_pc.rs"]
 pub(crate) mod remote_pc_info;
 #[path = "macos_sso.rs"]
