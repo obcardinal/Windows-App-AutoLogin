@@ -25,7 +25,7 @@ unsafe extern "C" {
     fn waal_observe_lock_screen(
         pid: i32,
         window_id: u32,
-        visitor: extern "C" fn(*mut c_void, *const u8, usize, f32, f64, f64, f64, f64),
+        visitor: extern "C" fn(*mut c_void, i32, *const u8, usize, f32, f64, f64, f64, f64),
         context: *mut c_void,
     ) -> bool;
 }
@@ -115,9 +115,11 @@ pub(crate) fn observe(pid: i32, window_id: u32) -> LockScreenObservation {
 enum Label {
     Password,
     MaskedField,
+    EditorBounds,
     Name,
     Conflict,
     SmallMark,
+    IconFragment,
     Other,
 }
 
@@ -131,8 +133,17 @@ struct Line {
     height: f64,
 }
 
+// Observation kinds in the native window reader.
+const OVERVIEW_TEXT: i32 = 0;
+const MASKED_FIELD: i32 = 1;
+const VERIFIED_PLACEHOLDER: i32 = 2;
+const EDITOR_BOUNDS: i32 = 3;
+const CORNER_TEXT: i32 = 4;
+const ACCOUNT_TEXT: i32 = 5;
+
 extern "C" fn visit_line(
     context: *mut c_void,
+    kind: i32,
     bytes: *const u8,
     len: usize,
     confidence: f32,
@@ -141,24 +152,88 @@ extern "C" fn visit_line(
     width: f64,
     height: f64,
 ) {
-    // A null text pointer denotes a pixel-confirmed masked field. Other
-    // pointers and the byte length are valid for this synchronous visit.
+    // The native reader emits all overview observations before its final
+    // detail observation. The screen text is discarded in this callback.
     let lines = unsafe { &mut *context.cast::<Vec<Line>>() };
-    let label = if bytes.is_null() {
-        Label::MaskedField
-    } else {
-        let utf8 = unsafe { slice::from_raw_parts(bytes, len) };
-        str::from_utf8(utf8).map_or(Label::Other, label)
+    let label = match kind {
+        OVERVIEW_TEXT | CORNER_TEXT | ACCOUNT_TEXT if !bytes.is_null() => {
+            let utf8 = unsafe { slice::from_raw_parts(bytes, len) };
+            let label = str::from_utf8(utf8).map_or(Label::Conflict, label);
+            // The accurate corner pass can veto an alternative sign-in method,
+            // even when fast OCR misses the tile or garbles its caption.
+            if (kind == CORNER_TEXT && label != Label::Conflict)
+                || (kind == ACCOUNT_TEXT && !matches!(label, Label::Conflict | Label::Name))
+            {
+                return;
+            }
+            label
+        }
+        MASKED_FIELD => Label::MaskedField,
+        VERIFIED_PLACEHOLDER => Label::Password,
+        EDITOR_BOUNDS => Label::EditorBounds,
+        _ => Label::Conflict,
     };
-    // Discard the actual screen text, including any possible display name.
-    lines.push(Line {
+    let line = Line {
         label,
         confidence,
         x,
         y,
         width,
         height,
+    };
+    if kind == VERIFIED_PLACEHOLDER || (kind == ACCOUNT_TEXT && label == Label::Name) {
+        merge_detail(lines, line);
+    } else {
+        lines.push(line);
+    }
+}
+
+// The overview may omit, truncate, or distort a word. Replace at
+// most one reading of those same glyphs. Conflicts and adjacent lines still
+// participate in classification, even if the cropped field reads "Password".
+fn merge_detail(lines: &mut Vec<Line>, verified: Line) {
+    let mut overlaps = lines.iter_mut().filter(|line| {
+        if line.label == Label::EditorBounds {
+            return false;
+        }
+        let dx = (line.x - verified.x).abs();
+        let dy = (line.y - verified.y).abs();
+        let w = line
+            .width
+            .min(verified.width)
+            .min((line.width + verified.width) / 2.0 - dx);
+        let h = line
+            .height
+            .min(verified.height)
+            .min((line.height + verified.height) / 2.0 - dy);
+        let area = w.max(0.0) * h.max(0.0);
+        let fast = line.width * line.height;
+        let accurate = verified.width * verified.height;
+        if verified.label == Label::Name {
+            area >= 0.50 * fast.max(accurate)
+        } else {
+            area >= 0.85 * fast && area >= 0.33 * accurate
+        }
     });
+    if let Some(same) = overlaps.next() {
+        if overlaps.next().is_some() {
+            lines.push(Line {
+                label: Label::Conflict,
+                ..verified
+            });
+            return;
+        }
+        if same.label == verified.label
+            || matches!(
+                same.label,
+                Label::Other | Label::SmallMark | Label::IconFragment
+            )
+        {
+            *same = verified;
+            return;
+        }
+    }
+    lines.push(verified);
 }
 
 fn label(raw: &str) -> Label {
@@ -207,7 +282,42 @@ fn label(raw: &str) -> Label {
     if text.chars().count() <= 3 && !text.is_empty() {
         return Label::SmallMark;
     }
+    if text.chars().count() == 4 && text.chars().any(|c| c.is_ascii_punctuation()) {
+        return Label::IconFragment;
+    }
     Label::Other
+}
+
+fn is_tile_caption(line: &Line, editor: &Line) -> bool {
+    let left = (line.x - line.width / 2.0) / editor.width;
+    matches!(line.label, Label::Name | Label::Other | Label::SmallMark)
+        && (0.10..=0.41).contains(&left)
+        && line.width <= editor.width * 0.75
+        && line.height <= editor.height * 0.62
+        && line.y <= editor.height * 3.55
+        && line.y + line.height / 2.0 < editor.y - editor.height / 2.0
+}
+
+fn is_system_icon(line: &Line, editor: &Line) -> bool {
+    // On small windows OCR can read the bottom-right Windows icons as glyphs.
+    matches!(line.label, Label::SmallMark | Label::IconFragment)
+        && (0.12..=0.48).contains(&((1.0 - line.x) / editor.width))
+        && (0.6..=1.7).contains(&(line.y / editor.height))
+        && line.width <= 0.12 * editor.width
+        && line.height <= 0.35 * editor.height
+}
+
+fn placeholder_in_editor(line: &Line, editor: Option<&Line>) -> bool {
+    let Some(e) = editor else {
+        return (0.33..=0.505).contains(&line.x)
+            && (0.25..=0.55).contains(&line.y)
+            && (0.006..=0.065).contains(&line.height);
+    };
+    let inset = ((line.x - line.width / 2.0) - (e.x - e.width / 2.0)) / e.width;
+    (-0.01..=0.15).contains(&inset)
+        && line.width <= 0.5 * e.width
+        && (line.y - e.y).abs() <= e.height * 0.28
+        && (0.15..=0.9).contains(&(line.height / e.height))
 }
 
 fn classify(lines: &[Line]) -> LockScreenObservation {
@@ -218,6 +328,15 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
     }
     let mut account = None;
     let mut field = None;
+    let mut editors = lines
+        .iter()
+        .filter(|line| matches!(line.label, Label::EditorBounds | Label::MaskedField));
+    let editor = editors.next();
+    if editors.next().is_some()
+        || editor.is_some_and(|e| !(0.47..=0.53).contains(&e.x) || !(0.20..=0.56).contains(&e.y))
+    {
+        return Other;
+    }
     for line in lines {
         if !line.confidence.is_finite()
             || !(0.0..=1.0).contains(&line.confidence)
@@ -238,10 +357,18 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
         if line.label == Label::Conflict {
             return Other;
         }
+        if line.label == Label::EditorBounds {
+            continue;
+        }
         // Known Windows account tiles sit in the bottom-left corner. They
         // may show a short second caption even for a locked session. Reject
         // explicit alternative sign-in methods or Other user above.
         if line.y <= 0.18 && line.x < 0.18 && line.width <= 0.24 && line.height < 0.035 {
+            continue;
+        }
+        // Tile captions start at the same inset from the left edge at every
+        // guest DPI. On a small window they reach beyond the usual corner.
+        if editor.is_some_and(|e| is_tile_caption(line, e) || is_system_icon(line, e)) {
             continue;
         }
         if line.label == Label::SmallMark
@@ -257,29 +384,22 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
                 if line.confidence >= 0.50
                     && (0.465..=0.535).contains(&line.x)
                     && (0.34..=0.63).contains(&line.y)
-                    && (0.010..=0.120).contains(&line.height)
+                    && editor.map_or_else(
+                        || (0.010..=0.120).contains(&line.height),
+                        |e| (0.35..=2.0).contains(&(line.height / e.height)),
+                    )
                     && account.is_none() =>
             {
                 account = Some(line)
             }
             Label::Password
                 if line.confidence >= 0.50
-                    && (0.33..=0.505).contains(&line.x)
-                    && (0.25..=0.55).contains(&line.y)
-                    && (0.006..=0.065).contains(&line.height)
+                    && placeholder_in_editor(line, editor)
                     && field.is_none() =>
             {
                 field = Some(line)
             }
-            Label::MaskedField
-                if (0.47..=0.53).contains(&line.x)
-                    && (0.25..=0.55).contains(&line.y)
-                    && (0.065..=0.45).contains(&line.width)
-                    && (0.012..=0.085).contains(&line.height)
-                    && field.is_none() =>
-            {
-                field = Some(line)
-            }
+            Label::MaskedField if field.is_none() => field = Some(line),
             _ => return Other,
         }
     }
@@ -294,7 +414,11 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
             }
             _ => false,
         };
-        if (0.018..=0.145).contains(&gap) && aligned {
+        let expected_gap = editor.map_or_else(
+            || (0.018..=0.145).contains(&gap),
+            |e| (0.8..=3.5).contains(&(gap / e.height)),
+        );
+        if expected_gap && aligned {
             return Password;
         }
     }
@@ -390,6 +514,44 @@ mod tests {
     }
 
     #[test]
+    fn accurate_crop_can_replace_one_fragment_of_the_same_word() {
+        let [name, password] = form();
+        let fragment = Line {
+            label: Label::Other,
+            width: password.width * 0.56,
+            height: password.height * 0.70,
+            x: password.x + password.width * 0.20,
+            ..password
+        };
+        let mut lines = vec![name, fragment];
+        merge_detail(&mut lines, password);
+        assert_eq!(classify(&lines), LockScreenObservation::Password);
+
+        // Nearby instructions, ambiguous fragments and a conflicting sign-in
+        // method must still be accounted for even if the crop reads Password.
+        for unexpected in [
+            vec![Line {
+                x: password.x + password.width,
+                ..fragment
+            }],
+            vec![fragment, fragment],
+            vec![Line {
+                label: Label::Conflict,
+                ..fragment
+            }],
+            vec![Line {
+                width: password.width * 2.0,
+                ..fragment
+            }],
+        ] {
+            let mut lines = vec![name];
+            lines.extend(unexpected);
+            merge_detail(&mut lines, password);
+            assert_eq!(classify(&lines), LockScreenObservation::Other);
+        }
+    }
+
+    #[test]
     fn alternate_methods_web_forms_and_mixed_account_screens_are_not_password_evidence() {
         for value in [
             "PIN",
@@ -460,3 +622,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "macos_lock_screen/frame_tests.rs"]
+mod frame_tests;

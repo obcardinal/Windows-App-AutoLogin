@@ -1,0 +1,210 @@
+//! Offline recognition through Vision and the same classifier used on captured windows.
+use super::{classify, visit_line, Line, LockScreenObservation};
+use core_foundation::base::CFRelease;
+use objc2::{
+    rc::{autoreleasepool, Retained},
+    AnyThread,
+};
+use objc2_app_kit::NSImage;
+use objc2_foundation::NSData;
+use std::{ffi::c_void, ptr};
+
+#[link(name = "ImageIO", kind = "framework")]
+unsafe extern "C" {
+    fn CGImageSourceCreateWithData(data: *const c_void, options: *const c_void) -> *const c_void;
+    fn CGImageSourceCreateImageAtIndex(
+        source: *const c_void,
+        index: usize,
+        options: *const c_void,
+    ) -> *const c_void;
+}
+
+unsafe extern "C" {
+    fn CGImageGetWidth(image: *const c_void) -> usize;
+    fn CGImageGetHeight(image: *const c_void) -> usize;
+    fn waal_recognize_lock_frame(
+        image: *const c_void,
+        visitor: extern "C" fn(*mut c_void, i32, *const u8, usize, f32, f64, f64, f64, f64),
+        context: *mut c_void,
+    ) -> bool;
+}
+
+fn observe_frame(
+    width: usize,
+    height: usize,
+    editor_width: usize,
+    placeholder: &str,
+    instruction: Option<(&str, usize, usize, usize)>,
+    tile_caption: Option<&str>,
+) -> LockScreenObservation {
+    // Window and editor sizes vary independently, as they do when resizing the RDP client.
+    let center = width as f64 / 2.;
+    let (extra_text, instruction_x, instruction_y, instruction_size) =
+        instruction.unwrap_or(("", width / 2, height / 5, 28));
+    let top = (height as f64 * 0.56).round();
+    let scale = editor_width as f64 / 300.;
+    let name_size = 36_f64.max(18. / scale);
+    let password_size = 15_f64.max(9. / scale);
+    let tile = tile_caption.map_or_else(String::new, |caption| {
+        let tile_x = 38. * scale;
+        let tile_y = height as f64 - 85. * scale;
+        format!(
+            r#"<g transform="translate({tile_x} {tile_y}) scale({scale})">
+                <text font-size="18">Morgan Lane</text>
+                <text y="23" font-size="16">{caption}</text>
+            </g>"#
+        )
+    });
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">
+          <rect width="100%" height="100%" fill="#263452"/>
+          <g font-family="Helvetica" fill="#eeeeee">
+            <text x="{instruction_x}" y="{instruction_y}" text-anchor="middle" font-size="{instruction_size}">{extra_text}</text>
+            {tile}
+            <g transform="translate({center} {top}) scale({scale})">
+              <text x="0" y="-40" text-anchor="middle" font-size="{name_size}">Example Person</text>
+              <rect x="-150" y="0" width="300" height="35" fill="#181d32"/>
+              <rect x="-150" y="33" width="300" height="2" fill="#3173d0"/>
+              <text x="-138" y="23" font-size="{password_size}">{placeholder}</text>
+              <path d="M 126 18 H 138 M 132 12 L 138 18 L 132 24" fill="none"
+                    stroke="#e5e6e8" stroke-width="2"/>
+            </g>
+          </g>
+        </svg>"##
+    );
+
+    // An NSImage's default screen representation may use the host display's scale.
+    // Its TIFF representation rasterizes these SVG dimensions at one pixel per point.
+    autoreleasepool(|_| {
+        let vector = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(svg.as_bytes()))
+            .expect("synthetic SVG");
+        let tiff = vector.TIFFRepresentation().expect("synthetic bitmap");
+        let mut lines: Vec<Line> = Vec::new();
+        // NSData is toll-free bridged to CFData. ImageIO retains it for the source's lifetime.
+        let success = unsafe {
+            let source = CGImageSourceCreateWithData(Retained::as_ptr(&tiff).cast(), ptr::null());
+            assert!(!source.is_null());
+            let image = CGImageSourceCreateImageAtIndex(source, 0, ptr::null());
+            CFRelease(source);
+            assert!(!image.is_null());
+            assert_eq!(
+                (CGImageGetWidth(image), CGImageGetHeight(image)),
+                (width, height)
+            );
+            let success =
+                waal_recognize_lock_frame(image, visit_line, (&mut lines as *mut Vec<Line>).cast());
+            CFRelease(image);
+            success
+        };
+        assert!(
+            success,
+            "could not process the synthetic {width}×{height} frame"
+        );
+        classify(&lines)
+    })
+}
+
+#[test]
+fn reads_the_centered_editor_as_the_window_and_guest_scale_change() {
+    // The overview alone can misread the 1366-wide fixture as "Pa8sword" and
+    // omit the placeholder altogether on the 4K fixture.
+    for (width, height, field) in [
+        (704, 420, 220),
+        (1366, 768, 300),
+        (1920, 1080, 450),
+        (3840, 2160, 330),
+    ] {
+        assert_eq!(
+            observe_frame(width, height, field, "Password", None, None),
+            LockScreenObservation::Password,
+            "window {width}×{height}, editor {field}px"
+        );
+    }
+}
+
+#[test]
+fn rejects_a_pin_a_lookalike_and_unrelated_guest_instructions() {
+    for (placeholder, extra) in [
+        ("PIN", ""),
+        ("Kassword", ""),
+        ("Kennwort", ""),
+        ("Password", "Please enter a verification code"),
+        ("Password", "Network maintenance"),
+    ] {
+        assert_eq!(
+            observe_frame(
+                1920,
+                1080,
+                340,
+                placeholder,
+                Some((extra, 960, 216, 28)),
+                None
+            ),
+            LockScreenObservation::Other,
+            "placeholder {placeholder:?}, extra text {extra:?}"
+        );
+    }
+}
+
+#[test]
+fn checks_account_tiles_at_small_and_five_k_window_sizes() {
+    use LockScreenObservation::{Other, Password};
+    let mut mismatches = Vec::new();
+    // Both scales are guest settings. Tile captions and controls keep their
+    // pixel sizes on the guest as the host window changes around them.
+    for (width, height, field) in [(800, 600, 369), (5120, 2880, 295)] {
+        for (caption, expected) in [
+            ("Work account", Password),
+            ("PIN", Other),
+            ("Other user", Other),
+        ] {
+            let result = observe_frame(width, height, field, "Password", None, Some(caption));
+            if result != expected {
+                mismatches.push((width, height, caption, result, expected));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "Account tile mismatches: {mismatches:?}"
+    );
+}
+
+#[test]
+fn recognizes_guest_instructions_crossing_an_overview_tile_boundary() {
+    use LockScreenObservation::{Other, Password};
+    let (width, height, editor) = (5120, 1440, 295);
+    // The account stays in the middle tile. Put the unrelated instructions
+    // halfway across the boundary between the first and second tiles.
+    assert_eq!(
+        observe_frame(width, height, editor, "Password", None, None),
+        Password
+    );
+    assert_eq!(
+        observe_frame(
+            width,
+            height,
+            editor,
+            "Password",
+            Some(("Network maintenance", width / 3, height / 5, 28)),
+            None
+        ),
+        Other
+    );
+}
+
+#[test]
+fn compressed_other_user_captions_veto_a_small_password_editor() {
+    use LockScreenObservation::{Other, Password};
+    for (tile, below, expected) in [
+        ("Work account", None, Password),
+        ("Other user", None, Other),
+        ("Work account", Some(("Other user", 550, 388, 8)), Other),
+    ] {
+        assert_eq!(
+            observe_frame(1100, 619, 130, "Password", below, Some(tile)),
+            expected,
+            "tile {tile:?}, below editor {below:?}"
+        );
+    }
+}

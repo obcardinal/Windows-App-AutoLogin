@@ -4,7 +4,17 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <stdbool.h>
 
-// Bounds use Vision's normalized coordinates, with the origin at bottom left.
-bool waal_masked_field(CGImageRef image, CGRect *normalizedField);
+typedef enum {
+    WaalFieldNone,
+    WaalFieldPlaceholderCandidate,
+    WaalFieldMasked,
+    WaalFieldAmbiguous,
+    WaalFieldUnavailable
+} WaalFieldKind;
+
+// A candidate only locates an editor for OCR. Its geometry cannot establish
+// that it is a password field. Bounds use Vision's bottom-left coordinates.
+// Ambiguous and unavailable scans must stop recognition for this frame.
+WaalFieldKind waal_password_field(CGImageRef image, CGRect *normalizedField);
 
 #endif

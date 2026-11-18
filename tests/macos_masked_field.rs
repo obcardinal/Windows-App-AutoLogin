@@ -1,4 +1,4 @@
-//! In-memory fixtures for Windows' focused, nonempty password control.
+//! In-memory fixtures for locating and classifying Windows' focused editor.
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
@@ -12,9 +12,19 @@ struct Box2d {
     h: f64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldKind {
+    None,
+    PlaceholderCandidate,
+    Masked,
+    Ambiguous,
+    Unavailable,
+}
+
 #[link(name = "waal_lock_screen_capture", kind = "static")]
 unsafe extern "C" {
-    fn waal_masked_field(image: *const c_void, result: *mut Box2d) -> bool;
+    fn waal_password_field(image: *const c_void, result: *mut Box2d) -> FieldKind;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -92,7 +102,7 @@ impl Fixture {
         }
     }
 
-    fn detect(&mut self) -> Option<Box2d> {
+    fn detect(&mut self) -> (FieldKind, Box2d) {
         let mut result = Box2d::default();
         unsafe {
             let space = CGColorSpaceCreateDeviceRGB();
@@ -110,10 +120,10 @@ impl Fixture {
             assert!(!bitmap.is_null());
             let image = CGBitmapContextCreateImage(bitmap);
             assert!(!image.is_null());
-            let matched = waal_masked_field(image, &mut result);
+            let kind = waal_password_field(image, &mut result);
             CGImageRelease(image);
             CGContextRelease(bitmap);
-            matched.then_some(result)
+            (kind, result)
         }
     }
 }
@@ -125,7 +135,8 @@ fn detects_a_focused_password_with_one_or_several_mask_dots_at_desktop_scale() {
             let mut frame = Fixture::new(width, height);
             let top = height / 2;
             frame.editor(top, field_width, dots, true, true, true);
-            let field = frame.detect().expect("focused masked field");
+            let (kind, field) = frame.detect();
+            assert_eq!(kind, FieldKind::Masked);
             assert!((field.x + field.w / 2. - 0.5).abs() < 0.02);
             assert!((field.w - field_width as f64 / width as f64).abs() < 0.02);
             assert!((field.y + field.h - (1. - top as f64 / height as f64)).abs() < 0.02);
@@ -134,21 +145,45 @@ fn detects_a_focused_password_with_one_or_several_mask_dots_at_desktop_scale() {
 }
 
 #[test]
-fn ignores_empty_incomplete_and_ambiguous_controls() {
-    for (dots, eye, arrow, focus) in [
-        (0, true, true, true),
-        (5, false, true, true),
-        (5, true, false, true),
-        (5, true, true, false),
-    ] {
-        let mut frame = Fixture::new(1024, 768);
-        frame.editor(370, 400, dots, eye, arrow, focus);
-        assert!(frame.detect().is_none());
+fn locates_empty_editor_for_ocr_without_confirming_a_password() {
+    for (width, height, field_width) in [(1920, 1080, 298), (1366, 768, 360), (704, 420, 566)] {
+        let mut frame = Fixture::new(width, height);
+        let top = height / 2;
+        frame.editor(top, field_width, 0, false, true, true);
+        let (kind, field) = frame.detect();
+        assert_eq!(kind, FieldKind::PlaceholderCandidate);
+        assert!((field.x + field.w / 2. - 0.5).abs() < 0.02);
+        assert!((field.w - field_width as f64 / width as f64).abs() < 0.02);
+        assert!((field.y + field.h - (1. - top as f64 / height as f64)).abs() < 0.02);
     }
-    let mut frame = Fixture::new(1024, 768);
-    frame.editor(350, 400, 1, true, true, true);
-    frame.editor(450, 400, 5, true, true, true);
-    assert!(frame.detect().is_none());
+}
+
+#[test]
+fn only_reports_masked_when_both_dots_and_eye_are_present() {
+    for (dots, eye) in [(0, true), (5, false)] {
+        let mut frame = Fixture::new(1024, 768);
+        frame.editor(370, 400, dots, eye, true, true);
+        assert_eq!(frame.detect().0, FieldKind::PlaceholderCandidate);
+    }
+}
+
+#[test]
+fn rejects_editors_without_a_submit_arrow_or_focus_underline() {
+    for (arrow, focus) in [(false, true), (true, false)] {
+        let mut frame = Fixture::new(1024, 768);
+        frame.editor(370, 400, 5, true, arrow, focus);
+        assert_eq!(frame.detect().0, FieldKind::None);
+    }
+}
+
+#[test]
+fn rejects_multiple_editors_including_mixed_masked_and_empty() {
+    for (first, second) in [(0, 0), (1, 0), (0, 5), (1, 5)] {
+        let mut frame = Fixture::new(1024, 768);
+        frame.editor(350, 400, first, first > 0, true, true);
+        frame.editor(450, 400, second, second > 0, true, true);
+        assert_eq!(frame.detect().0, FieldKind::Ambiguous);
+    }
 }
 
 #[test]
@@ -162,7 +197,7 @@ fn hollow_text_glyph_is_not_a_mask_dot() {
             frame.data[row * frame.width + col] = [24, 29, 50, 255];
         }
     }
-    assert!(frame.detect().is_none());
+    assert_eq!(frame.detect().0, FieldKind::PlaceholderCandidate);
 }
 
 #[test]
@@ -175,8 +210,78 @@ fn blue_wallpaper_touching_the_underline_does_not_enlarge_the_control() {
             frame.data[row * frame.width + col] = [49, 115, 208, 255];
         }
     }
-    let field = frame
-        .detect()
-        .expect("field edge must stop at the wallpaper");
+    let (kind, field) = frame.detect();
+    assert_eq!(kind, FieldKind::Masked);
     assert!((field.w - 400. / 1024.).abs() < 0.02);
+}
+
+#[test]
+fn detects_fixed_size_native_controls_on_a_wide_display() {
+    for dots in [0, 5] {
+        let mut frame = Fixture::new(5120, 1440);
+        frame.editor(750, 298, dots, dots > 0, true, true);
+        let (kind, field) = frame.detect();
+        let expected = if dots > 0 {
+            FieldKind::Masked
+        } else {
+            FieldKind::PlaceholderCandidate
+        };
+        assert_eq!(kind, expected);
+        assert!((field.w * 5120. - 298.).abs() <= 1.);
+        assert!(((1. - field.y - field.h) * 1440. - 750.).abs() <= 2.);
+    }
+}
+
+#[test]
+fn rejects_multiple_editors_on_different_scan_strips() {
+    let mut frame = Fixture::new(5120, 1440);
+    frame.editor(850, 298, 0, false, true, true);
+    // The second editor straddles the boundary between two strips.
+    frame.editor(1155, 298, 5, true, true, true);
+    assert_eq!(frame.detect().0, FieldKind::Ambiguous);
+}
+
+#[test]
+fn identifies_a_small_antialiased_arrow_only_with_its_shaft() {
+    // A horizontal stroke may occupy one row or share its coverage across two.
+    for (shaft, split) in [(true, false), (true, true), (false, false)] {
+        let mut frame = Fixture::new(1366, 768);
+        let (size, top) = (182, 380);
+        let left = (frame.width - size) / 2;
+        frame.editor(top, size, 0, false, true, true);
+        // At this scale the partially covered shaft pixels can be darker
+        // than the fully covered pixels at the junction of the arrow head.
+        for y in top..top + 20 {
+            for x in left + size * 9 / 10..left + size * 94 / 100 {
+                let pixel = &mut frame.data[y * frame.width + x];
+                if pixel[0] == 229 {
+                    let shared_pixel = split && x + 1 == left + size * 94 / 100;
+                    *pixel = if shared_pixel {
+                        [65, 68, 70, 255]
+                    } else if shaft {
+                        [100, 103, 105, 255]
+                    } else {
+                        [24, 29, 50, 255]
+                    };
+                    if shared_pixel {
+                        frame.data[(y - 1) * frame.width + x] = [65, 68, 70, 255];
+                    }
+                }
+            }
+        }
+        let expected = if shaft {
+            FieldKind::PlaceholderCandidate
+        } else {
+            FieldKind::None
+        };
+        assert_eq!(frame.detect().0, expected, "shaft={shaft} split={split}");
+    }
+}
+
+#[test]
+fn an_unavailable_frame_is_distinct_from_a_completed_scan_with_no_field() {
+    let mut field = Box2d::default();
+    let kind = unsafe { waal_password_field(std::ptr::null(), &mut field) };
+    assert_eq!(kind, FieldKind::Unavailable);
+    assert_eq!(Fixture::new(500, 350).detect().0, FieldKind::None);
 }
