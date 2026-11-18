@@ -190,7 +190,10 @@ fn helper_command() -> anyhow::Result<Command> {
     Ok(command)
 }
 
-pub(crate) fn host_prepare_command(warm_wifi: bool) -> anyhow::Result<Command> {
+pub(crate) fn host_prepare_command(
+    kind: crate::iphone_preparation::Preparation,
+) -> anyhow::Result<Command> {
+    use crate::iphone_preparation::Preparation;
     let mut command = verified_node_command()?;
     // The preparation entry point travels inside the signed app. Relative
     // imports resolve to the installed modules verified below.
@@ -199,8 +202,14 @@ pub(crate) fn host_prepare_command(warm_wifi: bool) -> anyhow::Result<Command> {
         "--eval",
         include_str!("../script/iphone-automation/prepare-host.mjs"),
     ]);
-    if warm_wifi {
-        command.args(["--", "warm-wifi"]);
+    match kind {
+        Preparation::Build => {}
+        Preparation::BuildAndWarmWifi => {
+            command.args(["--", "warm-wifi"]);
+        }
+        Preparation::WarmWifi => {
+            command.args(["--", "wifi-only"]);
+        }
     }
     Ok(command)
 }

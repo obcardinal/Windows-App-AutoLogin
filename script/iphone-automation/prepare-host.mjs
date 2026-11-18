@@ -13,6 +13,8 @@ try {
   const config = await readConfig();
   if (!config.device_udid || !await runtimeReady(config)) {
     process.exitCode = 1;
+  } else if (process.argv[1] === 'wifi-only') {
+    await warmSelectedWifi(config.device_udid, controller.signal);
   } else {
     await Promise.all([
       prepareHostRunner(config, controller.signal),

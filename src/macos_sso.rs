@@ -21,6 +21,12 @@ const AX_DOM_IDENTIFIER: &str = "AXDOMIdentifier";
 const AX_URL: &str = "AXURL";
 const SIGN_IN_WINDOW: &str = "MSID_SIGN_IN_WINDOW";
 const SIGN_IN_WEBVIEW: &str = "MSID_SIGN_IN_WEBVIEW";
+const CHALLENGE_CONTROL_IDS: [&str; 4] = [
+    "displayName",
+    "idDiv_SAOTCAS_Title",
+    "idDiv_SAOTCAS_Description",
+    "idRichContext_DisplaySign",
+];
 const MAX_NODES: usize = 300;
 const MAX_DEPTH: usize = 12;
 const MAX_AGE: Duration = Duration::from_secs(120);
@@ -310,6 +316,39 @@ fn owned(node: &AxElement, pid: i32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Index only the four supported controls during this observation. All nodes
+/// must be considered: an alert or duplicate can follow the expected controls.
+fn page_control_indices(
+    metadata: impl Iterator<Item = anyhow::Result<(Option<String>, Option<String>)>>,
+) -> anyhow::Result<Option<[usize; 4]>> {
+    let mut indices = [0; 4];
+    let mut counts = [0; 4];
+    for (index, entry) in metadata.enumerate() {
+        let (id, role) = entry?;
+        if role.as_deref() == Some("AXAlert")
+            || id
+                .as_deref()
+                .is_some_and(|id| id.to_ascii_lowercase().contains("error"))
+        {
+            return Ok(None);
+        }
+        if let Some(slot) = CHALLENGE_CONTROL_IDS
+            .iter()
+            .position(|required| Some(*required) == id.as_deref())
+        {
+            counts[slot] += 1;
+            indices[slot] = index;
+        }
+    }
+    for count in counts {
+        if count == 0 {
+            return Ok(None);
+        }
+        anyhow::ensure!(count == 1, "Microsoft sign-in page has ambiguous controls");
+    }
+    Ok(Some(indices))
+}
+
 fn challenge_in_window(
     process: &TrustedProcessInfo,
     window: &AxElement,
@@ -335,37 +374,36 @@ fn challenge_in_window(
         "Microsoft sign-in page origin is not supported"
     );
     let nodes = bounded_elements(&web_area, guard)?;
-    if nodes.iter().any(|node| {
-        node.string_attr(AX_DOM_IDENTIFIER)
-            .is_some_and(|id| id.to_ascii_lowercase().contains("error"))
-            || node.string_attr(AX_ROLE).as_deref() == Some("AXAlert")
-    }) {
-        return Ok(None);
-    }
-    let Some(account_group) = unique_element(&nodes, AX_DOM_IDENTIFIER, "displayName")? else {
-        return Ok(None);
-    };
-    let Some(heading) = unique_element(&nodes, AX_DOM_IDENTIFIER, "idDiv_SAOTCAS_Title")? else {
-        return Ok(None);
-    };
-    let Some(description) = unique_element(&nodes, AX_DOM_IDENTIFIER, "idDiv_SAOTCAS_Description")?
-    else {
+    let metadata = nodes.iter().map(|node| {
+        guard()?;
+        let mut attrs = node.string_attrs(&[AX_DOM_IDENTIFIER, AX_ROLE]).into_iter();
+        // Some AX implementations return individual errors inside a successful
+        // batch. Re-read missing entries before ruling out an error or alert.
+        let id = attrs
+            .next()
+            .flatten()
+            .or_else(|| node.string_attr(AX_DOM_IDENTIFIER));
+        let role = attrs.next().flatten().or_else(|| node.string_attr(AX_ROLE));
+        Ok((id, role))
+    });
+    let Some(indices) = page_control_indices(metadata)? else {
         return Ok(None);
     };
-    let Some(number_group) =
-        unique_element(&nodes, AX_DOM_IDENTIFIER, "idRichContext_DisplaySign")?
-    else {
-        return Ok(None);
-    };
-    for node in [&account_group, &heading, &description, &number_group] {
+    let controls = indices.map(|index| &nodes[index]);
+    for (node, expected_id) in controls.into_iter().zip(CHALLENGE_CONTROL_IDS) {
         owned(node, process.pid)?;
+        anyhow::ensure!(
+            node.string_attr(AX_DOM_IDENTIFIER).as_deref() == Some(expected_id),
+            "Microsoft sign-in control identity changed"
+        );
     }
+    let [account_group, heading, description, number_group] = controls;
     if heading.string_attr(AX_ROLE).as_deref() != Some("AXHeading")
         || heading.string_attr(AX_TITLE).as_deref() != Some("Approve sign in request")
     {
         return Ok(None);
     }
-    let description_text = static_text(&description, process.pid, guard)?;
+    let description_text = static_text(description, process.pid, guard)?;
     if !description_text
         .to_ascii_lowercase()
         .contains("authenticator")
@@ -375,11 +413,11 @@ fn challenge_in_window(
     {
         return Ok(None);
     }
-    let (account_element, username) = single_static_value(&account_group, process.pid, guard)?;
+    let (account_element, username) = single_static_value(account_group, process.pid, guard)?;
     let Some(account) = select_account(accounts, username.trim())? else {
         return Ok(None);
     };
-    let (number_element, number) = single_static_value(&number_group, process.pid, guard)?;
+    let (number_element, number) = single_static_value(number_group, process.pid, guard)?;
     anyhow::ensure!(
         valid_number(&number),
         "Microsoft number-matching value is not supported"
@@ -499,6 +537,29 @@ fn valid_number(number: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_complete_set_of_controls_cannot_hide_a_later_alert_error_or_duplicate() {
+        let controls = [
+            ("idRichContext_DisplaySign", "AXGroup"),
+            ("unrelated", "AXGroup"),
+            ("idDiv_SAOTCAS_Title", "AXHeading"),
+            ("displayName", "AXGroup"),
+            ("idDiv_SAOTCAS_Description", "AXGroup"),
+        ];
+        let inspect = |extra: Option<(&str, &str)>| {
+            page_control_indices(
+                controls
+                    .into_iter()
+                    .chain(extra)
+                    .map(|(id, role)| Ok((Some(id.to_owned()), Some(role.to_owned())))),
+            )
+        };
+        assert_eq!(inspect(None).unwrap(), Some([3, 2, 4, 0]));
+        assert_eq!(inspect(Some(("notice", "AXAlert"))).unwrap(), None);
+        assert_eq!(inspect(Some(("loginError", "AXGroup"))).unwrap(), None);
+        assert!(inspect(Some(("displayName", "AXGroup"))).is_err());
+    }
 
     #[test]
     fn a_new_number_in_the_same_dialog_is_eligible_without_replaying_the_old_request() {
