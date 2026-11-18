@@ -31,6 +31,15 @@ pub struct Account {
     pub username: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub remote_pc: String,
+    /// Saved Windows App device name on macOS or published desktop resource ID on Windows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vm_target: String,
+    /// Windows App profile that owned the device when it was chosen on macOS.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vm_profile: String,
+    /// Windows App catalog identifier, or "open-window" for a window-only macOS link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vm_device_id: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_saved_password: bool,
     #[serde(default = "default_account_enabled", skip_serializing_if = "is_true")]
@@ -47,6 +56,9 @@ impl Account {
             id: Uuid::new_v4().to_string(),
             username: username.into(),
             remote_pc: String::new(),
+            vm_target: String::new(),
+            vm_profile: String::new(),
+            vm_device_id: String::new(),
             has_saved_password: false,
             enabled: true,
             iphone_authenticator_enabled: false,

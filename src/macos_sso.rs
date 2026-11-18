@@ -121,6 +121,9 @@ impl Challenge {
             has_saved_password: false,
             enabled: true,
             remote_pc: String::new(),
+            vm_target: String::new(),
+            vm_profile: String::new(),
+            vm_device_id: String::new(),
             iphone_authenticator_enabled: true,
             authenticator_provider: Default::default(),
         };
@@ -152,6 +155,9 @@ impl Challenge {
             has_saved_password: false,
             enabled: true,
             remote_pc: String::new(),
+            vm_target: String::new(),
+            vm_profile: String::new(),
+            vm_device_id: String::new(),
             iphone_authenticator_enabled: true,
             authenticator_provider: Default::default(),
         };

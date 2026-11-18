@@ -2108,6 +2108,9 @@ mod windows_tests {
             has_saved_password: true,
             enabled,
             remote_pc: String::new(),
+            vm_target: String::new(),
+            vm_profile: String::new(),
+            vm_device_id: String::new(),
             iphone_authenticator_enabled: false,
             authenticator_provider: Default::default(),
         }
@@ -2158,6 +2161,9 @@ mod macos_context_tests {
             has_saved_password,
             enabled: true,
             remote_pc: String::new(),
+            vm_target: String::new(),
+            vm_profile: String::new(),
+            vm_device_id: String::new(),
             iphone_authenticator_enabled: false,
             authenticator_provider: Default::default(),
         }
