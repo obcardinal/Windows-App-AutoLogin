@@ -12,8 +12,6 @@ pub const STROKE: egui::Color32 = egui::Color32::from_rgb(216, 221, 229);
 const TAB_RAIL: egui::Color32 = egui::Color32::from_rgb(238, 240, 245);
 const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(226, 230, 238);
 const SEMIBOLD: &str = "Inter Semibold";
-const SECONDARY_IDLE: egui::Color32 = egui::Color32::from_rgb(246, 249, 252);
-const PRIMARY_OUTLINE: egui::Color32 = egui::Color32::from_rgb(43, 109, 166);
 
 pub fn apply(ctx: &egui::Context) {
     apply_fonts(ctx);
@@ -236,7 +234,7 @@ pub fn status_text(text: impl Into<String>) -> egui::RichText {
 
 enum ButtonKind {
     Primary,
-    Secondary(egui::Color32),
+    Secondary,
     Danger,
 }
 
@@ -271,10 +269,16 @@ impl egui::Widget for ActionButton {
                 ACCENT,
                 ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.12),
                 ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.24),
-                PRIMARY_OUTLINE,
-                PRIMARY_OUTLINE,
+                ACCENT,
+                ACCENT,
             ),
-            ButtonKind::Secondary(idle) => (idle, TOOLBAR_HOVER, ACCENT_SOFT, STROKE, ACCENT),
+            ButtonKind::Secondary => (
+                egui::Color32::WHITE,
+                TOOLBAR_HOVER,
+                ACCENT_SOFT,
+                STROKE,
+                ACCENT,
+            ),
             ButtonKind::Danger => (
                 DANGER_SOFT,
                 DANGER_SOFT.lerp_to_gamma(DANGER, 0.12),
@@ -305,7 +309,7 @@ impl egui::Widget for ActionButton {
 pub fn primary_button(text: impl Into<String>) -> ActionButton {
     let button = egui::Button::new(
         egui::RichText::new(text.into())
-            .strong()
+            .text_style(egui::TextStyle::Button)
             .color(egui::Color32::WHITE),
     );
     ActionButton::new(button, ButtonKind::Primary)
@@ -326,21 +330,13 @@ pub fn primary_button_with_icon(
 
 #[cfg(target_os = "macos")]
 pub fn settings_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let idle = if ui.is_enabled() {
-        egui::Color32::WHITE
-    } else {
-        SECONDARY_IDLE
-    };
-    ui.add(ActionButton::new(
-        egui::Button::new(egui::RichText::new(label).color(TEXT)),
-        ButtonKind::Secondary(idle),
-    ))
+    ui.add(secondary_button(label))
 }
 
 pub fn secondary_button(text: impl Into<String>) -> ActionButton {
     ActionButton::new(
         egui::Button::new(egui::RichText::new(text.into()).color(TEXT)),
-        ButtonKind::Secondary(SECONDARY_IDLE),
+        ButtonKind::Secondary,
     )
 }
 
@@ -352,7 +348,7 @@ pub fn secondary_button_with_icon(
         icon.tint(TEXT),
         egui::RichText::new(text.into()).color(TEXT),
     ));
-    ActionButton::new(button, ButtonKind::Secondary(SECONDARY_IDLE))
+    ActionButton::new(button, ButtonKind::Secondary)
 }
 
 pub fn danger_button(text: impl Into<String>) -> ActionButton {
