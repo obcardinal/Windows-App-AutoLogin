@@ -9,6 +9,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 enum { OverviewText, MaskedField, VerifiedPlaceholder, EditorBounds, CornerText, AccountText, LayoutText, AmbiguousText };
@@ -278,12 +279,43 @@ static id copyWindowImage(pid_t pid, CGWindowID windowID) {
     return captured;
 }
 
+static atomic_bool accurateRecognitionStarted;
+
 static VNRecognizeTextRequest *englishTextRequest(VNRequestTextRecognitionLevel level) {
+    if (level == VNRequestTextRecognitionLevelAccurate)
+        atomic_store_explicit(&accurateRecognitionStarted, true, memory_order_relaxed);
     VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
     request.recognitionLevel = level;
     request.usesLanguageCorrection = NO;
     request.recognitionLanguages = @[@"en-US"];
     return request;
+}
+
+void waal_prepare_lock_recognition(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            // A real observation can start first. It never waits for this task.
+            if (atomic_exchange_explicit(&accurateRecognitionStarted, true, memory_order_relaxed)) return;
+            NSBitmapImageRep *sample = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+                pixelsWide:240 pixelsHigh:48 bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES
+                isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+            NSGraphicsContext *graphics = sample ? [NSGraphicsContext graphicsContextWithBitmapImageRep:sample] : nil;
+            if (!graphics) return;
+            [NSGraphicsContext saveGraphicsState];
+            NSGraphicsContext.currentContext = graphics;
+            [NSColor.blackColor setFill];
+            NSRectFill(NSMakeRect(0, 0, 240, 48));
+            [@"Sample" drawAtPoint:NSMakePoint(8, 10) withAttributes:@{
+                NSFontAttributeName: [NSFont systemFontOfSize:22],
+                NSForegroundColorAttributeName: NSColor.whiteColor
+            }];
+            [NSGraphicsContext restoreGraphicsState];
+            CGImageRef image = sample.CGImage;
+            if (!image) return;
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
+            [handler performRequests:@[englishTextRequest(VNRequestTextRecognitionLevelAccurate)] error:nil];
+        }
+    });
 }
 
 // The overview and the crop cover the same captured frame. Only the overview

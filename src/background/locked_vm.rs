@@ -69,9 +69,29 @@ impl ReturnWindow {
 pub(super) struct ReturnMonitor {
     visit: ReturnWindow,
     attempted: Arc<Mutex<HashMap<String, Instant>>>,
+    warmup_started: bool,
+    next_warmup_permission_check: Option<Instant>,
 }
 
 impl ReturnMonitor {
+    pub(super) fn prepare_recognition(&mut self, accounts: &[Account]) {
+        let now = Instant::now();
+        if self.warmup_started
+            || self
+                .next_warmup_permission_check
+                .is_some_and(|next| now < next)
+            || !accounts.iter().any(Account::locked_vm_reconnect_enabled)
+        {
+            return;
+        }
+        if macos_lock_screen::screen_recording_allowed() {
+            self.warmup_started = true;
+            macos_lock_screen::prepare_recognition();
+        } else {
+            self.next_warmup_permission_check = Some(now + Duration::from_secs(30));
+        }
+    }
+
     pub(super) fn reset_focus(&mut self) {
         self.visit = ReturnWindow::default();
     }

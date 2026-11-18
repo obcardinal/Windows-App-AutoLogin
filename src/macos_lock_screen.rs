@@ -19,6 +19,7 @@ pub(crate) enum LockScreenObservation {
 unsafe extern "C" {
     fn waal_lock_capture_supported() -> bool;
     fn waal_lock_capture_allowed() -> bool;
+    fn waal_prepare_lock_recognition();
     fn waal_lock_capture_request() -> bool;
     fn waal_record_capture_request() -> bool;
     fn waal_open_capture_preferences() -> bool;
@@ -38,6 +39,11 @@ pub(crate) fn supported() -> bool {
 pub(crate) fn screen_recording_allowed() -> bool {
     // Preflight never displays the system permission dialog.
     unsafe { waal_lock_capture_allowed() }
+}
+
+pub(crate) fn prepare_recognition() {
+    // The native worker loads Vision using only its own fixed in-memory sample.
+    unsafe { waal_prepare_lock_recognition() }
 }
 
 pub(crate) fn request_screen_recording() -> bool {
