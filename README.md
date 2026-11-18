@@ -1,6 +1,4 @@
-# Windows App AutoLogin
-
-<img src="assets/icon.png" align="right" width="72" height="72" alt="">
+# <img src="assets/icon.png" width="40" height="40" align="top" alt=""> Windows App AutoLogin
 
 Windows App AutoLogin fills the password prompt when you reconnect to a work desktop in Microsoft Windows App. It runs in the macOS menu bar or Windows system tray. You choose which accounts it can use and can pause autofill with **Stop Monitor**.
 
