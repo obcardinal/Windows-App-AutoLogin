@@ -4,7 +4,7 @@
 #[path = "iphone_attempt_report.rs"]
 mod report;
 
-use report::{Reason, Stage};
+use report::{Milestone, Reason, Stage};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -81,22 +81,38 @@ impl Phase {
         }
     }
 
-    fn from_helper(value: &str) -> Result<(Self, Stage), Reason> {
+    fn from_helper(value: &str) -> Result<(Self, Stage, Option<Milestone>), Reason> {
         Ok(match value {
-            "waiting_for_device" => (Self::WaitingForDevice, Stage::WaitingForDevice),
+            "waiting_for_device" => (Self::WaitingForDevice, Stage::WaitingForDevice, None),
             "waiting_for_unlock" | "lock_state_unavailable" => {
-                (Self::Unlock, Stage::WaitingForUnlock)
+                (Self::Unlock, Stage::WaitingForUnlock, None)
             }
-            "starting_iphone_connection"
-            | "preparing_iphone_runner"
-            | "starting_iphone_runner"
-            | "iphone_connected" => (Self::Connecting, Stage::Connecting),
+            "preparing_iphone_runner" => (Self::Connecting, Stage::Connecting, None),
+            "starting_iphone_runner" => (
+                Self::Connecting,
+                Stage::Connecting,
+                Some(Milestone::RunnerStarting),
+            ),
+            "starting_iphone_connection" => (
+                Self::Connecting,
+                Stage::Connecting,
+                Some(Milestone::RunnerReady),
+            ),
+            "iphone_connected" => (
+                Self::Connecting,
+                Stage::Connecting,
+                Some(Milestone::PhoneConnected),
+            ),
             "waiting_for_authenticator" | "waiting_for_number_request" => {
-                (Self::WaitingForRequest, Stage::WaitingForRequest)
+                (Self::WaitingForRequest, Stage::WaitingForRequest, None)
             }
-            "entering_number" => (Self::EnteringNumber, Stage::EnteringNumber),
+            "entering_number" => (
+                Self::EnteringNumber,
+                Stage::EnteringNumber,
+                Some(Milestone::NumberEntryStarting),
+            ),
             "manual_confirmation_required" | "complete_confirmation_on_iphone" => {
-                (Self::FaceId, Stage::WaitingForConfirmation)
+                (Self::FaceId, Stage::WaitingForConfirmation, None)
             }
             _ => return Err(Reason::ProtocolError),
         })
@@ -520,8 +536,8 @@ pub(crate) fn assist(
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(Some(HelperEvent::Status { phase }))) => {
-                    let (phase, stage) = Phase::from_helper(&phase)?;
-                    trace.advance(stage);
+                    let (phase, stage, milestone) = Phase::from_helper(&phase)?;
+                    trace.observe(stage, milestone);
                     notify(phase);
                 }
                 Ok(Ok(Some(HelperEvent::Authorize { sequence, action }))) => {
@@ -699,6 +715,19 @@ mod tests {
             Phase::from_helper("unrecognized"),
             Err(Reason::ProtocolError)
         );
+    }
+
+    #[test]
+    fn diagnostic_times_start_at_the_corresponding_helper_status() {
+        for (status, milestone) in [
+            ("preparing_iphone_runner", None),
+            ("starting_iphone_runner", Some(Milestone::RunnerStarting)),
+            ("starting_iphone_connection", Some(Milestone::RunnerReady)),
+            ("iphone_connected", Some(Milestone::PhoneConnected)),
+            ("entering_number", Some(Milestone::NumberEntryStarting)),
+        ] {
+            assert_eq!(Phase::from_helper(status).unwrap().2, milestone);
+        }
     }
 
     #[test]

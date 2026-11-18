@@ -2,12 +2,23 @@
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 const FILE_NAME: &str = "last-iphone-attempt.json";
+
+/// Elapsed times when the Mac first observes each known helper status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Milestone {
+    RunnerStarting,
+    RunnerReady,
+    PhoneConnected,
+    NumberEntryStarting,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +147,8 @@ struct Report {
     elapsed_ms: u64,
     stage: Stage,
     outcome: Outcome,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    milestones_ms: BTreeMap<Milestone, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<Reason>,
 }
@@ -143,6 +156,7 @@ struct Report {
 pub(crate) struct Trace {
     started: Instant,
     stage: Stage,
+    milestones_ms: BTreeMap<Milestone, u64>,
     pending: Arc<Mutex<Option<Report>>>,
     worker: Option<(mpsc::SyncSender<()>, JoinHandle<()>)>,
 }
@@ -185,6 +199,7 @@ impl Trace {
         let trace = Self {
             started,
             stage: Stage::Preparing,
+            milestones_ms: BTreeMap::new(),
             pending,
             worker,
         };
@@ -193,7 +208,18 @@ impl Trace {
     }
 
     pub(crate) fn advance(&mut self, stage: Stage) {
-        if stage != self.stage {
+        self.observe(stage, None);
+    }
+
+    pub(super) fn observe(&mut self, stage: Stage, milestone: Option<Milestone>) {
+        let first_observation =
+            if let Some(Entry::Vacant(slot)) = milestone.map(|key| self.milestones_ms.entry(key)) {
+                slot.insert(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                true
+            } else {
+                false
+            };
+        if stage != self.stage || first_observation {
             self.stage = stage;
             self.publish(Outcome::InProgress, None);
         }
@@ -213,6 +239,7 @@ impl Trace {
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             stage: self.stage,
             outcome,
+            milestones_ms: self.milestones_ms.clone(),
             reason,
         };
         *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
@@ -261,6 +288,7 @@ mod tests {
         let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(bytes.len() < 512);
         assert_eq!(report.as_object().unwrap().len(), 5);
+        assert!(report.get("milestones_ms").is_none());
         assert_eq!(report["stage"], "verifying_number_field");
         assert_eq!(report["outcome"], "failed");
         assert_eq!(report["reason"], "account_mismatch");
@@ -272,6 +300,43 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_milestone_times_survive_duplicate_statuses_and_coalesced_writes() {
+        let directory = std::env::temp_dir().join(format!("waal-report-{}", uuid::Uuid::new_v4()));
+        let path = directory.join(FILE_NAME);
+        let writer_path = path.clone();
+        let (release, wait) = mpsc::channel();
+        let mut trace = Trace::start_with(move || {
+            wait.recv()?;
+            Ok(writer_path)
+        });
+        trace.observe(Stage::Connecting, Some(Milestone::RunnerStarting));
+        let first = trace.milestones_ms.get(&Milestone::RunnerStarting).copied();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        trace.observe(Stage::Connecting, Some(Milestone::RunnerReady));
+        trace.observe(Stage::Connecting, Some(Milestone::RunnerStarting));
+        trace.observe(Stage::Connecting, Some(Milestone::PhoneConnected));
+        trace.observe(Stage::EnteringNumber, Some(Milestone::NumberEntryStarting));
+        trace.advance(Stage::WaitingForConfirmation);
+        release.send(()).unwrap();
+        trace.finish(Outcome::SubmittedUnverified, None);
+
+        let bytes = std::fs::read(path).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let times = report["milestones_ms"].as_object().unwrap();
+        let first = first.unwrap();
+        assert_eq!(times.len(), 4);
+        assert_eq!(times["runner_starting"], first);
+        let ready = times["runner_ready"].as_u64().unwrap();
+        let connected = times["phone_connected"].as_u64().unwrap();
+        let entry = times["number_entry_starting"].as_u64().unwrap();
+        assert!(first < ready && ready <= connected && connected <= entry);
+        assert!(entry <= report["elapsed_ms"].as_u64().unwrap());
+        assert_eq!(report["stage"], "waiting_for_confirmation");
+        assert_eq!(report["outcome"], "submitted_unverified");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

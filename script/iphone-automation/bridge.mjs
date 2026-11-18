@@ -6,7 +6,7 @@ import {
   AutomationError, acquireSessionLock, cleanEnvironment,
   deviceLockState, listPhysicalDevices, probePhysicalDevice, readConfig, runtimeReady,
 } from './support.mjs';
-import { startNativeWda, stopOwnedProcessGroup } from './wda.mjs';
+import { startNativeWda, stopOwnedProcessGroup, tunnelEndpoint } from './wda.mjs';
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
@@ -163,9 +163,7 @@ export async function createIphoneSession({ signal, timeoutMs = 150000, onStatus
       await delay(1500, undefined, { signal: activeSignal });
     }
     activeSignal.throwIfAborted();
-    nativeWda = await startNativeWda(config, selectedDevice, { signal: activeSignal, onStatus: status });
-    activeSignal.throwIfAborted();
-    status('starting_iphone_connection');
+    tunnelEndpoint(selectedDevice, config.device_udid);
     const port = await freePort();
     const wdaPort = await freePort();
     activeSignal.throwIfAborted();
@@ -175,14 +173,26 @@ export async function createIphoneSession({ signal, timeoutMs = 150000, onStatus
       '--base-path', basePath, '--use-drivers', 'xcuitest', '--log-level', 'error', '--log-no-colors'], {
       cwd: config.runtime_dir, env: { ...cleanEnvironment(), APPIUM_XCUITEST_PREFER_DEVICECTL: 'true' }, detached: true, stdio: 'ignore',
     });
-    let spawnFailed = false;
-    server.once('error', () => { spawnFailed = true; });
+    // Appium boots locally while Xcode starts the runner. The first session
+    // request still follows both readiness checks.
+    const serverFailure = new AutomationError('server_start_failed', 'The local iPhone server could not start.');
+    const serverEnded = () => controller.abort(serverFailure);
+    server.once('error', serverEnded);
+    server.once('exit', serverEnded);
+    try {
+      nativeWda = await startNativeWda(config, selectedDevice, { signal: activeSignal, onStatus: status });
+    } catch (error) {
+      if (activeSignal.reason === serverFailure && error?.code !== 'wda_cleanup_unverified') throw serverFailure;
+      throw error;
+    } finally {
+      server.removeListener('exit', serverEnded);
+    }
+    activeSignal.throwIfAborted();
+    status('starting_iphone_connection');
     const startupDeadline = Date.now() + 15000;
     for (;;) {
       activeSignal.throwIfAborted();
-      if (spawnFailed || server.exitCode !== null || server.signalCode !== null || Date.now() >= startupDeadline) {
-        throw new AutomationError('server_start_failed', 'The local iPhone server could not start.');
-      }
+      if (server.exitCode !== null || server.signalCode !== null || Date.now() >= startupDeadline) throw serverFailure;
       try {
         const reply = await requestJson(base, 'GET', '/status', undefined, activeSignal, 1500);
         if (reply?.ready === true) break;

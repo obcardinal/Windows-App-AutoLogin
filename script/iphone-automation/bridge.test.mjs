@@ -2,7 +2,7 @@ import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { AutomationError } from './support.mjs';
-import { stopOwnedProcessGroup } from './wda.mjs';
+import { stopOwnedProcessGroup, tunnelEndpoint } from './wda.mjs';
 
 const udid = '00000000-0000000000000001';
 let state;
@@ -13,14 +13,18 @@ mock.module('./support.mjs', { namedExports: {
   AUTHENTICATOR_BUNDLE: 'com.microsoft.azureauthenticator', AutomationError,
   acquireSessionLock: async () => { state.acquired++; return async () => { state.released++; }; },
   cleanEnvironment: () => ({}), deviceLockState: async () => false,
-  listPhysicalDevices: async () => [{ udid, paired: true, connected: true, developerMode: true }],
+  listPhysicalDevices: async () => [{ udid, paired: true, connected: true, developerMode: true,
+    transport: state.transport, tunnelAddress: 'fd00::1', osVersion: '27.2' }],
   probePhysicalDevice: async device => device,
   readConfig: async () => config, runtimeReady: async () => true,
 } });
 mock.module('./wda.mjs', { namedExports: {
-  stopOwnedProcessGroup,
-  startNativeWda: async () => ({ url: 'http://[fd00::1]:8100', platformVersion: '27.2',
-    close: async () => { state.wdaStopped++; if (state.wdaFailure) throw state.wdaFailure; } }),
+  stopOwnedProcessGroup, tunnelEndpoint,
+  startNativeWda: async (_config, _phone, { signal }) => {
+    await state.onRunnerStartup?.(signal);
+    return { url: 'http://[fd00::1]:8100', platformVersion: '27.2',
+      close: async () => { state.wdaStopped++; if (state.wdaFailure) throw state.wdaFailure; } };
+  },
 } });
 mock.module('node:net', { defaultExport: { createServer() {
   const server = new EventEmitter();
@@ -41,7 +45,8 @@ mock.module('node:child_process', { namedExports: { spawn(_file, args, options) 
 const { createIphoneSession, sessionCapabilities, validateSessionPath } = await import('./bridge.mjs');
 
 function initialize(t) {
-  state = { acquired: 0, released: 0, spawned: 0, stopped: 0, wdaStopped: 0, deleted: 0, ports: 0 };
+  state = { transport: 'localNetwork', acquired: 0, released: 0, spawned: 0, stopped: 0,
+    wdaStopped: 0, deleted: 0, ports: 0, routes: [] };
   t.mock.method(process, 'kill', (pid, signal) => {
     assert.equal(pid, -99999999);
     if (signal === 0) {
@@ -55,6 +60,7 @@ function initialize(t) {
     return true;
   });
   t.mock.method(globalThis, 'fetch', async (url, options) => {
+    state.routes.push([options.method, new URL(url).pathname.split('/').at(-1)]);
     if (state.fetch) return state.fetch(url, options);
     if (url.endsWith('/status')) return Response.json({ value: { ready: true } });
     if (url.endsWith('/session') && options.method === 'POST') return Response.json({ value: { sessionId: 'test-session' } });
@@ -72,7 +78,60 @@ test('abort while reserving ports never starts an orphan server or leaks ownersh
   assert.equal(state.spawned, 0);
   assert.equal(state.acquired, 1);
   assert.equal(state.released, 1);
-  assert.equal(state.wdaStopped, 1);
+  assert.equal(state.wdaStopped, 0);
+});
+
+test('local server boots during runner startup and attaches only after both are ready', async t => {
+  initialize(t);
+  const entered = Promise.withResolvers();
+  const ready = Promise.withResolvers();
+  state.onRunnerStartup = () => { entered.resolve(); return ready.promise; };
+  const session = createIphoneSession();
+  await entered.promise;
+  try {
+    assert.equal(state.spawned, 1);
+    assert.deepEqual(state.routes, []);
+  } finally {
+    ready.resolve();
+    const connected = await session;
+    await connected.close();
+  }
+  assert.deepEqual(state.routes.slice(0, 3), [['GET', 'status'], ['POST', 'session'], ['POST', 'sync']]);
+  assert.equal(state.released, 1);
+});
+
+test('an unsupported transport starts neither the server nor the runner', async t => {
+  initialize(t);
+  state.transport = 'usb';
+  state.onRunnerStartup = () => assert.fail('unexpected phone launch');
+  await assert.rejects(createIphoneSession(), { code: 'wifi_device_required' });
+  assert.equal(state.spawned, 0);
+  assert.equal(state.released, 1);
+});
+
+test('runner startup failure cleans up the overlapping host process before releasing ownership', async t => {
+  initialize(t);
+  state.onRunnerStartup = () => { throw new AutomationError('wda_build_failed', 'test failure'); };
+  await assert.rejects(createIphoneSession(), { code: 'wda_build_failed' });
+  assert.equal(state.stopped, 1);
+  assert.equal(state.released, 1);
+  assert.deepEqual(state.routes, []);
+});
+
+test('server exit during runner startup cancels that launch and preserves a cleanup failure', async t => {
+  for (const cleanupFailed of [false, true]) {
+    initialize(t);
+    state.onRunnerStartup = signal => {
+      state.child.emit('exit', 1, null);
+      assert.ok(signal.aborted);
+      if (cleanupFailed) throw new AutomationError('wda_cleanup_unverified', 'cleanup failed');
+      signal.throwIfAborted();
+    };
+    await assert.rejects(createIphoneSession(), { code: cleanupFailed ? 'wda_cleanup_unverified' : 'server_start_failed' });
+    assert.equal(state.released, 1);
+    assert.deepEqual(state.routes, []);
+    t.mock.restoreAll();
+  }
 });
 
 test('abort during session creation stops the owned server and releases its lock', async t => {

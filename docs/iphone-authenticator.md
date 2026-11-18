@@ -43,6 +43,14 @@ check expired before entry.
 The report is private to the local user and contains no account or device identifiers,
 sign-in numbers, passwords, or screen contents.
 
+`milestones_ms` gives elapsed milliseconds from the start of assistance to the
+first time the Mac receives each status. `runner_starting` marks the Xcode
+launch request, `runner_ready` marks the iPhone runner answering, and
+`phone_connected` marks the Appium session ready after the lock check.
+`number_entry_starting` marks the start of entry. An attempt that ends earlier
+omits the later milestones. The clock starts after Monitor recognizes the sign-in
+request, so it excludes time spent waiting for detection.
+
 Supported Authenticator UI is pinned to the observed selectors in
 `script/iphone-automation/authenticator.mjs`. A missing profile fails before a
 phone session starts; an unexpected language, alert, account label, or
@@ -166,8 +174,11 @@ prevents verifying cleanup is returned as `wda_cleanup_unverified`; it is not
 silently reported as success. Reconnect the selected iPhone to finish stopping
 its dedicated test runner before another attempt.
 
-`wda.mjs` starts the signed XCTest runner through Apple's existing trusted
-CoreDevice Wi-Fi tunnel. Its WDA listener binds only to that tunnel's IPv6
+Once the bridge has checked the selected iPhone, its lock state, and the Wi-Fi
+tunnel, it starts the local Appium server while Xcode launches the signed XCTest
+runner. The bridge waits for both to be ready before creating a session.
+`wda.mjs` uses Apple's existing trusted CoreDevice Wi-Fi tunnel.
+Its WDA listener binds only to that tunnel's IPv6
 address, not all Wi-Fi interfaces. Appium attaches to that exact endpoint using
 the selected device's explicit iOS version. This avoids Appium's separate
 USB/RemoteXPC tunnel discovery and does not require a privileged tunnel daemon.
