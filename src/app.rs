@@ -2515,46 +2515,47 @@ impl eframe::App for AutoLoginApp {
         let toolbar = egui::Panel::top("top_panel")
             .frame(theme::top_bar_frame())
             .show_inside(ui, |ui| {
-                theme::apply_toolbar_style(ui);
                 ui.horizontal(|ui| {
                     if accessibility_ready {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let previous_button_padding = ui.spacing().button_padding;
-                        ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-                        for (tab, label, icon) in [
-                            (
-                                Tab::Accounts,
-                                "Accounts",
-                                Some(egui::include_image!("../assets/icons/users.svg")),
-                            ),
-                            (
-                                Tab::Settings,
-                                "Settings",
-                                Some(egui::include_image!("../assets/icons/settings.svg")),
-                            ),
-                            #[cfg(feature = "diagnostics-ui")]
-                            (Tab::Diagnose, "Diagnose", None),
-                        ] {
-                            let selected = self.selected_tab == tab;
-                            let mut contents =
-                                egui::Atoms::new(egui::RichText::new(label).strong());
-                            if let Some(icon) = icon {
-                                contents.push_left(theme::toolbar_icon(icon));
-                            }
-                            if ui
-                                .add(
+                        theme::tab_group_frame().show(ui, |ui| {
+                            theme::apply_toolbar_style(ui);
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
+                            for (tab, label, icon) in [
+                                (
+                                    Tab::Accounts,
+                                    "Accounts",
+                                    Some(egui::include_image!("../assets/icons/users.svg")),
+                                ),
+                                (
+                                    Tab::Settings,
+                                    "Settings",
+                                    Some(egui::include_image!("../assets/icons/settings.svg")),
+                                ),
+                                #[cfg(feature = "diagnostics-ui")]
+                                (Tab::Diagnose, "Diagnose", None),
+                            ] {
+                                let selected = self.selected_tab == tab;
+                                let mut contents = egui::Atoms::new(
+                                    egui::RichText::new(label).text_style(egui::TextStyle::Button),
+                                );
+                                if let Some(icon) = icon {
+                                    contents.push_left(theme::toolbar_icon(icon));
+                                }
+                                let response = ui.add(
                                     egui::Button::selectable(selected, contents)
                                         .image_tint_follows_text_color(true)
                                         .wrap_mode(egui::TextWrapMode::Extend)
-                                        .corner_radius(egui::CornerRadius::same(8))
-                                        .min_size(egui::vec2(0.0, 30.0)),
-                                )
-                                .clicked()
-                            {
-                                self.selected_tab = tab;
+                                        .corner_radius(6)
+                                        .min_size(egui::vec2(0.0, 28.0)),
+                                );
+                                if response.clicked() && !selected {
+                                    self.selected_tab = tab;
+                                    // Paint the tab selection and its contents together on this frame.
+                                    ctx.request_discard("tab selection changed");
+                                }
                             }
-                        }
-                        ui.spacing_mut().button_padding = previous_button_padding;
+                        });
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
