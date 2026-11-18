@@ -10,6 +10,46 @@ import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, stopO
 const udid = '00000000-0000000000000001';
 const device = { udid, paired: true, connected: true, transport: 'localNetwork', tunnelAddress: 'fd00::1', osVersion: '27.2' };
 
+test('only the remainder of the polling interval is spent asleep after a readiness probe', async t => {
+  let now = 0;
+  const sleeps = [];
+  const starts = [];
+  t.mock.method(performance, 'now', () => now);
+  t.mock.module('node:timers/promises', { namedExports: { setTimeout: async ms => { sleeps.push(ms); now += ms; } } });
+  const { waitForRunnerReady } = await import('./wda.mjs?readiness-cadence');
+  const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, 'http://[::1]:8100/status');
+    assert.equal(options.redirect, 'error');
+    starts.push(now);
+    if (starts.length === 1) { now += 100; throw new Error('unavailable'); }
+    if (starts.length === 2) { now += 800; return Response.json({ value: { ready: false } }); }
+    return Response.json({ value: { ready: true } });
+  });
+  await waitForRunnerReady('http://[::1]:8100', child, new AbortController().signal);
+  assert.deepEqual(starts, [0, 500, 1300]);
+  assert.deepEqual(sleeps, [400]);
+});
+
+test('a ready reply is rejected if the runner exited, the deadline expired, or the caller cancelled', async t => {
+  const { waitForRunnerReady } = await import('./wda.mjs');
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  for (const cause of ['exit', 'deadline', 'abort']) {
+    const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const controller = new AbortController();
+    const fetch = t.mock.method(globalThis, 'fetch', async () => {
+      if (cause === 'exit') child.exitCode = 1;
+      if (cause === 'deadline') now += 45000;
+      if (cause === 'abort') controller.abort();
+      return Response.json({ value: { ready: true } });
+    });
+    await assert.rejects(waitForRunnerReady('http://[::1]:8100', child, controller.signal),
+      cause === 'abort' ? { name: 'AbortError' } : { code: 'wda_connection_failed' });
+    fetch.mock.restore();
+  }
+});
+
 test('Wi-Fi WDA attachment uses only the exact paired physical-device tunnel', () => {
   assert.equal(tunnelEndpoint(device, udid), 'http://[fd00::1]:8100');
   for (const delta of [{ udid: 'other' }, { paired: false }, { connected: false }, { transport: 'usb' },

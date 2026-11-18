@@ -233,6 +233,39 @@ async function preparedTestRun(config, signal, onStatus) {
   return buildTestRun(config, upstream, source, derived, signal, false);
 }
 
+// Poll at most twice a second. Time spent waiting for the previous HTTP
+// response counts toward that interval; requests never overlap.
+export async function waitForRunnerReady(url, child, signal) {
+  const deadline = performance.now() + 45000;
+  let spawnFailed = false;
+  const onError = () => { spawnFailed = true; };
+  const check = () => {
+    signal.throwIfAborted();
+    if (spawnFailed || child.exitCode !== null || child.signalCode !== null || performance.now() >= deadline) {
+      throw new AutomationError('wda_connection_failed', 'Unlock the iPhone and enable UI Automation in Developer settings.');
+    }
+  };
+  child.once('error', onError);
+  try {
+    for (;;) {
+      check();
+      const started = performance.now();
+      const timeout = Math.max(1, Math.min(1500, Math.ceil(deadline - started)));
+      let ready = false;
+      try {
+        const response = await fetch(`${url}/status`, { redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]) });
+        ready = response.ok && (await response.json())?.value?.ready === true;
+      } catch { signal.throwIfAborted(); }
+      check();
+      if (ready) return;
+      const pause = Math.min(started + 500, deadline) - performance.now();
+      if (pause > 0) await delay(Math.ceil(pause), undefined, { signal });
+    }
+  } finally {
+    child.removeListener('error', onError);
+  }
+}
+
 /** Launch XCTest using Apple's paired Wi-Fi transport; Appium attaches afterward. */
 export async function startNativeWda(config, device, { signal, onStatus = () => {} }) {
   const url = tunnelEndpoint(device, config.device_udid);
@@ -262,20 +295,7 @@ export async function startNativeWda(config, device, { signal, onStatus = () => 
       '-resultBundlePath', path.join(resultsDirectory, 'results.xcresult')], {
       env: cleanEnvironment(), detached: true, stdio: 'ignore',
     });
-    let spawnFailed = false;
-    child.once('error', () => { spawnFailed = true; });
-    const deadline = Date.now() + 45000;
-    for (;;) {
-      signal.throwIfAborted();
-      if (spawnFailed || child.exitCode !== null || child.signalCode !== null || Date.now() >= deadline) {
-        throw new AutomationError('wda_connection_failed', 'Unlock the iPhone and enable UI Automation in Developer settings.');
-      }
-      try {
-        const response = await fetch(`${url}/status`, { redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(1500)]) });
-        if (response.ok && (await response.json())?.value?.ready === true) break;
-      } catch { signal.throwIfAborted(); }
-      await delay(500, undefined, { signal });
-    }
+    await waitForRunnerReady(url, child, signal);
     return { url, platformVersion: device.osVersion, close };
   } catch (error) {
     await close();
