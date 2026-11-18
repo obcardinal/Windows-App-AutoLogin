@@ -2751,10 +2751,7 @@ impl eframe::App for AutoLoginApp {
                     return None;
                 }
                 match self.selected_tab {
-                    Tab::Accounts => {
-                        let height = crate::ui::accounts::show(ui, self);
-                        self.confirm_delete_account.is_none().then_some(height)
-                    }
+                    Tab::Accounts => Some(crate::ui::accounts::show(ui, self)),
                     Tab::Settings => Some(crate::ui::settings::show(ui, self)),
                     #[cfg(feature = "diagnostics-ui")]
                     Tab::Diagnose => {

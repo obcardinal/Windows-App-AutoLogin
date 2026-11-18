@@ -2714,52 +2714,61 @@ fn show_delete_confirmation(
         return;
     };
 
-    let Some(idx) = app.config.accounts.iter().position(|a| a.id == account_id) else {
+    let Some(account) = app.config.accounts.iter().find(|a| a.id == account_id) else {
         app.confirm_delete_account = None;
         return;
     };
 
-    let account_name = app.config.accounts[idx].display_name();
-    let account_transaction_ready = app.account_transaction_ready();
-    let mut open = true;
-    egui::Window::new("Delete Account")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .default_width(340.0)
+    let frame = theme::glass_frame()
+        .corner_radius(10)
+        .shadow(ui.visuals().popup_shadow);
+    let dialog = egui::Modal::new(egui::Id::new("delete_account_confirmation"))
+        .frame(frame)
+        .backdrop_color(theme::TEXT.gamma_multiply(0.2))
         .show(ui.ctx(), |ui| {
-            theme::glass_frame().show(ui, |ui| {
-                ui.heading("Delete account?");
-                ui.label(theme::muted(format!(
-                    "This removes \"{}\" and attempts to delete its saved password storage.",
-                    account_name
-                )));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_sized([104.0, 28.0], theme::secondary_button("Cancel"))
-                        .clicked()
-                    {
-                        app.confirm_delete_account = None;
-                    }
+            ui.set_width(360.0);
+            let close = theme::tab_heading(ui, "Delete account?", |ui| {
+                account_action_button(ui, AccountActionIcon::CloseDialog, true)
+                    .on_hover_text("Close dialog")
+            });
+            ui.horizontal(|ui| {
+                account_monogram(ui, account);
+                let name = account.display_name();
+                ui.add(egui::Label::new(&name).truncate())
+                    .on_hover_text(name);
+            });
+            ui.label(theme::muted(
+                "The password saved in AutoLogin is also deleted.",
+            ));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let size = egui::vec2(82.0, 30.0);
                     let delete = ui.add_enabled(
-                        account_transaction_ready,
-                        theme::danger_button("Delete").min_size(egui::vec2(104.0, 28.0)),
+                        app.account_transaction_ready(),
+                        theme::danger_button("Delete").min_size(size),
                     );
                     let delete = with_transaction_disabled_reason(
                         delete,
-                        (!account_transaction_ready)
-                            .then(|| app.config_mutations_disabled_reason())
-                            .flatten(),
+                        app.config_mutations_disabled_reason(),
                     );
                     if delete.clicked() {
                         *account_to_delete = Some(account_id.clone());
                     }
+                    if ui
+                        .add_sized(size, theme::secondary_button("Cancel"))
+                        .clicked()
+                    {
+                        ui.close();
+                    }
                 });
             });
+            if close.clicked() {
+                ui.close();
+            }
         });
 
-    if !open {
+    if dialog.should_close() {
         app.confirm_delete_account = None;
     }
 }
@@ -3409,6 +3418,7 @@ enum AccountActionIcon {
     EmailCopied,
     Edit,
     Delete,
+    CloseDialog,
 }
 
 fn account_action_button(
@@ -3451,6 +3461,13 @@ fn account_action_button(
             "Delete account",
             theme::DANGER,
             theme::DANGER_SOFT,
+        ),
+        AccountActionIcon::CloseDialog => (
+            "bytes://icons/x.svg",
+            REMOVE_ACCOUNT_ICON,
+            "Close dialog",
+            theme::ACCENT,
+            theme::ACCENT_SOFT,
         ),
     };
     let response = ui.add_enabled(enabled, |ui: &mut egui::Ui| {
@@ -4487,6 +4504,82 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+    }
+
+    #[test]
+    fn delete_confirmation_only_requests_the_selected_account_on_explicit_delete() {
+        let selected = Account::new("selected@example.test");
+        let mut app = account_test_app(AppConfig {
+            accounts: vec![Account::new("other@example.test"), selected.clone()],
+            ..Default::default()
+        });
+        for (action, blocked) in [
+            ("Cancel", false),
+            ("Close dialog", false),
+            ("Backdrop", false),
+            ("Escape", false),
+            ("Delete", true),
+            ("Delete", false),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::theme::apply(&ctx);
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
+            app.confirm_delete_account = Some(selected.id.clone());
+            app.set_settings_changes_blocked_reason(blocked.then(|| "Storage recovery".into()));
+            let mut render = |events| {
+                let mut intent = None;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 268.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let frame = ctx.run_ui(input, |ui| {
+                    assert!(!ui.button("Background action").clicked());
+                    super::show_delete_confirmation(ui, &mut app, &mut intent);
+                });
+                (frame, intent)
+            };
+            render(vec![]); // Allow the modal to measure itself before targeting buttons.
+            let (frame, _) = render(vec![]);
+            let events = match action {
+                "Escape" => vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                "Backdrop" => click(visible_text_rects(&frame, "Background action")[0].center()),
+                label => {
+                    let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+                    let bounds = tree
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .and_then(|(_, node)| node.bounds())
+                        .unwrap();
+                    click(egui::pos2(
+                        (bounds.x0 + bounds.width() / 2.0) as f32,
+                        (bounds.y0 + bounds.height() / 2.0) as f32,
+                    ))
+                }
+            };
+            let (_, intent) = render(events);
+            assert_eq!(
+                intent.as_ref(),
+                (action == "Delete" && !blocked).then_some(&selected.id)
+            );
+            if action != "Delete" || blocked {
+                assert_eq!(
+                    app.confirm_delete_account.as_ref(),
+                    blocked.then_some(&selected.id)
+                );
+            }
+        }
     }
 
     #[test]
