@@ -2176,8 +2176,9 @@ fn secure_password_editor(
     id: egui::Id,
     hint: &str,
     reveal: bool,
+    width: f32,
 ) -> SecurePasswordEditorResponse {
-    let desired_size = egui::vec2(ACCOUNT_EDITOR_FIELD_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT);
+    let desired_size = egui::vec2(width, ACCOUNT_EDITOR_CONTROL_HEIGHT);
     let (_, rect) = ui.allocate_space(desired_size);
     let (text_rect, visibility_rect) = password_editor_regions(rect);
     let field_response = ui.interact(text_rect, id, egui::Sense::click());
@@ -2217,7 +2218,7 @@ fn secure_password_editor(
     .shrink(1.0);
     let field_painter = ui.painter().with_clip_rect(text_clip_rect);
     let painted_text_rect = field_painter.text(
-        text_rect.left_center() + egui::vec2(8.0, 0.0),
+        text_rect.left_center() + egui::vec2(ui.spacing().button_padding.x, 0.0),
         egui::Align2::LEFT_CENTER,
         display.as_ref(),
         egui::TextStyle::Body.resolve(ui.style()),
@@ -2234,10 +2235,11 @@ fn secure_password_editor(
     field_response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), "Password")
     });
-    ui.ctx().accesskit_node_builder(field_response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::PasswordInput);
-        builder.clear_value();
-    });
+    ui.ctx()
+        .accesskit_node_builder(field_response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::PasswordInput);
+            builder.clear_value();
+        });
     let visibility = password_visibility_button(ui, visibility_rect, id, reveal);
     SecurePasswordEditorResponse {
         field: field_response,
@@ -2285,9 +2287,8 @@ fn password_editor_cursor_x(
     painted_text_rect: egui::Rect,
     password_is_empty: bool,
 ) -> f32 {
-    let text_start = field_rect.left() + 8.0;
     let mask_end = if password_is_empty {
-        text_start
+        painted_text_rect.left()
     } else {
         painted_text_rect.right()
     };
@@ -2500,6 +2501,7 @@ fn show_account_editor(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                                     "Password"
                                 },
                                 app.show_password,
+                                ACCOUNT_EDITOR_FIELD_WIDTH,
                             );
                             let tooltip = if app.show_password {
                                 "Hide password"
@@ -5751,6 +5753,7 @@ mod tests {
                         password_editor_id("alignment-test"),
                         "Saved password",
                         false,
+                        ACCOUNT_EDITOR_FIELD_WIDTH,
                     );
                     let password_outer = password_response
                         .field
@@ -5804,7 +5807,7 @@ mod tests {
             egui::vec2(ACCOUNT_EDITOR_FIELD_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT),
         );
         let (field, _) = password_editor_regions(outer);
-        let text_start = field.left() + 8.0;
+        let text_start = field.left() + 12.0;
 
         for painted_width in [6.25, 62.5, 187.5] {
             let painted = egui::Rect::from_min_size(
