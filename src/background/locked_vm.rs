@@ -151,10 +151,16 @@ impl ReturnWindow {
     }
 }
 
+#[derive(Eq, Hash, PartialEq)]
+enum AttemptTarget {
+    Window(i32, u32),
+    Account(String),
+}
+
 #[derive(Default)]
 pub(super) struct ReturnMonitor {
     visit: ReturnWindow,
-    attempted: Arc<Mutex<HashMap<String, Instant>>>,
+    attempted: Arc<Mutex<HashMap<AttemptTarget, Instant>>>,
     warmup_started: bool,
     next_warmup_permission_check: Option<Instant>,
 }
@@ -282,6 +288,42 @@ impl ReturnMonitor {
                     return;
                 }
             };
+            let Ok(mut deadlines) = attempts.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            deadlines.retain(|_, until| *until > now);
+            let window_key = AttemptTarget::Window(probe.pid, probe.window_id);
+            if deadlines.contains_key(&window_key)
+                || probe.known_account_id().is_some_and(|id| {
+                    deadlines.contains_key(&AttemptTarget::Account(id.to_owned()))
+                })
+            {
+                tracing::trace!("Waiting to retry the locked desktop");
+                return;
+            }
+            drop(deadlines);
+            let detection_started = Instant::now();
+            if cancelled() {
+                return;
+            }
+            let observation = macos_lock_screen::observe(probe.pid, probe.window_id);
+            if observation != LockScreenObservation::Password {
+                tracing::debug!(?observation, "No Windows password screen detected");
+                return;
+            }
+            tracing::debug!(
+                recognition_ms = detection_started.elapsed().as_millis(),
+                "Recognized locked desktop"
+            );
+            // A Space transition can interrupt preflight while the original
+            // VM stays connected. Briefly debounce those checks. The long
+            // cooldown starts only when Windows App receives a close action.
+            let Ok(mut deadlines) = attempts.lock() else {
+                return;
+            };
+            deadlines.insert(window_key, Instant::now() + RETURN_WINDOW);
+            drop(deadlines);
             let session = match probe.identify_locked(&accounts, &cancelled) {
                 Ok(Some(session)) => session,
                 Ok(None) => {
@@ -293,15 +335,33 @@ impl ReturnMonitor {
                     return;
                 }
             };
-            // Suppress a fresh RDP window for the same account as well as this
-            // exact window. A failed reconnect must never cause a disconnect loop.
-            let Ok(mut previous) = attempts.lock() else {
+            let account_key = AttemptTarget::Account(session.account_id.clone());
+            let Ok(mut deadlines) = attempts.lock() else {
                 return;
             };
-            previous.retain(|_, time| recent(time));
-            previous.insert(session.account_id.clone(), Instant::now());
-            drop(previous);
-            match locked_session::reconnect(&session, &accounts, cancelled) {
+            if deadlines
+                .get(&account_key)
+                .is_some_and(|end| *end > Instant::now())
+            {
+                return;
+            }
+            deadlines.insert(
+                AttemptTarget::Account(session.account_id.clone()),
+                Instant::now() + RETURN_WINDOW,
+            );
+            drop(deadlines);
+            let before_disconnect = || {
+                let mut deadlines = attempts
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Reconnect state is unavailable."))?;
+                deadlines.insert(account_key, Instant::now() + RECONNECT_COOLDOWN);
+                Ok(())
+            };
+            let result =
+                locked_session::reconnect(&session, &accounts, cancelled, before_disconnect);
+            drop(_active);
+            drop(_permit);
+            match result {
                 Ok(()) => {
                     let _ = events.try_send(log_event(
                         LogLevel::Info,

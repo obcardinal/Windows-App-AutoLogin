@@ -453,6 +453,7 @@ pub(crate) fn reconnect(
     session: &LockedSession,
     accounts: &[Account],
     cancelled: impl Fn() -> bool,
+    before_disconnect: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     ensure!(!cancelled(), "Cancelled.");
     let app = device_windows::running_app()?.context("Windows App closed.")?;
@@ -481,6 +482,7 @@ pub(crate) fn reconnect(
     );
     // AX can time out after accepting a press. Observe the exact window and its
     // native session entry to establish disconnection before issuing Connect.
+    before_disconnect()?;
     close.perform_action(AX_PRESS);
     wait_for_disconnect(session, &app, &window)?;
     // Once the selected session has closed, restore that same device even if
