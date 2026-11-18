@@ -24,7 +24,6 @@ pub(crate) enum Trigger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Preparation {
     Build,
-    BuildAndWarmWifi,
     WarmWifi,
 }
 
@@ -105,7 +104,7 @@ impl HostPreparation {
         now: Instant,
         eligible: bool,
         trigger: Trigger,
-        command: impl FnOnce(Preparation) -> anyhow::Result<Command> + Send + 'static,
+        command: impl FnOnce(Preparation) -> anyhow::Result<Command> + Send + Clone + 'static,
     ) {
         PreparationJob::reap_finished(&mut self.wifi_job);
         if let Some(success) = PreparationJob::reap_finished(&mut self.job) {
@@ -131,27 +130,27 @@ impl HostPreparation {
         if self.config.is_none() {
             return;
         }
-        let warm_wifi = matches!(trigger, Trigger::PasswordWritten { warm_wifi: true })
-            && self.wifi_job.is_none();
-        if let Some(job) = &self.job {
-            // A build started at launch cannot anticipate a later password write.
-            // Let that write wake the paired phone while Xcode continues compiling.
-            if warm_wifi && job.kind == Preparation::Build && job.lease.is_some() {
-                self.wifi_job = PreparationJob::start(Preparation::WarmWifi, command).ok();
-            }
+        // A cancelled job still owns processes until it has been reaped.
+        if [&self.job, &self.wifi_job]
+            .into_iter()
+            .flatten()
+            .any(|job| job.lease.is_none())
+        {
             return;
         }
-        let should_prepare = match trigger {
-            Trigger::PasswordWritten { .. } => warm_wifi || self.outcome != Outcome::Ready,
-            _ => self.outcome == Outcome::Pending,
-        };
-        if should_prepare {
-            let kind = if warm_wifi {
-                Preparation::BuildAndWarmWifi
-            } else {
-                Preparation::Build
-            };
-            match PreparationJob::start(kind, command) {
+        let first_preparation = self.job.is_none() && self.outcome == Outcome::Pending;
+        let warm_after_password = self.wifi_job.is_none()
+            && matches!(trigger, Trigger::PasswordWritten { warm_wifi: true });
+        if (first_preparation && self.wifi_job.is_none()) || warm_after_password {
+            // Waking the selected device only reads its metadata. Keeping this
+            // job separate lets a later password write wake Wi-Fi again even
+            // if the initial Xcode build is still running.
+            self.wifi_job = PreparationJob::start(Preparation::WarmWifi, command.clone()).ok();
+        }
+        let retry_build = matches!(trigger, Trigger::PasswordWritten { .. })
+            && (self.outcome == Outcome::Failed || warm_after_password);
+        if self.job.is_none() && (first_preparation || retry_build) {
+            match PreparationJob::start(Preparation::Build, command) {
                 Ok(job) => self.job = Some(job),
                 Err(_) => self.outcome = Outcome::Failed,
             }
@@ -172,7 +171,6 @@ impl Drop for HostPreparation {
 }
 
 struct PreparationJob {
-    kind: Preparation,
     lease: Option<Sender<()>>,
     thread: JoinHandle<bool>,
 }
@@ -236,7 +234,6 @@ impl PreparationJob {
                 false
             })?;
         Ok(Self {
-            kind,
             lease: Some(lease),
             thread,
         })
@@ -322,11 +319,16 @@ mod tests {
     }
 
     fn finish(preparation: &mut HostPreparation) {
-        wait_until(|| preparation.job.as_ref().unwrap().thread.is_finished());
+        wait_until(|| {
+            [&preparation.job, &preparation.wifi_job]
+                .into_iter()
+                .flatten()
+                .all(|job| job.thread.is_finished())
+        });
         preparation.poll_with(Instant::now(), true, Trigger::Tick, |_| {
             panic!("a tick must not launch a second preparation")
         });
-        assert!(preparation.job.is_none());
+        assert!(preparation.job.is_none() && preparation.wifi_job.is_none());
     }
 
     #[test]
@@ -345,8 +347,12 @@ mod tests {
         });
         assert!(preparation.job.is_none());
 
-        preparation.poll_with(now, true, Trigger::Configuration, |_| {
-            Ok(Command::new("/usr/bin/false"))
+        preparation.poll_with(now, true, Trigger::Configuration, |kind| {
+            Ok(Command::new(if kind == Preparation::Build {
+                "/usr/bin/false"
+            } else {
+                "/usr/bin/true"
+            }))
         });
         finish(&mut preparation);
         assert!(preparation.outcome == Outcome::Failed);
@@ -398,7 +404,10 @@ mod tests {
         let state = fixture.0.join("state");
         let child_state = state.clone();
         let mut preparation = HostPreparation::new(config);
-        preparation.poll_with(Instant::now(), true, Trigger::Configuration, move |_| {
+        preparation.poll_with(Instant::now(), true, Trigger::Configuration, move |kind| {
+            if kind == Preparation::WarmWifi {
+                return Ok(Command::new("/usr/bin/true"));
+            }
             let mut command = Command::new("/bin/sh");
             command.args([
                 "-c",
@@ -417,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn password_can_warm_wifi_during_a_build_and_config_change_stops_both_jobs() {
+    fn selection_warms_wifi_and_password_can_wake_it_again_during_the_same_build() {
         let fixture = Fixture::new();
         let config = fixture.0.join("config.json");
         fs::write(&config, b"first").unwrap();
@@ -441,13 +450,25 @@ mod tests {
         let state_is =
             |file: &Path, value| fs::read_to_string(file).is_ok_and(|s| s.trim() == value);
         let password = Trigger::PasswordWritten { warm_wifi: true };
-        preparation.poll_with(
-            now,
-            true,
-            Trigger::Configuration,
-            wait_for_eof(build_state.clone(), Preparation::Build),
-        );
-        wait_until(|| state_is(&build_state, "ready"));
+        let first_wifi = fixture.0.join("first-wifi");
+        let startup_wifi = first_wifi.clone();
+        let startup_build = build_state.clone();
+        preparation.poll_with(now, true, Trigger::Configuration, move |kind| match kind {
+            Preparation::Build => wait_for_eof(startup_build, Preparation::Build)(kind),
+            Preparation::WarmWifi => {
+                fs::write(startup_wifi, "ready")?;
+                Ok(Command::new("/usr/bin/true"))
+            }
+        });
+        wait_until(|| {
+            state_is(&build_state, "ready")
+                && state_is(&first_wifi, "ready")
+                && preparation.wifi_job.as_ref().unwrap().thread.is_finished()
+        });
+        preparation.poll_with(now, true, Trigger::Tick, |_| {
+            panic!("no extra Wi-Fi wake on tick")
+        });
+        assert!(preparation.wifi_job.is_none());
         let build = preparation.job.as_ref().unwrap().thread.thread().id();
         preparation.poll_with(
             now,
@@ -478,11 +499,10 @@ mod tests {
             preparation.job.as_ref().unwrap().thread.is_finished()
                 && preparation.wifi_job.as_ref().unwrap().thread.is_finished()
         });
-        preparation.poll_with(now, true, Trigger::Tick, |kind| {
-            assert_eq!(kind, Preparation::Build);
+        preparation.poll_with(now, true, Trigger::Tick, |_| {
             Ok(Command::new("/usr/bin/true"))
         });
-        assert!(preparation.wifi_job.is_none());
+        assert!(preparation.wifi_job.is_some());
         finish(&mut preparation);
         assert!(preparation.outcome == Outcome::Ready);
     }
@@ -520,7 +540,10 @@ mod tests {
         let pid_file = fixture.0.join("compiler-pid");
         let child_pid_file = pid_file.clone();
         let mut preparation = HostPreparation::new(config);
-        preparation.poll_with(Instant::now(), true, Trigger::Configuration, move |_| {
+        preparation.poll_with(Instant::now(), true, Trigger::Configuration, move |kind| {
+            if kind == Preparation::WarmWifi {
+                return Ok(Command::new("/usr/bin/true"));
+            }
             let mut command = Command::new("/bin/sh");
             command.args([
                 "-c",

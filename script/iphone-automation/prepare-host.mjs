@@ -16,10 +16,7 @@ try {
   } else if (process.argv[1] === 'wifi-only') {
     await warmSelectedWifi(config.device_udid, controller.signal);
   } else {
-    await Promise.all([
-      prepareHostRunner(config, controller.signal),
-      process.argv[1] === 'warm-wifi' && warmSelectedWifi(config.device_udid, controller.signal),
-    ]);
+    await prepareHostRunner(config, controller.signal);
   }
 } catch {
   process.exitCode = 1;

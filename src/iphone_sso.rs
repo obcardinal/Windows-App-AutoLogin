@@ -202,14 +202,8 @@ pub(crate) fn host_prepare_command(
         "--eval",
         include_str!("../script/iphone-automation/prepare-host.mjs"),
     ]);
-    match kind {
-        Preparation::Build => {}
-        Preparation::BuildAndWarmWifi => {
-            command.args(["--", "warm-wifi"]);
-        }
-        Preparation::WarmWifi => {
-            command.args(["--", "wifi-only"]);
-        }
+    if kind == Preparation::WarmWifi {
+        command.args(["--", "wifi-only"]);
     }
     Ok(command)
 }

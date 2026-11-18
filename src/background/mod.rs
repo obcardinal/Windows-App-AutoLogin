@@ -1104,25 +1104,21 @@ fn emit_pre_password_skip_report(
     fields: &[(&'static str, String)],
 ) {
     let reason = reason.into();
-    let is_actionable_attempt_report = pre_password_skip_is_actionable(&reason);
-    let should_persist = if is_actionable_attempt_report {
-        persistence.should_persist(&reason, fields, Instant::now())
-    } else {
-        persistence.observe_non_actionable_skip();
-        false
-    };
-    let report = debug_fill::pre_password_skip_report(reason, fields);
     // Suppression is a consequence of an earlier attempted fill, not a new
     // attempt. Keep the first actionable failure visible in both the persisted
     // report and the UI instead of replacing it on the next monitor poll.
-    if should_persist && is_actionable_attempt_report {
+    if !pre_password_skip_is_actionable(&reason) {
+        persistence.observe_non_actionable_skip();
+        return;
+    }
+    let should_persist = persistence.should_persist(&reason, fields, Instant::now());
+    let report = debug_fill::pre_password_skip_report(reason, fields);
+    if should_persist {
         if let Err(e) = debug_fill::write_last_fill_attempt_report(&report) {
             warn!("Could not persist pre-password skip report: {e}");
         }
     }
-    if is_actionable_attempt_report {
-        let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
-    }
+    let _ = event_tx.try_send(WorkerEvent::FillAttemptReport(report));
 }
 
 fn pre_password_skip_is_actionable(reason: &str) -> bool {
@@ -2548,13 +2544,28 @@ mod tests {
         let mut persistence = PrePasswordReportPersistence::default();
         let now = Instant::now();
         let fields = [("prompt_context_source", "fallback".to_string())];
+        let (event_tx, mut event_rx) = mpsc::channel(1);
 
         persistence.begin_poll_tick();
-        persistence.observe_non_actionable_skip();
+        super::emit_pre_password_skip_report(
+            &event_tx,
+            &mut persistence,
+            "prompt_retry_suppressed",
+            &fields,
+        );
         assert!(persistence.should_persist("actionable_reason", &fields, now));
 
         persistence.begin_poll_tick();
-        persistence.observe_non_actionable_skip();
+        super::emit_pre_password_skip_report(
+            &event_tx,
+            &mut persistence,
+            "prompt_retry_suppressed",
+            &fields,
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         persistence.observe_no_prompt();
         persistence.begin_poll_tick();
         assert!(!persistence.should_persist(

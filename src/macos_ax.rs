@@ -510,7 +510,7 @@ impl AxElement {
             .filter(|value| !value.trim().is_empty())
     }
 
-    fn string_attrs(&self, attrs: &[&'static str]) -> Vec<Option<String>> {
+    fn string_attrs<const N: usize>(&self, attrs: &[&'static str; N]) -> [Option<String>; N] {
         let attr_strings = attrs
             .iter()
             .map(|attr| CFString::from_static_string(attr))
@@ -525,22 +525,11 @@ impl AxElement {
                 &mut values_ref,
             )
         };
-        if err != K_AX_ERROR_SUCCESS || values_ref.is_null() {
-            return attrs.iter().map(|attr| self.string_attr(attr)).collect();
-        }
-
-        let values = unsafe { CFArray::<CFType>::wrap_under_create_rule(values_ref) };
-        attrs
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                values
-                    .get(index.to_CFIndex())
-                    .and_then(|value| value.downcast::<CFString>())
-                    .map(|value| value.to_string())
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .collect()
+        let values = (!values_ref.is_null())
+            .then(|| unsafe { CFArray::<CFType>::wrap_under_create_rule(values_ref) });
+        batch_strings(values.as_ref().filter(|_| err == K_AX_ERROR_SUCCESS), |i| {
+            self.string_attr(attrs[i])
+        })
     }
 
     fn bool_attr(&self, attr: &'static str) -> Option<bool> {
@@ -657,6 +646,39 @@ impl AxElement {
     fn same_element(&self, other: &AxElement) -> bool {
         unsafe { CFEqual(self.raw.cast(), other.raw.cast()) != 0 }
     }
+}
+
+// A short result has no reliable positional mapping. An unexpected item
+// also needs its original scalar lookup before it can be treated as absent.
+fn batch_strings<const N: usize>(
+    values: Option<&CFArray<CFType>>,
+    mut single: impl FnMut(usize) -> Option<String>,
+) -> [Option<String>; N] {
+    let Some(values) = values.filter(|values| values.len() == N.to_CFIndex()) else {
+        return std::array::from_fn(single);
+    };
+    std::array::from_fn(|i| {
+        if let Some(value) = values.get(i.to_CFIndex()) {
+            if let Some(text) = value.downcast::<CFString>() {
+                let text = text.to_string();
+                return (!text.trim().is_empty()).then_some(text);
+            }
+            let raw = value.as_CFTypeRef();
+            let mut error: AXError = K_AX_ERROR_SUCCESS;
+            if unsafe {
+                CFGetTypeID(raw) == AXValueGetTypeID()
+                    && AXValueGetValue(
+                        raw,
+                        K_AX_VALUE_TYPE_AX_ERROR,
+                        (&mut error as *mut AXError).cast(),
+                    ) != 0
+            } && ax_relationship_attr_is_absent(error)
+            {
+                return None;
+            }
+        }
+        single(i)
+    })
 }
 
 impl Drop for AxElement {
@@ -2173,8 +2195,7 @@ fn prompt_text_snapshot_changed(snapshot: &PromptTextSnapshot) -> bool {
     if is_hidden(&snapshot.element) || has_sensitive_password_field_identity(&snapshot.element) {
         return true;
     }
-    let title = snapshot.element.string_attr(AX_TITLE);
-    let placeholder = snapshot.element.string_attr(AX_PLACEHOLDER);
+    let [title, placeholder] = snapshot.element.string_attrs(&[AX_TITLE, AX_PLACEHOLDER]);
     // Reclassify immediately before AXValue. A previously ordinary identity
     // element that became password-sensitive must be treated as changed
     // without ever materializing its value in an ordinary String.
@@ -2975,8 +2996,9 @@ fn collect_prompt_text(window_title: &str, elements: &[AxElement]) -> String {
             continue;
         }
 
-        push_text(&mut text, element.string_attr(AX_TITLE));
-        push_text(&mut text, element.string_attr(AX_PLACEHOLDER));
+        for value in element.string_attrs(&[AX_TITLE, AX_PLACEHOLDER]) {
+            push_text(&mut text, value);
+        }
 
         if is_text_or_static_text(element) && !has_sensitive_password_field_identity(element) {
             push_text(&mut text, element.string_attr(AX_VALUE));
@@ -3003,8 +3025,7 @@ fn prompt_text_snapshots(
             )
         })
         .map(|element| {
-            let title = element.string_attr(AX_TITLE);
-            let placeholder = element.string_attr(AX_PLACEHOLDER);
+            let [title, placeholder] = element.string_attrs(&[AX_TITLE, AX_PLACEHOLDER]);
             // Keep AXValue out of bulk reads and repeat the sensitivity check
             // immediately before the only possible value query.
             let value = if is_text_or_static_text(element)
@@ -3136,25 +3157,26 @@ fn button_text(element: &AxElement) -> String {
 
 fn element_label_text(element: &AxElement) -> String {
     let mut text = String::new();
-    push_text(&mut text, element.string_attr(AX_TITLE));
-    push_text(&mut text, element.string_attr(AX_DESCRIPTION));
-    push_text(&mut text, element.string_attr(AX_HELP));
-    push_text(&mut text, element.string_attr(AX_PLACEHOLDER));
-    push_text(&mut text, element.string_attr(AX_ROLE_DESCRIPTION));
+    for value in element.string_attrs(&[
+        AX_TITLE,
+        AX_DESCRIPTION,
+        AX_HELP,
+        AX_PLACEHOLDER,
+        AX_ROLE_DESCRIPTION,
+    ]) {
+        push_text(&mut text, value);
+    }
     text
 }
 
 fn element_role_text(element: &AxElement) -> String {
-    [
-        element.string_attr(AX_ROLE),
-        element.string_attr(AX_SUBROLE),
-        element.string_attr(AX_ROLE_DESCRIPTION),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|part| !part.trim().is_empty())
-    .collect::<Vec<_>>()
-    .join(" ")
+    element
+        .string_attrs(&[AX_ROLE, AX_SUBROLE, AX_ROLE_DESCRIPTION])
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn push_text(target: &mut String, value: Option<String>) {
@@ -3647,6 +3669,7 @@ const PASSWORD_CUES: &[&str] = &[
 type AXUIElementRef = *const c_void;
 type AXError = i32;
 type CGEventRef = *const c_void;
+const K_AX_VALUE_TYPE_AX_ERROR: u32 = 5;
 const K_AX_ERROR_SUCCESS: AXError = 0;
 const K_AX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
 const K_AX_ERROR_NO_VALUE: AXError = -25212;
@@ -3673,6 +3696,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     fn AXUIElementGetTypeID() -> CFTypeID;
+    #[cfg(test)]
+    fn AXValueCreate(value_type: u32, data: *const c_void) -> CFTypeRef;
+    fn AXValueGetTypeID() -> CFTypeID;
+    fn AXValueGetValue(value: CFTypeRef, value_type: u32, output: *mut c_void) -> u8;
     fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f32) -> AXError;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
@@ -3717,6 +3744,56 @@ mod tests {
         PASSWORD_FILL_READY_MS,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn incomplete_or_malformed_metadata_uses_the_original_attribute_lookup() {
+        use super::{batch_strings, CFArray, CFBoolean, CFString, TCFType};
+        let label = CFString::from_static_string("Label").as_CFType();
+        let empty = CFString::from_static_string("  ").as_CFType();
+        let wrong_type = CFBoolean::true_value().as_CFType();
+        let partial = CFArray::from_CFTypes(&[label.clone()]);
+        let scalar = |i: usize| Some(["Original title", "Password hint"][i].to_string());
+        assert_eq!(
+            batch_strings::<2>(Some(&partial), scalar),
+            [scalar(0), scalar(1)]
+        );
+        assert_eq!(batch_strings::<2>(None, scalar), [scalar(0), scalar(1)]);
+        let mixed = CFArray::from_CFTypes(&[label, wrong_type, empty]);
+        assert_eq!(
+            batch_strings::<3>(Some(&mixed), |i| {
+                assert_eq!(i, 1);
+                scalar(i)
+            }),
+            [Some("Label".into()), scalar(1), None]
+        );
+    }
+
+    #[test]
+    fn only_explicitly_absent_batch_attributes_skip_the_scalar_retry() {
+        use super::{batch_strings, AXError, AXValueCreate, CFArray, CFType, TCFType};
+        let error_value = |error: AXError| {
+            let raw = unsafe {
+                AXValueCreate(
+                    super::K_AX_VALUE_TYPE_AX_ERROR,
+                    (&error as *const AXError).cast(),
+                )
+            };
+            assert!(!raw.is_null());
+            unsafe { CFType::wrap_under_create_rule(raw) }
+        };
+        let values = CFArray::from_CFTypes(&[
+            error_value(super::K_AX_ERROR_ATTRIBUTE_UNSUPPORTED),
+            error_value(super::K_AX_ERROR_NO_VALUE),
+            error_value(-25204), // kAXErrorCannotComplete
+        ]);
+        assert_eq!(
+            batch_strings::<3>(Some(&values), |i| {
+                assert_eq!(i, 2);
+                Some("Password hint".into())
+            }),
+            [None, None, Some("Password hint".into())]
+        );
+    }
 
     #[test]
     fn extracts_email_like_text() {
