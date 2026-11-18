@@ -2,8 +2,8 @@
 //! is only a reason to reconnect; this module never retrieves or sends a password.
 use super::{
     device_launch::{self, SavedDevice},
-    device_windows, remote_pc_info, usernames_match, AXUIElementRef, AxElement,
-    AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_SHEETS, AX_TITLE, AX_WINDOWS,
+    device_windows, remote_pc_info, usernames_match, AXUIElementRef, AxElement, AX_ENABLED,
+    AX_FRONTMOST, AX_PRESS, AX_SHEETS, AX_TITLE, AX_WINDOWS,
 };
 use crate::models::{canonical_remote_pc, Account};
 use anyhow::{ensure, Context, Result};
@@ -17,6 +17,7 @@ pub(crate) struct LockedSession {
     device: BoundDevice,
     username: String,
     remote_pc: Option<String>,
+    matched_by_remote_pc: bool,
     other_sessions: Vec<String>,
 }
 
@@ -27,12 +28,25 @@ enum BoundDevice {
 }
 
 impl LockedSession {
+    pub(crate) fn endpoint_already_verified(&self) -> bool {
+        self.matched_by_remote_pc
+    }
+
     pub(crate) fn title(&self) -> &str {
         match &self.device {
             BoundDevice::Saved(device) => &device.name,
             BoundDevice::Window(title) => title,
         }
     }
+}
+
+fn valid_window_binding(account: &Account) -> bool {
+    account.locked_vm_reconnect_enabled()
+        && !account.username.trim().is_empty()
+        && (account.vm_device_id == "open-window"
+            || (account.vm_device_id.is_empty() && !account.vm_profile.trim().is_empty()))
+        && (account.vm_profile.is_empty()
+            || usernames_match(&account.vm_profile, &account.username))
 }
 
 fn endpoint_allowed(account: &Account, account_count: usize) -> bool {
@@ -48,19 +62,82 @@ fn native_account<'a>(accounts: &'a [Account], title: &str) -> Option<&'a Accoun
         .iter()
         .filter(|a| a.enabled && a.vm_target == title);
     let account = candidates.next()?;
-    if candidates.next().is_some()
-        || !account.locked_vm_reconnect_enabled()
-        || account.username.trim().is_empty()
-        || !endpoint_allowed(account, accounts.len())
+    if candidates.next().is_some() || !endpoint_allowed(account, accounts.len()) {
+        return None;
+    }
+    valid_window_binding(account).then_some(account)
+}
+
+fn eligible_endpoint_binding(account: &Account) -> bool {
+    valid_window_binding(account)
+        && canonical_remote_pc(&account.remote_pc)
+            .is_some_and(|host| !crate::remote_pc::is_cloud_pc_gateway(&host))
+}
+
+fn can_match_by_endpoint(accounts: &[Account], title: &str) -> bool {
+    !accounts
+        .iter()
+        .any(|a| a.enabled && a.vm_target.eq_ignore_ascii_case(title))
+        && accounts.iter().any(eligible_endpoint_binding)
+}
+
+pub(crate) fn should_probe(accounts: &[Account], title: &str, has_session_window_id: bool) -> bool {
+    accounts
+        .iter()
+        .any(|a| a.vm_target == title && a.locked_vm_reconnect_enabled())
+        || (has_session_window_id && can_match_by_endpoint(accounts, title))
+}
+
+fn account_for_endpoint<'a>(
+    accounts: &'a [Account],
+    title: &str,
+    other_sessions: &[String],
+    host: &str,
+) -> Option<&'a Account> {
+    if !can_match_by_endpoint(accounts, title) {
+        return None;
+    }
+    let mut matching = accounts
+        .iter()
+        .filter(|a| a.enabled && canonical_remote_pc(&a.remote_pc).as_deref() == Some(host));
+    let account = matching.next()?;
+    if matching.next().is_some()
+        || !eligible_endpoint_binding(account)
+        || other_sessions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(&account.vm_target) || s.eq_ignore_ascii_case(title))
+        || accounts
+            .iter()
+            .filter(|a| {
+                a.enabled
+                    && (a.id == account.id || a.vm_target.eq_ignore_ascii_case(&account.vm_target))
+            })
+            .count()
+            != 1
     {
         return None;
     }
-    let named_binding = account.vm_device_id == "open-window"
-        || (account.vm_device_id.is_empty() && !account.vm_profile.is_empty());
-    (named_binding
-        && (account.vm_profile.is_empty()
-            || usernames_match(&account.vm_profile, &account.username)))
-    .then_some(account)
+    Some(account)
+}
+
+fn account_for_observed_session<'a>(
+    accounts: &'a [Account],
+    session: &LockedSession,
+) -> Option<&'a Account> {
+    let account = if session.matched_by_remote_pc {
+        account_for_endpoint(
+            accounts,
+            session.title(),
+            &session.other_sessions,
+            session.remote_pc.as_deref()?,
+        )?
+    } else {
+        native_account(accounts, session.title())?
+    };
+    (account.id == session.account_id
+        && account.username == session.username
+        && canonical_remote_pc(&account.remote_pc) == session.remote_pc)
+        .then_some(account)
 }
 
 fn resolve_binding<'a>(
@@ -75,6 +152,7 @@ fn resolve_binding<'a>(
     }
     if !accounts.iter().any(|a| {
         a.locked_vm_reconnect_enabled()
+            && a.vm_target == title
             && (a.vm_device_id.starts_with("workspace:") || a.vm_device_id.starts_with("bookmark:"))
     }) {
         return Ok(None);
@@ -169,10 +247,79 @@ fn focused_desktop(app: &AxElement) -> Result<Option<(String, AxElement, Vec<Str
     Ok((count == 1).then_some((title, focused, others)))
 }
 
-pub(crate) fn probe(accounts: &[Account]) -> Result<Option<LockedSession>> {
-    if !accounts.iter().any(Account::locked_vm_reconnect_enabled) {
-        return Ok(None);
+pub(crate) struct SessionProbe<'a> {
+    pub(crate) pid: i32,
+    pub(crate) window_id: u32,
+    title: String,
+    app: AxElement,
+    window: AxElement,
+    other_sessions: Vec<String>,
+    direct: Option<(&'a Account, BoundDevice)>,
+}
+
+impl SessionProbe<'_> {
+    pub(crate) fn known_account_id(&self) -> Option<&str> {
+        self.direct.as_ref().map(|(account, _)| account.id.as_str())
     }
+
+    // Called only after OCR recognized the Windows password screen. An
+    // unmatched title can be linked only by this native session's own address.
+    pub(crate) fn identify_locked(
+        self,
+        accounts: &[Account],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Option<LockedSession>> {
+        ensure!(!cancelled(), "Cancelled.");
+        let matched_by_remote_pc = self.direct.is_none();
+        let (account, device) = if let Some(binding) = self.direct {
+            binding
+        } else {
+            let (title, original, others) =
+                focused_desktop(&self.app)?.context("The connected desktop lost focus.")?;
+            ensure!(
+                title == self.title
+                    && original.same_element(&self.window)
+                    && window_id(&original) == Some(self.window_id)
+                    && others == self.other_sessions,
+                "The connected desktop changed."
+            );
+            let remote_pc_info::SessionRemotePc::Selected(host) =
+                remote_pc_info::read_focused_session(&self.app, &original, &title, cancelled)?
+            else {
+                return Ok(None);
+            };
+            let Some(account) = account_for_endpoint(accounts, &title, &others, &host) else {
+                return Ok(None);
+            };
+            (account, BoundDevice::Window(title))
+        };
+        let session = LockedSession {
+            pid: self.pid,
+            window_id: self.window_id,
+            account_id: account.id.clone(),
+            device,
+            username: account.username.clone(),
+            remote_pc: canonical_remote_pc(&account.remote_pc),
+            matched_by_remote_pc,
+            other_sessions: self.other_sessions,
+        };
+        if matched_by_remote_pc {
+            ensure!(
+                !cancelled()
+                    && same_focused_session(&session, &self.app)?.same_element(&self.window),
+                "The connected desktop changed."
+            );
+        }
+        Ok(Some(session))
+    }
+}
+
+pub(crate) fn probe<'a>(
+    accounts: &'a [Account],
+    requested_pid: i32,
+    requested_title: &str,
+    requested_window_id: Option<u32>,
+) -> Result<Option<SessionProbe<'a>>> {
     let Some(app) = device_windows::running_app()? else {
         return Ok(None);
     };
@@ -182,17 +329,34 @@ pub(crate) fn probe(accounts: &[Account]) -> Result<Option<LockedSession>> {
     let Some(id) = window_id(&focused) else {
         return Ok(None);
     };
-    let Some((account, device)) = resolve_binding(accounts, &title, device_launch::saved_devices)?
-    else {
+    let pid = app.process_id().context("Windows App changed.")?;
+    if pid != requested_pid
+        || title != requested_title
+        || requested_window_id.is_some_and(|expected| expected != id)
+    {
         return Ok(None);
+    }
+    let direct = if accounts
+        .iter()
+        .any(|a| a.vm_target == title && a.locked_vm_reconnect_enabled())
+    {
+        let Some(binding) = resolve_binding(accounts, &title, device_launch::saved_devices)? else {
+            return Ok(None);
+        };
+        Some(binding)
+    } else {
+        if requested_window_id.is_none() || !can_match_by_endpoint(accounts, &title) {
+            return Ok(None);
+        }
+        None
     };
-    Ok(Some(LockedSession {
-        pid: app.process_id().context("Windows App changed.")?,
+    Ok(Some(SessionProbe {
+        pid,
         window_id: id,
-        account_id: account.id.clone(),
-        device,
-        username: account.username.clone(),
-        remote_pc: canonical_remote_pc(&account.remote_pc),
+        title,
+        app,
+        window: focused,
+        direct,
         other_sessions,
     }))
 }
@@ -253,7 +417,7 @@ fn preflight_reconnect(
 ) -> Result<BoundDevice> {
     let verified = match &session.device {
         BoundDevice::Window(title) => {
-            native_account(accounts, title).filter(|a| a.id == session.account_id && a.username == session.username && canonical_remote_pc(&a.remote_pc) == session.remote_pc)
+            account_for_observed_session(accounts, session)
                 .context("The selected session or account changed.")?;
             device_launch::verify_window_device(
                 app,
@@ -293,7 +457,11 @@ pub(crate) fn reconnect(
     ensure!(!cancelled(), "Cancelled.");
     let app = device_windows::running_app()?.context("Windows App closed.")?;
     let window = same_focused_session(session, &app)?;
-    if let Some(expected_host) = &session.remote_pc {
+    if let Some(expected_host) = session
+        .remote_pc
+        .as_ref()
+        .filter(|_| !session.endpoint_already_verified())
+    {
         let endpoint =
             remote_pc_info::read_focused_session(&app, &window, session.title(), &cancelled)?;
         ensure!(
@@ -390,6 +558,89 @@ mod tests {
     }
 
     #[test]
+    fn renamed_window_needs_an_observed_session_and_the_exact_connection_address() {
+        let mut owner = account();
+        owner.remote_pc = "Assigned.Example.Test.".into();
+        let host = "assigned.example.test";
+        let accounts = std::slice::from_ref(&owner);
+        assert!(should_probe(accounts, "Desktop", false));
+        assert!(!should_probe(accounts, "New desktop", false));
+        assert!(should_probe(accounts, "New desktop", true));
+        assert_eq!(
+            account_for_endpoint(accounts, "New desktop", &[], host),
+            Some(&owner)
+        );
+        for wrong in [
+            "assigned",
+            "other.example.test",
+            "assigned.example.test.attacker.test",
+        ] {
+            assert!(account_for_endpoint(accounts, "New desktop", &[], wrong).is_none());
+        }
+        for title in ["Desktop", "NEW DESKTOP"] {
+            assert!(account_for_endpoint(accounts, "New desktop", &[title.into()], host).is_none());
+        }
+        let session = LockedSession {
+            pid: 5,
+            window_id: 9,
+            account_id: owner.id.clone(),
+            device: BoundDevice::Window("New desktop".into()),
+            username: owner.username.clone(),
+            remote_pc: Some(host.into()),
+            matched_by_remote_pc: true,
+            other_sessions: vec![],
+        };
+        assert_eq!(
+            account_for_observed_session(accounts, &session),
+            Some(&owner)
+        );
+        let mut changed = owner;
+        changed.username = "new@example.test".into();
+        assert!(account_for_observed_session(&[changed], &session).is_none());
+    }
+
+    #[test]
+    fn renamed_window_rejects_conflicting_accounts_and_opted_out_or_unbound_targets() {
+        let mut owner = account();
+        let host = "selected.example.test";
+        owner.remote_pc = host.into();
+        let mut conflict = Account::new("other@example.test");
+        conflict.remote_pc = host.into();
+        assert!(
+            account_for_endpoint(&[owner.clone(), conflict.clone()], "New", &[], host).is_none()
+        );
+        conflict.remote_pc.clear();
+        for title in ["New", "desktop"] {
+            conflict.vm_target = title.into();
+            assert!(
+                account_for_endpoint(&[owner.clone(), conflict.clone()], "New", &[], host)
+                    .is_none()
+            );
+        }
+        let mut invalid = owner.clone();
+        invalid.reconnect_locked_vm = false;
+        let mut targets = vec![invalid];
+        for (id, profile, host) in [
+            ("workspace:one", "", host),
+            ("bookmark:one", "", host),
+            ("", "", host),
+            ("open-window", "other@example.test", host),
+            ("open-window", "", ""),
+            ("open-window", "", "rdgateway-test.wvd.microsoft.com"),
+        ] {
+            let mut a = owner.clone();
+            a.vm_device_id = id.into();
+            a.vm_profile = profile.into();
+            a.remote_pc = host.into();
+            targets.push(a);
+        }
+        for invalid in targets {
+            assert!(!should_probe(std::slice::from_ref(&invalid), "New", true));
+            assert!(account_for_endpoint(&[invalid], "New", &[], host).is_none());
+        }
+    }
+
+    #[test]
     fn window_and_legacy_profile_bindings_work_without_catalog_access() {
         let never = || {
             panic!("A window binding should not request access to another app's protected files")
@@ -408,9 +659,14 @@ mod tests {
             assert!(matches!(device, BoundDevice::Window(name) if name == "Desktop"));
         }
         selected.vm_profile = "wrong@example.test".into();
-        assert!(resolve_binding(&[selected], "Desktop", never)
-            .unwrap()
-            .is_none());
+        let mut catalog_account = account();
+        catalog_account.vm_target = "Different PC".into();
+        catalog_account.vm_device_id = "workspace:other".into();
+        assert!(
+            resolve_binding(&[selected, catalog_account], "Desktop", never)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

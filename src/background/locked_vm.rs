@@ -216,7 +216,7 @@ impl ReturnMonitor {
         let now = Instant::now();
         let idle = target.and_then(|_| local_idle()).unwrap_or(Duration::MAX);
         let linked_target = target.filter(|(_, title)| {
-            accounts.iter().any(|account| account.locked_vm_reconnect_enabled() && account.vm_target == *title)
+            locked_session::should_probe(accounts, title, snapshot.session_presentation.is_some())
         });
         let clicks = linked_target.map(|_| unsafe {
             CGEventSourceCounterForEventType(HID_SYSTEM_STATE, LEFT_MOUSE_DOWN)
@@ -264,10 +264,17 @@ impl ReturnMonitor {
             if cancelled() {
                 return;
             }
-            let session = match locked_session::probe(&accounts) {
+            let probe = match locked_session::probe(
+                &accounts,
+                requested_pid,
+                &requested_title,
+                presentation.map(|p| p.window_id),
+            ) {
                 Ok(Some(session)) => session,
                 Ok(None) => {
-                    tracing::debug!("The focused desktop does not match an enabled reconnect account");
+                    tracing::debug!(
+                        "The focused desktop does not match an enabled reconnect account"
+                    );
                     return;
                 }
                 Err(err) => {
@@ -275,29 +282,17 @@ impl ReturnMonitor {
                     return;
                 }
             };
-            if session.pid != requested_pid || session.title() != requested_title {
-                return;
-            }
-            let recent = |last: &Instant| last.elapsed() < RECONNECT_COOLDOWN;
-            if !attempts
-                .lock()
-                .is_ok_and(|a| !a.get(&session.account_id).is_some_and(recent))
-            {
-                return;
-            }
-            let detection_started = Instant::now();
-            if cancelled() {
-                return;
-            }
-            let observation = macos_lock_screen::observe(session.pid, session.window_id);
-            if observation != LockScreenObservation::Password {
-                tracing::debug!(?observation, "No Windows password screen detected");
-                return;
-            }
-            tracing::debug!(
-                recognition_ms = detection_started.elapsed().as_millis(),
-                "Recognized locked desktop"
-            );
+            let session = match probe.identify_locked(&accounts, &cancelled) {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    tracing::debug!("The active Remote PC has no unique enabled desktop binding");
+                    return;
+                }
+                Err(err) => {
+                    tracing::debug!(reason = %err, "Could not confirm the locked desktop");
+                    return;
+                }
+            };
             // Suppress a fresh RDP window for the same account as well as this
             // exact window. A failed reconnect must never cause a disconnect loop.
             let Ok(mut previous) = attempts.lock() else {
