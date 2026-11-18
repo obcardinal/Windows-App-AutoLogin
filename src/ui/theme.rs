@@ -11,6 +11,9 @@ pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(248, 250, 252);
 pub const STROKE: egui::Color32 = egui::Color32::from_rgb(214, 222, 230);
 
 const INTER_FONT_NAME: &str = "inter";
+const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(238, 246, 252);
+const SECONDARY_IDLE: egui::Color32 = egui::Color32::from_rgb(246, 249, 252);
+const PRIMARY_OUTLINE: egui::Color32 = egui::Color32::from_rgb(43, 109, 166);
 
 fn glass() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 212)
@@ -118,8 +121,8 @@ pub fn apply_toolbar_style(ui: &mut egui::Ui) {
     visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(238, 246, 252);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.hovered.weak_bg_fill = TOOLBAR_HOVER;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, STROKE);
     visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
 }
@@ -210,99 +213,132 @@ pub fn status_text(text: impl Into<String>) -> egui::RichText {
         .line_height(Some(22.0))
 }
 
-pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
-    style_primary_button(egui::Button::new(
+enum ButtonKind {
+    Primary,
+    Secondary(egui::Color32),
+    Danger,
+}
+
+pub struct ActionButton {
+    button: egui::Button<'static>,
+    kind: ButtonKind,
+}
+
+impl ActionButton {
+    fn new(button: egui::Button<'static>, kind: ButtonKind) -> Self {
+        Self {
+            button: button.corner_radius(7).min_size(egui::vec2(0.0, 28.0)),
+            kind,
+        }
+    }
+
+    pub fn wrap_mode(mut self, mode: egui::TextWrapMode) -> Self {
+        self.button = self.button.wrap_mode(mode);
+        self
+    }
+
+    pub fn min_size(mut self, size: egui::Vec2) -> Self {
+        self.button = self.button.min_size(size);
+        self
+    }
+}
+
+impl egui::Widget for ActionButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (idle, hover, active, outline, active_outline) = match self.kind {
+            ButtonKind::Primary => (
+                ACCENT,
+                ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.12),
+                ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.24),
+                PRIMARY_OUTLINE,
+                PRIMARY_OUTLINE,
+            ),
+            ButtonKind::Secondary(idle) => (idle, TOOLBAR_HOVER, ACCENT_SOFT, STROKE, ACCENT),
+            ButtonKind::Danger => (
+                DANGER_SOFT,
+                DANGER_SOFT.lerp_to_gamma(DANGER, 0.12),
+                DANGER_SOFT.lerp_to_gamma(DANGER, 0.24),
+                egui::Color32::from_rgb(235, 177, 177),
+                DANGER,
+            ),
+        };
+        ui.scope(|ui| {
+            let enabled = ui.is_enabled();
+            let widgets = &mut ui.visuals_mut().widgets;
+            for (state, fill, stroke) in [
+                (&mut widgets.inactive, idle, outline),
+                (&mut widgets.hovered, hover, outline),
+                (&mut widgets.active, active, active_outline),
+            ] {
+                state.weak_bg_fill = if enabled { fill } else { idle };
+                state.bg_stroke = egui::Stroke::new(1.0, if enabled { stroke } else { outline });
+                state.expansion = 0.0;
+            }
+            ui.add(self.button)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        })
+        .inner
+    }
+}
+
+pub fn primary_button(text: impl Into<String>) -> ActionButton {
+    let button = egui::Button::new(
         egui::RichText::new(text.into())
             .strong()
             .color(egui::Color32::WHITE),
-    ))
+    );
+    ActionButton::new(button, ButtonKind::Primary)
 }
 
 pub fn primary_button_with_icon(
     text: impl Into<String>,
     icon: egui::Image<'static>,
-) -> egui::Button<'static> {
-    style_primary_button(egui::Button::new((
+) -> ActionButton {
+    let button = egui::Button::new((
         icon.tint(egui::Color32::WHITE),
         egui::RichText::new(text.into())
             .strong()
             .color(egui::Color32::WHITE),
-    )))
-}
-
-fn style_primary_button(button: egui::Button<'static>) -> egui::Button<'static> {
-    button
-        .fill(ACCENT)
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgb(43, 109, 166),
-        ))
-        .corner_radius(egui::CornerRadius::same(7))
-        .min_size(egui::vec2(0.0, 28.0))
+    ));
+    ActionButton::new(button, ButtonKind::Primary)
 }
 
 #[cfg(target_os = "macos")]
 pub fn settings_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.scope(|ui| {
-        if !ui.is_enabled() {
-            return ui.add(secondary_button(label));
-        }
-        apply_toolbar_style(ui);
-        let widgets = &mut ui.visuals_mut().widgets;
-        widgets.inactive.weak_bg_fill = egui::Color32::WHITE;
-        let outline = egui::Stroke::new(1.0, STROKE);
-        widgets.inactive.bg_stroke = outline;
-        widgets.hovered.bg_stroke = outline;
-        for state in [
-            &mut widgets.inactive,
-            &mut widgets.hovered,
-            &mut widgets.active,
-        ] {
-            state.expansion = 0.0;
-        }
-        ui.add(
-            egui::Button::new(egui::RichText::new(label).color(TEXT))
-                .corner_radius(7)
-                .min_size(egui::vec2(0.0, 28.0)),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-    })
-    .inner
+    let idle = if ui.is_enabled() {
+        egui::Color32::WHITE
+    } else {
+        SECONDARY_IDLE
+    };
+    ui.add(ActionButton::new(
+        egui::Button::new(egui::RichText::new(label).color(TEXT)),
+        ButtonKind::Secondary(idle),
+    ))
 }
 
-pub fn secondary_button(text: impl Into<String>) -> egui::Button<'static> {
-    style_secondary_button(egui::Button::new(
-        egui::RichText::new(text.into()).color(TEXT),
-    ))
+pub fn secondary_button(text: impl Into<String>) -> ActionButton {
+    ActionButton::new(
+        egui::Button::new(egui::RichText::new(text.into()).color(TEXT)),
+        ButtonKind::Secondary(SECONDARY_IDLE),
+    )
 }
 
 pub fn secondary_button_with_icon(
     text: impl Into<String>,
     icon: egui::Image<'static>,
-) -> egui::Button<'static> {
-    style_secondary_button(egui::Button::new((
+) -> ActionButton {
+    let button = egui::Button::new((
         icon.tint(TEXT),
         egui::RichText::new(text.into()).color(TEXT),
-    )))
+    ));
+    ActionButton::new(button, ButtonKind::Secondary(SECONDARY_IDLE))
 }
 
-fn style_secondary_button(button: egui::Button<'static>) -> egui::Button<'static> {
-    button
-        .fill(egui::Color32::from_rgb(246, 249, 252))
-        .stroke(egui::Stroke::new(1.0, STROKE))
-        .corner_radius(egui::CornerRadius::same(7))
-        .min_size(egui::vec2(0.0, 28.0))
-}
-
-pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.into()).color(DANGER))
-        .fill(DANGER_SOFT)
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgb(235, 177, 177),
-        ))
-        .corner_radius(egui::CornerRadius::same(7))
-        .min_size(egui::vec2(0.0, 28.0))
+pub fn danger_button(text: impl Into<String>) -> ActionButton {
+    ActionButton::new(
+        egui::Button::new(egui::RichText::new(text.into()).color(DANGER)),
+        ButtonKind::Danger,
+    )
 }
 
 pub fn message_color(msg: &str) -> egui::Color32 {
@@ -311,5 +347,97 @@ pub fn message_color(msg: &str) -> egui::Color32 {
         DANGER
     } else {
         MUTED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_buttons_change_fill_and_preserve_sizing_and_keyboard_activation() {
+        for (label, width, make_button) in [
+            (
+                "Save",
+                104.0,
+                primary_button as fn(&'static str) -> ActionButton,
+            ),
+            ("Cancel", 104.0, secondary_button),
+            ("Delete", 104.0, danger_button),
+            ("Start", 152.0, |label| {
+                primary_button_with_icon(
+                    label,
+                    toolbar_icon(egui::include_image!("../../assets/icons/play.svg")),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend)
+            }),
+            ("Stop", 152.0, |label| {
+                secondary_button_with_icon(
+                    label,
+                    toolbar_icon(egui::include_image!("../../assets/icons/stop.svg")),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend)
+            }),
+        ] {
+            let ctx = egui::Context::default();
+            apply(&ctx);
+            let size = egui::vec2(width, 30.0);
+            let render = |enabled, events| {
+                let mut response = None;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        response = Some(
+                            ui.add_enabled_ui(enabled, |ui| {
+                                ui.add_sized(size, make_button(label).min_size(size))
+                            })
+                            .inner,
+                        );
+                    },
+                );
+                let response = response.unwrap();
+                let frame = output
+                    .shapes
+                    .iter()
+                    .rev()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect) if rect.rect == response.rect => Some(rect),
+                        _ => None,
+                    })
+                    .expect("painted button at its hit target");
+                (response, frame.fill, output.platform_output.cursor_icon)
+            };
+            let (idle, idle_fill, _) = render(true, vec![]);
+            assert_eq!(idle.rect.size(), size, "{label}");
+            let position = egui::pos2(idle.rect.right() - 1.0, idle.rect.center().y);
+            let hover = egui::Event::PointerMoved(position);
+            let (hovered, hover_fill, cursor) = render(true, vec![hover.clone()]);
+            assert_eq!(hovered.rect, idle.rect);
+            assert_ne!(hover_fill, idle_fill);
+            assert_eq!(cursor, egui::CursorIcon::PointingHand);
+            let (disabled, disabled_fill, cursor) = render(false, vec![hover]);
+            assert!(!disabled.enabled());
+            assert_ne!(cursor, egui::CursorIcon::PointingHand);
+            let outside = egui::Event::PointerMoved(position + egui::vec2(20.0, 0.0));
+            assert_eq!(render(false, vec![outside]).1, disabled_fill);
+            let (enabled, _, _) = render(true, vec![]);
+            enabled.request_focus();
+            let (focused, active_fill, _) = render(true, vec![]);
+            assert!(focused.has_focus());
+            assert_ne!(active_fill, hover_fill);
+            assert_ne!(active_fill, idle_fill);
+            assert_eq!(focused.rect, idle.rect);
+            let enter = egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            assert!(render(true, vec![enter]).0.clicked());
+        }
     }
 }
