@@ -41,19 +41,17 @@ const ACCOUNT_TOGGLE_JOB_DISCONNECTED_REASON: &str =
 const ACCOUNT_TRANSACTION_IN_PROGRESS_REASON: &str =
     "Wait for the current account or settings update to finish.";
 
-const STATE_COLUMN_WIDTH: f32 = 72.0;
+const STATE_COLUMN_WIDTH: f32 = 68.0;
 const TABLE_SPACING: f32 = 8.0;
-const EDIT_BUTTON_WIDTH: f32 = 40.0;
-const DELETE_BUTTON_WIDTH: f32 = 40.0;
-const ROW_BUTTON_HEIGHT: f32 = 30.0;
-const ACTIONS_COLUMN_WIDTH: f32 = EDIT_BUTTON_WIDTH + TABLE_SPACING + DELETE_BUTTON_WIDTH;
-const ACCOUNT_ROW_HEIGHT: f32 = 36.0;
+const ACTION_BUTTON_SIZE: f32 = 30.0;
+const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 2.0 + TABLE_SPACING;
+const ACCOUNT_ROW_HEIGHT: f32 = 49.0;
 const ACCOUNT_EDITOR_WIDTH: f32 = 430.0;
 const ACCOUNT_EDITOR_LABEL_WIDTH: f32 = 82.0;
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
 const ACCOUNT_EDITOR_CONTROL_HEIGHT: f32 = 28.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
-const ACTION_ICON_SIZE: f32 = 17.0;
+const ACTION_ICON_SIZE: f32 = 16.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
 const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
 const PASSWORD_EDITOR_MAX_BYTES: usize = 4096;
@@ -62,7 +60,7 @@ const ACCOUNT_TOGGLE_BURST_MAX_COALESCE_PERIOD: Duration = Duration::from_millis
 const ACCOUNT_TOGGLE_START_RETRY_DELAY: Duration = Duration::from_secs(1);
 const ACCOUNT_TOGGLE_INTENT_QUEUE_CAPACITY: usize = 16;
 const PENCIL_ICON: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
-const TRASH_ICON: &[u8] = include_bytes!("../../assets/icons/trash.svg");
+const REMOVE_ACCOUNT_ICON: &[u8] = include_bytes!("../../assets/icons/x.svg");
 const EYE_ICON: &[u8] = include_bytes!("../../assets/icons/eye.svg");
 const EYE_OFF_ICON: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
 
@@ -75,8 +73,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let launch_controls_enabled = !modal_open && availability.launch_controls_ready;
     let projected_enabled_states = projected_account_enabled_states(app);
 
-    let account_count = app.config.accounts.len();
-    let add_account = show_accounts_page_header(ui, account_count, launch_controls_enabled);
+    let add_account = show_accounts_page_header(ui, launch_controls_enabled);
     if with_transaction_disabled_reason(add_account, launch_controls_disabled_reason(&availability))
         .clicked()
     {
@@ -84,12 +81,28 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     }
 
     if app.config.accounts.is_empty() {
-        theme::glass_frame().show(ui, |ui| {
+        theme::compact_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
-                ui.heading("No accounts yet");
-                ui.label(theme::muted(
-                    "Add an email and password to start monitoring.",
-                ));
+                ui.add_space(18.0);
+                let (tile, _) =
+                    ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::hover());
+                ui.painter().rect_filled(tile, 12, theme::ACCENT_SOFT);
+                egui::Image::new(egui::include_image!("../../assets/icons/users.svg"))
+                    .tint(theme::ACCENT)
+                    .paint_at(ui, tile.shrink(10.0));
+                ui.label(
+                    egui::RichText::new("No accounts yet")
+                        .size(17.0)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new("Add an account to fill matching sign-in prompts.")
+                        .size(13.0)
+                        .color(theme::MUTED),
+                );
+                ui.add_space(18.0);
             });
         });
     } else {
@@ -113,9 +126,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
                                 ui,
                                 account,
                                 displayed_enabled,
-                                toggle_controls_enabled,
-                                launch_controls_enabled,
-                                launch_controls_disabled_reason(&availability),
+                                AccountRowControls {
+                                    toggle: toggle_controls_enabled,
+                                    edit: launch_controls_enabled,
+                                    delete: launch_controls_enabled,
+                                    edit_disabled_reason: launch_controls_disabled_reason(&availability),
+                                },
                                 &mut row_actions,
                             );
                         });
@@ -1860,43 +1876,43 @@ fn storage_prepare_failure_status(
     }
 }
 
-fn show_accounts_page_header(
-    ui: &mut egui::Ui,
-    account_count: usize,
-    controls_enabled: bool,
-) -> egui::Response {
-    ui.add_space(2.0);
-    let response = ui
-        .horizontal(|ui| {
-            ui.set_min_height(34.0);
-            ui.label(
-                egui::RichText::new("Accounts")
-                    .size(20.0)
-                    .strong()
-                    .color(theme::TEXT),
-            );
-            ui.label(
-                egui::RichText::new(format!("· {account_count}"))
-                    .size(15.0)
-                    .color(theme::MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
-                ui.add_enabled(
-                    controls_enabled,
-                    theme::primary_button_with_icon(
-                        "Add Account",
-                        theme::toolbar_icon(egui::include_image!("../../assets/icons/plus.svg")),
-                    )
-                    .wrap_mode(egui::TextWrapMode::Extend)
-                    .min_size(egui::vec2(144.0, 32.0)),
-                )
-            })
-            .inner
-        })
-        .inner;
-    ui.add_space(10.0);
+fn show_accounts_page_header(ui: &mut egui::Ui, controls_enabled: bool) -> egui::Response {
+    let response = theme::tab_heading(ui, "Accounts", |ui| {
+        ui.add_enabled(controls_enabled, add_account_button)
+    });
+    ui.add_space(6.0);
     response
+}
+
+pub(super) fn add_account_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(34.0), egui::Sense::click());
+    let label = "Add Account";
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
+    if ui.is_rect_visible(rect) {
+        let shade = if response.is_pointer_button_down_on() {
+            0.22
+        } else if response.hovered() || response.highlighted() {
+            0.10
+        } else {
+            0.0
+        };
+        let fill = theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, shade);
+        let center = rect.center();
+        let painter = ui.painter();
+        painter.circle_filled(center, 15.0, fill);
+        egui::Image::new(egui::include_image!("../../assets/icons/plus.svg")).paint_at(
+            ui,
+            egui::Rect::from_center_size(center, egui::Vec2::splat(20.0)),
+        );
+        if response.has_focus() {
+            painter.circle_stroke(center, 16.5, egui::Stroke::new(1.0, theme::TEXT));
+        }
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(label)
 }
 
 struct AccountColumns {
@@ -1906,13 +1922,13 @@ struct AccountColumns {
 }
 
 fn show_accounts_header(ui: &mut egui::Ui) {
-    show_table_row(ui, 22.0, |ui, cells| {
+    show_table_row(ui, 27.0, |ui, cells| {
         show_cell(
             ui,
             cells.email,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(table_header_text("Account"));
+                ui.label(theme::section_label("EMAIL ADDRESS"));
             },
         );
         show_cell(
@@ -1922,7 +1938,7 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             |ui| {
                 ui.add_sized(
                     [ui.available_width(), 22.0],
-                    egui::Label::new(table_header_text("Enabled")).halign(egui::Align::Center),
+                    egui::Label::new(theme::section_label("ENABLED")).halign(egui::Align::Center),
                 );
             },
         );
@@ -1933,18 +1949,11 @@ fn show_accounts_header(ui: &mut egui::Ui) {
             |ui| {
                 ui.add_sized(
                     [ui.available_width(), 22.0],
-                    egui::Label::new(table_header_text("Actions")).halign(egui::Align::Center),
+                    egui::Label::new(theme::section_label("ACTIONS")).halign(egui::Align::Center),
                 );
             },
         );
     });
-}
-
-fn table_header_text(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text)
-        .size(13.0)
-        .color(theme::MUTED)
-        .line_height(Some(19.0))
 }
 
 #[derive(Default)]
@@ -1954,13 +1963,19 @@ struct AccountRowActions {
     confirm_delete_account: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct AccountRowControls<'a> {
+    toggle: bool,
+    edit: bool,
+    delete: bool,
+    edit_disabled_reason: Option<&'a str>,
+}
+
 fn show_account_row(
     ui: &mut egui::Ui,
     account: &Account,
     displayed_enabled: bool,
-    toggle_enabled: bool,
-    transaction_actions_enabled: bool,
-    transaction_disabled_reason: Option<&str>,
+    controls: AccountRowControls<'_>,
     actions: &mut AccountRowActions,
 ) {
     show_table_row(ui, ACCOUNT_ROW_HEIGHT, |ui, cells| {
@@ -1970,16 +1985,16 @@ fn show_account_row(
             cells.email,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                if email.is_empty() {
-                    ui.label(theme::muted("Missing email"));
+                account_monogram(ui, account);
+                let (name, color) = if email.is_empty() {
+                    ("Missing email", theme::MUTED)
                 } else {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(email).color(theme::TEXT))
-                            .halign(egui::Align::LEFT)
-                            .truncate(),
-                    )
-                    .on_hover_text(email);
-                }
+                    (email, theme::TEXT)
+                };
+                ui.add(
+                    egui::Label::new(egui::RichText::new(name).size(14.0).color(color)).truncate(),
+                )
+                .on_hover_text(name);
             },
         );
 
@@ -1989,9 +2004,9 @@ fn show_account_row(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let mut enabled = displayed_enabled;
-                ui.add_space(((ui.available_width() - 40.0) / 2.0).max(0.0));
+                ui.add_space((STATE_COLUMN_WIDTH - 40.0) / 2.0);
                 let response = ui
-                    .add_enabled_ui(toggle_enabled, |ui| {
+                    .add_enabled_ui(controls.toggle, |ui| {
                         crate::ui::toggle::switch(
                             ui,
                             &mut enabled,
@@ -2011,22 +2026,18 @@ fn show_account_row(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 if with_transaction_disabled_reason(
-                    account_action_button(ui, AccountActionIcon::Edit, transaction_actions_enabled)
+                    account_action_button(ui, AccountActionIcon::Edit, controls.edit)
                         .on_hover_text("Edit account"),
-                    transaction_disabled_reason,
+                    controls.edit_disabled_reason,
                 )
                 .clicked()
                 {
                     actions.edit_account = Some(account.clone());
                 }
                 if with_transaction_disabled_reason(
-                    account_action_button(
-                        ui,
-                        AccountActionIcon::Delete,
-                        transaction_actions_enabled,
-                    )
-                    .on_hover_text("Delete account"),
-                    transaction_disabled_reason,
+                    account_action_button(ui, AccountActionIcon::Delete, controls.delete)
+                        .on_hover_text("Delete account"),
+                    controls.edit_disabled_reason,
                 )
                 .clicked()
                 {
@@ -2037,8 +2048,75 @@ fn show_account_row(
     });
 }
 
-fn table_spacing() -> f32 {
-    TABLE_SPACING
+fn account_initials(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or_default();
+    let mut words = local
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty());
+    let Some(first_word) = words.next() else {
+        return String::new();
+    };
+    let mut letters = first_word.chars();
+    let first = letters.next();
+    let second = words
+        .next()
+        .and_then(|word| word.chars().next())
+        .or_else(|| letters.next());
+    first
+        .into_iter()
+        .chain(second)
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn account_monogram(ui: &mut egui::Ui, account: &Account) {
+    use egui::Color32;
+    const SWATCHES: [(Color32, Color32); 5] = [
+        (
+            Color32::from_rgb(232, 238, 255),
+            Color32::from_rgb(65, 84, 155),
+        ),
+        (
+            Color32::from_rgb(221, 241, 235),
+            Color32::from_rgb(43, 107, 88),
+        ),
+        (
+            Color32::from_rgb(242, 231, 251),
+            Color32::from_rgb(122, 76, 147),
+        ),
+        (
+            Color32::from_rgb(251, 234, 219),
+            Color32::from_rgb(142, 86, 48),
+        ),
+        (
+            Color32::from_rgb(224, 240, 248),
+            Color32::from_rgb(39, 100, 130),
+        ),
+    ];
+    let (tile, _) = ui.allocate_exact_size(egui::vec2(31.0, 31.0), egui::Sense::hover());
+    if !ui.is_rect_visible(tile) {
+        return;
+    }
+    let initials = account_initials(&account.username);
+    let palette_index = account
+        .id
+        .bytes()
+        .fold(0usize, |sum, byte| sum.wrapping_add(byte as usize));
+    let (fill, ink) = SWATCHES[palette_index % SWATCHES.len()];
+    ui.painter().rect_filled(tile, 9, fill);
+    if initials.is_empty() {
+        egui::Image::new(egui::include_image!("../../assets/icons/users.svg"))
+            .tint(ink)
+            .paint_at(ui, tile.shrink(7.0));
+    } else {
+        ui.painter().text(
+            tile.center(),
+            egui::Align2::CENTER_CENTER,
+            initials,
+            egui::FontId::proportional(12.0),
+            ink,
+        );
+    }
 }
 
 struct AccountCellRects {
@@ -2055,7 +2133,7 @@ fn show_table_row(
     let width = ui.available_width();
     let (row_rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let columns = account_columns(width);
-    let spacing = table_spacing();
+    let spacing = TABLE_SPACING;
 
     let email = egui::Rect::from_min_size(row_rect.min, egui::vec2(columns.email, height));
     let state = egui::Rect::from_min_size(
@@ -2083,17 +2161,17 @@ fn show_cell(
     layout: egui::Layout,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    ui.scope_builder(
-        egui::UiBuilder::new().max_rect(rect).layout(layout),
-        add_contents,
-    );
+    // The row already reserved its full height. Cell contents must not move
+    // the table cursor back to the bottom of a shorter, centered control.
+    let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    add_contents(&mut cell);
 }
 
 fn account_columns(width: f32) -> AccountColumns {
-    let spacing = table_spacing() * 2.0;
+    let spacing = TABLE_SPACING * 2.0;
     let fixed_width = STATE_COLUMN_WIDTH + ACTIONS_COLUMN_WIDTH + spacing;
     AccountColumns {
-        email: (width - fixed_width).max(120.0),
+        email: (width - fixed_width).max(0.0),
         state: STATE_COLUMN_WIDTH,
         actions: ACTIONS_COLUMN_WIDTH,
     }
@@ -2670,54 +2748,62 @@ fn account_action_button(
     icon: AccountActionIcon,
     enabled: bool,
 ) -> egui::Response {
-    let (width, bytes_uri, icon_bytes, icon_color, label) = match icon {
+    let (uri, bytes, label, accent, soft) = match icon {
         AccountActionIcon::Edit => (
-            EDIT_BUTTON_WIDTH,
             "bytes://icons/pencil.svg",
             PENCIL_ICON,
-            theme::TEXT,
             "Edit account",
+            theme::ACCENT,
+            theme::ACCENT_SOFT,
         ),
         AccountActionIcon::Delete => (
-            DELETE_BUTTON_WIDTH,
-            "bytes://icons/trash.svg",
-            TRASH_ICON,
-            theme::DANGER,
+            "bytes://icons/x.svg",
+            REMOVE_ACCOUNT_ICON,
             "Delete account",
+            theme::DANGER,
+            theme::DANGER_SOFT,
         ),
     };
-    let icon_color = if enabled {
-        icon_color
-    } else {
-        theme::MUTED.linear_multiply(0.55)
-    };
-    let response = ui
-        .scope(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-            let widgets = &mut ui.visuals_mut().widgets;
-            widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(248, 250, 252);
-            widgets.inactive.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(225, 232, 238));
-            if matches!(icon, AccountActionIcon::Delete) {
-                widgets.hovered.weak_bg_fill = theme::DANGER_SOFT;
-                widgets.active.weak_bg_fill = theme::DANGER_SOFT;
-                widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme::DANGER);
-                widgets.active.bg_stroke = egui::Stroke::new(1.0, theme::DANGER);
+    let response = ui.add_enabled(enabled, |ui: &mut egui::Ui| {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(ACTION_BUTTON_SIZE), egui::Sense::click());
+        let hovered = response.hover_pos().is_some_and(|pos| rect.contains(pos));
+        if ui.is_rect_visible(rect) {
+            let focused = response.enabled() && response.has_focus();
+            let hover = ui.ctx().animate_bool_responsive(
+                response.id,
+                response.enabled() && (hovered || response.highlighted() || focused),
+            );
+            let (fill, tint) = if response.is_pointer_button_down_on() {
+                (soft.lerp_to_gamma(accent, 0.16), accent)
+            } else {
+                (
+                    soft.gamma_multiply(hover),
+                    theme::MUTED.lerp_to_gamma(accent, hover),
+                )
+            };
+            ui.painter().rect_filled(rect, 7, fill);
+            if focused {
+                ui.painter().rect_stroke(
+                    rect,
+                    7,
+                    egui::Stroke::new(1.5, accent),
+                    egui::StrokeKind::Inside,
+                );
             }
-            ui.add_enabled(
-                enabled,
-                egui::Button::image(svg_icon(
-                    bytes_uri,
-                    icon_bytes,
-                    ACTION_ICON_SIZE,
-                    icon_color,
-                ))
-                .corner_radius(egui::CornerRadius::same(7))
-                .min_size(egui::vec2(width, ROW_BUTTON_HEIGHT)),
-            )
-        })
-        .inner;
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+            let icon_rect =
+                egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(ACTION_ICON_SIZE));
+            svg_icon(uri, bytes, ACTION_ICON_SIZE, tint).paint_at(ui, icon_rect);
+        }
+        if hovered {
+            response.on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            response
+        }
+    });
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
     response
 }
 
@@ -3659,8 +3745,52 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::channel as tokio_channel;
 
+    #[test]
+    fn account_initials_use_the_next_word_or_the_second_character() {
+        for (email, expected) in [
+            ("obrien@example.test", "OB"),
+            ("olivia.brooks@example.test", "OB"),
+            ("amy--rose_lee@example.test", "AR"),
+            (" élise@example.test ", "ÉL"),
+            ("o@example.test", "O"),
+            ("@example.test", ""),
+        ] {
+            assert_eq!(super::account_initials(email), expected);
+        }
+    }
+
     fn account_test_app(config: AppConfig) -> AutoLoginApp {
         account_test_app_with_mode(config, false)
+    }
+
+    #[test]
+    fn action_hover_starts_at_the_edge_of_the_painted_button() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let mut rect = egui::Rect::NOTHING;
+        let mut render = |pos: Option<egui::Pos2>| {
+            let input = egui::RawInput {
+                events: pos.into_iter().map(egui::Event::PointerMoved).collect(),
+                ..Default::default()
+            };
+            let frame = ctx.run_ui(input, |ui| {
+                ui.add_space(12.0);
+                rect = super::account_action_button(ui, super::AccountActionIcon::Edit, true).rect;
+            });
+            (rect, frame)
+        };
+        let (button, _) = render(None);
+        assert_eq!(button.size(), egui::Vec2::splat(30.0));
+        for (offset, expected_hover) in [(-0.25, true), (0.25, false)] {
+            let (_, frame) = render(Some(button.right_center() + egui::vec2(offset, 0.0)));
+            let painted = frame.shapes.iter().any(|item| {
+                matches!(&item.shape,
+                egui::Shape::Rect(shape) if shape.fill == crate::ui::theme::ACCENT_SOFT
+                    && shape.rect == button)
+            });
+            assert_eq!(painted, expected_hover);
+        }
     }
 
     fn account_test_app_with_mode(config: AppConfig, settings_window_mode: bool) -> AutoLoginApp {
