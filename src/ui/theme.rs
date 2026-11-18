@@ -1,3 +1,4 @@
+use crate::models::MonitorControlState;
 use eframe::egui;
 use std::sync::Arc;
 
@@ -258,11 +259,6 @@ impl ActionButton {
         }
     }
 
-    pub fn wrap_mode(mut self, mode: egui::TextWrapMode) -> Self {
-        self.button = self.button.wrap_mode(mode);
-        self
-    }
-
     pub fn min_size(mut self, size: egui::Vec2) -> Self {
         self.button = self.button.min_size(size);
         self
@@ -322,19 +318,6 @@ pub fn primary_button(text: impl Into<String>) -> ActionButton {
     ActionButton::new(button, ButtonKind::Primary)
 }
 
-pub fn primary_button_with_icon(
-    text: impl Into<String>,
-    icon: egui::Image<'static>,
-) -> ActionButton {
-    let button = egui::Button::new((
-        icon.tint(egui::Color32::WHITE),
-        egui::RichText::new(text.into())
-            .strong()
-            .color(egui::Color32::WHITE),
-    ));
-    ActionButton::new(button, ButtonKind::Primary)
-}
-
 #[cfg(target_os = "macos")]
 pub fn settings_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(secondary_button(label))
@@ -347,15 +330,49 @@ pub fn secondary_button(text: impl Into<String>) -> ActionButton {
     )
 }
 
-pub fn secondary_button_with_icon(
-    text: impl Into<String>,
-    icon: egui::Image<'static>,
-) -> ActionButton {
-    let button = egui::Button::new((
-        icon.tint(TEXT),
-        egui::RichText::new(text.into()).color(TEXT),
-    ));
-    ActionButton::new(button, ButtonKind::Secondary)
+pub fn monitor_button(state: MonitorControlState) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(72.0, 28.0), egui::Sense::click());
+        let fill = if response.is_pointer_button_down_on() {
+            STROKE
+        } else if response.hovered() || response.highlighted() {
+            TOOLBAR_HOVER
+        } else {
+            TAB_RAIL
+        };
+        let outline = if response.has_focus() {
+            egui::Stroke::new(1.0, ACCENT)
+        } else {
+            egui::Stroke::NONE
+        };
+        ui.painter()
+            .rect(rect, 8, fill, outline, egui::StrokeKind::Inside);
+        let (label, icon) = if state.toggle_requests_stop() {
+            ("Stop", egui::include_image!("../../assets/icons/stop.svg"))
+        } else {
+            ("Start", egui::include_image!("../../assets/icons/play.svg"))
+        };
+        let icon_rect = egui::Rect::from_center_size(
+            rect.left_center() + egui::vec2(18.0, 0.0),
+            egui::Vec2::splat(16.0),
+        );
+        toolbar_icon(icon).tint(MUTED).paint_at(ui, icon_rect);
+        ui.painter().text(
+            icon_rect.right_center() + egui::vec2(6.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::TextStyle::Button.resolve(ui.style()),
+            MUTED,
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                response.enabled(),
+                state.toggle_label(),
+            )
+        });
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
 }
 
 pub fn danger_button(text: impl Into<String>) -> ActionButton {
@@ -380,32 +397,14 @@ mod tests {
 
     #[test]
     fn action_buttons_change_fill_and_preserve_sizing_and_keyboard_activation() {
-        for (label, width, make_button) in [
-            (
-                "Save",
-                104.0,
-                primary_button as fn(&'static str) -> ActionButton,
-            ),
-            ("Cancel", 104.0, secondary_button),
-            ("Delete", 104.0, danger_button),
-            ("Start", 152.0, |label| {
-                primary_button_with_icon(
-                    label,
-                    toolbar_icon(egui::include_image!("../../assets/icons/play.svg")),
-                )
-                .wrap_mode(egui::TextWrapMode::Extend)
-            }),
-            ("Stop", 152.0, |label| {
-                secondary_button_with_icon(
-                    label,
-                    toolbar_icon(egui::include_image!("../../assets/icons/stop.svg")),
-                )
-                .wrap_mode(egui::TextWrapMode::Extend)
-            }),
+        for (label, make_button) in [
+            ("Save", primary_button as fn(&'static str) -> ActionButton),
+            ("Cancel", secondary_button),
+            ("Delete", danger_button),
         ] {
             let ctx = egui::Context::default();
             apply(&ctx);
-            let size = egui::vec2(width, 30.0);
+            let size = egui::vec2(104.0, 30.0);
             let render = |enabled, events| {
                 let mut response = None;
                 let output = ctx.run_ui(
@@ -435,7 +434,7 @@ mod tests {
                 (response, frame.fill, output.platform_output.cursor_icon)
             };
             let (idle, idle_fill, _) = render(true, vec![]);
-            assert_eq!(idle.rect.size(), size, "{label}");
+            assert_eq!(idle.rect.size(), size);
             let position = egui::pos2(idle.rect.right() - 1.0, idle.rect.center().y);
             let hover = egui::Event::PointerMoved(position);
             let (hovered, hover_fill, cursor) = render(true, vec![hover.clone()]);
@@ -462,6 +461,127 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             };
             assert!(render(true, vec![enter]).0.clicked());
+        }
+    }
+
+    #[test]
+    fn icon_actions_keep_their_painted_contents_and_hit_target_still() {
+        #[derive(Debug, PartialEq)]
+        struct ButtonFrame {
+            geometry: [egui::Rect; 3],
+            text: Option<egui::Rect>,
+            fill: egui::Color32,
+            clicked: bool,
+        }
+
+        let mut monitor_geometry = None;
+        for (label, monitor_state) in [
+            ("Add Account", None),
+            ("Stop", Some(MonitorControlState::Running)),
+            ("Start", Some(MonitorControlState::Stopped)),
+            ("Stop", Some(MonitorControlState::PausedWithStartIntent)),
+        ] {
+            let ctx = egui::Context::default();
+            apply(&ctx);
+            let render = |enabled, events| {
+                let mut response = None;
+                let input = egui::RawInput {
+                    system_theme: Some(egui::Theme::Light),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 80.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        response = Some(match monitor_state {
+                            Some(state) => ui.add_enabled(enabled, monitor_button(state)),
+                            None => {
+                                ui.add_enabled(enabled, crate::ui::accounts::add_account_button)
+                            }
+                        });
+                    });
+                });
+                let response = response.unwrap();
+                let mut background = None;
+                let mut icon = None;
+                let mut text = None;
+                for clipped in &output.shapes {
+                    match &clipped.shape {
+                        egui::Shape::Rect(shape) if shape.brush.is_some() => {
+                            icon = Some(shape.rect)
+                        }
+                        egui::Shape::Rect(shape) if shape.fill != egui::Color32::TRANSPARENT => {
+                            background = Some((shape.rect, shape.fill));
+                        }
+                        egui::Shape::Circle(shape) if shape.fill != egui::Color32::TRANSPARENT => {
+                            background = Some((shape.visual_bounding_rect(), shape.fill));
+                        }
+                        egui::Shape::Text(shape) if shape.galley.text() == label => {
+                            text = Some(shape.visual_bounding_rect());
+                        }
+                        _ => {}
+                    }
+                }
+                let (background, fill) = background.expect("painted button background");
+                let geometry = [
+                    response.interact_rect,
+                    background,
+                    icon.expect("painted icon"),
+                ];
+                ButtonFrame {
+                    geometry,
+                    text,
+                    fill,
+                    clicked: response.clicked(),
+                }
+            };
+
+            let initial = render(true, vec![]);
+            let [hit, background, icon] = initial.geometry;
+            assert!(background.contains_rect(icon));
+            if monitor_state.is_some() {
+                let text = initial.text.expect("painted monitor label");
+                assert!(background.contains_rect(text) && icon.right() <= text.left());
+                assert_eq!(hit.size(), egui::vec2(72.0, 28.0));
+                assert_eq!(
+                    *monitor_geometry.get_or_insert(initial.geometry),
+                    initial.geometry
+                );
+            } else {
+                assert!(initial.text.is_none());
+                assert_eq!(background.center(), icon.center());
+            }
+            let edge = egui::pos2(hit.right() - 1.0, hit.center().y);
+            let button = |pressed| egui::Event::PointerButton {
+                pos: edge,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let hover = render(true, vec![egui::Event::PointerMoved(edge)]);
+            let press = render(true, vec![button(true)]);
+            let release = render(true, vec![button(false)]);
+            let leave = render(true, vec![egui::Event::PointerMoved(egui::pos2(4.0, 4.0))]);
+            for state in [&hover, &press, &release, &leave] {
+                assert_eq!(
+                    state.geometry, initial.geometry,
+                    "{label} moved during interaction"
+                );
+                assert_eq!(state.text, initial.text);
+            }
+            assert_ne!(initial.fill, hover.fill);
+            assert_ne!(hover.fill, press.fill);
+            assert_eq!(release.fill, hover.fill);
+            assert_eq!(leave.fill, initial.fill);
+            assert!(!hover.clicked && !press.clicked && release.clicked && !leave.clicked);
+            let disabled = render(false, vec![]);
+            for event in [egui::Event::PointerMoved(edge), button(true), button(false)] {
+                assert_eq!(render(false, vec![event]), disabled);
+            }
+            assert!(!disabled.clicked);
         }
     }
 }

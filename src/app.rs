@@ -2624,32 +2624,14 @@ fn push_bounded_log(logs: &mut VecDeque<LogEntry>, mut entry: LogEntry) {
 
 fn show_monitor_control(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     let state = app.monitor_control_state();
-    let button = if state.toggle_requests_stop() {
-        theme::secondary_button_with_icon(
-            state.toggle_label(),
-            theme::toolbar_icon(egui::include_image!("../assets/icons/stop.svg")),
-        )
-    } else {
-        theme::primary_button_with_icon(
-            state.toggle_label(),
-            theme::toolbar_icon(egui::include_image!("../assets/icons/play.svg")),
-        )
-    };
-    if ui
-        .scope(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(12.0, 4.0);
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add(
-                button
-                    .wrap_mode(egui::TextWrapMode::Extend)
-                    .min_size(egui::vec2(152.0, 30.0)),
-            )
-        })
-        .inner
-        .clicked()
-    {
+    if ui.add(theme::monitor_button(state)).clicked() {
         app.toggle_monitor_from_ui(ui.ctx());
     }
+    ui.label(
+        egui::RichText::new("Monitor:")
+            .size(13.0)
+            .color(theme::MUTED),
+    );
 }
 
 fn show_accessibility_onboarding(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
@@ -5175,7 +5157,8 @@ mod tests {
 
         assert!(rendered_text.contains(ACCESSIBILITY_SETTINGS_INSTRUCTIONS));
         assert!(rendered_text.contains("Windows App AutoLogin"));
-        assert!(rendered_text.contains("Start Monitor"));
+        assert!(rendered_text.contains("Monitor:"));
+        assert!(rendered_text.contains("Start"));
         assert!(rendered_text.contains("Request Accessibility Access"));
         assert!(rendered_text.contains("Open Accessibility Settings"));
         assert!(!rendered_text_lowercase.contains("exact app bundle"));
