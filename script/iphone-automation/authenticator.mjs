@@ -81,6 +81,15 @@ async function unlocked(session) {
   if (await session.execute('mobile: isLocked') !== false) throw failure('phone_locked');
 }
 
+async function readFieldValue(session, field, layout) {
+  const value = await session.request('GET', `/element/${field}/attribute/value`);
+  // UIKit can expose an untouched field as null on some layouts.
+  if (value === null ? !layout.empty_values.includes(null) : typeof value !== 'string' || value.length > 128) {
+    throw failure('invalid_device_response');
+  }
+  return value;
+}
+
 /** Reads only the specific account/challenge controls; never requests page source. */
 export async function observeNumberMatch(session, layout, account) {
   requireLayout(layout);
@@ -111,14 +120,9 @@ export async function observeNumberMatch(session, layout, account) {
     throw failure('ambiguous_authenticator_screen');
   }
   const [value, enabled] = await Promise.all([
-    session.request('GET', `/element/${fields[0]}/attribute/value`),
+    readFieldValue(session, fields[0], layout),
     session.request('GET', `/element/${buttons[0]}/enabled`),
   ]);
-  // UIKit can expose an untouched field as null. Accept that only when the
-  // observed profile explicitly identifies it as an empty-field value.
-  if (value === null ? !layout.empty_values.includes(null) : typeof value !== 'string' || value.length > 128) {
-    throw failure('invalid_device_response');
-  }
   if (typeof enabled !== 'boolean') throw failure('invalid_device_response');
   return { kind: 'number_match', field: fields[0], submit: buttons[0], submitEnabled: enabled, value };
 }
@@ -180,13 +184,13 @@ export async function assistNumberMatch({ session, layout, request, authorize, o
   onStatus('entering_number');
   await session.request('POST', `/element/${beforeWrite.field}/value`, { text: request.number });
   current();
-  const afterWrite = await observeNumberMatch(session, layout, request.account);
+  const writtenValue = await readFieldValue(session, beforeWrite.field, layout);
   current();
-  if (!sameControls(beforeWrite, afterWrite) || afterWrite.value !== request.number) throw failure('number_entry_unconfirmed');
+  if (writtenValue !== request.number) throw failure('number_entry_unconfirmed');
   const submitPermit = await permit('submit_number');
   const beforeSubmit = await observeNumberMatch(session, layout, request.account);
   current();
-  if (!sameControls(afterWrite, beforeSubmit) || beforeSubmit.value !== request.number || !beforeSubmit.submitEnabled) {
+  if (!sameControls(beforeWrite, beforeSubmit) || beforeSubmit.value !== request.number || !beforeSubmit.submitEnabled) {
     throw failure('screen_changed');
   }
   freshPermit(submitPermit);

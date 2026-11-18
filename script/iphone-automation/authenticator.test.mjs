@@ -18,7 +18,7 @@ function fixture() {
   const session = {
     execute: async (script, args) => {
       state.scripts.push(script);
-      state.beforeRead?.();
+      state.beforeRead?.('execute', script);
       if (script === 'mobile: isLocked') return state.locked;
       if (script === 'mobile: activeAppInfo') return { bundleId: state.activeBundle };
       assert.equal(script, 'mobile: launchApp');
@@ -26,7 +26,7 @@ function fixture() {
       state.mutations.push('open');
     },
     request: async (method, route, body) => {
-      state.beforeRead?.();
+      state.beforeRead?.(method, route);
       if (route === '/elements') {
         assert.equal(method, 'POST');
         assert.equal(body.using, '-ios predicate string');
@@ -153,6 +153,47 @@ test('preexisting text and unconfirmed input are never submitted', async () => {
   second.state.alterWrittenValue = true;
   await assert.rejects(second.run(), { code: 'number_entry_unconfirmed' });
   assert.equal(second.state.clicks, 0);
+});
+
+test('only the written field is read back before requesting the submit permit', async () => {
+  const { state, run } = fixture();
+  const reads = [];
+  state.beforeRead = (method, route) => {
+    if (state.writes === 1 && !state.permits.includes('submit_number')) reads.push([method, route]);
+  };
+  await run();
+  assert.deepEqual(reads, [['GET', '/element/number-field/attribute/value']]);
+});
+
+test('a stale field during readback stops before the submit permit', async () => {
+  const { state, run } = fixture();
+  state.beforeRead = (method, route) => {
+    if (state.writes && method === 'GET' && route === '/element/number-field/attribute/value') {
+      throw new AutomationError('screen_changed', 'stale field');
+    }
+  };
+  await assert.rejects(run(), { code: 'screen_changed' });
+  assert.deepEqual(state.permits, ['open_authenticator', 'enter_number']);
+  assert.deepEqual(state.mutations, ['open', 'write']);
+});
+
+test('readback rejects a malformed field value before the submit permit', async () => {
+  const { state, run } = fixture();
+  state.beforeRead = () => { if (state.writes) state.value = 42; };
+  await assert.rejects(run(), { code: 'invalid_device_response' });
+  assert.deepEqual(state.permits, ['open_authenticator', 'enter_number']);
+  assert.deepEqual(state.mutations, ['open', 'write']);
+});
+
+test('final verification rejects replacement controls even with the same number', async () => {
+  for (const replacement of [{ field: 'new-field' }, { submit: 'new-button' }]) {
+    const { state, run } = fixture();
+    state.onPermit = action => {
+      if (action === 'submit_number') Object.assign(state, replacement);
+    };
+    await assert.rejects(run(), { code: 'screen_changed' });
+    assert.deepEqual(state.mutations, ['open', 'write']);
+  }
 });
 
 test('a null empty-field value requires an observed profile and becomes the exact number after entry', async () => {
