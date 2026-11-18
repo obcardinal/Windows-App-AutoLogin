@@ -3,8 +3,11 @@
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <Vision/Vision.h>
+#include "macos_guest_viewport.h"
 #include "macos_masked_field.h"
 
+#import <ApplicationServices/ApplicationServices.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -49,6 +52,127 @@ static bool isFrontmost(pid_t pid) {
     return app.processIdentifier == pid && [app.bundleIdentifier isEqualToString:@"com.microsoft.rdc.macos"];
 }
 
+static CGImageRef copyDetail(CGImageRef source, CGRect pixels, double scale);
+
+typedef struct { CGRect window, viewport; } GuestViewport;
+
+static bool validRect(CGRect r) {
+    return isfinite(r.origin.x) && isfinite(r.origin.y) && isfinite(r.size.width) &&
+           isfinite(r.size.height) && r.size.width > 0 && r.size.height > 0;
+}
+
+// AX and SCShareableContent both use global, top-left coordinates in points.
+// The captured bitmap is local to the filter, including on a secondary screen.
+CGRect waal_guest_viewport_pixels(CGRect window, CGRect viewport, CGRect content,
+                                  size_t imageWidth, size_t imageHeight) {
+    if (!validRect(window) || !validRect(viewport) || !validRect(content) || !imageWidth || !imageHeight ||
+        !CGRectContainsRect(window, viewport) || !CGRectContainsRect(content, viewport))
+        return CGRectNull;
+    double sx = imageWidth / content.size.width, sy = imageHeight / content.size.height;
+    double scaleError = fabs(sx - sy) * fmin(content.size.width, content.size.height);
+    if (!isfinite(scaleError) || scaleError > 1.0) return CGRectNull;
+    // Round inward so a fractional edge never includes an adjacent native control.
+    double x = ceil((viewport.origin.x - content.origin.x) * sx);
+    double y = ceil((viewport.origin.y - content.origin.y) * sy);
+    double right = floor((CGRectGetMaxX(viewport) - content.origin.x) * sx);
+    double bottom = floor((CGRectGetMaxY(viewport) - content.origin.y) * sy);
+    CGRect r = CGRectMake(x, y, right - x, bottom - y);
+    return validRect(r) ? r : CGRectNull;
+}
+
+static id axValue(AXUIElementRef element, CFStringRef key) {
+    CFTypeRef value = NULL;
+    if (AXUIElementCopyAttributeValue(element, key, &value) != kAXErrorSuccess) return nil;
+    return CFBridgingRelease(value);
+}
+
+static bool axGeometry(AXUIElementRef element, CFStringRef key, AXValueType type, void *out) {
+    id value = axValue(element, key);
+    return value && CFGetTypeID((__bridge CFTypeRef)value) == AXValueGetTypeID() &&
+           AXValueGetValue((__bridge AXValueRef)value, type, out);
+}
+
+static bool axBounds(AXUIElementRef element, CGRect *bounds) {
+    return axGeometry(element, kAXPositionAttribute, kAXValueCGPointType, &bounds->origin) &&
+           axGeometry(element, kAXSizeAttribute, kAXValueCGSizeType, &bounds->size) && validRect(*bounds);
+}
+
+static bool emptyRelationship(AXUIElementRef element, CFStringRef key) {
+    CFTypeRef value = NULL;
+    AXError error = AXUIElementCopyAttributeValue(element, key, &value);
+    if (error == kAXErrorAttributeUnsupported || error == kAXErrorNoValue) return true;
+    id objects = CFBridgingRelease(value);
+    return error == kAXErrorSuccess && [objects isKindOfClass:NSArray.class] && [objects count] == 0;
+}
+
+static bool readGuestViewport(pid_t pid, CGWindowID expected, GuestViewport *result) {
+    // The Rust binding resolves the same exact window ID when admitting the session.
+    typedef AXError (*GetWindowID)(AXUIElementRef, CGWindowID *);
+    static GetWindowID getWindowID;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ getWindowID = (GetWindowID)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
+    if (!getWindowID || !isFrontmost(pid)) return false;
+    id app = CFBridgingRelease(AXUIElementCreateApplication(pid));
+    if (!app) return false;
+    AXUIElementSetMessagingTimeout((__bridge AXUIElementRef)app, 0.25);
+    id focused = axValue((__bridge AXUIElementRef)app, kAXFocusedWindowAttribute);
+    if (!focused || CFGetTypeID((__bridge CFTypeRef)focused) != AXUIElementGetTypeID()) return false;
+    AXUIElementRef window = (__bridge AXUIElementRef)focused;
+    CGWindowID wid = 0;
+    pid_t owner = 0;
+    if (AXUIElementGetPid(window, &owner) != kAXErrorSuccess || owner != pid ||
+        getWindowID(window, &wid) != kAXErrorSuccess || wid != expected ||
+        ![axValue(window, kAXRoleAttribute) isEqual:@"AXWindow"] ||
+        ![axValue(window, kAXMinimizedAttribute) isEqual:@NO] ||
+        !emptyRelationship(window, CFSTR("AXSheets")) || !axBounds(window, &result->window))
+        return false;
+    NSArray *children = axValue(window, kAXChildrenAttribute);
+    if (![children isKindOfClass:NSArray.class] || children.count > 32) return false;
+    CGRect viewport = CGRectNull;
+    bool fullscreen = [axValue(window, CFSTR("AXFullScreen")) isEqual:@YES];
+    CGRect chrome = CGRectNull;
+    for (id child in children) {
+        if (CFGetTypeID((__bridge CFTypeRef)child) != AXUIElementGetTypeID()) return false;
+        AXUIElementRef node = (__bridge AXUIElementRef)child;
+        if (AXUIElementGetPid(node, &owner) != kAXErrorSuccess || owner != pid) return false;
+        id role = axValue(node, kAXRoleAttribute);
+        if ([axValue(node, CFSTR("AXHidden")) isEqual:@YES]) continue;
+        CGRect frame;
+        if (!axBounds(node, &frame)) return false;
+        if ([role isEqual:@"AXScrollArea"]) {
+            CGSize canvas;
+            if (!CGRectIsNull(viewport) ||
+                !axGeometry(node, CFSTR("AXContentSize"), kAXValueCGSizeType, &canvas) ||
+                !CGSizeEqualToSize(canvas, frame.size) ||
+                !emptyRelationship(node, kAXHorizontalScrollBarAttribute) ||
+                !emptyRelationship(node, kAXVerticalScrollBarAttribute) ||
+                !emptyRelationship(node, kAXChildrenAttribute) ||
+                !emptyRelationship(node, kAXContentsAttribute)) return false;
+            viewport = frame;
+        } else if (fullscreen && [role isEqual:@"AXStaticText"] &&
+                   [axValue(window, kAXTitleUIElementAttribute) isEqual:child] &&
+                   [axValue(window, kAXTitleAttribute) isEqual:axValue(node, kAXValueAttribute)] &&
+                   CGRectContainsRect(result->window, frame) &&
+                   CGRectGetMaxY(frame) - CGRectGetMinY(result->window) <= 32) {
+            // Windows App keeps its native title in AX when the fullscreen
+            // title bar retracts. Scan the canvas under it, including its top.
+            continue;
+        } else if ([role isEqual:@"AXButton"] || [role isEqual:@"AXStaticText"] || [role isEqual:@"AXToolbar"]) {
+            chrome = CGRectUnion(chrome, frame);
+        } else {
+            return false;
+        }
+    }
+    // A fullscreen session may expose only its native AXWindow. Never treat
+    // a window containing other controls as an otherwise empty remote canvas.
+    if (CGRectIsNull(viewport) && fullscreen && children.count == 0) viewport = result->window;
+    if (!validRect(viewport) || !CGRectContainsRect(result->window, viewport) ||
+        (!CGRectIsNull(chrome) && CGRectGetMaxY(chrome) > CGRectGetMinY(viewport)))
+        return false;
+    result->viewport = viewport;
+    return true;
+}
+
 // Keep at most one ScreenCaptureKit operation outstanding, including callbacks
 // that arrive after a timeout. Late callbacks never hold pointers into Rust.
 static dispatch_semaphore_t captureGate(void) {
@@ -56,6 +180,35 @@ static dispatch_semaphore_t captureGate(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ gate = dispatch_semaphore_create(1); });
     return gate;
+}
+
+// ScreenCaptureKit scales a whole independent window down to the requested size.
+// Keep native pixels where possible and cap both dimensions and total allocation.
+CGSize waal_lock_capture_size(CGSize points, double backingScale) {
+    double nativeWidth = round(points.width * backingScale);
+    double nativeHeight = round(points.height * backingScale);
+    if (!isfinite(backingScale) || backingScale <= 0 || !isfinite(nativeWidth) ||
+        !isfinite(nativeHeight) || nativeWidth < 1 || nativeHeight < 1) return CGSizeZero;
+    double scale = fmin(1, fmin(16384.0 / nativeWidth, 16384.0 / nativeHeight));
+    const double pixelBudget = 8192.0 * 4320.0;
+    scale = fmin(scale, sqrt(pixelBudget / nativeWidth / nativeHeight));
+    double w = floor(nativeWidth * scale), h = floor(nativeHeight * scale);
+    return w >= 1 && h >= 1 ? CGSizeMake(w, h) : CGSizeZero;
+}
+
+static CGImageRef copyGuestPixels(CGImageRef image, GuestViewport layout, CGRect content) {
+    size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    CGRect pixels = waal_guest_viewport_pixels(layout.window, layout.viewport, content, w, h);
+    if (CGRectIsNull(pixels)) return NULL;
+    CGImageRef view = CGImageCreateWithImageInRect(image, pixels);
+    if (!view) return NULL;
+    CGRect guest = waal_guest_content_rect(view);
+    CGImageRelease(view);
+    if (CGRectIsEmpty(guest) ||
+        !CGRectContainsRect(CGRectMake(0, 0, pixels.size.width, pixels.size.height), guest)) return NULL;
+    guest = CGRectOffset(guest, pixels.origin.x, pixels.origin.y);
+    return CGRectEqualToRect(CGRectMake(0, 0, w, h), guest)
+        ? CGImageRetain(image) : copyDetail(image, guest, 1.0);
 }
 
 API_AVAILABLE(macos(14.0))
@@ -80,7 +233,7 @@ static id copyWindowImage(pid_t pid, CGWindowID windowID) {
             }
             const CGSize size = window.frame.size;
             if (error || !window || !isfinite(size.width) || !isfinite(size.height) ||
-                size.width < 500 || size.height < 350 || dispatch_time(DISPATCH_TIME_NOW, 0) >= deadline ||
+                size.width <= 0 || size.height <= 0 || dispatch_time(DISPATCH_TIME_NOW, 0) >= deadline ||
                 !isFrontmost(pid)) {
                 dispatch_semaphore_signal(finished);
                 dispatch_semaphore_signal(gate);
@@ -88,31 +241,34 @@ static id copyWindowImage(pid_t pid, CGWindowID windowID) {
             }
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
             // The window's backing scale can change when it moves between displays.
-            const CGSize contentSize = filter.contentRect.size;
-            const double backingScale = filter.pointPixelScale;
-            const double width = round(contentSize.width * backingScale);
-            const double height = round(contentSize.height * backingScale);
-            // Bound a single BGRA capture to a DCI 8K frame's pixel count.
-            if (!(backingScale > 0 && width >= 1 && height >= 1 &&
-                  width <= 16384 && height <= 16384 && width * height <= 8192.0 * 4320.0)) {
+            const CGRect contentRect = filter.contentRect;
+            const CGSize output = waal_lock_capture_size(contentRect.size, filter.pointPixelScale);
+            GuestViewport before;
+            if (CGSizeEqualToSize(output, CGSizeZero) || !readGuestViewport(pid, windowID, &before) ||
+                !CGRectEqualToRect(before.window, window.frame) || dispatch_time(DISPATCH_TIME_NOW, 0) >= deadline) {
                 dispatch_semaphore_signal(finished);
                 dispatch_semaphore_signal(gate);
                 return;
             }
             SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
-            config.width = (size_t)width;
-            config.height = (size_t)height;
+            config.width = (size_t)output.width;
+            config.height = (size_t)output.height;
             config.captureResolution = SCCaptureResolutionBest;
+            config.preservesAspectRatio = YES;
             config.scalesToFit = NO;
             config.showsCursor = NO;
             config.ignoreShadowsSingleWindow = YES;
             config.ignoreGlobalClipSingleWindow = YES;
+            if (@available(macOS 14.2, *)) config.includeChildWindows = NO;
             [SCScreenshotManager captureImageWithFilter:filter configuration:config
                 completionHandler:^(CGImageRef image, NSError *captureError) {
-                if (image && !captureError && isFrontmost(pid) &&
-                    dispatch_time(DISPATCH_TIME_NOW, 0) < deadline) {
-                    captured = CFBridgingRelease(CGImageRetain(image));
-                }
+                GuestViewport after;
+                if (image && !captureError && CGImageGetWidth(image) == (size_t)output.width &&
+                    CGImageGetHeight(image) == (size_t)output.height &&
+                    dispatch_time(DISPATCH_TIME_NOW, 0) < deadline && readGuestViewport(pid, windowID, &after) &&
+                    CGRectEqualToRect(before.window, after.window) && CGRectEqualToRect(before.viewport, after.viewport) &&
+                    dispatch_time(DISPATCH_TIME_NOW, 0) < deadline)
+                    captured = CFBridgingRelease(copyGuestPixels(image, before, contentRect));
                 dispatch_semaphore_signal(finished);
                 dispatch_semaphore_signal(gate);
             }];

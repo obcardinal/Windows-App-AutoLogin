@@ -13,6 +13,13 @@ struct Box2d {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Size {
+    w: f64,
+    h: f64,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FieldKind {
     None,
@@ -27,6 +34,14 @@ enum FieldKind {
 unsafe extern "C" {
     fn waal_password_field(image: *const c_void, result: *mut Box2d) -> FieldKind;
     fn waal_neutral_password_field(image: *const c_void, verified_password: Box2d) -> Box2d;
+    fn waal_guest_viewport_pixels(
+        window: Box2d,
+        viewport: Box2d,
+        content: Box2d,
+        width: usize,
+        height: usize,
+    ) -> Box2d;
+    fn waal_lock_capture_size(points: Size, backing_scale: f64) -> Size;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -293,6 +308,148 @@ fn an_unavailable_frame_is_distinct_from_a_completed_scan_with_no_field() {
     let kind = unsafe { waal_password_field(std::ptr::null(), &mut field) };
     assert_eq!(kind, FieldKind::Unavailable);
     assert_eq!(Fixture::new(500, 350).detect().0, FieldKind::None);
+}
+
+#[test]
+fn maps_the_guest_below_the_native_title_on_each_display_and_at_each_scale() {
+    for (x, y) in [(158.0, 376.0), (-1900.0, -400.0), (2080.0, 512.0)] {
+        let window = Box2d {
+            x,
+            y,
+            w: 1650.,
+            h: 960.,
+        };
+        let guest = Box2d {
+            x,
+            y: y + 32.,
+            w: 1650.,
+            h: 928.,
+        };
+        for (w, h, top) in [(1650, 960, 32.), (3300, 1920, 64.), (2475, 1440, 48.)] {
+            let crop = unsafe { waal_guest_viewport_pixels(window, guest, window, w, h) };
+            assert_eq!(
+                crop,
+                Box2d {
+                    x: 0.,
+                    y: top,
+                    w: w as f64,
+                    h: h as f64 - top
+                }
+            );
+            let fullscreen = unsafe { waal_guest_viewport_pixels(window, window, window, w, h) };
+            assert_eq!(
+                fullscreen,
+                Box2d {
+                    x: 0.,
+                    y: 0.,
+                    w: w as f64,
+                    h: h as f64
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn rounds_fractional_edges_inward_and_rejects_stale_or_distorted_capture_bounds() {
+    let window = Box2d {
+        x: -550.,
+        y: 80.,
+        w: 500.,
+        h: 300.,
+    };
+    let guest = Box2d {
+        x: -549.75,
+        y: 111.25,
+        w: 499.5,
+        h: 268.5,
+    };
+    let crop = unsafe { waal_guest_viewport_pixels(window, guest, window, 1000, 600) };
+    assert_eq!(
+        crop,
+        Box2d {
+            x: 1.,
+            y: 63.,
+            w: 998.,
+            h: 536.
+        }
+    );
+    for (viewport, content, w, h) in [
+        (
+            Box2d {
+                x: window.x - 1.,
+                ..guest
+            },
+            window,
+            1000,
+            600,
+        ),
+        (
+            guest,
+            Box2d {
+                x: window.x + 8.,
+                ..window
+            },
+            1000,
+            600,
+        ),
+        (guest, window, 1000, 595),
+        (guest, window, 0, 600),
+        (
+            guest,
+            Box2d {
+                h: f64::NAN,
+                ..window
+            },
+            1000,
+            600,
+        ),
+    ] {
+        let invalid = unsafe { waal_guest_viewport_pixels(window, viewport, content, w, h) };
+        assert!(invalid.x.is_infinite() && invalid.y.is_infinite());
+    }
+}
+
+#[test]
+fn keeps_full_frames_at_native_scale_and_proportionally_fits_oversized_portrait_or_wide_windows() {
+    let retina = Size { w: 1650., h: 960. };
+    assert_eq!(
+        unsafe { waal_lock_capture_size(retina, 2.) },
+        Size { w: 3300., h: 1920. }
+    );
+    for (w, h) in [(16384., 8640.), (4000., 32000.), (61440., 2160.)] {
+        let points = Size { w, h };
+        let pixels = unsafe { waal_lock_capture_size(points, 1.) };
+        assert!(pixels.w >= 1. && pixels.h >= 1.);
+        assert!(pixels.w <= 16384. && pixels.h <= 16384.);
+        assert!(pixels.w * pixels.h <= 8192. * 4320.);
+        let source = Box2d {
+            x: -600.,
+            y: -500.,
+            w,
+            h,
+        };
+        let crop = unsafe {
+            waal_guest_viewport_pixels(source, source, source, pixels.w as usize, pixels.h as usize)
+        };
+        assert_eq!(
+            crop,
+            Box2d {
+                x: 0.,
+                y: 0.,
+                w: pixels.w,
+                h: pixels.h
+            }
+        );
+    }
+    assert_eq!(
+        unsafe { waal_lock_capture_size(retina, f64::INFINITY) },
+        Size::default()
+    );
+    assert_eq!(
+        unsafe { waal_lock_capture_size(Size { w: 0., h: 960. }, 2.) },
+        Size::default()
+    );
 }
 
 #[test]
