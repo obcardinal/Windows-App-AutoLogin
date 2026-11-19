@@ -2,9 +2,10 @@
 
 This optional macOS integration assists Microsoft Authenticator number matching
 for an account's Windows App sign-in. In **Settings → iPhone Authentication**,
-click **Set up iPhone…**, choose a paired device by name, and click **Save iPhone**.
-All participating accounts use this phone. The choice is saved on this Mac by
-device identifier. Open **Sign-in details… → iPhone setup…** to change it later.
+click **Connect iPhone…**, choose your phone by name, and click **Connect iPhone**.
+AutoLogin checks that this phone responds over Wi-Fi before saving its device
+identifier on this Mac. All participating accounts use that phone. To change
+the selection, return to **Settings → iPhone Authentication**.
 In **Accounts**, open an account, turn on **2FA → Use iPhone**, and save.
 AutoLogin identifies Microsoft Authenticator from the instructions next to the
 two-digit number in Windows App. Other methods require manual sign-in.
@@ -84,10 +85,36 @@ version range. Inspection did not enter a number or approve a sign-in.
 
 ## Host setup
 
-Requirements: macOS, Xcode, Node.js compatible with the pinned Appium release,
-npm 10+, and an Apple Development signing identity for team `76C2QW8JV3`.
+To pair an iPhone and verify its Wi-Fi connection, install Xcode and open it once
+to finish setup. This step uses Apple’s device tools and requires no signing team.
 
-From the repository root:
+To prepare UI Automation, open **Sign-in details… → Set up automation…**.
+
+1. On the iPhone, enable **Developer Mode** under **Settings → Privacy & Security**
+   and **Enable UI Automation** under **Settings → Developer**. Add your work
+   account to Microsoft Authenticator.
+2. In **Xcode → Settings → Accounts**, add your own Apple Account. Select its
+   personal or organization team and create an **Apple Development** certificate
+   under **Manage Certificates → +**. AutoLogin can open Xcode from the setup screen.
+3. Return to AutoLogin, select that signing account and click **Set up automation**.
+   Keep the selected iPhone unlocked on the same Wi-Fi. AutoLogin installs the
+   tools, asks Xcode to sign the helper for this device, and checks a UI Automation
+   session. Follow any developer trust prompts on the iPhone.
+
+Xcode uses the selected user's signing identity and keeps its private key in
+Keychain. Personal Team provisioning is time-limited by Apple, typically to seven
+days. AutoLogin checks the profile before reuse and asks Xcode to refresh expired
+provisioning. If Xcode requires account attention, return to setup and retry after
+completing its prompts.
+
+AutoLogin uses a compatible local Node.js with npm when available. Otherwise it
+downloads Node.js **24.22.3 LTS** from **nodejs.org** into its private tools folder
+and verifies the archive against a SHA-256 value embedded in the app before
+extracting it. The installed app contains the helper source used by setup.
+
+Developers can also prepare the helper from the repository root. Choose a local
+team explicitly with `setup --team TEAM_ID`, or use `setup` to retain the configured
+team or select the only available team.
 
 ```sh
 node script/iphone-automation/cli.mjs setup
@@ -102,11 +129,10 @@ npm lockfile. It uses a dedicated versioned directory under:
 ~/Library/Application Support/WindowsAppAutoLogin/iphone-automation/
 ```
 
-No global npm packages or existing Appium installation are modified. Dependencies
-remain outside the source repository. The directory is private to the current
-user; `config.json` is mode `0600`. Setup copies the helper's `.mjs` modules there;
-rerun it after updating helper source. Repeated setup preserves the selected
-device and reuses an already installed matching runtime.
+The directory is private to the current user and `config.json` is mode `0600`.
+Repeated setup preserves the selected iPhone and reuses a matching installed
+runtime. Setup publishes the helper modules and selected signing team together
+with the configuration. Run setup again after updating helper source.
 
 ### What happens before a sign-in
 
@@ -131,38 +157,41 @@ and does not open Authenticator.
 
 ## Select and prepare the physical iPhone
 
-1. Keep this Mac and the previously paired iPhone on the same trusted Wi-Fi
-   network, and unlock the iPhone manually. This helper uses Wi-Fi only; it does
-   not require or fall back to USB. The selected phone must already be paired
-   with this Mac in Xcode's Devices and Simulators window.
-2. Enable Developer Mode and enable
-   **Settings → Developer → Enable UI Automation**.
-3. Ensure Microsoft Authenticator is installed and its required account is set up.
-4. In **Settings → iPhone Authentication**, open **Set up iPhone…**. Choose a
-   phone from **Paired iPhone** and click **Save iPhone**. If the phone is missing,
-   check pairing in Xcode, then click **Refresh iPhones**. You can save the phone
-   before installing the host helper. Setup uses the saved choice on this Mac.
+1. Unlock the iPhone and connect it and the Mac to the same Wi-Fi network.
+   Open **Settings → iPhone Authentication → Connect iPhone…** in AutoLogin.
+2. If the phone has never been paired with this Mac, click **Open device pairing…**.
+   In Xcode 27’s Device Hub, an iPhone running iOS 27 or later can pair wirelessly
+   using **+ → Pair Nearby Device…**. Confirm the trust prompt on the iPhone.
+   With an earlier iOS version, connect the iPhone by cable for initial pairing.
+   Older versions of Xcode manage devices under **Window → Devices and Simulators**.
+   [Apple’s device pairing guide](https://developer.apple.com/documentation/xcode/managing-your-simulated-and-physical-devices-in-device-hub)
+3. Disconnect the cable if you used one. Return to AutoLogin, select your phone
+   and click **Connect iPhone**. If it hasn't appeared, click **Refresh iPhones**.
+   AutoLogin saves your choice after the
+   Wi-Fi check succeeds, even if you haven’t installed the sign-in helper yet.
+   If the check fails, your previous choice stays in effect.
 
    For command-line setup, `node script/iphone-automation/cli.mjs select-device`
    selects the sole paired physical iPhone. With multiple paired phones, pass
    `--udid IDENTIFIER` from Xcode’s **Window → Devices and Simulators**.
 
-5. After the device is connected and unlocked, deliberately prepare WDA:
+4. Open **Sign-in details… → Set up automation…** and complete the setup steps above.
+   Developer setup can prepare the connected, unlocked phone directly:
 
    ```sh
    node script/iphone-automation/cli.mjs prepare-device
    ```
 
-   This builds/signs the dedicated WebDriverAgent runner using the existing Apple
-   Development identity when needed, then installs/launches it through Xcode over
-   Wi-Fi. The build cache is scoped to the pinned WDA version. It does not open
-   Authenticator, submit a
-   number, or request an authentication approval. Missing provisioning requires
-   completing Xcode signing setup; the helper does not silently change developer
-   account registration or device security settings.
+   This signs the dedicated WebDriverAgent runner with the selected user's Apple
+   Development identity, permits Xcode to provision the selected device, and
+   verifies a UI Automation session over Wi-Fi. The build cache is scoped to the
+   WDA version, signing team and helper bundle ID. The preparation session closes
+   after verification.
 
-The Appium WDA bundle identifier is
-`com.obcardinal.WindowsAppAutoLogin.WebDriverAgentRunner`. Authenticator's bundle
+New installations use the WDA bundle identifier
+`com.obcardinal.WindowsAppAutoLogin.<TEAM_ID>.WebDriverAgentRunner`.
+Existing installations retain their original bundle when keeping the same team.
+Authenticator's bundle
 identifier is `com.microsoft.azureauthenticator`, verified against its Apple App
 Store entry.
 
