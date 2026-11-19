@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
-const MICROSOFT_REMOTE_DESKTOP_BUNDLE_ID: &str = "com.microsoft.rdc.macos";
+pub(crate) const MICROSOFT_REMOTE_DESKTOP_BUNDLE_ID: &str = "com.microsoft.rdc.macos";
 #[cfg(target_os = "macos")]
 const MICROSOFT_TEAM_ID: &str = "UBF8T346G9";
 #[cfg(target_os = "macos")]

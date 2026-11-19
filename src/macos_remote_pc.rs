@@ -98,6 +98,16 @@ pub(super) fn read_focused_session(
     read_focused_session_with_settle(app, session, title, cancelled, Duration::ZERO)
 }
 
+/// Menu enablement applies to the active native desktop in Windows App.
+pub(super) fn connection_information_command(app: &AxElement, pid: i32) -> Option<AxElement> {
+    menu_item(
+        app,
+        &["Connections", "连接"],
+        &["Show Connection Information", "显示连接信息"],
+    )
+    .filter(|item| item.process_id() == Some(pid) && item.bool_attr(AX_ENABLED) == Some(true))
+}
+
 fn read_focused_session_with_settle(
     app: &AxElement,
     session: &AxElement,
@@ -109,13 +119,7 @@ fn read_focused_session_with_settle(
     let until = Instant::now() + Duration::from_secs(2);
     let command = loop {
         ensure!(!cancelled(), "Cancelled.");
-        if let Some(command) = menu_item(
-            app,
-            &["Connections", "连接"],
-            &["Show Connection Information", "显示连接信息"],
-        )
-        .filter(|item| item.process_id() == Some(pid) && item.bool_attr(AX_ENABLED) == Some(true))
-        {
+        if let Some(command) = connection_information_command(app, pid) {
             break command;
         }
         ensure!(

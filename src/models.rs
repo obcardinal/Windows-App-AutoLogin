@@ -120,6 +120,7 @@ pub struct AppSettings {
     /// Hide the macOS menu-bar icon or Windows system-tray icon.
     pub hide_menu_bar_icon: bool,
     pub show_menu_diagnostics: bool,
+    pub close_connection_center_after_connect: bool,
     pub use_keyring: bool,
 }
 
@@ -131,6 +132,7 @@ impl Default for AppSettings {
             start_minimized: false,
             hide_menu_bar_icon: false,
             show_menu_diagnostics: false,
+            close_connection_center_after_connect: true,
             use_keyring: true,
         }
     }

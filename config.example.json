@@ -5,6 +5,7 @@
     "start_minimized": false,
     "hide_menu_bar_icon": false,
     "show_menu_diagnostics": false,
+    "close_connection_center_after_connect": true,
     "use_keyring": true
   }
 }

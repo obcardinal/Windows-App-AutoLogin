@@ -71,7 +71,10 @@ pub(crate) fn open_session_titles() -> Result<Vec<String>> {
         .collect())
 }
 
-fn exact_session<'a, T>(entries: &'a [(String, T)], title: &str) -> Result<Option<&'a T>> {
+pub(super) fn exact_session<'a, T>(
+    entries: &'a [(String, T)],
+    title: &str,
+) -> Result<Option<&'a T>> {
     let mut matches = entries.iter().filter(|(name, _)| name == title);
     let matched = matches.next();
     ensure!(

@@ -427,6 +427,7 @@ struct StoredAppSettingsWire {
     start_minimized: bool,
     hide_menu_bar_icon: bool,
     show_menu_diagnostics: bool,
+    close_connection_center_after_connect: bool,
     use_keyring: bool,
     #[serde(rename = "reconnect_delay_secs")]
     _removed_reconnect_delay_secs: u64,
@@ -442,6 +443,8 @@ impl Default for StoredAppSettingsWire {
             start_minimized: false,
             hide_menu_bar_icon: false,
             show_menu_diagnostics: false,
+            close_connection_center_after_connect: AppSettings::default()
+                .close_connection_center_after_connect,
             use_keyring: true,
             _removed_reconnect_delay_secs: 2,
             _removed_macos_app_name: None,
@@ -474,6 +477,9 @@ impl From<StoredAppConfigWire> for AppConfig {
                 start_minimized: stored.settings.start_minimized,
                 hide_menu_bar_icon: stored.settings.hide_menu_bar_icon,
                 show_menu_diagnostics: stored.settings.show_menu_diagnostics,
+                close_connection_center_after_connect: stored
+                    .settings
+                    .close_connection_center_after_connect,
                 use_keyring: stored.settings.use_keyring,
             },
         }
@@ -6026,6 +6032,7 @@ mod tests {
         assert!(config.settings.use_keyring);
         assert!(!config.settings.hide_menu_bar_icon);
         assert!(!config.settings.show_menu_diagnostics);
+        assert!(config.settings.close_connection_center_after_connect);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6094,6 +6101,8 @@ mod tests {
         config.settings.start_minimized = true;
         config.settings.hide_menu_bar_icon = true;
         config.settings.show_menu_diagnostics = true;
+        assert!(config.settings.close_connection_center_after_connect);
+        config.settings.close_connection_center_after_connect = false;
         config.settings.use_keyring = false;
 
         for reconnect in [true, false] {

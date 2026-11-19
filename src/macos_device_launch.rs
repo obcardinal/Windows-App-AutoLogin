@@ -14,10 +14,13 @@ use std::time::{Duration, Instant};
 mod catalog;
 #[path = "macos_connected_card.rs"]
 mod connected;
+#[path = "macos_connection_center.rs"]
+mod connection_center;
 #[path = "macos_enter_profile.rs"]
 mod enter_profile;
 pub(super) use catalog::verify_card_identity_in;
 pub(crate) use catalog::{saved_devices, saved_remote_pc, SavedDevice};
+pub(super) use connection_center::ConnectionCenter;
 use enter_profile::prepare_profile_devices;
 
 const READ_ERROR: &str = "Could not read the Windows App Devices view.";
@@ -514,16 +517,22 @@ fn wait_for<T>(mut read: impl FnMut() -> Option<T>) -> Option<T> {
 
 pub(super) fn center_window(app: &AxElement) -> Option<AxElement> {
     let mut windows = app.array_attr_checked(AX_WINDOWS)?.into_iter().filter(|w| {
-        w.string_attr(AX_SUBROLE).as_deref() == Some("AXStandardWindow")
-            && matches!(
-                w.string_attr(AX_TITLE).as_deref(),
-                Some("Windows App" | "Connection Center" | "连接中心")
-            )
+        is_center_window(w)
             && w.optional_relationship_array_attr_result("AXSheets")
                 .is_ok_and(|s| s.is_empty())
     });
     let window = windows.next()?;
     windows.next().is_none().then_some(window)
+}
+
+fn is_center_window(window: &AxElement) -> bool {
+    let [role, subrole, title] = window.string_attrs(&[AX_ROLE, AX_SUBROLE, AX_TITLE]);
+    role.as_deref() == Some("AXWindow")
+        && subrole.as_deref() == Some("AXStandardWindow")
+        && matches!(
+            title.as_deref(),
+            Some("Windows App" | "Connection Center" | "连接中心")
+        )
 }
 
 fn children(element: &AxElement) -> Result<Vec<AxElement>> {

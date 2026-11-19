@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 mod locked_vm;
 #[cfg(target_os = "macos")]
-mod window_hints;
+pub(crate) mod window_hints;
 
 use crate::config::Config;
 use crate::debug_fill::{self, FillAttemptReport, FillMethod};

@@ -13,6 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "macos_connection_watch.rs"]
+pub(crate) mod connection_watch;
 #[path = "macos_desktops.rs"]
 pub(crate) mod desktops;
 #[path = "macos_device_launch.rs"]
@@ -572,6 +574,10 @@ impl AxElement {
 
     fn element_attr(&self, attr: &'static str) -> Option<AxElement> {
         let value = self.copy_attr(attr)?;
+        Self::from_cf(&value)
+    }
+
+    fn from_cf(value: &CFType) -> Option<Self> {
         if unsafe { CFGetTypeID(value.as_CFTypeRef()) } != unsafe { AXUIElementGetTypeID() } {
             return None;
         }

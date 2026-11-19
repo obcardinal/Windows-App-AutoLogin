@@ -996,6 +996,8 @@ struct LightweightSupervisor {
     #[cfg(target_os = "macos")]
     iphone_preparation: Option<iphone_preparation::HostPreparation>,
     #[cfg(target_os = "macos")]
+    connection_center: macos_ax::connection_watch::ConnectionWatch,
+    #[cfg(target_os = "macos")]
     pending_update_check: bool,
     #[cfg(target_os = "macos")]
     update_resume_monitor: Option<bool>,
@@ -1064,6 +1066,8 @@ impl LightweightSupervisor {
             iphone_progress: iphone_sso_ui::ProgressUi::default(),
             #[cfg(target_os = "macos")]
             iphone_preparation: None,
+            #[cfg(target_os = "macos")]
+            connection_center: Default::default(),
             #[cfg(target_os = "macos")]
             pending_update_check: false,
             #[cfg(target_os = "macos")]
@@ -3197,6 +3201,12 @@ impl ApplicationHandler<SupervisorEvent> for LightweightSupervisor {
             }
         }
         self.poll_settings_window();
+        #[cfg(target_os = "macos")]
+        self.connection_center.update(
+            !self.exit_requested
+                && self.accessibility_trusted
+                && self.config.settings.close_connection_center_after_connect,
+        );
         if self.exit_requested {
             if self.poll_exit_request(Instant::now()) && self.finish_exit(event_loop) {
                 return;
