@@ -95,12 +95,38 @@ pub(super) fn focused_session(app: &AxElement, title: &str) -> Option<AxElement>
     if app.bool_attr(AX_FRONTMOST) != Some(true) {
         return None;
     }
+    key_session(app, title)
+}
+
+fn key_session(app: &AxElement, title: &str) -> Option<AxElement> {
     app.element_attr("AXFocusedWindow").filter(|window| {
         window.process_id() == app.process_id()
             && window.string_attr(AX_ROLE).as_deref() == Some("AXWindow")
             && window.string_attr(AX_TITLE).as_deref() == Some(title)
             && window.bool_attr("AXMinimized") == Some(false)
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionFocusAction {
+    SelectSession,
+    ActivateApp,
+    Wait,
+}
+
+fn session_focus_action(
+    target_is_key: bool,
+    frontmost: bool,
+    selected: bool,
+    activated: bool,
+) -> SessionFocusAction {
+    if target_is_key && !frontmost && !activated {
+        SessionFocusAction::ActivateApp
+    } else if !target_is_key && !selected {
+        SessionFocusAction::SelectSession
+    } else {
+        SessionFocusAction::Wait
+    }
 }
 
 pub(super) fn focus_session_in_app(
@@ -114,38 +140,52 @@ pub(super) fn focus_session_in_app(
         return Ok(None);
     }
     ensure!(!cancelled(), "Cancelled.");
-    if let Some(window) = focused_session(app, title) {
-        return Ok(Some(window));
-    }
-    if app.bool_attr(AX_FRONTMOST) != Some(true) {
-        ensure!(!cancelled(), "Cancelled.");
-        ensure!(
-            app.set_bool_attr(AX_FRONTMOST, true),
-            "Windows App could not come to the front."
-        );
-        on_handoff();
-    }
-    // Cocoa can leave menu entries disabled while the app is in the background.
-    // Resolve the exact entry again after activation and press it at most once.
     let until = Instant::now() + Duration::from_secs(3);
-    let mut pressed = false;
+    let mut selected = false;
+    let mut activated = false;
+    let mut handoff = Some(on_handoff);
     loop {
         ensure!(!cancelled(), "Cancelled.");
-        if let Some(window) = focused_session(app, title) {
-            return Ok(Some(window));
+        let frontmost = app.bool_attr(AX_FRONTMOST) == Some(true);
+        let key = key_session(app, title);
+        if frontmost && key.is_some() {
+            return Ok(key);
         }
-        if !pressed && app.bool_attr(AX_FRONTMOST) == Some(true) {
-            let entries = session_entries(app)?;
-            let item = exact_session(&entries, title)?
-                .context("The selected desktop has disconnected.")?;
-            if item.bool_attr(AX_ENABLED) == Some(true) {
+        match session_focus_action(key.is_some(), frontmost, selected, activated) {
+            SessionFocusAction::SelectSession => {
+                // activateSession: targets this specific VM, including on another
+                // Space. Activating the app first would raise its previous VM.
+                let entries = session_entries(app)?;
+                let item = exact_session(&entries, title)?
+                    .context("The selected desktop has disconnected.")?;
+                if item.bool_attr(AX_ENABLED) == Some(true) {
+                    ensure!(!cancelled(), "Cancelled.");
+                    ensure!(
+                        item.perform_action(AX_PRESS),
+                        "Windows App could not bring the session to the front."
+                    );
+                    selected = true;
+                    if !frontmost {
+                        if let Some(notify) = handoff.take() {
+                            notify();
+                        }
+                    }
+                }
+            }
+            SessionFocusAction::ActivateApp => {
+                // The native action can select the correct window without
+                // activating the client. Only hand off once it is the key VM.
                 ensure!(!cancelled(), "Cancelled.");
                 ensure!(
-                    item.perform_action(AX_PRESS),
-                    "Windows App could not bring the session to the front."
+                    app.set_bool_attr(AX_FRONTMOST, true),
+                    "Windows App could not come to the front."
                 );
-                pressed = true;
+                activated = true;
+                if let Some(notify) = handoff.take() {
+                    notify();
+                }
             }
+            SessionFocusAction::Wait => {}
         }
         ensure!(
             Instant::now() < until,
@@ -158,6 +198,23 @@ pub(super) fn focus_session_in_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_key_session_is_never_raised_to_activate_the_client() {
+        use SessionFocusAction::{ActivateApp, SelectSession, Wait};
+        for frontmost in [false, true] {
+            assert_eq!(
+                session_focus_action(false, frontmost, false, false),
+                SelectSession
+            );
+            assert_eq!(session_focus_action(false, frontmost, true, false), Wait);
+        }
+        // The menu selected the requested VM in the background; activate it
+        // once, even if macOS takes another tick to report the handoff.
+        assert_eq!(session_focus_action(true, false, true, false), ActivateApp);
+        assert_eq!(session_focus_action(true, false, true, true), Wait);
+        assert_eq!(session_focus_action(true, false, false, false), ActivateApp);
+    }
 
     #[test]
     fn only_an_exact_unique_open_session_can_be_focused() {
