@@ -2,7 +2,7 @@
 use super::desktops::LaunchHost;
 use super::{
     collect_descendants_bounded, macos_identity, role_matches, AXUIElementSetAttributeValue,
-    AxElement, AX_CHILDREN, AX_DESCRIPTION, AX_ENABLED, AX_FRONTMOST, AX_MAIN, AX_PRESS, AX_ROLE,
+    AxElement, AX_CHILDREN, AX_DESCRIPTION, AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_ROLE,
     AX_SUBROLE, AX_TITLE, AX_VALUE, AX_WINDOWS, K_AX_ERROR_SUCCESS,
 };
 use crate::config::TARGET_APP_NAME;
@@ -364,32 +364,53 @@ fn devices_in_app(app: AxElement) -> Result<DeviceList> {
     devices_from_window(app, window)
 }
 
+// AXMain can still describe the device list while AXFocusedWindow points to a
+// VM on another Space. Only the latter identifies the actual input target.
+fn key_center(app: &AxElement) -> Option<AxElement> {
+    let focused = app.element_attr("AXFocusedWindow")?;
+    let window = center_window(app)?;
+    (focused.same_element(&window) && window.bool_attr("AXMinimized") == Some(false))
+        .then_some(window)
+}
+
+fn show_center_command(app: &AxElement) -> Option<AxElement> {
+    menu_item(app, &["Window", "窗口"], &["Connection Center", "连接中心"])
+        .filter(|item| item.bool_attr(AX_ENABLED) == Some(true))
+}
+
 fn devices_window(app: &AxElement) -> Result<AxElement> {
-    app.set_bool_attr(AX_FRONTMOST, true);
-    let mut window = center_window(app);
-    if window
-        .as_ref()
-        .is_none_or(|w| w.bool_attr(AX_MAIN) != Some(true))
-    {
-        let show_center = wait_for(|| {
-            menu_item(
-                app,
-                &["Window", "窗口"],
-                &["Connection Center", "连接中心"],
-            )
+    if app.bool_attr(AX_FRONTMOST) != Some(true) || key_center(app).is_none() {
+        let command = wait_for(|| {
+            let command = show_center_command(app);
+            // Cocoa may disable the menu in the background. In that case
+            // bringing the app forward is safe only if its key window is the list.
+            (command.is_some() || key_center(app).is_some()).then_some(command)
         })
         .context("Windows App's Connection Center is unavailable.")?;
-        ensure!(
-            show_center.perform_action(AX_PRESS),
-            "Could not open the Windows App Connection Center."
-        );
-        window = wait_for(|| center_window(app));
+        // The Window menu targets the list directly, including when closed.
+        // An AXPress may time out after delivery; observe its effect once.
+        if let Some(command) = command {
+            command.perform_action(AX_PRESS);
+        }
+        if let Some(window) =
+            center_window(app).filter(|w| w.bool_attr("AXMinimized") == Some(true))
+        {
+            window.set_bool_attr("AXMinimized", false);
+        }
     }
-    let window = window.context("The Windows App Connection Center did not open.")?;
-    if window.bool_attr("AXMinimized") == Some(true) {
-        window.set_bool_attr("AXMinimized", false);
-    }
-    window.perform_action("AXRaise");
+    let mut requested_activation = false;
+    let window = wait_for(|| {
+        let window = key_center(app)?;
+        if app.bool_attr(AX_FRONTMOST) == Some(true) {
+            return Some(window);
+        }
+        if !requested_activation {
+            requested_activation = true;
+            app.set_bool_attr(AX_FRONTMOST, true);
+        }
+        None
+    })
+    .context("Windows App did not bring its device list to the front.")?;
     show_devices(app, &window)?;
     Ok(window)
 }

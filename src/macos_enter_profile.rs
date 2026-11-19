@@ -1,5 +1,6 @@
 //! Resolve a Windows App profile by its unique email before using its Devices view.
 use super::*;
+use crate::macos_ax::device_windows;
 
 struct ProfileRow<T> {
     email: String,
@@ -151,17 +152,35 @@ pub(super) fn prepare_profile_devices(
         }
         Ok((target.label.clone(), !selected))
     })?;
-    if switched {
-        // The selector already tied this unique toolbar label to the requested email.
-        // Wait for Windows App to show that profile after dismissing the sheet.
+    let center = if switched {
+        // Dismissing the selector can restore a fullscreen VM or rebuild the
+        // center. Resolve the live window under the already verified profile.
+        let mut requested_center = false;
         wait_for(|| {
-            (app.bool_attr(AX_FRONTMOST) == Some(true)
-                && app.element_attr("AXFocusedWindow")?.same_element(&center)
-                && profile_label(&center).ok()?.1 == label)
-                .then_some(())
+            if app.bool_attr(AX_FRONTMOST) != Some(true) {
+                return None;
+            }
+            if let Some(window) = key_center(app) {
+                return (profile_label(&window).ok()?.1 == label).then_some(window);
+            }
+            if !requested_center {
+                let title = app.element_attr("AXFocusedWindow")?.string_attr(AX_TITLE)?;
+                let sessions = device_windows::session_entries(app).ok()?;
+                if device_windows::exact_session(&sessions, &title)
+                    .ok()?
+                    .is_some()
+                {
+                    let command = show_center_command(app)?;
+                    requested_center = true;
+                    command.perform_action(AX_PRESS);
+                }
+            }
+            None
         })
-        .context(PROFILE_ERROR)?;
-    }
+        .context("Windows App did not show the selected account in its device list.")?
+    } else {
+        center
+    };
     // Read the new account's cards after confirming it. The previous account
     // may legitimately have had an empty Devices view.
     let list = devices_from_window(app.clone(), center)?;
