@@ -94,11 +94,11 @@ export async function readConfig() {
   }
 }
 
-export function runQuiet(file, args, { timeout = 10000, signal, cwd, maxBuffer = 2 * 1024 * 1024, env = cleanEnvironment() } = {}) {
+export function runQuiet(file, args, { timeout = 10000, signal, cwd, maxBuffer = 2 * 1024 * 1024, env = cleanEnvironment(), captureStderr = false } = {}) {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout, signal, cwd, env, maxBuffer, encoding: 'utf8' }, (error, stdout) => {
+    execFile(file, args, { timeout, signal, cwd, env, maxBuffer, encoding: 'utf8' }, (error, stdout, stderr) => {
       if (error) reject(new AutomationError(signal?.aborted ? 'cancelled' : 'command_failed', 'The iPhone helper command could not complete.'));
-      else resolve(stdout);
+      else resolve(captureStderr ? stderr : stdout);
     });
   });
 }

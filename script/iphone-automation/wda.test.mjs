@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -7,7 +8,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import timers from 'node:timers/promises';
 import * as support from './support.mjs';
-import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, tunnelEndpoint } from './wda.mjs';
+import { configureTestRun, dedicatedRunnerExecutable, dedicatedRunnerPids, tunnelEndpoint, profileApplicationMatches } from './wda.mjs';
 
 const udid = '00000000-0000000000000001';
 const device = { udid, paired: true, connected: true, transport: 'localNetwork', tunnelAddress: 'fd00::1', osVersion: '27.2' };
@@ -185,7 +186,7 @@ async function writeProducts(products) {
 async function buildFixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'waal-wda-test-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const config = { runtime_dir: path.join(root, 'runtime'), development_team: 'fixture-team', device_udid: udid };
+  const config = { runtime_dir: path.join(root, 'runtime'), development_team: 'TESTTEAM01', wda_bundle_id: support.teamRunnerBundle('TESTTEAM01'), device_udid: udid };
   const upstream = path.join(config.runtime_dir, 'node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent');
   await fs.mkdir(path.join(upstream, 'WebDriverAgent.xcodeproj'), { recursive: true });
   await fs.writeFile(path.join(upstream, 'package.json'), '{"version":"1.2.3"}');
@@ -211,16 +212,22 @@ async function buildFixture(t) {
   // Stop foreground requests at their first plist read, before XCTest or device access.
   t.mock.module('./support.mjs', { namedExports: { ...support, runQuiet: async (file, args) => {
     if (file === '/usr/bin/security') { assert.deepEqual(args.slice(0, 3), ['cms', '-D', '-i']); return ''; }
+    if (file === '/usr/bin/codesign') return `Identifier=${config.wda_bundle_id}.xctrunner\nTeamIdentifier=${config.development_team}\n`;
     assert.equal(file, '/usr/bin/plutil');
     if (args[0] === '-extract') {
-      return args[1] === 'ProvisionedDevices' ? JSON.stringify(fixture.profileDevices) : fixture.profileExpiry;
+      if (args[1] === 'ProvisionedDevices') return JSON.stringify(fixture.profileDevices);
+      if (args[1] === 'TeamIdentifier') return JSON.stringify([fixture.profileTeam ?? config.development_team]);
+      if (args[1] === 'ApplicationIdentifierPrefix') return JSON.stringify([config.development_team]);
+      if (args[1] === 'Entitlements.application-identifier') return fixture.profileBundle ?? `${config.development_team}.${config.wda_bundle_id}.xctrunner`;
+      return fixture.profileExpiry;
     }
     fixture.readManifests.push(args.at(-1));
     throw new Error('fixture plist');
   } } });
   const api = await import(`./wda.mjs?fixture=${path.basename(root)}`);
-  const host = path.join(root, 'wda-host-products-1.2.3');
-  const existing = path.join(root, 'wda-derived-data-1.2.3/Build/Products');
+  const signing = createHash('sha256').update(`${config.development_team}\n${config.wda_bundle_id}`).digest('hex').slice(0, 16);
+  const host = path.join(root, `wda-host-products-1.2.3-${signing}`);
+  const existing = path.join(root, `wda-derived-data-1.2.3-${signing}/Build/Products`);
   return Object.assign(fixture, { ...api, config, host, existing, root });
 }
 
@@ -233,6 +240,16 @@ test('host preparation reuses existing signed products and requires no selected 
   assert.deepEqual(f.readManifests, []);
 });
 
+test('Apple development wildcard profiles match only their own bundle prefix', () => {
+  const application = 'PERSONAL01.com.obcardinal.WindowsAppAutoLogin.PERSONAL01.WebDriverAgentRunner.xctrunner';
+  assert.equal(profileApplicationMatches(application, application), true);
+  assert.equal(profileApplicationMatches('PERSONAL01.*', application), true);
+  assert.equal(profileApplicationMatches('PERSONAL01.com.obcardinal.*', application), true);
+  for (const pattern of ['OTHERTEAM1.*', 'PERSONAL01.com.other.*', '*', 'PERSONAL01.*.xctrunner', 'PERSONAL01..*']) {
+    assert.equal(profileApplicationMatches(pattern, application), false);
+  }
+});
+
 test('host build uses local signing and publishes complete products for foreground reuse', async t => {
   const f = await buildFixture(t);
   const signal = new AbortController().signal;
@@ -241,7 +258,7 @@ test('host build uses local signing and publishes complete products for foregrou
   await f.prepareHostRunner(hostConfig, signal);
   const [args] = f.builds;
   assert.equal(args[args.indexOf('-destination') + 1], 'generic/platform=iOS');
-  assert.ok(args.includes('DEVELOPMENT_TEAM=fixture-team'));
+  assert.ok(args.includes('DEVELOPMENT_TEAM=TESTTEAM01'));
   assert.ok(args.includes('CODE_SIGN_IDENTITY=Apple Development'));
   assert.ok(!args.includes('-allowProvisioningUpdates'));
   assert.ok(!args.includes('-allowProvisioningDeviceRegistration'));
@@ -291,6 +308,35 @@ test('foreground fallback never consumes an unfinished optional build or waits f
     await assert.rejects(background, { code: 'wda_build_failed' });
   }
   assert.ok(!(await fs.readdir(f.root)).some(item => item.startsWith('wda-host-build-')));
+});
+
+test('device registration happens during explicit preparation and signing caches follow the selected team', async t => {
+  const f = await buildFixture(t);
+  const signal = new AbortController().signal;
+  await f.prepareDeviceRunner(f.config, signal);
+  const first = f.builds[0];
+  assert.ok(first.includes('-allowProvisioningDeviceRegistration'));
+  assert.ok(first.includes('-allowProvisioningUpdates'));
+  const other = { ...f.config, development_team: 'PERSONAL01', wda_bundle_id: support.teamRunnerBundle('PERSONAL01') };
+  await f.prepareDeviceRunner(other, signal);
+  const second = f.builds[1];
+  assert.ok(second.includes('DEVELOPMENT_TEAM=PERSONAL01'));
+  assert.notEqual(first[first.indexOf('-derivedDataPath') + 1], second[second.indexOf('-derivedDataPath') + 1]);
+  const project = await fs.readFile(path.join(second[second.indexOf('-project') + 1], 'project.pbxproj'), 'utf8');
+  assert.equal(project, other.wda_bundle_id);
+});
+
+test('expired targeted profiles and profiles for another signing team are rebuilt', async t => {
+  const f = await buildFixture(t);
+  const signal = new AbortController().signal;
+  await writeProducts(f.existing);
+  f.profileExpiry = '2000-01-01T00:00:00Z';
+  await assert.rejects(f.startNativeWda(f.config, device, { signal }), /fixture plist/);
+  f.profileExpiry = '2099-01-01T00:00:00Z';
+  f.profileTeam = 'OTHERTEAM1';
+  await assert.rejects(f.startNativeWda(f.config, device, { signal }), /fixture plist/);
+  assert.equal(f.builds.length, 2);
+  assert.ok(f.builds.every(args => !args.includes('-allowProvisioningDeviceRegistration')));
 });
 
 test('aborted preparation stops the compiler in the supervisor group and discards staging products', async t => {

@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { AutomationError, cleanEnvironment, ensurePrivateDirectory, paths, runQuiet } from './support.mjs';
+import { AutomationError, cleanEnvironment, ensurePrivateDirectory, paths, runQuiet, validRunnerBundle } from './support.mjs';
 
 export function tunnelEndpoint(device, expectedUdid) {
   if (device?.udid !== expectedUdid || !device.paired || !device.connected
@@ -103,7 +104,7 @@ export async function stopOwnedProcessGroup(child) {
   }
 }
 
-async function buildRunner(args, signal, detached) {
+async function buildRunner(args, signal, detached, timeoutMs = 100000) {
   signal.throwIfAborted();
   const child = spawn('/usr/bin/xcodebuild', args, { env: cleanEnvironment(), detached, stdio: 'ignore' });
   let succeeded = false;
@@ -121,7 +122,7 @@ async function buildRunner(args, signal, detached) {
     }
   };
   signal.addEventListener('abort', abort, { once: true });
-  const timeout = setTimeout(abort, 100000);
+  const timeout = setTimeout(abort, timeoutMs);
   try {
     succeeded = await new Promise(resolve => {
       child.once('error', () => resolve(false));
@@ -154,20 +155,22 @@ async function findTestRun(products) {
   }
 }
 
-async function buildTestRun(config, upstream, source, derived, signal, hostOnly) {
+async function buildTestRun(config, upstream, source, derived, signal, hostOnly, registerDevice = false) {
   signal.throwIfAborted();
   await ensurePrivateDirectory(source);
   await fs.cp(upstream, source, { recursive: true, force: true });
   signal.throwIfAborted();
   const projectFile = path.join(source, 'WebDriverAgent.xcodeproj', 'project.pbxproj');
   const project = await fs.readFile(projectFile, 'utf8');
-  await fs.writeFile(projectFile, project.replaceAll('com.facebook.WebDriverAgent', 'com.obcardinal.WindowsAppAutoLogin.WebDriverAgent'), { mode: 0o600 });
+  const bundleBase = config.wda_bundle_id.slice(0, -'Runner'.length);
+  await fs.writeFile(projectFile, project.replaceAll('com.facebook.WebDriverAgent', bundleBase), { mode: 0o600 });
   const destinationArgs = hostOnly ? ['-destination', 'generic/platform=iOS']
     : ['-destination', `id=${config.device_udid}`, '-allowProvisioningUpdates'];
+  if (registerDevice) destinationArgs.push('-allowProvisioningDeviceRegistration');
   await buildRunner(['-project', path.join(source, 'WebDriverAgent.xcodeproj'),
     '-scheme', 'WebDriverAgentRunner', ...destinationArgs, '-derivedDataPath', derived,
     `DEVELOPMENT_TEAM=${config.development_team}`, 'CODE_SIGN_IDENTITY=Apple Development',
-    'CODE_SIGN_STYLE=Automatic', 'build-for-testing'], signal, !hostOnly);
+    'CODE_SIGN_STYLE=Automatic', 'build-for-testing'], signal, !hostOnly, registerDevice ? 180000 : 100000);
   const result = await findTestRun(path.join(derived, 'Build', 'Products'));
   if (!result) throw new AutomationError('wda_build_failed', 'The iPhone automation runner could not be prepared.');
   return result;
@@ -179,9 +182,14 @@ async function runnerPaths(config, signal) {
   const upstream = path.join(config.runtime_dir, 'node_modules', 'appium-xcuitest-driver', 'node_modules', 'appium-webdriveragent');
   const metadata = JSON.parse(await fs.readFile(path.join(upstream, 'package.json'), 'utf8'));
   if (!/^\d+\.\d+\.\d+$/.test(metadata.version)) throw new AutomationError('runtime_missing', 'Reinstall the pinned iPhone helper runtime.');
-  const source = path.join(root, `wda-${metadata.version}`);
-  const derived = path.join(root, `wda-derived-data-${metadata.version}`);
-  const hostProducts = path.join(root, `wda-host-products-${metadata.version}`);
+  if (!validRunnerBundle(config.development_team, config.wda_bundle_id)) {
+    throw new AutomationError('invalid_configuration', 'Choose an Apple signing team in iPhone setup.');
+  }
+  const signing = createHash('sha256').update(`${config.development_team}\n${config.wda_bundle_id}`).digest('hex').slice(0, 16);
+  const cache = `${metadata.version}-${signing}`;
+  const source = path.join(root, `wda-${cache}`);
+  const derived = path.join(root, `wda-derived-data-${cache}`);
+  const hostProducts = path.join(root, `wda-host-products-${cache}`);
   const existing = await findTestRun(path.join(derived, 'Build', 'Products'));
   const hosted = existing ? null : await findTestRun(hostProducts);
   signal.throwIfAborted();
@@ -210,19 +218,35 @@ export async function prepareHostRunner(config, signal) {
 
 // A generic build may choose a development profile for different devices.
 // Check the local signed product during a request before handing it to XCTest.
-async function hostProfileSupports(root, products, udid, signal) {
-  const profile = path.join(products, 'Debug-iphoneos', 'WebDriverAgentRunner-Runner.app', 'embedded.mobileprovision');
+async function hostProfileSupports(root, products, config, signal) {
+  const runner = path.join(products, 'Debug-iphoneos', 'WebDriverAgentRunner-Runner.app');
+  const profile = path.join(runner, 'embedded.mobileprovision');
   const directory = await fs.mkdtemp(path.join(root, 'wda-profile-'));
   try {
     const decoded = path.join(directory, 'profile.plist');
     await runQuiet('/usr/bin/security', ['cms', '-D', '-i', profile, '-o', decoded], { signal });
-    const [devices, expiration] = await Promise.all([
+    const [devices, expiration, team, prefixes, application, signature] = await Promise.all([
       runQuiet('/usr/bin/plutil', ['-extract', 'ProvisionedDevices', 'json', '-o', '-', decoded], { signal }),
       runQuiet('/usr/bin/plutil', ['-extract', 'ExpirationDate', 'raw', '-o', '-', decoded], { signal }),
+      runQuiet('/usr/bin/plutil', ['-extract', 'TeamIdentifier', 'json', '-o', '-', decoded], { signal }),
+      runQuiet('/usr/bin/plutil', ['-extract', 'ApplicationIdentifierPrefix', 'json', '-o', '-', decoded], { signal }),
+      runQuiet('/usr/bin/plutil', ['-extract', 'Entitlements.application-identifier', 'raw', '-o', '-', decoded], { signal }),
+      runQuiet('/usr/bin/codesign', ['--display', '--verbose=4', runner], { signal, captureStderr: true }),
+      runQuiet('/usr/bin/codesign', ['--verify', '--deep', '--strict', runner], { signal }),
     ]);
     const listed = JSON.parse(devices);
+    const teamIdentifiers = JSON.parse(team);
+    const appPrefixes = JSON.parse(prefixes);
+    const signedFields = signature.split('\n');
+    const signedTeam = signedFields.filter(line => line.startsWith('TeamIdentifier='));
+    const signedBundle = signedFields.filter(line => line.startsWith('Identifier='));
     return Date.parse(expiration.trim()) > Date.now() && Array.isArray(listed)
-      && listed.some(value => typeof value === 'string' && value.toLowerCase() === udid.toLowerCase());
+      && listed.some(value => typeof value === 'string' && value.toLowerCase() === config.device_udid.toLowerCase())
+      && Array.isArray(teamIdentifiers) && teamIdentifiers.length === 1 && teamIdentifiers[0] === config.development_team
+      && signedTeam.length === 1 && signedTeam[0] === `TeamIdentifier=${config.development_team}`
+      && signedBundle.length === 1 && signedBundle[0] === `Identifier=${config.wda_bundle_id}.xctrunner`
+      && Array.isArray(appPrefixes) && appPrefixes.some(prefix => typeof prefix === 'string'
+        && /^[A-Z0-9]{10}$/.test(prefix) && profileApplicationMatches(application.trim(), `${prefix}.${config.wda_bundle_id}.xctrunner`));
   } catch {
     signal.throwIfAborted();
     return false;
@@ -231,12 +255,26 @@ async function hostProfileSupports(root, products, udid, signal) {
   }
 }
 
+export function profileApplicationMatches(pattern, application) {
+  if (pattern === application) return true;
+  // Apple's automatic development profiles can cover a bundle prefix. The
+  // actual signed bundle and team are verified independently above.
+  return pattern.endsWith('.*') && !pattern.slice(0, -1).includes('*')
+    && application.startsWith(pattern.slice(0, -1));
+}
+
 async function preparedTestRun(config, signal, onStatus) {
   const { root, upstream, source, derived, hostProducts, existing, hosted } = await runnerPaths(config, signal);
-  if (existing) return existing;
-  if (hosted && await hostProfileSupports(root, hostProducts, config.device_udid, signal)) return hosted;
+  if (existing && await hostProfileSupports(root, path.dirname(existing.original), config, signal)) return existing;
+  if (hosted && await hostProfileSupports(root, hostProducts, config, signal)) return hosted;
   onStatus('preparing_iphone_runner');
   return buildTestRun(config, upstream, source, derived, signal, false);
+}
+
+/** Explicit setup may register the selected device with the user's Apple team. */
+export async function prepareDeviceRunner(config, signal) {
+  const { upstream, source, derived } = await runnerPaths(config, signal);
+  await buildTestRun(config, upstream, source, derived, signal, false, true);
 }
 
 // XCTest prints this marker after binding its HTTP listener. We only use it
