@@ -28,6 +28,8 @@ mod iphone_node;
 #[cfg(target_os = "macos")]
 mod iphone_preparation;
 #[cfg(target_os = "macos")]
+mod iphone_setup;
+#[cfg(target_os = "macos")]
 pub(crate) mod iphone_setup_info;
 #[cfg(target_os = "macos")]
 mod iphone_signing;
