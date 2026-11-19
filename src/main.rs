@@ -24,6 +24,8 @@ pub(crate) mod background;
 pub(crate) mod config;
 pub(crate) mod debug_fill;
 #[cfg(target_os = "macos")]
+mod iphone_node;
+#[cfg(target_os = "macos")]
 mod iphone_preparation;
 #[cfg(target_os = "macos")]
 pub(crate) mod iphone_setup_info;
