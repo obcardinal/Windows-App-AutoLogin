@@ -15,9 +15,12 @@ pub(crate) enum SetupInfo {
     NotConfigured,
     NoDeviceSelected,
     ConfigUnavailable,
-    SelectedUnavailable,
-    SelectedNeedsSetup { name: Option<String> },
-    Selected { name: String, wifi_connected: bool },
+    Selected {
+        id: String,
+        name: Option<String>,
+        wifi_connected: bool,
+        helper_installed: bool,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -44,17 +47,11 @@ pub(crate) fn read() -> SetupInfo {
             .into_iter()
             .find(|p| p.id.eq_ignore_ascii_case(&selected))
     });
-    if !installed {
-        return SetupInfo::SelectedNeedsSetup {
-            name: device.map(|p| p.name),
-        };
-    }
-    match device {
-        Some(phone) => SetupInfo::Selected {
-            name: phone.name,
-            wifi_connected: phone.wifi_connected,
-        },
-        None => SetupInfo::SelectedUnavailable,
+    SetupInfo::Selected {
+        id: selected,
+        wifi_connected: device.as_ref().is_some_and(|p| p.wifi_connected),
+        name: device.map(|p| p.name),
+        helper_installed: installed,
     }
 }
 
@@ -74,18 +71,72 @@ pub(crate) fn paired_phones() -> Result<Vec<PairedPhone>, String> {
     Ok(phones)
 }
 
-pub(crate) fn select_phone(id: &str) -> Result<(), String> {
+const UNREACHABLE: &str = "The iPhone didn’t respond. Unlock it, connect it to the same Wi-Fi as this Mac, and try again.";
+
+pub(crate) fn connect_phone(id: &str) -> Result<(), String> {
+    let path = root().map_err(|_| "The iPhone preferences could not be located.")?;
+    connect_phone_at(&path, id)
+}
+
+fn connect_phone_at(path: &Path, id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err("Choose an iPhone from the paired devices.".into());
     }
-    let phones = list_inventory()?;
-    let selected = phones
-        .iter()
-        .find(|p| p.id.eq_ignore_ascii_case(id))
-        .ok_or("This iPhone is no longer in the paired device list. Refresh and choose again.")?;
-    let path = root().map_err(|_| "The iPhone preferences could not be located.")?;
-    save_selection(&path, &selected.id)
+    // A dormant Wi-Fi tunnel can still be reachable. This read asks the actual
+    // phone to respond; the inventory by itself can return cached information.
+    let response = device_command(
+        &[
+            "device",
+            "info",
+            "lockState",
+            "--device",
+            id,
+            "--timeout",
+            "8",
+        ],
+        Duration::from_secs(10),
+        UNREACHABLE,
+    )?;
+    let live_device = responding_device(&response).ok_or(UNREACHABLE)?;
+    let phone = verify_wifi_device(&inventory()?, id, live_device)?;
+    save_selection(path, &phone.id)
         .map_err(|_| "The iPhone selection couldn’t be saved. Check for another setup in progress and try again.".into())
+}
+
+fn responding_device(response: &[u8]) -> Option<uuid::Uuid> {
+    let doc: Value = serde_json::from_slice(response).ok()?;
+    if doc.pointer("/info/outcome")?.as_str()? != "success" {
+        return None;
+    }
+    uuid::Uuid::parse_str(doc.pointer("/result/deviceIdentifier")?.as_str()?).ok()
+}
+
+fn verify_wifi_device(
+    bytes: &[u8],
+    id: &str,
+    live_device: uuid::Uuid,
+) -> Result<PairedPhone, &'static str> {
+    const MISSING: &str =
+        "Xcode couldn’t confirm the selected iPhone. Refresh the device list and try again.";
+    let doc: Value = serde_json::from_slice(bytes).map_err(|_| MISSING)?;
+    let mut matches = doc
+        .pointer("/result/devices")
+        .and_then(Value::as_array)
+        .ok_or(MISSING)?
+        .iter()
+        .filter_map(|device| Some((device, paired_iphone(device)?)))
+        .filter(|(_, phone)| phone.id.eq_ignore_ascii_case(id));
+    let (device, phone) = matches.next().ok_or(MISSING)?;
+    let identifier = device["identifier"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    if matches.next().is_some() || identifier != Some(live_device) {
+        return Err(MISSING);
+    }
+    if !phone.wifi_connected {
+        return Err("Xcode couldn’t confirm a Wi-Fi connection. Disconnect any USB cable, keep the iPhone on the same Wi-Fi as this Mac, and try again.");
+    }
+    Ok(phone)
 }
 
 fn check_dir(root: &Path) -> anyhow::Result<()> {
@@ -223,22 +274,27 @@ fn lock_selection(root: &Path) -> anyhow::Result<File> {
 }
 
 fn inventory() -> Result<Vec<u8>, &'static str> {
-    const UNAVAILABLE: &str = "Couldn’t read Xcode’s paired iPhone list. Open Xcode and try again.";
+    device_command(
+        &["list", "devices", "--timeout", "5"],
+        Duration::from_secs(7),
+        "Couldn’t read Xcode’s paired iPhone list. Open Xcode and try again.",
+    )
+}
+
+fn device_command(
+    args: &[&str],
+    timeout: Duration,
+    unavailable: &'static str,
+) -> Result<Vec<u8>, &'static str> {
     const MISSING: &str = "Xcode’s device tools are unavailable. Install Xcode and select it as the active developer tools.";
     const MAX_BYTES: usize = 2 * 1024 * 1024;
-    let home = crate::user_paths::home_dir().ok_or(UNAVAILABLE)?;
-    let (mut reader, writer) = UnixStream::pair().map_err(|_| UNAVAILABLE)?;
-    reader.set_nonblocking(true).map_err(|_| UNAVAILABLE)?;
+    let home = crate::user_paths::home_dir().ok_or(unavailable)?;
+    let (mut reader, writer) = UnixStream::pair().map_err(|_| unavailable)?;
+    reader.set_nonblocking(true).map_err(|_| unavailable)?;
     let mut child = Command::new("/usr/bin/xcrun")
-        .args([
-            "devicectl",
-            "list",
-            "devices",
-            "--timeout",
-            "5",
-            "--json-output",
-            "-",
-        ])
+        .arg("devicectl")
+        .args(args)
+        .args(["--json-output", "-"])
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -248,10 +304,10 @@ fn inventory() -> Result<Vec<u8>, &'static str> {
         .spawn()
         .map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => MISSING,
-            _ => UNAVAILABLE,
+            _ => unavailable,
         })?;
 
-    let deadline = Instant::now() + Duration::from_secs(7);
+    let deadline = Instant::now() + timeout;
     let mut data = Vec::new();
     let mut buffer = [0; 16384];
     while Instant::now() < deadline {
@@ -259,7 +315,7 @@ fn inventory() -> Result<Vec<u8>, &'static str> {
             Ok(0) => match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(data),
                 Ok(Some(status)) if matches!(status.code(), Some(69 | 72)) => return Err(MISSING),
-                Ok(Some(_)) => return Err(UNAVAILABLE),
+                Ok(Some(_)) => return Err(unavailable),
                 Ok(None) => {}
                 Err(_) => break,
             },
@@ -275,7 +331,7 @@ fn inventory() -> Result<Vec<u8>, &'static str> {
     }
     let _ = child.kill();
     let _ = child.wait();
-    Err(UNAVAILABLE)
+    Err(unavailable)
 }
 
 fn list_inventory() -> Result<Vec<PairedPhone>, String> {
@@ -365,14 +421,11 @@ mod tests {
             "connectionProperties":{"pairingState":"paired","transportType":"localNetwork","tunnelState":"connected"}})
     }
 
-    fn result(devices: Vec<Value>) -> Option<SetupInfo> {
+    fn result(devices: Vec<Value>) -> Option<(String, bool)> {
         parse_inventory(&serde_json::to_vec(&json!({"result":{"devices":devices}})).unwrap())?
             .into_iter()
             .find(|p| p.id.eq_ignore_ascii_case(ID))
-            .map(|p| SetupInfo::Selected {
-                name: p.name,
-                wifi_connected: p.wifi_connected,
-            })
+            .map(|p| (p.name, p.wifi_connected))
     }
 
     #[test]
@@ -405,12 +458,7 @@ mod tests {
     #[test]
     fn distinguishes_named_selected_iphone_from_current_wifi_connection() {
         let device = legacy_device();
-        let expected = |connected| {
-            Some(SetupInfo::Selected {
-                name: "Work iPhone".into(),
-                wifi_connected: connected,
-            })
-        };
+        let expected = |connected| Some(("Work iPhone".into(), connected));
         assert_eq!(result(vec![device.clone()]), expected(true));
         let mut dormant = device.clone();
         dormant["connectionProperties"]["tunnelState"] = json!("disconnected");
@@ -422,11 +470,48 @@ mod tests {
         anonymous["deviceProperties"]["name"] = json!(ID);
         assert_eq!(
             result(vec![anonymous]),
-            Some(SetupInfo::Selected {
-                name: "Paired iPhone".into(),
-                wifi_connected: true
-            })
+            Some(("Paired iPhone".into(), true))
         );
+    }
+
+    #[test]
+    fn connection_requires_a_response_from_the_selected_physical_wifi_device() {
+        let identifier = uuid::Uuid::new_v4();
+        let mut response = json!({"info":{"outcome":"success"},"result":{
+            "deviceIdentifier":identifier.to_string(),"passcodeRequired":true}});
+        let live = responding_device(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(live, identifier);
+        response["info"]["outcome"] = json!("failed");
+        assert!(responding_device(&serde_json::to_vec(&response).unwrap()).is_none());
+        assert!(responding_device(b"{}").is_none());
+
+        let mut device = legacy_device();
+        device["identifier"] = json!(identifier.to_string());
+        let inventory = |devices: Vec<Value>| {
+            serde_json::to_vec(&json!({"result":{"devices":devices}})).unwrap()
+        };
+        let verify = |devices| verify_wifi_device(&inventory(devices), ID, live);
+        assert_eq!(verify(vec![device.clone()]).unwrap().id, ID);
+        assert!(verify(vec![device.clone(), device.clone()]).is_err());
+        let mut modern = json!({"identifier":identifier.to_string(),"properties":{
+            "hardware":device["hardwareProperties"],
+            "state":{"name":"Work iPhone"},
+            "connection":{"pairingState":"paired","state":"connected","transportType":"localNetwork"}
+        }});
+        assert!(verify(vec![modern.clone()]).is_ok());
+        modern["properties"]["connection"]["transportType"] = json!("wired");
+        assert!(verify(vec![modern]).is_err());
+        let mut dormant = device.clone();
+        dormant["connectionProperties"]["tunnelState"] = json!("disconnected");
+        assert!(verify(vec![dormant]).is_err());
+        let mut unpaired = device.clone();
+        unpaired["connectionProperties"]["pairingState"] = json!("unpaired");
+        assert!(verify(vec![unpaired]).is_err());
+        let mut wrong_phone = device.clone();
+        wrong_phone["hardwareProperties"]["udid"] = json!("AAAAAAAA-0000000000000002");
+        assert!(verify(vec![wrong_phone]).is_err());
+        device["identifier"] = json!(uuid::Uuid::new_v4().to_string());
+        assert!(verify(vec![device]).is_err());
     }
     #[test]
     fn pending_choice_and_installed_config_have_one_authoritative_phone() {
@@ -450,7 +535,7 @@ mod tests {
             config_value(&root.join("config.json")).unwrap().unwrap()["runtime_dir"],
             "preserve-me"
         );
-        assert!(save_selection(&root, "bad").is_err());
+        assert!(connect_phone_at(&root, "bad").is_err());
         assert_eq!(selected_id(&root), Ok((other.into(), true)));
         fs::remove_dir_all(root).unwrap();
     }
