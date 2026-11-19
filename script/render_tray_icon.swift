@@ -3,9 +3,12 @@ import AppKit
 // Render the source vector directly, preserving its transparent background.
 let sourceURL = URL(fileURLWithPath: "assets/icon_tray.svg")
 let outputURL = URL(fileURLWithPath: "assets/icon_tray.png")
-guard let image = NSImage(contentsOf: sourceURL),
-  let bitmap = NSBitmapImageRep(
-    bitmapDataPlanes: nil, pixelsWide: 128, pixelsHigh: 128,
+guard let image = NSImage(contentsOf: sourceURL) else {
+  fatalError("Could not load the menu-bar SVG")
+}
+let size = image.size
+guard let bitmap = NSBitmapImageRep(
+    bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
     isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
   ),
@@ -15,7 +18,7 @@ else {
 }
 NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = context
-let bounds = NSRect(x: 0, y: 0, width: 128, height: 128)
+let bounds = NSRect(origin: .zero, size: size)
 NSColor.clear.setFill()
 bounds.fill(using: .copy)
 image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1)
