@@ -2981,7 +2981,7 @@ fn account_editor_contents(
         crate::ui::toggle::labeled_switch(
             ui,
             &mut account.iphone_authenticator_enabled,
-            "Use iPhone for 2FA",
+            "Use iPhone",
             "Use the iPhone selected in Settings for this account.",
         );
         account_editor_help(ui, ACCOUNT_2FA_HELP);
@@ -7503,7 +7503,7 @@ mod tests {
             "Match the active remote desktop session to this account.",
             "Open the VM when you click the Open desktop arrow in Accounts.",
             "2FA",
-            "Use iPhone for 2FA",
+            "Use iPhone",
         ] {
             assert_eq!(
                 !visible_text_rects(&frame, name).is_empty(),
@@ -7546,7 +7546,7 @@ mod tests {
                     .iter()
                     .find(|(_, node)| {
                         node.role() == egui::accesskit::Role::CheckBox
-                            && node.label() == Some("Use iPhone for 2FA")
+                            && node.label() == Some("Use iPhone")
                     })
                     .expect("account 2FA switch");
                 (node.bounds().unwrap(), node.toggled().unwrap())
@@ -7557,7 +7557,7 @@ mod tests {
                 (bounds.x0 + bounds.x1) as f32 * 0.5,
                 (bounds.y0 + bounds.y1) as f32 * 0.5,
             );
-            let label = visible_text_rects(&frame, "Use iPhone for 2FA")[0];
+            let label = visible_text_rects(&frame, "Use iPhone")[0];
             assert!(label.right() < bounds.x0 as f32);
             assert!((label.center().y - pos.y).abs() < 2.0);
             let help = visible_text_rects(&frame, super::ACCOUNT_2FA_HELP)[0];

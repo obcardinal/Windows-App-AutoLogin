@@ -197,7 +197,7 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
                     });
             });
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("In Accounts, open an account and turn on “Use iPhone for 2FA”.").small().color(theme::MUTED));
+            ui.label(egui::RichText::new("In Accounts, open an account and turn on 2FA → Use iPhone.").small().color(theme::MUTED));
         });
     Some(body.inner_rect.top() - top + body.content_size.y)
 }

@@ -5,7 +5,7 @@ for an account's Windows App sign-in. In **Settings → iPhone Authentication**,
 click **Set up iPhone…**, choose a paired device by name, and click **Save iPhone**.
 All participating accounts use this phone. The choice is saved on this Mac by
 device identifier. Open **Sign-in details… → iPhone setup…** to change it later.
-In **Accounts**, open an account, turn on **Use iPhone for 2FA**, and save.
+In **Accounts**, open an account, turn on **2FA → Use iPhone**, and save.
 AutoLogin identifies Microsoft Authenticator from the instructions next to the
 two-digit number in Windows App. Other methods require manual sign-in.
 The switch defaults to off for new accounts. This feature requires macOS and Xcode.
