@@ -43,44 +43,22 @@ pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Respo
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-pub(super) fn labeled_switch(
-    ui: &mut egui::Ui,
-    value: &mut bool,
-    label: impl Into<egui::WidgetText>,
-    hint: &str,
-) -> bool {
-    let label = label.into();
-    let (label_response, switch_response) = egui::containers::Sides::new()
+pub(super) fn labeled_switch(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) -> bool {
+    let (_, switch_response) = egui::containers::Sides::new()
         .height(36.0)
         .shrink_left()
         .wrap()
         .show(
             ui,
             |ui| {
-                let visuals = ui.visuals_mut();
-                visuals.override_text_color = None;
-                visuals.widgets.inactive.fg_stroke.color = theme::TEXT;
-                visuals.widgets.hovered.fg_stroke.color = theme::ACCENT;
-                visuals.widgets.active.fg_stroke.color = theme::ACCENT;
                 ui.add(
-                    egui::Label::new(label.clone())
-                        .selectable(false)
-                        .sense(egui::Sense::CLICK),
+                    egui::Label::new(egui::RichText::new(label).color(theme::TEXT))
+                        .selectable(false),
                 )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(hint)
             },
-            |ui| switch(ui, value, label.text()).on_hover_text(hint),
+            |ui| switch(ui, value, label).on_hover_text(hint),
         );
-    // The switch provides a single named keyboard and accessibility target.
-    if label_response.clicked() {
-        *value = !*value;
-        switch_response.request_focus();
-        ui.ctx().request_repaint();
-        true
-    } else {
-        switch_response.changed()
-    }
+    switch_response.changed()
 }
 
 #[cfg(test)]
@@ -131,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn clickable_setting_label_changes_ink_only_while_enabled_and_hovered() {
+    fn switch_label_keeps_its_text_color_and_cursor_on_hover() {
         for enabled in [true, false] {
             let ctx = egui::Context::default();
             theme::apply(&ctx);
@@ -163,21 +141,18 @@ mod tests {
                                 } else {
                                     ink
                                 },
+                                output.platform_output.cursor_icon,
                             ))
                         }
                         _ => None,
                     })
                     .expect("setting label must be painted")
             };
-            let (rect, idle) = render(vec![]);
-            let (hover_rect, hover) = render(vec![egui::Event::PointerMoved(rect.center())]);
-            assert_eq!(hover_rect, rect);
-            assert_eq!(idle != hover, enabled);
+            let (rect, idle, cursor) = render(vec![]);
+            assert_eq!(cursor, egui::CursorIcon::Default);
             assert_eq!(
-                render(vec![egui::Event::PointerMoved(
-                    rect.right_center() + egui::vec2(12.0, 0.0)
-                )]),
-                (rect, idle)
+                render(vec![egui::Event::PointerMoved(rect.center())]),
+                (rect, idle, cursor)
             );
             assert!(!checked);
         }

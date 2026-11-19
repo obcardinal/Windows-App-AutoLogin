@@ -2978,7 +2978,7 @@ fn account_editor_contents(
 
     #[cfg(target_os = "macos")]
     account_editor_card(ui, "2FA", |ui| {
-        account_editor_switch(
+        crate::ui::toggle::labeled_switch(
             ui,
             &mut account.iphone_authenticator_enabled,
             "Use iPhone for 2FA",
@@ -3037,30 +3037,6 @@ fn account_editor_help(ui: &mut egui::Ui, message: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn account_editor_switch(
-    ui: &mut egui::Ui,
-    value: &mut bool,
-    label: &str,
-    hint: &str,
-) -> egui::Response {
-    let (_, switch) = egui::containers::Sides::new()
-        .height(36.0)
-        .shrink_left()
-        .wrap()
-        .show(
-            ui,
-            |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(label).color(theme::TEXT))
-                        .selectable(false),
-                )
-            },
-            |ui| crate::ui::toggle::switch(ui, value, label).on_hover_text(hint),
-        );
-    switch
-}
-
-#[cfg(target_os = "macos")]
 fn show_locked_vm_reconnect(
     ui: &mut egui::Ui,
     account: &mut Account,
@@ -3078,7 +3054,7 @@ fn show_locked_vm_reconnect(
     let hint = "Reconnect the selected desktop when Windows App shows its lock screen.";
     let changed = ui
         .add_enabled_ui(supported || account.reconnect_locked_vm, |ui| {
-            account_editor_switch(ui, &mut account.reconnect_locked_vm, label, hint).changed()
+            crate::ui::toggle::labeled_switch(ui, &mut account.reconnect_locked_vm, label, hint)
         })
         .inner;
     if !supported {

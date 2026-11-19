@@ -1018,7 +1018,7 @@ mod tests {
     use tokio::sync::mpsc::channel as tokio_channel;
 
     #[test]
-    fn preference_label_and_switch_each_toggle_once_and_respect_disabled_state() {
+    fn only_the_enabled_switch_changes_a_preference() {
         for enabled in [true, false] {
             for click_label in [true, false] {
                 let ctx = egui::Context::default();
@@ -1057,9 +1057,10 @@ mod tests {
                 let (_, changed, value) = frame(vec![egui::Event::PointerMoved(pos), button(true)]);
                 assert!(!changed && !value);
                 let (_, changed, value) = frame(vec![button(false)]);
-                assert_eq!((changed, value), (enabled, enabled));
+                let toggled = enabled && !click_label;
+                assert_eq!((changed, value), (toggled, toggled));
                 let (_, changed, value) = frame(vec![]);
-                assert_eq!((changed, value), (false, enabled));
+                assert_eq!((changed, value), (false, toggled));
             }
         }
     }
