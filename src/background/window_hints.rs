@@ -11,6 +11,8 @@ use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::ptr;
+use std::sync::mpsc::{sync_channel, Receiver as WindowReceiver, SyncSender};
+use std::thread::Thread;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -23,9 +25,50 @@ pub(super) struct WindowHints {
 
 struct Subscription {
     hints: Receiver<()>,
+    _lifetime: UnixStream,
+}
+
+pub(crate) struct WindowObservation {
     // Closing the peer stops the native run loop, including when cancellation
     // happens before it has installed its sources.
     _lifetime: UnixStream,
+    windows: WindowReceiver<ObservedElement>,
+}
+
+struct ObservedElement(CFType);
+// SAFETY: This wrapper only receives a retained AXUIElementRef, an immutable
+// remote proxy. The producer only retains it; AX queries run on the receiver.
+unsafe impl Send for ObservedElement {}
+
+const WINDOW_QUEUE_LIMIT: usize = 16;
+
+enum Wake {
+    Prompt(Sender<()>),
+    Connection(Thread, SyncSender<ObservedElement>),
+}
+
+impl Wake {
+    unsafe fn notify(&self, element: CFTypeRef, notification: CFStringRef) {
+        match self {
+            Self::Prompt(sender) => {
+                let _ = sender.try_send(());
+            }
+            Self::Connection(worker, windows) => {
+                if !element.is_null() && !notification.is_null() {
+                    let name = CFString::wrap_under_get_rule(notification);
+                    if name != CFString::from_static_string("AXApplicationActivated") {
+                        let proxy = ObservedElement(CFType::wrap_under_get_rule(element));
+                        let _ = windows.try_send(proxy);
+                    }
+                }
+                worker.unpark();
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        matches!(self, Self::Prompt(sender) if sender.is_closed())
+    }
 }
 
 impl WindowHints {
@@ -69,17 +112,40 @@ impl WindowHints {
 
 impl Subscription {
     fn start(pid: i32) -> Option<Self> {
-        let (lifetime, cancellation) = UnixStream::pair().ok()?;
         let (sender, hints) = mpsc::channel(1);
-        std::thread::Builder::new()
-            .name("desktop-window-observer".to_string())
-            .spawn(move || observe_windows(pid, sender, cancellation))
-            .ok()?;
+        let lifetime = start_observation(pid, Wake::Prompt(sender))?;
         Some(Self {
             hints,
             _lifetime: lifetime,
         })
     }
+}
+
+/// Wakes the connection watcher for a fresh inspection. Thread park tokens
+/// coalesce repeated notifications and retain a wake that precedes the wait.
+pub(crate) fn observe_connection_windows(pid: i32, wake: Thread) -> Option<WindowObservation> {
+    let (sender, windows) = sync_channel(WINDOW_QUEUE_LIMIT);
+    Some(WindowObservation {
+        _lifetime: start_observation(pid, Wake::Connection(wake, sender))?,
+        windows,
+    })
+}
+
+impl WindowObservation {
+    /// Notifications can refer to unrelated windows or to the application
+    /// itself. Resolve the owner, role and window identity on the watcher.
+    pub(crate) fn take_window(&self) -> Option<CFType> {
+        self.windows.try_recv().ok().map(|proxy| proxy.0)
+    }
+}
+
+fn start_observation(pid: i32, wake: Wake) -> Option<UnixStream> {
+    let (lifetime, cancellation) = UnixStream::pair().ok()?;
+    std::thread::Builder::new()
+        .name("desktop-window-observer".to_owned())
+        .spawn(move || observe_windows(pid, wake, cancellation))
+        .ok()?;
+    Some(lifetime)
 }
 
 type ObserverCallback = extern "C" fn(CFTypeRef, CFTypeRef, CFStringRef, *mut c_void);
@@ -100,21 +166,20 @@ unsafe extern "C" {
 
 extern "C" fn received_window_hint(
     _: CFTypeRef,
-    _: CFTypeRef,
-    _: CFStringRef,
+    element: CFTypeRef,
+    notification: CFStringRef,
     context: *mut c_void,
 ) {
-    // SAFETY: Registration and delivery share one thread. Its sender lives
+    // SAFETY: Registration and delivery share one thread. Its wake handle lives
     // until after both the run-loop source and observer have been removed.
-    let sender = unsafe { &*context.cast::<Sender<()>>() };
-    let _ = sender.try_send(());
+    unsafe { (&*context.cast::<Wake>()).notify(element, notification) };
 }
 
 extern "C" fn cancel_observation(_: CFFileDescriptorRef, _: CFOptionFlags, _: *mut c_void) {
     CFRunLoop::get_current().stop();
 }
 
-fn observe_windows(pid: i32, sender: Sender<()>, cancellation: UnixStream) {
+fn observe_windows(pid: i32, wake: Wake, cancellation: UnixStream) {
     let Some(stop_fd) =
         CFFileDescriptor::new(cancellation.as_raw_fd(), false, cancel_observation, None)
     else {
@@ -123,11 +188,11 @@ fn observe_windows(pid: i32, sender: Sender<()>, cancellation: UnixStream) {
     let Some(stop_source) = stop_fd.to_run_loop_source(0) else {
         return;
     };
-    if sender.is_closed() {
+    if wake.is_closed() {
         return;
     }
-    // SAFETY: The create rules return owned CF objects. The callback only
-    // receives a bounded channel; it never reads the notifying AX element.
+    // SAFETY: The create rules return owned CF objects. The callback can retain
+    // the notifying AX proxy but never reads its attributes or performs actions.
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -143,8 +208,17 @@ fn observe_windows(pid: i32, sender: Sender<()>, cancellation: UnixStream) {
         }
         let observer = CFType::wrap_under_create_rule(observer);
         let mut subscribed = false;
-        for name in ["AXWindowCreated", "AXSheetCreated"] {
-            if sender.is_closed() {
+        let notifications: &[&str] = match &wake {
+            Wake::Prompt(_) => &["AXWindowCreated", "AXSheetCreated"],
+            Wake::Connection(_, _) => &[
+                "AXWindowCreated",
+                "AXFocusedWindowChanged",
+                "AXMainWindowChanged",
+                "AXApplicationActivated",
+            ],
+        };
+        for &name in notifications {
+            if wake.is_closed() {
                 return;
             }
             let name = CFString::from_static_string(name);
@@ -152,10 +226,10 @@ fn observe_windows(pid: i32, sender: Sender<()>, cancellation: UnixStream) {
                 observer.as_CFTypeRef(),
                 app.as_CFTypeRef(),
                 name.as_concrete_TypeRef(),
-                ptr::from_ref(&sender).cast_mut().cast(),
+                ptr::from_ref(&wake).cast_mut().cast(),
             ) == 0;
         }
-        if !subscribed || sender.is_closed() {
+        if !subscribed || wake.is_closed() {
             return;
         }
         let source = AXObserverGetRunLoopSource(observer.as_CFTypeRef());
@@ -167,6 +241,10 @@ fn observe_windows(pid: i32, sender: Sender<()>, cancellation: UnixStream) {
         run_loop.add_source(&stop_source, kCFRunLoopDefaultMode);
         run_loop.add_source(&source, kCFRunLoopDefaultMode);
         stop_fd.enable_callbacks(kCFFileDescriptorReadCallBack);
+        if let Wake::Connection(worker, _) = &wake {
+            // Catch changes between the watcher's first snapshot and registration.
+            worker.unpark();
+        }
         CFRunLoop::run_current();
         run_loop.remove_source(&source, kCFRunLoopDefaultMode);
         run_loop.remove_source(&stop_source, kCFRunLoopDefaultMode);
@@ -178,6 +256,39 @@ fn observe_windows(pid: i32, sender: Sender<()>, cancellation: UnixStream) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn connection_window_hints_retain_bounded_proxies_and_skip_app_activation() {
+        let (lifetime, _peer) = UnixStream::pair().unwrap();
+        let (sender, windows) = sync_channel(WINDOW_QUEUE_LIMIT);
+        let observation = WindowObservation {
+            _lifetime: lifetime,
+            windows,
+        };
+        let wake = Wake::Connection(std::thread::current(), sender);
+        let emit = move |event, count| {
+            let raw = unsafe { AXUIElementCreateApplication(std::process::id() as i32) };
+            assert!(!raw.is_null());
+            let app = unsafe { CFType::wrap_under_create_rule(raw) };
+            let name = CFString::from_static_string(event);
+            for _ in 0..count {
+                unsafe { wake.notify(app.as_CFTypeRef(), name.as_concrete_TypeRef()) };
+            }
+            raw as usize
+        };
+        emit("AXApplicationActivated", 1);
+        assert!(observation.take_window().is_none());
+        let expected = std::thread::spawn(move || emit("AXWindowCreated", WINDOW_QUEUE_LIMIT + 1))
+            .join()
+            .unwrap();
+        for _ in 0..WINDOW_QUEUE_LIMIT {
+            assert_eq!(
+                observation.take_window().unwrap().as_CFTypeRef() as usize,
+                expected
+            );
+        }
+        assert!(observation.take_window().is_none());
+    }
 
     fn fixture() -> (WindowHints, Sender<()>, UnixStream) {
         let (lifetime, peer) = UnixStream::pair().unwrap();
