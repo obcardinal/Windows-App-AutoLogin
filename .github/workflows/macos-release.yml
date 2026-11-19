@@ -8,7 +8,7 @@ permissions: {}
 jobs:
   build:
     if: github.repository == 'obcardinal/Windows-App-AutoLogin' && github.ref == 'refs/heads/main'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       contents: read
@@ -26,6 +26,12 @@ jobs:
           cargo fetch --locked --target aarch64-apple-darwin
       - name: Build the application
         run: python3 script/build_macos_hosted_release.py
+      - name: Verify the linked SDK for the native macOS appearance
+        run: |
+          binary=target/aarch64-apple-darwin/release/windows-app-autologin
+          sdk=$(xcrun vtool -show-build "$binary" | awk '$1 == "sdk" { print $2 }')
+          echo "Linked macOS SDK $sdk (26 or later required)"
+          test "${sdk%%.*}" -ge 26
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-arm64-executable
