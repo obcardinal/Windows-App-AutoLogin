@@ -98,14 +98,14 @@ class UpdatePreparationTests(unittest.TestCase):
                 archive.writestr(entry, data)
 
     def test_framework_symlinks_are_allowed_but_escape_and_link_children_are_not(self):
-        framework = "WindowsAppAutoLogin.app/Contents/Frameworks/Sparkle.framework/"
+        framework = "Windows App AutoLogin.app/Contents/Frameworks/Sparkle.framework/"
         normal = [(framework + "Versions/B/Sparkle", b"binary", stat.S_IFREG | 0o755),
                   (framework + "Versions/Current", b"B", stat.S_IFLNK | 0o755),
                   (framework + "Sparkle", b"Versions/Current/Sparkle", stat.S_IFLNK | 0o755)]
         with tempfile.TemporaryDirectory() as temp:
             archive = Path(temp) / "test.zip"
             self.make_zip(archive, normal)
-            self.assertEqual(UPDATE.validate_zip(archive), "WindowsAppAutoLogin.app")
+            self.assertEqual(UPDATE.validate_zip(archive), "Windows App AutoLogin.app")
             for extra in [(framework + "escape", b"../../../../outside", stat.S_IFLNK | 0o755),
                           (framework + "Versions/Current/injected", b"bad", stat.S_IFREG | 0o644),
                           ("../outside", b"bad", stat.S_IFREG | 0o644),

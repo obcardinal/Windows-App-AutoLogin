@@ -27,7 +27,7 @@ output directory:
 
 ```sh
 ditto -c -k --sequesterRsrc --keepParent \
-  dist/WindowsAppAutoLogin.app /tmp/WindowsAppAutoLogin-development.zip
+  "dist/Windows App AutoLogin.app" /tmp/WindowsAppAutoLogin-development.zip
 python3 script/prepare_sparkle_update.py \
   --channel development \
   /tmp/WindowsAppAutoLogin-development.zip \

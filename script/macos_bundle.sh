@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
 
+waal_macos_bundle_name() {
+  /usr/bin/awk '
+    NR == 1 && /^[[:alnum:]]+([ -][[:alnum:]]+)*$/ { name = $0 }
+    END {
+      if (NR != 1 || name == "") {
+        print "Invalid macOS application name in " FILENAME > "/dev/stderr"
+        exit 1
+      }
+      print name
+    }
+  ' "$1/macos/BundleName.txt"
+}
+
 waal_require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required tool: $1" >&2

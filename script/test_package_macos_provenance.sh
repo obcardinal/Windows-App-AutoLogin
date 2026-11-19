@@ -31,6 +31,7 @@ REAL_MACOS_SDKROOT="$REAL_DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs
 REAL_CLANG_RESOURCE_DIR="$($REAL_CLANG_BIN -print-resource-dir)"
 # shellcheck source=script/package_macos.sh
 source "$ROOT_DIR/script/package_macos.sh"
+APP_NAME="$(waal_macos_bundle_name "$ROOT_DIR")"
 
 export WAAL_RELEASE_CARGO_PATH="$REAL_RELEASE_CARGO_BIN"
 export WAAL_RELEASE_RUSTC_PATH="$REAL_RELEASE_RUSTC_BIN"
@@ -162,14 +163,13 @@ write_crafted_raw_deflate_zip() {
         use strict;
         use warnings;
         use bytes;
-        my ($archive, $actual_size, $declared_size, $crc_mode) = @ARGV;
+        my ($archive, $actual_size, $declared_size, $crc_mode, $root) = @ARGV;
         die "invalid raw Deflate fixture size\n"
           unless $actual_size =~ /\A[0-9]+\z/ && $declared_size =~ /\A[0-9]+\z/;
         die "invalid raw Deflate fixture CRC mode\n"
           unless $crc_mode eq "matching" || $crc_mode eq "mismatch";
 
-        my $root = "WindowsAppAutoLogin.app/";
-        my $name = "WindowsAppAutoLogin.app/Contents/file";
+        my $name = $root . "Contents/file";
         my $payload = "\0" x $actual_size;
         my ($deflater, $status) = Compress::Raw::Zlib::Deflate->new(
           -WindowBits => -MAX_WBITS,
@@ -219,7 +219,7 @@ write_crafted_raw_deflate_zip() {
         print {$out} $local_bytes, $central_bytes, $eocd
           or die "write raw Deflate ZIP: $!\n";
         close $out or die "close raw Deflate ZIP: $!\n";
-      ' "$archive_path" "$actual_size" "$declared_size" "$crc_mode"
+      ' "$archive_path" "$actual_size" "$declared_size" "$crc_mode" "$APP_NAME.app/"
 }
 
 hex_bytes() {
@@ -235,8 +235,7 @@ write_crafted_entry_count_limit_zip() {
       use strict;
       use warnings;
       use bytes;
-      my ($archive, $limit) = @ARGV;
-      my $root = "WindowsAppAutoLogin.app/";
+      my ($archive, $limit, $root) = @ARGV;
       my $local_bytes = "";
       my $central_bytes = "";
       my $offset = 0;
@@ -263,7 +262,7 @@ write_crafted_entry_count_limit_zip() {
       print {$out} $local_bytes, $central_bytes, $eocd
         or die "write count-limit ZIP: $!\n";
       close $out or die "close count-limit ZIP: $!\n";
-    ' "$archive_path" "$entry_limit"
+    ' "$archive_path" "$entry_limit" "$APP_NAME.app/"
 }
 
 assert_archive_resource_limit_rejected() {
@@ -544,7 +543,7 @@ STAGE_DIR="$TEST_FUNCTION_STAGE_DIR"
 RELEASE_SOURCE_ROOT="$TEST_FUNCTION_SOURCE_ROOT"
 
 REPO_DIR="$TEST_ROOT/source"
-/bin/mkdir -p "$REPO_DIR/src" "$REPO_DIR/assets"
+/bin/mkdir -p "$REPO_DIR/src" "$REPO_DIR/assets" "$REPO_DIR/macos"
 /usr/bin/git init --quiet "$REPO_DIR"
 /usr/bin/git -C "$REPO_DIR" config user.name "Release Provenance Test"
 /usr/bin/git -C "$REPO_DIR" config user.email "release-provenance@example.invalid"
@@ -557,7 +556,8 @@ REPO_DIR="$TEST_ROOT/source"
 /usr/bin/printf 'fn main() { assert!(std::env::var_os("WAAL_HOSTILE_CARGO_CONFIG").is_none(), "hostile Cargo config was loaded"); }\n' >"$REPO_DIR/build.rs"
 /usr/bin/printf 'pub fn fixture() {}\n' >"$REPO_DIR/src/lib.rs"
 /usr/bin/printf 'asset\n' >"$REPO_DIR/assets/fixture.txt"
-/usr/bin/git -C "$REPO_DIR" add -- .gitignore Cargo.toml Cargo.lock build.rs src assets tracked.txt
+/bin/cp "$ROOT_DIR/macos/BundleName.txt" "$REPO_DIR/macos/BundleName.txt"
+/usr/bin/git -C "$REPO_DIR" add -- .gitignore Cargo.toml Cargo.lock build.rs src assets macos tracked.txt
 /usr/bin/git -C "$REPO_DIR" commit --quiet -m "fixture"
 
 capture_release_provenance_for_root "$REPO_DIR"
@@ -648,6 +648,8 @@ materialize_release_source_for_root \
   "$RELEASE_GIT_TREE"
 [ "$(/bin/cat "$SNAPSHOT_DIR/tracked.txt")" = "tracked" ] \
   || fail "materialized source does not match the captured commit"
+[ "$(waal_macos_bundle_name "$SNAPSHOT_DIR")" = "$APP_NAME" ] \
+  || fail "materialized source has the wrong macOS application name"
 [ ! -e "$SNAPSHOT_DIR/ignored-injection" ] \
   || fail "ignored working-copy content leaked into the release source snapshot"
 RELEASE_SOURCE_DIR="$SNAPSHOT_DIR"
@@ -1070,9 +1072,9 @@ fi
 prepare_atomic_no_replace_rename_helper
 
 ZIP_ENV_ROOT="$STAGE_DIR/zip-environment-fixture"
-/bin/mkdir -p "$ZIP_ENV_ROOT/WindowsAppAutoLogin.app/Contents"
+/bin/mkdir -p "$ZIP_ENV_ROOT/$APP_NAME.app/Contents"
 /usr/bin/printf 'ZIP environment fixture\n' \
-  >"$ZIP_ENV_ROOT/WindowsAppAutoLogin.app/Contents/file"
+  >"$ZIP_ENV_ROOT/$APP_NAME.app/Contents/file"
 ZIPOPT_MARKER_HELPER="$STAGE_DIR/zipopt-marker-helper"
 ZIPOPT_MARKER="$ZIPOPT_MARKER_HELPER.ran"
 /usr/bin/printf '%s\n' \
@@ -1085,7 +1087,7 @@ ZIPOPT_MARKER="$ZIPOPT_MARKER_HELPER.ran"
   cd "$ZIP_ENV_ROOT"
   export ZIPOPT="-T -TT $ZIPOPT_MARKER_HELPER"
   sanitized_zip -r -X "$STAGE_DIR/hostile-zipopt-command.zip" \
-    WindowsAppAutoLogin.app >/dev/null
+    "$APP_NAME.app" >/dev/null
 )
 [ ! -e "$ZIPOPT_MARKER" ] \
   || fail "caller ZIPOPT executed an external test command"
@@ -1095,16 +1097,16 @@ validate_archive_entries "$STAGE_DIR/hostile-zipopt-command.zip"
   export ZIPOPT=-j
   export ZIP=-j
   sanitized_zip -r -X "$STAGE_DIR/hostile-zipopt-j.zip" \
-    WindowsAppAutoLogin.app >/dev/null
+    "$APP_NAME.app" >/dev/null
 )
 (
   cd "$ZIP_ENV_ROOT"
   export ZIPOPT=-m
   export ZIP=-m
   sanitized_zip -r -X "$STAGE_DIR/hostile-zipopt-m.zip" \
-    WindowsAppAutoLogin.app >/dev/null
+    "$APP_NAME.app" >/dev/null
 )
-[ -f "$ZIP_ENV_ROOT/WindowsAppAutoLogin.app/Contents/file" ] \
+[ -f "$ZIP_ENV_ROOT/$APP_NAME.app/Contents/file" ] \
   || fail "hostile ZIPOPT=-m removed release source content"
 /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   /usr/bin/zipinfo -1 "$STAGE_DIR/hostile-zipopt-j.zip" \
@@ -1116,7 +1118,7 @@ validate_archive_entries "$STAGE_DIR/hostile-zipopt-command.zip"
   "$STAGE_DIR/hostile-zipopt-j.entries" \
   "$STAGE_DIR/hostile-zipopt-m.entries" \
   || fail "caller ZIP/ZIPOPT changed the sanitized ZIP entry set"
-/usr/bin/grep -Fxq 'WindowsAppAutoLogin.app/Contents/file' \
+/usr/bin/grep -Fxq "$APP_NAME.app/Contents/file" \
   "$STAGE_DIR/hostile-zipopt-j.entries" \
   || fail "hostile ZIPOPT flattened the sanitized ZIP"
 validate_archive_entries "$STAGE_DIR/hostile-zipopt-j.zip"
@@ -1133,18 +1135,18 @@ ARCHIVE_SESSION_A="$STAGE_DIR/archive-session-a.zip"
 ARCHIVE_SESSION_A_ASIDE="$STAGE_DIR/archive-session-a.aside.zip"
 ARCHIVE_SESSION_B="$STAGE_DIR/archive-session-b.zip"
 ARCHIVE_SESSION_B_ASIDE="$STAGE_DIR/archive-session-b.aside.zip"
-/bin/mkdir -p "$ARCHIVE_SESSION_ROOT/WindowsAppAutoLogin.app/Contents"
+/bin/mkdir -p "$ARCHIVE_SESSION_ROOT/$APP_NAME.app/Contents"
 /usr/bin/printf 'archive session A\n' \
-  >"$ARCHIVE_SESSION_ROOT/WindowsAppAutoLogin.app/Contents/file"
+  >"$ARCHIVE_SESSION_ROOT/$APP_NAME.app/Contents/file"
 (
   cd "$ARCHIVE_SESSION_ROOT"
-  sanitized_zip -r -X "$ARCHIVE_SESSION_A" WindowsAppAutoLogin.app >/dev/null
+  sanitized_zip -r -X "$ARCHIVE_SESSION_A" "$APP_NAME.app" >/dev/null
 )
 /usr/bin/printf 'archive session B\n' \
-  >"$ARCHIVE_SESSION_ROOT/WindowsAppAutoLogin.app/Contents/file"
+  >"$ARCHIVE_SESSION_ROOT/$APP_NAME.app/Contents/file"
 (
   cd "$ARCHIVE_SESSION_ROOT"
-  sanitized_zip -r -X "$ARCHIVE_SESSION_B" WindowsAppAutoLogin.app >/dev/null
+  sanitized_zip -r -X "$ARCHIVE_SESSION_B" "$APP_NAME.app" >/dev/null
 )
 ARCHIVE_SESSION_A_SHA256="$(release_tool_sha256 "$ARCHIVE_SESSION_A")"
 ARCHIVE_SESSION_B_SHA256="$(release_tool_sha256 "$ARCHIVE_SESSION_B")"
@@ -1283,11 +1285,11 @@ verify_bundle_tree_entry_safety "$ASSEMBLY_ACL_BUNDLE"
 eval "$ASSEMBLY_ICON_FUNCTION"
 eval "$ASSEMBLY_PLIST_FUNCTION"
 
-ZIP_ROOT_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f
-ZIP_CONTENTS_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f
-ZIP_FILE_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f66696c65
-ZIP_FILE_UPPER_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f46494c45
-ZIP_EXECUTABLE_HEX=57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f4d61634f532f77696e646f77732d6170702d6175746f6c6f67696e
+ZIP_ROOT_HEX=$(hex_bytes "$APP_NAME.app/")
+ZIP_CONTENTS_HEX=$(hex_bytes "$APP_NAME.app/Contents/")
+ZIP_FILE_HEX=$(hex_bytes "$APP_NAME.app/Contents/file")
+ZIP_FILE_UPPER_HEX=$(hex_bytes "$APP_NAME.app/Contents/FILE")
+ZIP_EXECUTABLE_HEX=$(hex_bytes "$APP_NAME.app/Contents/MacOS/$BINARY_NAME")
 CANONICAL_MODE_ZIP="$STAGE_DIR/canonical-modes.zip"
 write_crafted_stored_zip "$CANONICAL_MODE_ZIP" \
   "040755|$ZIP_ROOT_HEX|-|" \
@@ -1320,22 +1322,22 @@ assert_archive_rejected_before_extraction main-non-executable-mode \
   "0100644|$ZIP_EXECUTABLE_HEX|-|78"
 assert_archive_rejected_before_extraction traversal \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f2e2e2f657363617065|-|78'
+  "0100644|${ZIP_ROOT_HEX}2e2e2f657363617065|-|78"
 assert_archive_rejected_before_extraction absolute \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|2f57696e646f77734170704175746f4c6f67696e2e6170702f66696c65|-|78'
+  "0100644|2f${ZIP_ROOT_HEX}66696c65|-|78"
 assert_archive_rejected_before_extraction backslash \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74735c66696c65|-|78'
+  "0100644|${ZIP_ROOT_HEX}436f6e74656e74735c66696c65|-|78"
 assert_archive_rejected_before_extraction dot-component \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f2e2f66696c65|-|78'
+  "0100644|${ZIP_ROOT_HEX}2e2f66696c65|-|78"
 assert_archive_rejected_before_extraction empty-component \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f2f66696c65|-|78'
+  "0100644|${ZIP_ROOT_HEX}436f6e74656e74732f2f66696c65|-|78"
 assert_archive_rejected_before_extraction control-character \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f0a66696c65|-|78'
+  "0100644|${ZIP_ROOT_HEX}436f6e74656e74732f0a66696c65|-|78"
 assert_archive_rejected_before_extraction exact-duplicate \
   "040755|$ZIP_ROOT_HEX|-|" \
   "0100644|$ZIP_FILE_HEX|-|78" \
@@ -1346,7 +1348,7 @@ assert_archive_rejected_before_extraction case-duplicate \
   "0100644|$ZIP_FILE_UPPER_HEX|-|78"
 assert_archive_rejected_before_extraction file-directory-collision \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e7473|-|78' \
+  "0100644|${ZIP_ROOT_HEX}436f6e74656e7473|-|78" \
   "0100644|$ZIP_FILE_HEX|-|78"
 assert_archive_rejected_before_extraction symlink \
   "040755|$ZIP_ROOT_HEX|-|" \
@@ -1359,8 +1361,8 @@ assert_archive_rejected_before_extraction central-local-name-mismatch \
   "0100644|$ZIP_FILE_HEX|$ZIP_FILE_UPPER_HEX|78"
 assert_archive_rejected_before_extraction implicit-directory-case-collision \
   "040755|$ZIP_ROOT_HEX|-|" \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f466f6f2f6f6e65|-|31' \
-  '0100644|57696e646f77734170704175746f4c6f67696e2e6170702f436f6e74656e74732f666f6f2f74776f|-|32'
+  "0100644|${ZIP_ROOT_HEX}436f6e74656e74732f466f6f2f6f6e65|-|31" \
+  "0100644|${ZIP_ROOT_HEX}436f6e74656e74732f666f6f2f74776f|-|32"
 
 TEST_ZIP_MAX_ARCHIVE_BYTES=536870912
 TEST_ZIP_MAX_ENTRY_COUNT=16384

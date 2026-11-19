@@ -2442,7 +2442,10 @@ fn collect_current_process_diagnostic_fields() -> CurrentProcessDiagnosticFields
     };
     let signing = current_signing_info(&executable_path);
     let is_running_from_target_debug = executable_text.contains("/target/debug/");
-    let is_running_from_dist_app = executable_text.contains("/dist/WindowsAppAutoLogin.app/");
+    let is_running_from_dist_app = bundle_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .is_some_and(|parent| parent.ends_with("dist"));
 
     CurrentProcessDiagnosticFields {
         executable_path,

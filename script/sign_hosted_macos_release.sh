@@ -21,13 +21,14 @@ source "$work/source/script/macos_bundle.sh"
 source "$work/source/script/macos_sparkle.sh"
 
 binary=windows-app-autologin
-app="$work/WindowsAppAutoLogin.app"
+name="$(waal_macos_bundle_name "$work/source")"
+app="$work/$name.app"
 identifier=com.obcardinal.WindowsAppAutoLogin
 version=$(waal_cargo_version "$work/source")
 build=$(waal_build_version "$version")
 install -m 755 "$1" "$work/$binary"
 waal_assemble_app_bundle "$work/source" "$app" "$binary" "$work/$binary" \
-  "$identifier" "Windows App AutoLogin" "$version" "$build"
+  "$identifier" "$name" "$version" "$build"
 waal_stage_sparkle "$work/source" "$app"
 
 # Verify the bytes inside the bundle against the hosted workflow and commit

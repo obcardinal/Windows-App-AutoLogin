@@ -141,7 +141,7 @@ fn app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> bool {
         return development_app_bundle_identity_is_trusted(&bundle_path);
     }
 
-    bundle_path == std::path::Path::new(crate::app_identity::TRUSTED_MACOS_BUNDLE_PATH)
+    crate::app_identity::is_macos_install_path(&bundle_path)
         && app_bundle_signature_is_trusted(&bundle_path)
 }
 
@@ -197,13 +197,10 @@ fn development_app_bundle_identity_is_trusted(bundle_path: &std::path::Path) -> 
 
 #[cfg(target_os = "macos")]
 fn development_app_bundle_path_is_trusted(bundle_path: &std::path::Path) -> bool {
-    [
-        crate::app_identity::TRUSTED_MACOS_BUNDLE_PATH,
-        crate::app_identity::DEVELOPMENT_MACOS_BUNDLE_PATH,
-    ]
-    .into_iter()
-    .filter_map(|path| std::path::Path::new(path).canonicalize().ok())
-    .any(|candidate| candidate == bundle_path)
+    crate::app_identity::is_macos_install_path(bundle_path)
+        || std::path::Path::new(crate::app_identity::DEVELOPMENT_MACOS_BUNDLE_PATH)
+            .canonicalize()
+            .is_ok_and(|candidate| candidate == bundle_path)
 }
 
 #[cfg(target_os = "macos")]

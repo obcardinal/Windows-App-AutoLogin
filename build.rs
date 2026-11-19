@@ -122,10 +122,20 @@ fn main() {
     let release_provenance = release_provenance();
     let windows_authenticode_publisher = windows_authenticode_publisher();
     let windows_authenticode_cert_sha256 = windows_authenticode_cert_sha256();
-    let app_name = app_name();
-    let trusted_bundle_path = format!("/Applications/{app_name}.app");
+    // APP_NAME is a persistent storage and login-item identifier. Only the macOS
+    // bundle filename follows the user-facing product name.
+    println!("cargo:rerun-if-changed=macos/BundleName.txt");
+    let (app_name, bundle_name) = if env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some() {
+        (DIAGNOSTICS_APP_NAME, DIAGNOSTICS_APP_NAME)
+    } else {
+        (
+            PRODUCTION_APP_NAME,
+            include_str!("macos/BundleName.txt").trim(),
+        )
+    };
+    let trusted_bundle_path = format!("/Applications/{bundle_name}.app");
     let development_bundle_path =
-        development_bundle_path(&macos_identity, &macos_team_id, app_name);
+        development_bundle_path(&macos_identity, &macos_team_id, bundle_name);
     println!("cargo:rustc-env=WAAL_APP_NAME={app_name}");
     println!("cargo:rustc-env=WAAL_TRUSTED_MACOS_BUNDLE_PATH={trusted_bundle_path}");
     println!("cargo:rustc-env=WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH={development_bundle_path}");
@@ -712,7 +722,7 @@ fn truthy_env(name: &str) -> bool {
 fn development_bundle_path(
     macos_identity: &MacosIdentity,
     macos_team_id: &str,
-    app_name: &str,
+    bundle_name: &str,
 ) -> String {
     if macos_identity.bundle_id != DEVELOPMENT_MACOS_BUNDLE_ID
         || !macos_team_id.is_empty()
@@ -727,17 +737,9 @@ fn development_bundle_path(
 
     PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"))
         .join("dist")
-        .join(format!("{app_name}.app"))
+        .join(format!("{bundle_name}.app"))
         .to_string_lossy()
         .to_string()
-}
-
-fn app_name() -> &'static str {
-    if env::var_os("CARGO_FEATURE_RELEASE_DIAGNOSTICS").is_some() {
-        DIAGNOSTICS_APP_NAME
-    } else {
-        PRODUCTION_APP_NAME
-    }
 }
 
 fn trimmed_env(name: &str) -> Option<String> {

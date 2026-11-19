@@ -13,8 +13,6 @@ use windows_registry::{Type, CURRENT_USER};
 
 const APP_NAME: &str = crate::app_identity::APP_NAME;
 #[cfg(target_os = "macos")]
-const MACOS_TRUSTED_AUTOSTART_BUNDLE: &str = "/Applications/WindowsAppAutoLogin.app";
-#[cfg(target_os = "macos")]
 const PREVIOUS_DEVELOPMENT_MACOS_BUNDLE_ID: &str = "dev.codex.windows-app-autologin";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
@@ -214,6 +212,17 @@ pub(crate) fn cleanup_stale() -> anyhow::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
+        // Rebind an existing Open at Login entry before stale-item cleanup and
+        // before startup reconciles the saved preference with the system state.
+        let new_bundle = crate::app_identity::TRUSTED_MACOS_BUNDLE_PATH;
+        if current_launch_path().is_ok_and(|path| path == new_bundle)
+            && launch_agent_path()
+                .as_deref()
+                .is_some_and(launch_agent_targets_legacy_bundle)
+            && macos_trusted_autostart_path(new_bundle)
+        {
+            write_macos_launch_agent(new_bundle)?;
+        }
         remove_macos_login_items_by_name()?;
         remove_legacy_launch_agent_files()?;
         if !launch_agent_matches_current_exe() || !current_autostart_path_is_stable() {
@@ -475,6 +484,16 @@ fn launch_agent_file_exists() -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn launch_agent_targets_legacy_bundle(path: &std::path::Path) -> bool {
+    let legacy_exe = std::path::Path::new(crate::app_identity::LEGACY_MACOS_BUNDLE_PATH)
+        .join("Contents/MacOS/windows-app-autologin");
+    launch_agent_file_is_regular(path)
+        && launch_agent_program_path(path).is_some_and(|program| {
+            std::path::Path::new(&program).as_os_str() == legacy_exe.as_os_str()
+        })
+}
+
+#[cfg(target_os = "macos")]
 fn launch_agent_file_is_regular(path: &std::path::Path) -> bool {
     launch_agent_file_metadata_is_trusted(path)
         .map(|metadata| metadata.file_type().is_file())
@@ -621,7 +640,11 @@ fn ensure_stable_autostart_path(app_path: &str) -> anyhow::Result<()> {
 fn stable_autostart_path_message() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "Open at Login can only be enabled from /Applications/WindowsAppAutoLogin.app."
+        concat!(
+            "To enable Open at Login, install the app at ",
+            env!("WAAL_TRUSTED_MACOS_BUNDLE_PATH"),
+            "."
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -649,34 +672,26 @@ fn current_autostart_path_is_stable() -> bool {
 #[cfg(target_os = "macos")]
 fn macos_trusted_autostart_path(app_path: &str) -> bool {
     let path = PathBuf::from(app_path);
-    if !macos_autostart_bundle_path_has_safe_spelling(&path) {
+    if !macos_autostart_install_path(&path) || !macos_autostart_bundle_path_has_safe_spelling(&path)
+    {
         return false;
     }
     let Ok(canonical_path) = path.canonicalize() else {
         return false;
     };
-    macos_trusted_autostart_canonical_path(&canonical_path)
+    macos_autostart_install_path(&canonical_path)
         && macos_autostart_bundle_identifier_is_trusted(&canonical_path)
         && crate::autologin::trusted_app_bundle_identity_is_trusted(&canonical_path)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_autostart_bundle_name_is_trusted(path: &std::path::Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "app")
-        && path
-            .file_name()
-            .is_some_and(|name| name == "WindowsAppAutoLogin.app")
-}
-
-#[cfg(target_os = "macos")]
 fn macos_autostart_bundle_path_has_safe_spelling(path: &std::path::Path) -> bool {
-    macos_autostart_bundle_name_is_trusted(path)
-        && !crate::macos_identity::path_has_symlink_component(path)
+    !crate::macos_identity::path_has_symlink_component(path)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_trusted_autostart_canonical_path(path: &std::path::Path) -> bool {
-    path == std::path::Path::new(MACOS_TRUSTED_AUTOSTART_BUNDLE)
+fn macos_autostart_install_path(path: &std::path::Path) -> bool {
+    !cfg!(feature = "release-diagnostics") && crate::app_identity::is_macos_install_path(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -1114,24 +1129,23 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_autostart_trust_requires_exact_applications_bundle() {
-        assert!(macos_autostart_bundle_name_is_trusted(
-            std::path::Path::new("/Applications/WindowsAppAutoLogin.app")
-        ));
-        assert!(macos_trusted_autostart_canonical_path(
-            std::path::Path::new("/Applications/WindowsAppAutoLogin.app")
-        ));
-        assert!(!macos_autostart_bundle_name_is_trusted(
-            std::path::Path::new("/Applications/WindowsAppAutoLogin-copy.app")
-        ));
-        assert!(!macos_autostart_bundle_name_is_trusted(
-            std::path::Path::new("/Applications/Other.app")
-        ));
-        assert!(!macos_trusted_autostart_canonical_path(
-            std::path::Path::new("/Users/me/Downloads/WindowsAppAutoLogin.app")
-        ));
-        assert!(!macos_trusted_autostart_canonical_path(
-            std::path::Path::new("/Users/me/Applications/WindowsAppAutoLogin.app")
-        ));
+        for path in [
+            "/Applications/Windows App AutoLogin.app",
+            "/Applications/WindowsAppAutoLogin.app",
+        ] {
+            assert_eq!(
+                macos_autostart_install_path(std::path::Path::new(path)),
+                !cfg!(feature = "release-diagnostics")
+            );
+        }
+        for path in [
+            "/Applications/Windows App AutoLogin-copy.app",
+            "/Applications/Other.app",
+            "/Users/me/Downloads/Windows App AutoLogin.app",
+            "/Users/me/Applications/WindowsAppAutoLogin.app",
+        ] {
+            assert!(!macos_autostart_install_path(std::path::Path::new(path)));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1152,7 +1166,6 @@ mod tests {
         std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
 
         let link_bundle = link_parent.join("WindowsAppAutoLogin.app");
-        assert!(macos_autostart_bundle_name_is_trusted(&link_bundle));
         assert!(!macos_autostart_bundle_path_has_safe_spelling(&link_bundle));
         assert!(macos_autostart_bundle_path_has_safe_spelling(&real_bundle));
 
@@ -1192,7 +1205,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_launch_agent_program_path_uses_structured_plist() {
+    fn macos_launch_agent_recognizes_only_the_installed_legacy_program_for_migration() {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "windows-app-autologin-launch-agent-plist-test-{}-{}",
             std::process::id(),
@@ -1201,16 +1214,31 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&root).unwrap();
-        let program_path =
-            "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin";
+        prepare_launch_agent_dir(&root).unwrap();
         let plist_path = root.join("valid.plist");
-        std::fs::write(&plist_path, macos_launch_agent_plist(program_path)).unwrap();
-
-        assert_eq!(
-            launch_agent_program_path(&plist_path).as_deref(),
-            Some(program_path)
-        );
+        assert!(!launch_agent_targets_legacy_bundle(&plist_path));
+        for (program_path, migrates) in [
+            (
+                "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
+                true,
+            ),
+            (
+                "/Applications/Windows App AutoLogin.app/Contents/MacOS/windows-app-autologin",
+                false,
+            ),
+            (
+                "/Users/me/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
+                false,
+            ),
+        ] {
+            let contents = macos_launch_agent_plist(program_path);
+            write_private_launch_agent_file(&plist_path, contents.as_bytes()).unwrap();
+            assert_eq!(
+                launch_agent_program_path(&plist_path).as_deref(),
+                Some(program_path)
+            );
+            assert_eq!(launch_agent_targets_legacy_bundle(&plist_path), migrates);
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

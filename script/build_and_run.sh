@@ -7,14 +7,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/script/macos_bundle.sh"
 # shellcheck source=script/macos_sparkle.sh
 source "$ROOT_DIR/script/macos_sparkle.sh"
-APP_NAME="WindowsAppAutoLogin"
-APP_DISPLAY_NAME="Windows App AutoLogin"
+APP_NAME="$(waal_macos_bundle_name "$ROOT_DIR")"
+LEGACY_APP_NAME="WindowsAppAutoLogin"
 BUNDLE_ID="obcardinal.windows-app-autologin"
 BINARY_NAME="windows-app-autologin"
 BUNDLE_DIR="$ROOT_DIR/dist/$APP_NAME.app"
-CONTENTS_DIR="$BUNDLE_DIR/Contents"
-MACOS_DIR="$CONTENTS_DIR/MacOS"
-APP_EXECUTABLE="$MACOS_DIR/$BINARY_NAME"
 DEFAULT_RUNTIME_ROOT="${HOME:-/tmp}/Library/Application Support/WindowsAppAutoLogin/Runtime"
 LOCK_ROOT="${WAAL_RUNTIME_ROOT:-$DEFAULT_RUNTIME_ROOT}"
 LOCK_DIR="$LOCK_ROOT/WindowsAppAutoLogin.lock"
@@ -42,17 +39,20 @@ else
 fi
 
 app_pids() {
-  ps -axo pid=,command= | awk \
-    -v app="$APP_EXECUTABLE" \
+  ps -awwxo pid=,comm= | awk \
     -v target="$TARGET_EXECUTABLE" \
     -v app_name="$APP_NAME" \
+    -v legacy_name="$LEGACY_APP_NAME" \
     -v binary_name="$BINARY_NAME" '
+    BEGIN {
+      bundle_suffix = "/" app_name ".app/Contents/MacOS/" binary_name
+      legacy_suffix = "/" legacy_name ".app/Contents/MacOS/" binary_name
+    }
     {
       pid = $1
       sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-      exe = $1
-      bundle_suffix = "/" app_name ".app/Contents/MacOS/" binary_name
-      if (exe == app || exe == target || substr(exe, length(exe) - length(bundle_suffix) + 1) == bundle_suffix) {
+      if ($0 == target || substr($0, length($0) - length(bundle_suffix) + 1) == bundle_suffix ||
+          substr($0, length($0) - length(legacy_suffix) + 1) == legacy_suffix) {
         print pid
       }
     }
@@ -154,7 +154,7 @@ waal_assemble_app_bundle \
   "$BINARY_NAME" \
   "$TARGET_EXECUTABLE" \
   "$BUNDLE_ID" \
-  "$APP_DISPLAY_NAME" \
+  "$APP_NAME" \
   "$CARGO_VERSION" \
   "$BUILD_VERSION"
 
@@ -180,7 +180,7 @@ fi
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [ -x "$LSREGISTER" ]; then
-  for stale_bundle in "/tmp/$APP_NAME.app" "/private/tmp/$APP_NAME.app"; do
+  for stale_bundle in "/tmp/$LEGACY_APP_NAME.app" "/private/tmp/$LEGACY_APP_NAME.app"; do
     if [ "$stale_bundle" != "$BUNDLE_DIR" ]; then
       "$LSREGISTER" -u "$stale_bundle" >/dev/null 2>&1 || true
       rm -rf "$stale_bundle"

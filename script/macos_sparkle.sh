@@ -112,7 +112,7 @@ waal_sign_sparkle() {
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   if [ "$#" -ne 1 ]; then
-    echo 'Usage: script/macos_sparkle.sh /absolute/path/to/WindowsAppAutoLogin.app' >&2
+    echo 'Usage: script/macos_sparkle.sh "/absolute/path/to/Windows App AutoLogin.app"' >&2
     exit 2
   fi
   root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -125,9 +125,7 @@ if [ "$RELEASE_SNAPSHOT_REEXECUTED" = true ]; then
 fi
 readonly LOADED_PACKAGE_MACOS_OID
 readonly LOADED_MACOS_BUNDLE_OID
-PRODUCTION_APP_NAME="WindowsAppAutoLogin"
-APP_NAME="$PRODUCTION_APP_NAME"
-APP_DISPLAY_NAME="Windows App AutoLogin"
+APP_NAME=""
 DEVELOPMENT_BUNDLE_ID="obcardinal.windows-app-autologin"
 ZIP_PATH=""
 ZIP_SHA256_PATH=""
@@ -224,8 +222,7 @@ for arg in "$@"; do
   esac
 done
 
-APP_NAME="$PRODUCTION_APP_NAME"
-RELEASE_ARCHIVE_BASE="$APP_NAME-macos-local-signed"
+RELEASE_ARCHIVE_BASE="WindowsAppAutoLogin-macos-local-signed"
 EXPECTED_BUNDLE_ID="$PRODUCTION_BUNDLE_ID"
 EXPECTED_BUNDLE_ID_ENV="WAAL_RELEASE_BUNDLE_ID"
 
@@ -3166,7 +3163,7 @@ assemble_release_bundle() {
     "$BINARY_NAME" \
     "$TARGET_EXECUTABLE" \
     "$EXPECTED_BUNDLE_ID" \
-    "$APP_DISPLAY_NAME" \
+    "$APP_NAME" \
     "$CARGO_VERSION" \
     "$BUILD_VERSION"; then
     assembly_status=0
@@ -4776,6 +4773,7 @@ restore_and_verify_snapshot_execution() {
   load_authenticated_bundle_helper || return 1
   capture_release_source_identity_baseline || return 1
   verify_release_source_identity_guard || return 1
+  APP_NAME="$(waal_macos_bundle_name "$RELEASE_SOURCE_DIR")" || return 1
   CARGO_VERSION="$(waal_cargo_version "$RELEASE_SOURCE_DIR")"
   BUILD_VERSION="$(waal_build_version "$CARGO_VERSION")"
   verify_release_source_identity_guard || return 1

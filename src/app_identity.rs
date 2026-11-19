@@ -197,6 +197,16 @@ const DEVELOPMENT_MACOS_BUNDLE_ID: &str = "obcardinal.windows-app-autologin";
 pub(crate) const TRUSTED_MACOS_BUNDLE_PATH: &str = env!("WAAL_TRUSTED_MACOS_BUNDLE_PATH");
 
 #[cfg(target_os = "macos")]
+pub(crate) const LEGACY_MACOS_BUNDLE_PATH: &str = "/Applications/WindowsAppAutoLogin.app";
+
+#[cfg(target_os = "macos")]
+pub(crate) fn is_macos_install_path(path: &std::path::Path) -> bool {
+    path == std::path::Path::new(TRUSTED_MACOS_BUNDLE_PATH)
+        || (!cfg!(feature = "release-diagnostics")
+            && path == std::path::Path::new(LEGACY_MACOS_BUNDLE_PATH))
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) const DEVELOPMENT_MACOS_BUNDLE_PATH: &str = env!("WAAL_DEVELOPMENT_MACOS_BUNDLE_PATH");
 
 #[cfg(target_os = "macos")]
