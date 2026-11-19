@@ -3057,12 +3057,24 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn ipc_test_app_bundle(root: &Path) -> (PathBuf, PathBuf) {
+        let bundle = root
+            .canonicalize()
+            .unwrap()
+            .join("Windows App AutoLogin.app");
+        let executable_dir = bundle.join("Contents/MacOS");
+        std::fs::create_dir_all(&executable_dir).unwrap();
+        let executable = executable_dir.join("windows-app-autologin");
+        std::fs::write(&executable, b"fixture").unwrap();
+        (bundle, executable)
+    }
+
     #[cfg(all(target_os = "macos", unix))]
     #[test]
     fn macos_ipc_identity_requires_live_code_match_without_team_id() {
-        let path = PathBuf::from(
-            "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
-        );
+        let root = temp_test_root("ipc-live-code");
+        let (_, path) = ipc_test_app_bundle(&root);
         let mut release_verifier_called = false;
         let mut development_verifier_called = false;
 
@@ -3093,14 +3105,14 @@ mod tests {
             |_bundle_path, _bundle_id, _team_id| false,
             || true,
         ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(target_os = "macos", unix))]
     #[test]
     fn macos_ipc_identity_requires_matching_bundle_identifier() {
-        let path = PathBuf::from(
-            "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
-        );
+        let root = temp_test_root("ipc-bundle-identifier");
+        let (bundle, path) = ipc_test_app_bundle(&root);
         let mut bundle_identifier_args = None;
 
         assert!(!macos_process_identity_matches_current_app(
@@ -3119,11 +3131,9 @@ mod tests {
         ));
         assert_eq!(
             bundle_identifier_args,
-            Some((
-                PathBuf::from("/Applications/WindowsAppAutoLogin.app"),
-                "obcardinal.windows-app-autologin".to_string(),
-            ))
+            Some((bundle, "obcardinal.windows-app-autologin".to_string(),))
         );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(target_os = "macos", unix))]
@@ -3224,9 +3234,8 @@ mod tests {
     #[cfg(all(target_os = "macos", unix))]
     #[test]
     fn macos_ipc_identity_requires_release_signature_when_team_id_is_configured() {
-        let path = PathBuf::from(
-            "/Applications/WindowsAppAutoLogin.app/Contents/MacOS/windows-app-autologin",
-        );
+        let root = temp_test_root("ipc-release-signature");
+        let (bundle, path) = ipc_test_app_bundle(&root);
         let mut verifier_args = None;
 
         assert!(!macos_process_identity_matches_current_app(
@@ -3248,7 +3257,7 @@ mod tests {
         assert_eq!(
             verifier_args,
             Some((
-                PathBuf::from("/Applications/WindowsAppAutoLogin.app"),
+                bundle,
                 "com.example.WindowsAppAutoLogin".to_string(),
                 "ABCDE12345".to_string(),
             ))
@@ -3263,6 +3272,7 @@ mod tests {
             |_bundle_path, _bundle_id, _team_id| true,
             || panic!("development verifier must not run when Team ID is configured"),
         ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(target_os = "macos", unix))]
