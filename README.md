@@ -24,7 +24,7 @@ These checks run on your computer. The Microsoft client handles authentication. 
 
 | Platform | Download | Install |
 | --- | --- | --- |
-| macOS 11+, Apple Silicon | [macOS v1.0.1](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.1) | Extract the ZIP and move `Windows App AutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
+| macOS 11+, Apple Silicon | [macOS v1.0.2](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.2) | Extract the ZIP and move `Windows App AutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
 | Windows 10/11, x64 | [Windows v0.4.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.0) | Extract the ZIP and run `WindowsAppAutoLogin.exe`. Keep `WindowsAppAutoLoginUI.exe` in the same folder. Both executables are unsigned. |
 
 1. Open AutoLogin. On macOS, grant it **Accessibility** under **System Settings → Privacy & Security** so it can read and fill the sign-in prompt.
