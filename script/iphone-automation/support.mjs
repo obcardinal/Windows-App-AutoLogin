@@ -8,7 +8,6 @@ export const APPIUM_VERSION = '4.0.0';
 export const XCUITEST_VERSION = '13.1.1';
 export const AUTHENTICATOR_BUNDLE = 'com.microsoft.azureauthenticator';
 export const LEGACY_DEVELOPMENT_TEAM = '76C2QW8JV3';
-export const DEVELOPMENT_TEAM = LEGACY_DEVELOPMENT_TEAM;
 export const WDA_BUNDLE = 'com.obcardinal.WindowsAppAutoLogin.WebDriverAgentRunner';
 
 export function validDevelopmentTeam(value) {
