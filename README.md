@@ -47,7 +47,11 @@ Choose the desktop under **Connection → VM device** in the account editor. Wit
 
 ### Confirm a sign-in on your iPhone
 
-Select your Xcode-paired phone in **Settings → iPhone Authentication**. Turn on **2FA → Use iPhone** for each participating account. AutoLogin recognizes Microsoft Authenticator requests in Windows App and enters the two-digit number on your unlocked iPhone over Wi-Fi. Complete Face ID on the phone if prompted. Setup requires Developer Mode and a signed local helper. [iPhone requirements and setup](docs/iphone-authenticator.md#host-setup)
+In **Settings → iPhone Authentication → Connect iPhone…**, choose your phone and click **Connect iPhone**. AutoLogin checks the Wi-Fi connection and remembers that iPhone for your accounts. For first-time pairing, click **Open device pairing…** and follow Apple’s prompts. Connecting requires Xcode but no signing certificate.
+
+Open **Sign-in details… → Set up automation…** to prepare UI Automation. The setup screen guides you through Developer Mode, Enable UI Automation and adding your own Apple Account in Xcode. Choose your signing account and click **Set up automation**. AutoLogin installs the required tools, signs the helper for your iPhone and checks that it can run over Wi-Fi.
+
+Turn on **2FA → Use iPhone** for each participating account. AutoLogin enters the number from Windows App in Microsoft Authenticator. Complete Face ID on the phone if prompted. [iPhone setup and requirements](docs/iphone-authenticator.md#host-setup)
 
 **Optional Telegram reminder.** Select **Settings → 2FA Notifications → Link Telegram…** and tap **Start** in the bot chat. Only a matching two-factor request triggers a reminder, which can wake the phone if lock-screen notifications are enabled. The notification service sees when a reminder is requested and uses a link token to reach your chat. The request excludes your work email, password, sign-in number and screen contents.
 
