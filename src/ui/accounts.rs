@@ -2104,20 +2104,16 @@ fn enter_account(ctx: &egui::Context, app: &mut AutoLoginApp, id: &str) {
         }
         return;
     }
+    #[cfg(target_os = "macos")]
+    let launch =
+        crate::macos_ax::desktops::DesktopLaunch::for_account(account, &app.config.accounts);
+    #[cfg(not(target_os = "macos"))]
     let target = account.vm_target.clone();
-    #[cfg(target_os = "macos")]
-    let profile = account.vm_profile.clone();
-    #[cfg(target_os = "macos")]
-    let device_id = account.vm_device_id.clone();
-    #[cfg(target_os = "macos")]
-    let host = crate::macos_ax::desktops::LaunchHost::for_account(account, &app.config.accounts);
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     let username = account.username.clone();
     let task = DeviceTask::start(ctx, move || {
         #[cfg(target_os = "macos")]
-        return crate::macos_ax::desktops::open_desktop(
-            &device_id, &target, &profile, &username, host.as_ref(),
-        );
+        return launch.open();
         #[cfg(target_os = "windows")]
         return crate::windows_device_launch::open_device(&target, &username);
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]

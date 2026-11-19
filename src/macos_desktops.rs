@@ -128,32 +128,72 @@ impl LaunchHost {
     }
 }
 
-pub(crate) fn open_desktop(
-    id: &str,
-    name: &str,
-    owner: &str,
-    account_email: &str,
-    host: Option<&LaunchHost>,
-) -> Result<()> {
-    open_with(
-        id,
-        name,
-        owner,
-        saved_devices,
-        focus_open_session,
-        open_saved_device,
-        |title| {
-            if host.is_some() {
-                return reconnect_window_device(title, account_email, host);
-            }
-            if let Ok(devices) = saved_devices() {
-                if let Some(device) = saved_window_device(&devices, title, account_email)? {
-                    return open_saved_device(device);
+pub(crate) struct DesktopLaunch {
+    account: Account,
+    host: Option<LaunchHost>,
+    other_titles: Vec<String>,
+}
+
+impl DesktopLaunch {
+    pub(crate) fn for_account(account: &Account, accounts: &[Account]) -> Self {
+        Self {
+            account: account.clone(),
+            host: LaunchHost::for_account(account, accounts),
+            other_titles: accounts
+                .iter()
+                .filter(|other| other.id != account.id && !other.vm_target.is_empty())
+                .map(|other| other.vm_target.clone())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn open(&self) -> Result<()> {
+        let account = &self.account;
+        let focus = |title: &str| self.focus_if_unshared(title, focus_open_session);
+        open_with(
+            account,
+            saved_devices,
+            focus,
+            |device, shared_in_catalog| {
+                open_saved_device(
+                    device,
+                    shared_in_catalog || !self.unshared_title(&device.name),
+                )
+            },
+            |title| {
+                if self.host.is_none() && self.unshared_title(title) {
+                    if let Ok(devices) = saved_devices() {
+                        if let Some(device) =
+                            saved_window_device(&devices, title, &account.username)?
+                        {
+                            return open_saved_device(device, !has_unique_title(&devices, device));
+                        }
+                    }
                 }
-            }
-            reconnect_window_device(title, account_email, None)
-        },
-    )
+                reconnect_window_device(title, &account.username, self.host.as_ref(), |candidate| {
+                    self.unshared_title(candidate)
+                })
+            },
+        )
+    }
+
+    fn unshared_title(&self, title: &str) -> bool {
+        !self.other_titles.iter().any(|other| other == title)
+    }
+
+    fn focus_if_unshared(
+        &self,
+        title: &str,
+        focus: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<bool> {
+        // The Window menu has no account identity. Even one open window can
+        // belong to another account when both profiles use the same title.
+        if self.unshared_title(title) {
+            focus(title)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 pub(crate) fn remote_pc_session_title(id: &str, name: &str, owner: &str) -> Result<Option<String>> {
@@ -183,15 +223,14 @@ fn session_title_with(
 }
 
 fn open_with(
-    id: &str,
-    name: &str,
-    owner: &str,
+    account: &Account,
     catalog: impl FnOnce() -> Result<Vec<SavedDevice>>,
     focus: impl FnOnce(&str) -> Result<bool>,
-    connect: impl FnOnce(&SavedDevice) -> Result<()>,
+    connect: impl FnOnce(&SavedDevice, bool) -> Result<()>,
     reconnect: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
-    if id == WINDOW_ONLY {
+    let name = account.vm_target.as_str();
+    if account.vm_device_id == WINDOW_ONLY {
         ensure!(!name.trim().is_empty(), "The linked VM has no device name.");
         return if focus(name)? {
             Ok(())
@@ -201,11 +240,24 @@ fn open_with(
     }
 
     let catalog = catalog()?;
-    let device = selected_saved_device(&catalog, id, name, owner)?;
-    if has_unique_title(&catalog, device) && focus(&device.name)? {
+    let device = selected_saved_device(&catalog, &account.vm_device_id, name, &account.vm_profile)?;
+    if device.id.starts_with("workspace:") {
+        let expected_owner = if account.vm_profile.trim().is_empty() {
+            &account.username
+        } else {
+            &account.vm_profile
+        };
+        ensure!(
+            !device.owner.trim().is_empty()
+                && super::usernames_match(expected_owner, &device.owner),
+            "This Windows App desktop belongs to another profile. Choose the desktop for this account."
+        );
+    }
+    let unique_title = has_unique_title(&catalog, device);
+    if unique_title && focus(&device.name)? {
         return Ok(());
     }
-    connect(device)
+    connect(device, !unique_title)
 }
 
 // Windows App identifies its session windows by title only.
@@ -336,6 +388,14 @@ mod tests {
         assert!(duplicates.open[0].ambiguous);
     }
 
+    fn linked(id: &str, title: &str, owner: &str) -> Account {
+        let mut account = Account::new("owner@example.test");
+        account.vm_device_id = id.into();
+        account.vm_target = title.into();
+        account.vm_profile = owner.into();
+        account
+    }
+
     #[test]
     fn existing_link_focuses_first_and_connects_only_if_the_session_is_closed() {
         // A previous version saved only the name and account UPN. A new link
@@ -345,27 +405,24 @@ mod tests {
             ("workspace:example", "Old name", ""),
         ] {
             open_with(
-                id,
-                name,
-                owner,
+                &linked(id, name, owner),
                 || Ok(vec![saved()]),
                 |title| {
                     assert_eq!(title, "Desktop");
                     Ok(true)
                 },
-                |_| panic!("an open session must not reconnect"),
+                |_, _| panic!("an open session must not reconnect"),
                 |_| panic!("saved catalog binding"),
             )
             .unwrap();
         }
         let mut connected = false;
         open_with(
-            "workspace:example",
-            "Desktop",
-            "",
+            &linked("workspace:example", "Desktop", ""),
             || Ok(vec![saved()]),
             |_| Ok(false),
-            |d| {
+            |d, shared| {
+                assert!(!shared);
                 assert_eq!(d.id, saved().id);
                 connected = true;
                 Ok(())
@@ -375,40 +432,74 @@ mod tests {
         .unwrap();
         assert!(connected);
         open_with(
-            WINDOW_ONLY,
-            "Visible",
-            "",
+            &linked(WINDOW_ONLY, "Visible", ""),
             || panic!("no catalog needed"),
             |_| Ok(true),
-            |_| panic!("focus only"),
+            |_, _| panic!("focus only"),
             |_| panic!("an open window must not start another connection"),
         )
         .unwrap();
         assert!(open_with(
-            "",
-            "Desktop",
-            "different@example.test",
+            &linked("", "Desktop", "different@example.test"),
             || Ok(vec![saved()]),
             |_| panic!("wrong profile"),
-            |_| panic!("wrong profile"),
+            |_, _| panic!("wrong profile"),
             |_| panic!("wrong profile"),
         )
         .is_err());
     }
 
     #[test]
+    fn shared_titles_use_the_requested_profile_even_with_only_one_open_session() {
+        let mut selected = Account::new("one@example.test");
+        selected.vm_device_id = WINDOW_ONLY.into();
+        selected.vm_target = "Desktop".into();
+        let mut other = Account::new("two@example.test");
+        other.vm_target = "Desktop".into();
+        other.enabled = false; // Its VM can stay open after monitoring is disabled.
+        let launch = DesktopLaunch::for_account(&selected, &[selected.clone(), other]);
+        let focus = |title: &str| {
+            launch.focus_if_unshared(title, |_| {
+                panic!("title alone cannot identify this account")
+            })
+        };
+        open_with(
+            &linked(WINDOW_ONLY, "Desktop", ""),
+            || panic!("no catalog is required"),
+            focus,
+            |_, _| panic!("a window link needs the profile"),
+            |title| {
+                assert_eq!(title, "Desktop");
+                Ok(())
+            },
+        )
+        .unwrap();
+        // A saved device may acquire a title claimed by another account.
+        open_with(
+            &linked("workspace:example", "Previous name", ""),
+            || Ok(vec![saved()]),
+            focus,
+            |device, _| {
+                assert_eq!(device.id, "workspace:example");
+                Ok(())
+            },
+            |_| panic!("a catalog link must connect its selected record"),
+        )
+        .unwrap();
+        assert!(launch.focus_if_unshared("Unique VM", |_| Ok(true)).unwrap());
+    }
+
+    #[test]
     fn closed_window_link_reconnects_the_selected_vm_without_reopening_the_editor() {
         let mut requested = Vec::new();
         open_with(
-            WINDOW_ONLY,
-            "Selected VM",
-            "",
+            &linked(WINDOW_ONLY, "Selected VM", ""),
             || panic!("a window binding is independent of the saved catalog ID"),
             |name| {
                 assert_eq!(name, "Selected VM");
                 Ok(false)
             },
-            |_| panic!("a window binding has no saved ID"),
+            |_, _| panic!("a window binding has no saved ID"),
             |name| {
                 requested.push(name.to_owned());
                 Ok(())
@@ -417,15 +508,60 @@ mod tests {
         .unwrap();
         assert_eq!(requested, ["Selected VM"]);
         assert!(open_with(
-            WINDOW_ONLY,
-            "Selected VM",
-            "",
+            &linked(WINDOW_ONLY, "Selected VM", ""),
             || panic!("no catalog ID"),
             |_| anyhow::bail!("ambiguous open windows"),
-            |_| panic!("ambiguous"),
+            |_, _| panic!("ambiguous"),
             |_| panic!("an ambiguous open session must not reconnect"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn saved_workspace_checks_owner_before_focusing_or_opening_a_session() {
+        let mut account = linked("workspace:example", "Desktop", "OWNER@example.test");
+        account.username = "rdp-user@example.test".into();
+        open_with(
+            &account,
+            || Ok(vec![saved()]),
+            |_| Ok(true),
+            |_, _| panic!("already focused in explicitly bound workspace"),
+            |_| panic!("workspace has a verified catalog ID"),
+        )
+        .unwrap();
+        for (username, profile) in [
+            ("other@example.test", ""),
+            ("owner@example.test", "other@example.test"),
+        ] {
+            account.username = username.into();
+            account.vm_profile = profile.into();
+            assert!(open_with(
+                &account,
+                || Ok(vec![saved()]),
+                |_| panic!("workspace owned by another profile"),
+                |_, _| panic!("workspace owned by another profile"),
+                |_| panic!("workspace owned by another profile"),
+            )
+            .is_err());
+        }
+        account.vm_profile.clear();
+        open_with(
+            &account,
+            || {
+                Ok(vec![
+                    saved(),
+                    SavedDevice::for_test("workspace:other", "Desktop", "other@example.test"),
+                ])
+            },
+            |_| panic!("duplicate workspace name"),
+            |device, shared| {
+                assert!(shared);
+                assert_eq!(device.id, "workspace:example");
+                Ok(())
+            },
+            |_| panic!("workspace has a verified catalog ID"),
+        )
+        .unwrap();
     }
 
     #[test]

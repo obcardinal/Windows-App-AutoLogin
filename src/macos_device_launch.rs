@@ -35,17 +35,21 @@ struct DeviceList {
     devices: Vec<(String, AxElement)>,
 }
 
-pub(crate) fn open_saved_device(device: &SavedDevice) -> Result<()> {
+pub(crate) fn open_saved_device(device: &SavedDevice, shared_title: bool) -> Result<()> {
     if device.id.starts_with("workspace:") && !device.owner.trim().is_empty() {
         let app = trusted_app()?;
         let (list, profile) = prepare_profile_devices(&app, &device.owner, || Ok(()))?;
         catalog::verify_card_identity(device)?;
-        return list.connect(&device.name, || {
+        return list.open_for_enter(&device.name, shared_title, || {
             list.ensure_profile(&profile)?;
             catalog::verify_card_identity(device)
         });
     }
-    open_saved_device_if(device, || Ok(()))
+    catalog::verify_card_identity(device)?;
+    let list = devices_in_app(trusted_app()?)?;
+    list.open_for_enter(&device.name, shared_title, || {
+        catalog::verify_card_identity(device)
+    })
 }
 
 pub(super) fn open_saved_device_if(
@@ -66,6 +70,7 @@ pub(crate) fn reconnect_window_device(
     name: &str,
     account_email: &str,
     host: Option<&LaunchHost>,
+    unshared_title: impl FnOnce(&str) -> bool,
 ) -> Result<()> {
     let app = trusted_app()?;
     ensure!(
@@ -78,10 +83,11 @@ pub(crate) fn reconnect_window_device(
         connected::cloud_pc_device_name(&app, &list.window, card)
     })?;
     // On repeated Enter Windows App may already have a newly named session.
-    if selected != name && super::device_windows::focus_open_session(selected)? {
+    let shared_title = !unshared_title(selected);
+    if selected != name && !shared_title && super::device_windows::focus_open_session(selected)? {
         return Ok(());
     }
-    list.connect(selected, || list.ensure_profile(&profile))
+    list.open_for_enter(selected, shared_title, || list.ensure_profile(&profile))
 }
 
 pub(super) struct VerifiedWindowDevice {
@@ -245,6 +251,15 @@ pub(super) fn exact_device<'a, T>(devices: &'a [(String, T)], name: &str) -> Res
     Ok(item)
 }
 
+fn same_sole_session<T>(
+    name: &str,
+    before: &[(String, T)],
+    after: &[(String, T)],
+    same_entry: impl FnOnce(&T, &T) -> bool,
+) -> bool {
+    matches!((before, after), ([(a, old)], [(b, new)]) if a == name && b == name && same_entry(old, new))
+}
+
 impl DeviceList {
     fn ensure_profile(&self, expected: &str) -> Result<()> {
         ensure!(
@@ -252,6 +267,38 @@ impl DeviceList {
             "The active Windows App account changed. Try opening the desktop again."
         );
         Ok(())
+    }
+
+    fn open_for_enter(
+        &self,
+        name: &str,
+        shared_title: bool,
+        verify: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        if shared_title {
+            use super::device_windows::{focus_session_in_app, session_entries};
+            let entries = session_entries(&self.app)?;
+            if entries.iter().any(|(title, _)| title == name) {
+                let card = exact_device(&self.devices, name)?;
+                verify()?;
+                if connected::connected_card(&self.app, &self.window, card)? {
+                    // A renamed card may still have an open window under its old title.
+                    // With several sessions, even one matching title can belong to a peer.
+                    let current = session_entries(&self.app)?;
+                    ensure!(
+                        same_sole_session(name, &entries, &current, AxElement::same_element),
+                        "The selected desktop is connected, but its window could not be distinguished from the other open sessions."
+                    );
+                    verify()?;
+                    ensure!(
+                        focus_session_in_app(&self.app, name, &|| false, || {})?.is_some(),
+                        "The selected desktop disconnected before it could be focused."
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        self.connect(name, verify)
     }
 
     fn connect(&self, name: &str, verify_binding: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -624,6 +671,34 @@ pub(super) fn menu_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_connected_card_can_focus_only_its_sole_stable_session() {
+        let original = [("Shared".into(), 1)];
+        let peer = [("Other".into(), 2)];
+        let replaced = [("Shared".into(), 2)];
+        let multiple = [original[0].clone(), peer[0].clone()];
+        assert!(same_sole_session(
+            "Shared",
+            &original,
+            &original,
+            PartialEq::eq
+        ));
+        for changed in [&peer[..], &replaced, &multiple, &[]] {
+            assert!(!same_sole_session(
+                "Shared",
+                &original,
+                changed,
+                PartialEq::eq
+            ));
+        }
+        assert!(!same_sole_session(
+            "Shared",
+            &multiple,
+            &original,
+            PartialEq::eq
+        ));
+    }
 
     #[test]
     fn enter_after_restart_recognizes_the_cloud_pc_by_its_computer_name() {
