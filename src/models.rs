@@ -11,20 +11,6 @@ pub enum AuthenticatorProvider {
     MicrosoftAuthenticator,
 }
 
-impl AuthenticatorProvider {
-    pub const SUPPORTED: &'static [Self] = &[Self::MicrosoftAuthenticator];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::MicrosoftAuthenticator => "Microsoft Authenticator",
-        }
-    }
-
-    fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Account {
     pub id: AccountId,
@@ -49,8 +35,6 @@ pub struct Account {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub iphone_authenticator_enabled: bool,
-    #[serde(default, skip_serializing_if = "AuthenticatorProvider::is_default")]
-    pub authenticator_provider: AuthenticatorProvider,
 }
 
 impl Account {
@@ -66,7 +50,6 @@ impl Account {
             has_saved_password: false,
             enabled: true,
             iphone_authenticator_enabled: false,
-            authenticator_provider: AuthenticatorProvider::default(),
         }
     }
 

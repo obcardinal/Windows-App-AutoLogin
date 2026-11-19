@@ -60,6 +60,8 @@ const ACCOUNT_EDITOR_COLUMN_GAP: f32 = 12.0;
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
 const ACCOUNT_EDITOR_CONTROL_HEIGHT: f32 = 28.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
+#[cfg(target_os = "macos")]
+const ACCOUNT_2FA_HELP: &str = "AutoLogin recognizes Microsoft Authenticator requests and enters the sign-in number on your unlocked iPhone over Wi-Fi. Complete Face ID if prompted.";
 const ACTION_ICON_SIZE: f32 = 16.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
 const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
@@ -2976,20 +2978,13 @@ fn account_editor_contents(
 
     #[cfg(target_os = "macos")]
     account_editor_card(ui, "2FA", |ui| {
-        let field_width =
-            ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - ACCOUNT_EDITOR_COLUMN_GAP;
-        account_editor_input_scope(ui, |ui| {
-            egui::Grid::new("account_2fa_fields")
-                .num_columns(2)
-                .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
-                .show(ui, |ui| {
-                    let label = account_editor_field_label(ui, "iPhone app");
-                    crate::ui::iphone_sign_in::provider_picker(ui, account, field_width)
-                        .labelled_by(label.id);
-                    ui.end_row();
-                });
-        });
-        account_editor_help(ui, crate::ui::iphone_sign_in::ACCOUNT_HELP);
+        account_editor_switch(
+            ui,
+            &mut account.iphone_authenticator_enabled,
+            "Use iPhone for 2FA",
+            "Use the iPhone selected in Settings for this account.",
+        );
+        account_editor_help(ui, ACCOUNT_2FA_HELP);
     });
 
     let feedback_id = password_editor_id.with("validation");
@@ -3042,6 +3037,30 @@ fn account_editor_help(ui: &mut egui::Ui, message: &str) {
 }
 
 #[cfg(target_os = "macos")]
+fn account_editor_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    label: &str,
+    hint: &str,
+) -> egui::Response {
+    let (_, switch) = egui::containers::Sides::new()
+        .height(36.0)
+        .shrink_left()
+        .wrap()
+        .show(
+            ui,
+            |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(label).color(theme::TEXT))
+                        .selectable(false),
+                )
+            },
+            |ui| crate::ui::toggle::switch(ui, value, label).on_hover_text(hint),
+        );
+    switch
+}
+
+#[cfg(target_os = "macos")]
 fn show_locked_vm_reconnect(
     ui: &mut egui::Ui,
     account: &mut Account,
@@ -3059,22 +3078,7 @@ fn show_locked_vm_reconnect(
     let hint = "Reconnect the selected desktop when Windows App shows its lock screen.";
     let changed = ui
         .add_enabled_ui(supported || account.reconnect_locked_vm, |ui| {
-            let (_, switch) = egui::containers::Sides::new()
-                .height(36.0)
-                .shrink_left()
-                .wrap()
-                .show(
-                    ui,
-                    |ui| {
-                        let text = egui::RichText::new(label).color(theme::TEXT);
-                        ui.add(egui::Label::new(text).selectable(false))
-                    },
-                    |ui| {
-                        crate::ui::toggle::switch(ui, &mut account.reconnect_locked_vm, label)
-                            .on_hover_text(hint)
-                    },
-                );
-            switch.changed()
+            account_editor_switch(ui, &mut account.reconnect_locked_vm, label, hint).changed()
         })
         .inner;
     if !supported {
@@ -3732,7 +3736,6 @@ fn save_edited_account_transaction(
             previous_password_saved
                 && existing.enabled == account.enabled
                 && existing.iphone_authenticator_enabled == account.iphone_authenticator_enabled
-                && existing.authenticator_provider == account.authenticator_provider
                 && existing.remote_pc == account.remote_pc
                 && existing.vm_target == account.vm_target
                 && existing.vm_profile == account.vm_profile
@@ -7442,6 +7445,8 @@ mod tests {
     #[test]
     fn account_editor_shows_validation_and_keeps_the_draft_in_view() {
         let ctx = egui::Context::default();
+        #[cfg(target_os = "macos")]
+        ctx.enable_accesskit();
         crate::ui::theme::apply(&ctx);
         let mut app = account_test_app(AppConfig::default());
         let original_status = app.status_message.clone();
@@ -7522,8 +7527,7 @@ mod tests {
             "Match the active remote desktop session to this account.",
             "Open the VM when you click the Open desktop arrow in Accounts.",
             "2FA",
-            "iPhone app",
-            "Off",
+            "Use iPhone for 2FA",
         ] {
             assert_eq!(
                 !visible_text_rects(&frame, name).is_empty(),
@@ -7552,18 +7556,44 @@ mod tests {
             };
             let vm = field_for("Choose device…");
             let import = field_for("Import");
-            let phone = field_for("Off");
-            assert_eq!(
-                field_for("https://invalid.example").x_range(),
-                phone.x_range()
-            );
-            assert_eq!(vm.left(), phone.left());
+            let remote_pc = field_for("https://invalid.example");
+            assert_eq!(vm.left(), remote_pc.left());
             assert!(vm.right() < import.left());
-            assert_eq!(import.right(), phone.right());
+            assert_eq!(import.right(), remote_pc.right());
             assert_eq!(vm.y_range(), import.y_range());
-            assert_eq!(vm.height(), phone.height());
-            let help = visible_text_rects(&frame, crate::ui::iphone_sign_in::ACCOUNT_HELP)[0];
-            assert!(phone.bottom() < help.top() && help.bottom() < save.top());
+            assert_eq!(vm.height(), remote_pc.height());
+
+            let switch_node = |output: &egui::FullOutput| {
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let (_, node) = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == egui::accesskit::Role::CheckBox
+                            && node.label() == Some("Use iPhone for 2FA")
+                    })
+                    .expect("account 2FA switch");
+                (node.bounds().unwrap(), node.toggled().unwrap())
+            };
+            let (bounds, state) = switch_node(&frame);
+            assert_eq!(state, egui::accesskit::Toggled::False);
+            let pos = egui::pos2(
+                (bounds.x0 + bounds.x1) as f32 * 0.5,
+                (bounds.y0 + bounds.y1) as f32 * 0.5,
+            );
+            let label = visible_text_rects(&frame, "Use iPhone for 2FA")[0];
+            assert!(label.right() < bounds.x0 as f32);
+            assert!((label.center().y - pos.y).abs() < 2.0);
+            let help = visible_text_rects(&frame, super::ACCOUNT_2FA_HELP)[0];
+            assert!(bounds.y1 as f32 <= help.top() && help.bottom() < save.top());
+            for expected in [
+                egui::accesskit::Toggled::True,
+                egui::accesskit::Toggled::False,
+            ] {
+                let (changed, close, _) = render(click(pos));
+                assert!(!close);
+                assert_eq!(switch_node(&changed).1, expected);
+            }
         }
         assert!(visible_text_rects(&frame, "Sign-in details…").is_empty());
         assert!(visible_text_rects(&frame, "Microsoft Authenticator").is_empty());

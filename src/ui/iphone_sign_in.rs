@@ -1,58 +1,8 @@
 //! Account authentication choices and details for the iPhone shared by this Mac.
 use crate::iphone_setup_info::{self, PairedPhone, SetupInfo};
-use crate::models::{Account, AuthenticatorProvider};
 use crate::ui::theme;
 use eframe::egui;
 use std::sync::{Arc, OnceLock};
-
-pub(super) const ACCOUNT_HELP: &str = "When Windows App shows a sign-in number, Monitor enters it in Authenticator on your unlocked iPhone over Wi-Fi. If the field check is slow, tap Approve yourself. Complete Face ID if prompted.";
-
-pub(super) fn provider_picker(
-    ui: &mut egui::Ui,
-    account: &mut Account,
-    field_width: f32,
-) -> egui::Response {
-    let initial = account
-        .iphone_authenticator_enabled
-        .then_some(account.authenticator_provider);
-    let mut selection = initial;
-    let popup_id = ui.make_persistent_id(("account_authenticator_provider", &account.id));
-    let mut response = super::accounts::account_picker_button(
-        ui,
-        popup_id,
-        initial.map_or("Off", AuthenticatorProvider::label),
-        field_width,
-    );
-    let frame = egui::Frame::popup(ui.style());
-    let content_width = response.rect.width() - frame.total_margin().sum().x;
-    egui::Popup::menu(&response)
-        .id(popup_id)
-        .width(response.rect.width())
-        .frame(frame)
-        .style(theme::picker_popup_style)
-        .show(|ui| {
-            ui.set_width(content_width);
-            if ui.selectable_value(&mut selection, None, "Off").clicked() {
-                ui.close();
-            }
-            for &provider in AuthenticatorProvider::SUPPORTED {
-                if ui
-                    .selectable_value(&mut selection, Some(provider), provider.label())
-                    .clicked()
-                {
-                    ui.close();
-                }
-            }
-        });
-    if initial != selection {
-        account.iphone_authenticator_enabled = selection.is_some();
-        if let Some(provider) = selection {
-            account.authenticator_provider = provider;
-        }
-        response.mark_changed();
-    }
-    response
-}
 
 #[derive(Clone, Default)]
 struct DeviceSnapshot(Arc<OnceLock<SetupInfo>>);
@@ -230,7 +180,7 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
                 let steps = [
                     ("Before sign-in", "Unlock your iPhone on the same Wi-Fi as your Mac."),
                     ("On your Mac", "Monitor reads the number in Windows App."),
-                    ("On your iPhone", "AutoLogin fills the number. Tap Approve if asked, then use Face ID if prompted."),
+                    ("On your iPhone", "AutoLogin enters the number in Microsoft Authenticator. Complete Face ID if prompted."),
                 ];
                 let column_gap = 14.0;
                 let description_width = (ui.available_width() - 106.0 - column_gap).max(1.0);
@@ -247,7 +197,7 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
                     });
             });
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Set up per account in Accounts → 2FA → iPhone app.").small().color(theme::MUTED));
+            ui.label(egui::RichText::new("In Accounts, open an account and turn on “Use iPhone for 2FA”.").small().color(theme::MUTED));
         });
     Some(body.inner_rect.top() - top + body.content_size.y)
 }
@@ -738,143 +688,6 @@ mod tests {
                 assert!(text_rect(&setup, text).is_some(), "{text}");
             }
         }
-    }
-
-    #[test]
-    fn provider_picker_selects_and_restores_the_account_choice() {
-        let ctx = egui::Context::default();
-        theme::apply(&ctx);
-        ctx.all_styles_mut(|style| style.animation_time = 0.0);
-        let mut account = Account::new("example");
-        let render = |account: &mut Account, events| {
-            ctx.run_ui(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    ui.set_width(350.0);
-                    provider_picker(ui, account, 240.0);
-                },
-            )
-        };
-        let find = |frame: &egui::FullOutput, text: &str| -> Vec<egui::Rect> {
-            frame
-                .shapes
-                .iter()
-                .filter_map(|shape| match &shape.shape {
-                    egui::Shape::Text(label) if label.galley.text() == text => {
-                        Some(label.visual_bounding_rect())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let click = |account: &mut Account, screen: &egui::FullOutput, label| {
-            let items = find(screen, label);
-            assert_eq!(items.len(), 1, "expected one clickable {label}");
-            let pos = items[0].center();
-            let press = |pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: Default::default(),
-            };
-            render(
-                account,
-                vec![egui::Event::PointerMoved(pos), press(true), press(false)],
-            );
-            render(account, vec![])
-        };
-
-        render(&mut account, vec![]);
-        let closed = render(&mut account, vec![]);
-        let open = click(&mut account, &closed, "Off");
-        assert_eq!(find(&open, "Off").len(), 2);
-        assert_eq!(find(&open, "Microsoft Authenticator").len(), 1);
-        assert!(find(&open, "Duo Mobile").is_empty());
-        let selected_option = *find(&open, "Off").last().unwrap();
-        let selected_stroke = |frame: &egui::FullOutput| {
-            frame
-                .shapes
-                .iter()
-                .find_map(|item| match &item.shape {
-                    egui::Shape::Rect(row)
-                        if row.fill == theme::ACCENT_SOFT
-                            && row.rect.contains_rect(selected_option) =>
-                    {
-                        Some(row.stroke)
-                    }
-                    _ => None,
-                })
-                .expect("selected popup option")
-        };
-        let idle_stroke = selected_stroke(&open);
-        render(
-            &mut account,
-            vec![egui::Event::PointerMoved(selected_option.center())],
-        );
-        let hover = render(&mut account, vec![]);
-        assert_ne!(selected_stroke(&hover), idle_stroke);
-        assert_eq!(find(&hover, "Off").last(), Some(&selected_option));
-        render(&mut account, vec![egui::Event::PointerGone]);
-        assert_eq!(selected_stroke(&render(&mut account, vec![])), idle_stroke);
-        check_option_hover(&open, "Microsoft Authenticator", |events| {
-            render(&mut account, events)
-        });
-        let provider = text_rect(&open, "Microsoft Authenticator").unwrap();
-        let focus_is_visible = (0..5).any(|_| {
-            render(
-                &mut account,
-                vec![egui::Event::Key {
-                    key: egui::Key::Tab,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-            );
-            let frame = render(&mut account, vec![]);
-            assert_eq!(text_rect(&frame, "Microsoft Authenticator"), Some(provider));
-            frame.shapes.iter().any(|clipped| {
-                matches!(&clipped.shape, egui::Shape::Rect(row)
-                    if row.rect.contains_rect(provider)
-                        && row.stroke == egui::Stroke::new(1.0, theme::ACCENT))
-            })
-        });
-        assert!(focus_is_visible, "Tab must visibly focus a picker option");
-        render(
-            &mut account,
-            vec![egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Default::default(),
-            }],
-        );
-        let dismissed = render(&mut account, vec![]);
-        assert!(find(&dismissed, "Microsoft Authenticator").is_empty());
-        assert!(!account.iphone_authenticator_enabled);
-        let open = click(&mut account, &dismissed, "Off");
-        let selected = click(&mut account, &open, "Microsoft Authenticator");
-        assert!(account.iphone_authenticator_enabled);
-        assert_eq!(
-            account.authenticator_provider,
-            AuthenticatorProvider::MicrosoftAuthenticator
-        );
-        let open = click(&mut account, &selected, "Microsoft Authenticator");
-        let disabled = click(&mut account, &open, "Off");
-        assert!(!account.iphone_authenticator_enabled);
-        assert_eq!(find(&disabled, "Off").len(), 1);
-
-        let mut legacy: Account = serde_json::from_value(serde_json::json!({
-            "id": "legacy", "username": "legacy", "iphone_authenticator_enabled": true
-        }))
-        .unwrap();
-        let initial = render(&mut legacy, vec![]);
-        assert_eq!(find(&initial, "Microsoft Authenticator").len(), 1);
-        assert!(legacy.iphone_authenticator_enabled);
     }
 
     #[test]

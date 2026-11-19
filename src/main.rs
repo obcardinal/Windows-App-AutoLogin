@@ -1451,11 +1451,11 @@ impl LightweightSupervisor {
                 #[cfg(target_os = "macos")]
                 background::WorkerEvent::PasswordWritten {
                     generation,
-                    microsoft_authenticator_enabled,
+                    iphone_authenticator_enabled,
                 } => {
                     if self.worker_pause_latch.stable_unpaused_generation() == Some(generation) {
                         self.poll_iphone_preparation(iphone_preparation::Trigger::PasswordWritten {
-                            warm_wifi: microsoft_authenticator_enabled,
+                            warm_wifi: iphone_authenticator_enabled,
                         });
                     }
                 }

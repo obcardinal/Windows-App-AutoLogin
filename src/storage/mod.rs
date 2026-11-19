@@ -412,8 +412,8 @@ struct StoredAccountWire {
     enabled: bool,
     #[serde(default)]
     iphone_authenticator_enabled: bool,
-    #[serde(default)]
-    authenticator_provider: crate::models::AuthenticatorProvider,
+    #[serde(default, rename = "authenticator_provider")]
+    _legacy_authenticator_provider: crate::models::AuthenticatorProvider,
     #[serde(default, rename = "target_window_title")]
     _removed_target_window_title: Option<String>,
 }
@@ -466,7 +466,6 @@ impl From<StoredAppConfigWire> for AppConfig {
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
                     iphone_authenticator_enabled: account.iphone_authenticator_enabled,
-                    authenticator_provider: account.authenticator_provider,
                 })
                 .collect(),
             settings: AppSettings {
@@ -6048,7 +6047,6 @@ mod tests {
 
     #[test]
     fn authenticator_provider_preserves_legacy_accounts_and_rejects_unknown_values() {
-        use crate::models::AuthenticatorProvider;
         use serde_json::json;
 
         for enabled in [false, true] {
@@ -6067,10 +6065,6 @@ mod tests {
             for input in [legacy.clone(), explicit.clone()] {
                 let config = decode(input).unwrap();
                 let account = &config.accounts[0];
-                assert_eq!(
-                    account.authenticator_provider,
-                    AuthenticatorProvider::MicrosoftAuthenticator
-                );
                 assert_eq!(account.iphone_authenticator_enabled, enabled);
                 // The canonical account representation is also used in recovery journals.
                 assert_eq!(serde_json::to_value(account).unwrap(), legacy);

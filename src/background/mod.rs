@@ -53,7 +53,7 @@ pub(crate) enum WorkerEvent {
     #[cfg(target_os = "macos")]
     PasswordWritten {
         generation: u64,
-        microsoft_authenticator_enabled: bool,
+        iphone_authenticator_enabled: bool,
     },
 }
 
@@ -1378,7 +1378,7 @@ async fn wait_or_handle_command(
 fn send_password_written(
     event_tx: &Sender<WorkerEvent>,
     generation: u64,
-    microsoft_authenticator_enabled: bool,
+    iphone_authenticator_enabled: bool,
 ) {
     use block2::RcBlock;
     use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
@@ -1387,7 +1387,7 @@ fn send_password_written(
     if event_tx
         .try_send(WorkerEvent::PasswordWritten {
             generation,
-            microsoft_authenticator_enabled,
+            iphone_authenticator_enabled,
         })
         .is_ok()
     {
@@ -1489,11 +1489,11 @@ fn spawn_current_prompt_attempt(job: CurrentPromptAttempt) -> bool {
                         )
                     },
                     #[cfg(target_os = "macos")]
-                    |microsoft_authenticator_enabled| {
+                    |iphone_authenticator_enabled| {
                         send_password_written(
                             &event_tx,
                             expected_generation,
-                            microsoft_authenticator_enabled,
+                            iphone_authenticator_enabled,
                         );
                     },
                 )
@@ -1688,19 +1688,20 @@ fn spawn_iphone_probe(job: IphoneProbe) -> bool {
                 return;
             }
         }
-        if account.authenticator_provider
-            == crate::models::AuthenticatorProvider::MicrosoftAuthenticator
-            && guard().is_ok()
-        {
-            crate::telegram_notifications::schedule_reminder();
+        if guard().is_err() {
+            return;
         }
-        let pending = crate::iphone_sso_ui::PendingProgress::default();
-        let outcome =
-            crate::iphone_sso::assist(&challenge, account, detection_time, &guard, |event| {
-                pending.publish(event, |update| {
-                    let _ = job.progress_proxy.send_event(update);
-                });
-            });
+        let outcome = match challenge.provider {
+            crate::models::AuthenticatorProvider::MicrosoftAuthenticator => {
+                crate::telegram_notifications::schedule_reminder();
+                let pending = crate::iphone_sso_ui::PendingProgress::default();
+                crate::iphone_sso::assist(&challenge, account, detection_time, &guard, |event| {
+                    pending.publish(event, |update| {
+                        let _ = job.progress_proxy.send_event(update);
+                    });
+                })
+            }
+        };
         let message = match outcome {
             crate::iphone_sso::Outcome::SubmittedUnverified => {
                 "iPhone number submitted; desktop authentication result is not verified"
@@ -4299,7 +4300,6 @@ mod tests {
             vm_device_id: String::new(),
             reconnect_locked_vm: false,
             iphone_authenticator_enabled: false,
-            authenticator_provider: Default::default(),
         }
     }
 

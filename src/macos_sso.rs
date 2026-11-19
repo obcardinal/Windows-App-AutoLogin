@@ -6,7 +6,7 @@ use super::{
     AX_SUBROLE, AX_TITLE, AX_VALUE, AX_WINDOWS,
 };
 use crate::macos_identity::{self, TrustedProcessInfo};
-use crate::models::Account;
+use crate::models::{Account, AuthenticatorProvider};
 use anyhow::Context;
 use core_foundation::base::CFHash;
 use core_foundation::string::CFString;
@@ -34,6 +34,7 @@ const MAX_AGE: Duration = Duration::from_secs(120);
 /// Kept on the thread that detected it. No Debug/Serialize implementation:
 /// account and challenge values must not enter logs or persistence.
 pub(crate) struct Challenge {
+    pub(crate) provider: AuthenticatorProvider,
     account_id: String,
     username: String,
     number: Zeroizing<String>,
@@ -126,7 +127,6 @@ impl Challenge {
             vm_device_id: String::new(),
             reconnect_locked_vm: false,
             iphone_authenticator_enabled: true,
-            authenticator_provider: Default::default(),
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?
             .context(DesktopCheckFailure::RequestGone)?;
@@ -161,7 +161,6 @@ impl Challenge {
             vm_device_id: String::new(),
             reconnect_locked_vm: false,
             iphone_authenticator_enabled: true,
-            authenticator_provider: Default::default(),
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?;
         guard()?;
@@ -178,7 +177,8 @@ impl Challenge {
     }
 
     fn same_request(&self, other: &Self) -> bool {
-        self.account_id == other.account_id
+        self.provider == other.provider
+            && self.account_id == other.account_id
             && self.username.eq_ignore_ascii_case(&other.username)
             && self.number.as_str() == other.number.as_str()
             && self.webview.same_element(&other.webview)
@@ -412,15 +412,9 @@ fn challenge_in_window(
         return Ok(None);
     }
     let description_text = static_text(description, process.pid, guard)?;
-    if !description_text
-        .to_ascii_lowercase()
-        .contains("authenticator")
-        || !description_text
-            .to_ascii_lowercase()
-            .contains("enter the number")
-    {
+    let Some(provider) = provider_from_number_match_instruction(&description_text) else {
         return Ok(None);
-    }
+    };
     let (account_element, username) = single_static_value(account_group, process.pid, guard)?;
     let Some(account) = select_account(accounts, username.trim())? else {
         return Ok(None);
@@ -432,6 +426,7 @@ fn challenge_in_window(
     );
     guard()?;
     Ok(Some(Challenge {
+        provider,
         account_id: account.id.clone(),
         username: account.username.trim().to_string(),
         number,
@@ -542,9 +537,53 @@ fn valid_number(number: &str) -> bool {
     number.len() == 2 && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+// Called only for the number-matching controls in Microsoft's native sign-in dialog.
+// Entra can call Microsoft Authenticator simply "your Authenticator app".
+fn provider_from_number_match_instruction(text: &str) -> Option<AuthenticatorProvider> {
+    let instruction = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let app = instruction
+        .trim_end_matches('.')
+        .strip_suffix(" and enter the number shown to sign in")?
+        .trim_end_matches(',');
+    match app {
+        "open your authenticator app"
+        | "open your microsoft authenticator app"
+        | "open the microsoft authenticator app"
+        | "open microsoft authenticator" => Some(AuthenticatorProvider::MicrosoftAuthenticator),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microsoft_number_match_instructions_identify_the_provider() {
+        for instruction in [
+            "Open your Authenticator app, and enter the number shown to sign in.",
+            "Open the Microsoft Authenticator app and enter the number shown to sign in.",
+            "Open your Microsoft Authenticator app,\nand enter the number shown to sign in.",
+        ] {
+            assert_eq!(
+                provider_from_number_match_instruction(instruction),
+                Some(AuthenticatorProvider::MicrosoftAuthenticator)
+            );
+        }
+        for other in [
+            "42",
+            "Enter the number shown to sign in.",
+            "Open your Duo Authenticator app, and enter the number shown to sign in.",
+            "Open your Microsoft Authenticator app or Duo, and enter the number shown to sign in.",
+            "Enter the verification code from your Microsoft Authenticator app.",
+        ] {
+            assert_eq!(provider_from_number_match_instruction(other), None);
+        }
+    }
 
     #[test]
     fn password_only_page_does_not_qualify_as_an_authenticator_challenge() {

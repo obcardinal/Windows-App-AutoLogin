@@ -4,10 +4,11 @@ This optional macOS integration assists Microsoft Authenticator number matching
 for an account's Windows App sign-in. In **Settings → iPhone Authentication**,
 click **Set up iPhone…**, choose a paired device by name, and click **Save iPhone**.
 All participating accounts use this phone. The choice is saved on this Mac by
-device identifier. Open **Sign-in details… → iPhone setup…** to change it later. In **Accounts**, open an account and choose
-**Microsoft Authenticator** from the **2FA → iPhone app** dropdown, then save.
-Choose **Off** to handle sign-in requests manually. New accounts default to
-**Off**. This feature requires macOS and Xcode.
+device identifier. Open **Sign-in details… → iPhone setup…** to change it later.
+In **Accounts**, open an account, turn on **Use iPhone for 2FA**, and save.
+AutoLogin identifies Microsoft Authenticator from the instructions next to the
+two-digit number in Windows App. Other methods require manual sign-in.
+The switch defaults to off for new accounts. This feature requires macOS and Xcode.
 
 The Mac recognizes a supported number-matching prompt from Windows App and binds
 it to the enabled account and the current sign-in window. It passes the account

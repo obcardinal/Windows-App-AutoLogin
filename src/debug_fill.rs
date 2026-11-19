@@ -1050,12 +1050,7 @@ fn fill_current_prompt_once_macos(
         return log.fail("password_field_not_detected_in_verified_prompt");
     }
 
-    on_password_written(
-        selected_account.enabled
-            && selected_account.iphone_authenticator_enabled
-            && selected_account.authenticator_provider
-                == crate::models::AuthenticatorProvider::MicrosoftAuthenticator,
-    );
+    on_password_written(selected_account.enabled && selected_account.iphone_authenticator_enabled);
     let submit_start = Instant::now();
     let submit_result = match crate::macos_ax::submit_prompt_after_fill(
         app_name,
@@ -2113,7 +2108,6 @@ mod windows_tests {
             vm_device_id: String::new(),
             reconnect_locked_vm: false,
             iphone_authenticator_enabled: false,
-            authenticator_provider: Default::default(),
         }
     }
 
@@ -2167,7 +2161,6 @@ mod macos_context_tests {
             vm_device_id: String::new(),
             reconnect_locked_vm: false,
             iphone_authenticator_enabled: false,
-            authenticator_provider: Default::default(),
         }
     }
 
