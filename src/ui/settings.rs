@@ -31,6 +31,7 @@ struct QueuedSettingsIntent {
     start_minimized: Option<bool>,
     hide_menu_bar_icon: Option<bool>,
     show_menu_diagnostics: Option<bool>,
+    close_connection_center_after_connect: Option<bool>,
     use_keyring: Option<bool>,
 }
 
@@ -47,6 +48,12 @@ impl QueuedSettingsIntent {
         }
         if before.show_menu_diagnostics != after.show_menu_diagnostics {
             self.show_menu_diagnostics = Some(after.show_menu_diagnostics);
+        }
+        if before.close_connection_center_after_connect
+            != after.close_connection_center_after_connect
+        {
+            self.close_connection_center_after_connect =
+                Some(after.close_connection_center_after_connect);
         }
         if before.use_keyring != after.use_keyring {
             self.use_keyring = Some(after.use_keyring);
@@ -70,6 +77,13 @@ impl QueuedSettingsIntent {
         {
             self.show_menu_diagnostics = Some(latest.show_menu_diagnostics);
         }
+        if self.close_connection_center_after_connect.is_none()
+            && requested.close_connection_center_after_connect
+                != latest.close_connection_center_after_connect
+        {
+            self.close_connection_center_after_connect =
+                Some(latest.close_connection_center_after_connect);
+        }
         if self.use_keyring.is_none() && requested.use_keyring != latest.use_keyring {
             self.use_keyring = Some(latest.use_keyring);
         }
@@ -88,6 +102,9 @@ impl QueuedSettingsIntent {
         }
         if let Some(value) = self.show_menu_diagnostics {
             rebased.show_menu_diagnostics = value;
+        }
+        if let Some(value) = self.close_connection_center_after_connect {
+            rebased.close_connection_center_after_connect = value;
         }
         if let Some(value) = self.use_keyring {
             rebased.use_keyring = value;
@@ -190,6 +207,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
                         "Include password storage status and the last fill result in the menu.",
                     );
                 });
+
+                #[cfg(target_os = "macos")]
+                {
+                    ui.add_space(12.0);
+                    section(ui, "WINDOWS APP", |ui| {
+                        let hint = "Your remote desktop stays open.";
+                        settings_changed |= labeled_switch(
+                            ui,
+                            &mut app.settings_draft.close_connection_center_after_connect,
+                            "Close device list after connecting",
+                            hint,
+                        );
+                        preference_hint(ui, hint);
+                    });
+                }
 
                 ui.add_space(12.0);
                 section(ui, "SECURITY", |ui| {
@@ -1615,6 +1647,7 @@ mod tests {
         latest.auto_start = false;
         latest.hide_menu_bar_icon = true;
         latest.show_menu_diagnostics = true;
+        latest.close_connection_center_after_connect = false;
         latest.use_keyring = true;
 
         let mut authoritative = requested.clone();
@@ -1631,6 +1664,7 @@ mod tests {
         assert!(rebased.start_minimized);
         assert!(rebased.hide_menu_bar_icon);
         assert!(rebased.show_menu_diagnostics);
+        assert!(!rebased.close_connection_center_after_connect);
         assert!(rebased.use_keyring);
         assert_eq!(rebased.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
     }
@@ -1640,18 +1674,21 @@ mod tests {
         let requested = AppSettings {
             auto_start: true,
             hide_menu_bar_icon: true,
+            close_connection_center_after_connect: true,
             ..AppSettings::default()
         };
         let latest = requested.clone();
         let mut authoritative = requested.clone();
         authoritative.auto_start = false;
         authoritative.hide_menu_bar_icon = false;
+        authoritative.close_connection_center_after_connect = false;
         authoritative.show_menu_diagnostics = true;
         let mut queued_intent = QueuedSettingsIntent::default();
 
         let mut away = requested.clone();
         away.auto_start = false;
         away.hide_menu_bar_icon = false;
+        away.close_connection_center_after_connect = false;
         away.show_menu_diagnostics = true;
         queued_intent.record_changes(&requested, &away);
         queued_intent.record_changes(&away, &latest);
@@ -1661,6 +1698,7 @@ mod tests {
 
         assert!(rebased.auto_start);
         assert!(rebased.hide_menu_bar_icon);
+        assert!(rebased.close_connection_center_after_connect);
         assert!(!rebased.show_menu_diagnostics);
         assert_ne!(rebased, authoritative);
     }
