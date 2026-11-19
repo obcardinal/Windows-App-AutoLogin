@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { DEVELOPMENT_TEAM, WDA_BUNDLE, writePrivateJson } from './support.mjs';
+import { LEGACY_DEVELOPMENT_TEAM, WDA_BUNDLE, writePrivateJson } from './support.mjs';
 import { saveInstalledSelection, saveSetupConfig } from './selection-config.mjs';
 
 const first = 'AAAAAAAA-0000000000000001';
@@ -16,7 +16,7 @@ test('setup promotes a preselected phone, keeps subsequent choices, and preserve
   const runtime = path.join(root, 'runtime-0123456789abcdef');
   const installed = { schema_version: 1, runtime_dir: runtime, node_path: '/vendor/node',
     appium_main: path.join(runtime, 'node_modules', 'appium', 'index.js'), device_udid: null,
-    development_team: DEVELOPMENT_TEAM, wda_bundle_id: WDA_BUNDLE };
+    development_team: LEGACY_DEVELOPMENT_TEAM, wda_bundle_id: WDA_BUNDLE };
   const pending = path.join(root, 'pending-device.json');
   const config = path.join(root, 'config.json');
   await writePrivateJson(pending, { schema_version: 1, device_udid: first });

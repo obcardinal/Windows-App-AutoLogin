@@ -7,8 +7,23 @@ import path from 'node:path';
 export const APPIUM_VERSION = '4.0.0';
 export const XCUITEST_VERSION = '13.1.1';
 export const AUTHENTICATOR_BUNDLE = 'com.microsoft.azureauthenticator';
-export const DEVELOPMENT_TEAM = '76C2QW8JV3';
+export const LEGACY_DEVELOPMENT_TEAM = '76C2QW8JV3';
+export const DEVELOPMENT_TEAM = LEGACY_DEVELOPMENT_TEAM;
 export const WDA_BUNDLE = 'com.obcardinal.WindowsAppAutoLogin.WebDriverAgentRunner';
+
+export function validDevelopmentTeam(value) {
+  return typeof value === 'string' && /^[A-Z0-9]{10}$/.test(value);
+}
+
+export function teamRunnerBundle(team) {
+  if (!validDevelopmentTeam(team)) throw new AutomationError('invalid_signing_team', 'Choose a signing team from Xcode.');
+  return `com.obcardinal.WindowsAppAutoLogin.${team}.WebDriverAgentRunner`;
+}
+
+export function validRunnerBundle(team, bundle) {
+  return validDevelopmentTeam(team) && (bundle === teamRunnerBundle(team)
+    || (team === LEGACY_DEVELOPMENT_TEAM && bundle === WDA_BUNDLE));
+}
 
 export class AutomationError extends Error {
   constructor(code, message) { super(message); this.name = 'AutomationError'; this.code = code; }
@@ -53,7 +68,7 @@ export function validateConfig(config, root = paths().root) {
       || !/^runtime-[a-f0-9]{16}$/.test(path.basename(config.runtime_dir))
       || typeof config.node_path !== 'string' || !path.isAbsolute(config.node_path)
       || config.appium_main !== path.join(config.runtime_dir, 'node_modules', 'appium', 'index.js')
-      || config.development_team !== DEVELOPMENT_TEAM || config.wda_bundle_id !== WDA_BUNDLE
+      || !validRunnerBundle(config.development_team, config.wda_bundle_id)
       || (config.device_udid !== null && !validUdid(config.device_udid))) {
     throw new AutomationError('invalid_configuration', 'Run iPhone helper setup again.');
   }

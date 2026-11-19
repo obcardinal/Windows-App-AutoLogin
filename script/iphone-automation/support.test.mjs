@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import { physicalDevices, selectPhysicalDevice, pairedDeviceCandidate, deviceFromDetails, parseLockState, validateConfig } from './support.mjs';
+import { physicalDevices, selectPhysicalDevice, pairedDeviceCandidate, deviceFromDetails, parseLockState, validateConfig, teamRunnerBundle } from './support.mjs';
 
 const udid = '00000000-0000000000000001';
 const device = (reality, connected = true) => ({
@@ -93,8 +93,12 @@ test('private configuration cannot redirect Appium outside its pinned runtime', 
     development_team: '76C2QW8JV3', wda_bundle_id: 'com.obcardinal.WindowsAppAutoLogin.WebDriverAgentRunner',
   };
   assert.equal(validateConfig(config, root), config);
+  const personal = { ...config, development_team: 'PERSONAL01', wda_bundle_id: teamRunnerBundle('PERSONAL01') };
+  assert.equal(validateConfig(personal, root), personal);
   for (const changes of [{ appium_main: '/tmp/appium.js' }, { device_udid: 'auto' },
-    { runtime_dir: `${root}/../arbitrary` }, { development_team: 'UNTRUSTED' }]) {
+    { runtime_dir: `${root}/../arbitrary` }, { development_team: 'UNTRUSTED' },
+    { development_team: 'PERSONAL01' }, { wda_bundle_id: teamRunnerBundle('PERSONAL01') },
+    { development_team: '../TEAM001', wda_bundle_id: 'other.app' }]) {
     assert.throws(() => validateConfig({ ...config, ...changes }, root), { code: 'invalid_configuration' });
   }
 });
