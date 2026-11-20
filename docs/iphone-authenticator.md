@@ -145,10 +145,12 @@ The signed product stays on disk across app restarts. A failed preparation can
 retry after a password write. Turning off the last eligible account or quitting
 AutoLogin cancels an in-progress build.
 
-When AutoLogin finishes writing the password for an account using Microsoft
-Authenticator, it can wake the selected paired iPhone’s Wi-Fi tunnel with a
-read-only CoreDevice query while the Mac submits and checks the password. The
-actual request checks the device, Wi-Fi transport and lock state again.
+When **Enter** starts a new desktop connection for an enabled account with
+**Use iPhone** turned on, AutoLogin starts connecting to the selected iPhone
+over Wi-Fi while Windows App opens the desktop. Bringing an existing desktop
+to the front skips this step. AutoLogin can also wake the connection when it
+fills the password. Both paths share a single in-flight Wi-Fi check. The
+sign-in request verifies the device, Wi-Fi transport and lock state again.
 
 The Xcode app can stay open for other projects. Each real sign-in starts a
 private Appium server and a fresh XCTest session on the selected iPhone. Both

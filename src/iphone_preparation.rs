@@ -18,6 +18,7 @@ const EOF_GRACE: Duration = Duration::from_secs(4);
 pub(crate) enum Trigger {
     Tick,
     Configuration,
+    DesktopConnect,
     PasswordWritten { warm_wifi: bool },
 }
 
@@ -139,16 +140,18 @@ impl HostPreparation {
             return;
         }
         let first_preparation = self.job.is_none() && self.outcome == Outcome::Pending;
-        let warm_after_password = self.wifi_job.is_none()
-            && matches!(trigger, Trigger::PasswordWritten { warm_wifi: true });
-        if (first_preparation && self.wifi_job.is_none()) || warm_after_password {
-            // Waking the selected device only reads its metadata. Keeping this
-            // job separate lets a later password write wake Wi-Fi again even
-            // if the initial Xcode build is still running.
+        let start_wifi = self.wifi_job.is_none()
+            && (first_preparation
+                || matches!(
+                    trigger,
+                    Trigger::DesktopConnect | Trigger::PasswordWritten { warm_wifi: true }
+                ));
+        if start_wifi {
+            // Enter and a later password write share a single in-flight probe.
             self.wifi_job = PreparationJob::start(Preparation::WarmWifi, command.clone()).ok();
         }
         let retry_build = matches!(trigger, Trigger::PasswordWritten { .. })
-            && (self.outcome == Outcome::Failed || warm_after_password);
+            && (self.outcome == Outcome::Failed || start_wifi);
         if self.job.is_none() && (first_preparation || retry_build) {
             match PreparationJob::start(Preparation::Build, command) {
                 Ok(job) => self.job = Some(job),
@@ -360,6 +363,13 @@ mod tests {
             panic!("unchanged config")
         });
         assert!(preparation.job.is_none());
+        preparation.poll_with(now, true, Trigger::DesktopConnect, |kind| {
+            assert_eq!(kind, Preparation::WarmWifi);
+            Ok(Command::new("/usr/bin/true"))
+        });
+        assert!(preparation.wifi_job.is_some() && preparation.job.is_none());
+        finish(&mut preparation);
+        assert!(preparation.outcome == Outcome::Failed);
         preparation.poll_with(
             now,
             true,
@@ -478,6 +488,9 @@ mod tests {
         );
         wait_until(|| state_is(&wifi_state, "ready"));
         let wifi = preparation.wifi_job.as_ref().unwrap().thread.thread().id();
+        preparation.poll_with(now, true, Trigger::DesktopConnect, |_| {
+            panic!("a desktop launch must reuse the in-flight Wi-Fi check")
+        });
         preparation.poll_with(now, true, password, |_| panic!("duplicate preparation"));
         assert_eq!(
             preparation.job.as_ref().unwrap().thread.thread().id(),

@@ -1584,6 +1584,14 @@ impl LightweightSupervisor {
                         .send(tray::TrayCommand::CheckForUpdates)
                         .is_ok()
             }
+            #[cfg(target_os = "macos")]
+            single_instance::LocalIpcCommand::PrepareIphoneWifi => {
+                if self.exit_requested || self.settings_mutation_active {
+                    return false;
+                }
+                self.poll_iphone_preparation(iphone_preparation::Trigger::DesktopConnect);
+                true
+            }
             single_instance::LocalIpcCommand::SettingsBootstrap => false,
             single_instance::LocalIpcCommand::SettingsMutationBegin => {
                 self.begin_settings_mutation()
@@ -3260,6 +3268,10 @@ fn local_ipc_command_authorized(
         single_instance::LocalIpcCommand::Activate => true,
         #[cfg(target_os = "macos")]
         single_instance::LocalIpcCommand::CheckForUpdates => true,
+        #[cfg(target_os = "macos")]
+        single_instance::LocalIpcCommand::PrepareIphoneWifi => {
+            settings_child_bootstrapped && Some(peer_pid) == settings_child_pid
+        }
         single_instance::LocalIpcCommand::SettingsBootstrap => Some(peer_pid) == settings_child_pid,
         single_instance::LocalIpcCommand::SettingsMutationBegin
         | single_instance::LocalIpcCommand::SettingsMutationCancel
@@ -4722,6 +4734,23 @@ mod tests {
     fn local_ipc_authorization_requires_bootstrapped_settings_child_for_privileged_commands() {
         use super::single_instance::{LocalIpcCommand, MonitorControlCommand};
 
+        #[cfg(target_os = "macos")]
+        for (peer, child, bootstrapped, allowed) in [
+            (42, Some(42), true, true),
+            (42, Some(42), false, false),
+            (7, Some(42), true, false),
+            (42, None, true, false),
+        ] {
+            assert_eq!(
+                super::local_ipc_command_authorized(
+                    LocalIpcCommand::PrepareIphoneWifi,
+                    peer,
+                    child,
+                    bootstrapped
+                ),
+                allowed
+            );
+        }
         assert!(super::local_ipc_command_authorized(
             LocalIpcCommand::Activate,
             42,

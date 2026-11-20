@@ -134,6 +134,18 @@ pub(crate) struct DesktopLaunch {
     other_titles: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EnterOutcome {
+    Focused,
+    ConnectRequested,
+}
+
+impl EnterOutcome {
+    fn should_prepare_iphone(self, account: &Account) -> bool {
+        self == Self::ConnectRequested && account.enabled && account.iphone_authenticator_enabled
+    }
+}
+
 impl DesktopLaunch {
     pub(crate) fn for_account(account: &Account, accounts: &[Account]) -> Self {
         Self {
@@ -150,7 +162,7 @@ impl DesktopLaunch {
     pub(crate) fn open(&self) -> Result<()> {
         let account = &self.account;
         let focus = |title: &str| self.focus_if_unshared(title, focus_open_session);
-        open_with(
+        let outcome = open_with(
             account,
             saved_devices,
             focus,
@@ -174,7 +186,15 @@ impl DesktopLaunch {
                     self.unshared_title(candidate)
                 })
             },
-        )
+        )?;
+        if outcome.should_prepare_iphone(account) {
+            // Windows App has accepted Connect. The optional supervisor request
+            // must not keep the Enter control busy while awaiting its reply.
+            let _ = std::thread::Builder::new()
+                .name("iphone-wifi-request".into())
+                .spawn(crate::single_instance::request_iphone_wifi_preparation);
+        }
+        Ok(())
     }
 
     fn unshared_title(&self, title: &str) -> bool {
@@ -226,14 +246,14 @@ fn open_with(
     account: &Account,
     catalog: impl FnOnce() -> Result<Vec<SavedDevice>>,
     focus: impl FnOnce(&str) -> Result<bool>,
-    connect: impl FnOnce(&SavedDevice, bool) -> Result<()>,
-    reconnect: impl FnOnce(&str) -> Result<()>,
-) -> Result<()> {
+    connect: impl FnOnce(&SavedDevice, bool) -> Result<EnterOutcome>,
+    reconnect: impl FnOnce(&str) -> Result<EnterOutcome>,
+) -> Result<EnterOutcome> {
     let name = account.vm_target.as_str();
     if account.vm_device_id == WINDOW_ONLY {
         ensure!(!name.trim().is_empty(), "The linked VM has no device name.");
         return if focus(name)? {
-            Ok(())
+            Ok(EnterOutcome::Focused)
         } else {
             reconnect(name)
         };
@@ -255,7 +275,7 @@ fn open_with(
     }
     let unique_title = has_unique_title(&catalog, device);
     if unique_title && focus(&device.name)? {
-        return Ok(());
+        return Ok(EnterOutcome::Focused);
     }
     connect(device, !unique_title)
 }
@@ -404,7 +424,7 @@ mod tests {
             ("", "Desktop", "OWNER@example.test"),
             ("workspace:example", "Old name", ""),
         ] {
-            open_with(
+            let outcome = open_with(
                 &linked(id, name, owner),
                 || Ok(vec![saved()]),
                 |title| {
@@ -415,23 +435,22 @@ mod tests {
                 |_| panic!("saved catalog binding"),
             )
             .unwrap();
+            assert_eq!(outcome, EnterOutcome::Focused);
         }
-        let mut connected = false;
-        open_with(
+        let outcome = open_with(
             &linked("workspace:example", "Desktop", ""),
             || Ok(vec![saved()]),
             |_| Ok(false),
             |d, shared| {
                 assert!(!shared);
                 assert_eq!(d.id, saved().id);
-                connected = true;
-                Ok(())
+                Ok(EnterOutcome::ConnectRequested)
             },
             |_| panic!("saved catalog binding"),
         )
         .unwrap();
-        assert!(connected);
-        open_with(
+        assert_eq!(outcome, EnterOutcome::ConnectRequested);
+        let outcome = open_with(
             &linked(WINDOW_ONLY, "Visible", ""),
             || panic!("no catalog needed"),
             |_| Ok(true),
@@ -439,6 +458,7 @@ mod tests {
             |_| panic!("an open window must not start another connection"),
         )
         .unwrap();
+        assert_eq!(outcome, EnterOutcome::Focused);
         assert!(open_with(
             &linked("", "Desktop", "different@example.test"),
             || Ok(vec![saved()]),
@@ -463,29 +483,31 @@ mod tests {
                 panic!("title alone cannot identify this account")
             })
         };
-        open_with(
+        let outcome = open_with(
             &linked(WINDOW_ONLY, "Desktop", ""),
             || panic!("no catalog is required"),
             focus,
             |_, _| panic!("a window link needs the profile"),
             |title| {
                 assert_eq!(title, "Desktop");
-                Ok(())
+                Ok(EnterOutcome::Focused)
             },
         )
         .unwrap();
+        assert_eq!(outcome, EnterOutcome::Focused);
         // A saved device may acquire a title claimed by another account.
-        open_with(
+        let outcome = open_with(
             &linked("workspace:example", "Previous name", ""),
             || Ok(vec![saved()]),
             focus,
             |device, _| {
                 assert_eq!(device.id, "workspace:example");
-                Ok(())
+                Ok(EnterOutcome::ConnectRequested)
             },
             |_| panic!("a catalog link must connect its selected record"),
         )
         .unwrap();
+        assert_eq!(outcome, EnterOutcome::ConnectRequested);
         assert!(launch.focus_if_unshared("Unique VM", |_| Ok(true)).unwrap());
     }
 
@@ -502,7 +524,7 @@ mod tests {
             |_, _| panic!("a window binding has no saved ID"),
             |name| {
                 requested.push(name.to_owned());
-                Ok(())
+                Ok(EnterOutcome::ConnectRequested)
             },
         )
         .unwrap();
@@ -557,11 +579,25 @@ mod tests {
             |device, shared| {
                 assert!(shared);
                 assert_eq!(device.id, "workspace:example");
-                Ok(())
+                Ok(EnterOutcome::ConnectRequested)
             },
             |_| panic!("workspace has a verified catalog ID"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn enter_requests_iphone_preparation_only_for_an_enabled_opted_in_new_connection() {
+        let mut account = Account::new("owner@example.test");
+        for (enabled, opted_in) in [(true, true), (true, false), (false, true), (false, false)] {
+            account.enabled = enabled;
+            account.iphone_authenticator_enabled = opted_in;
+            assert!(!EnterOutcome::Focused.should_prepare_iphone(&account));
+            assert_eq!(
+                EnterOutcome::ConnectRequested.should_prepare_iphone(&account),
+                enabled && opted_in
+            );
+        }
     }
 
     #[test]

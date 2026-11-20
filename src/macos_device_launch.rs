@@ -1,5 +1,5 @@
 //! Launch the saved Windows App device so its workspace and gateway settings apply.
-use super::desktops::LaunchHost;
+use super::desktops::{EnterOutcome, LaunchHost};
 use super::{
     collect_descendants_bounded, macos_identity, role_matches, AXUIElementSetAttributeValue,
     AxElement, AX_CHILDREN, AX_DESCRIPTION, AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_ROLE,
@@ -35,7 +35,7 @@ struct DeviceList {
     devices: Vec<(String, AxElement)>,
 }
 
-pub(crate) fn open_saved_device(device: &SavedDevice, shared_title: bool) -> Result<()> {
+pub(super) fn open_saved_device(device: &SavedDevice, shared_title: bool) -> Result<EnterOutcome> {
     if device.id.starts_with("workspace:") && !device.owner.trim().is_empty() {
         let app = trusted_app()?;
         let (list, profile) = prepare_profile_devices(&app, &device.owner, || Ok(()))?;
@@ -66,12 +66,12 @@ pub(super) fn open_saved_device_if(
 
 /// Window-only bindings predate a stable resource ID. The native Devices view
 /// can still reconnect the exact card under the account that owns the binding.
-pub(crate) fn reconnect_window_device(
+pub(super) fn reconnect_window_device(
     name: &str,
     account_email: &str,
     host: Option<&LaunchHost>,
     unshared_title: impl FnOnce(&str) -> bool,
-) -> Result<()> {
+) -> Result<EnterOutcome> {
     let app = trusted_app()?;
     ensure!(
         !name.trim().is_empty(),
@@ -85,7 +85,7 @@ pub(crate) fn reconnect_window_device(
     // On repeated Enter Windows App may already have a newly named session.
     let shared_title = !unshared_title(selected);
     if selected != name && !shared_title && super::device_windows::focus_open_session(selected)? {
-        return Ok(());
+        return Ok(EnterOutcome::Focused);
     }
     list.open_for_enter(selected, shared_title, || list.ensure_profile(&profile))
 }
@@ -274,7 +274,7 @@ impl DeviceList {
         name: &str,
         shared_title: bool,
         verify: impl Fn() -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<EnterOutcome> {
         if shared_title {
             use super::device_windows::{focus_session_in_app, session_entries};
             let entries = session_entries(&self.app)?;
@@ -294,11 +294,12 @@ impl DeviceList {
                         focus_session_in_app(&self.app, name, &|| false, || {})?.is_some(),
                         "The selected desktop disconnected before it could be focused."
                     );
-                    return Ok(());
+                    return Ok(EnterOutcome::Focused);
                 }
             }
         }
-        self.connect(name, verify)
+        self.connect(name, verify)?;
+        Ok(EnterOutcome::ConnectRequested)
     }
 
     fn connect(&self, name: &str, verify_binding: impl FnOnce() -> Result<()>) -> Result<()> {

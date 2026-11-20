@@ -93,6 +93,8 @@ const MAX_IPC_COMMANDS_PER_TICK: usize = 16;
 const IPC_COMMAND_ACTIVATE: &str = "activate";
 #[cfg(target_os = "macos")]
 const IPC_COMMAND_CHECK_FOR_UPDATES: &str = "updates:check";
+#[cfg(target_os = "macos")]
+const IPC_COMMAND_PREPARE_IPHONE_WIFI: &str = "iphone:prepare-wifi";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_SETTINGS_BOOTSTRAP: &str = "settings:bootstrap";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -175,6 +177,8 @@ pub(crate) enum LocalIpcCommand {
     Activate,
     #[cfg(target_os = "macos")]
     CheckForUpdates,
+    #[cfg(target_os = "macos")]
+    PrepareIphoneWifi,
     SettingsBootstrap,
     SettingsMutationBegin,
     SettingsMutationCancel,
@@ -807,6 +811,11 @@ pub(crate) fn request_check_for_updates() -> anyhow::Result<()> {
     // This uses the same endpoint ownership, peer identity and fresh nonce
     // validation as app activation. There is no feed URL or command payload.
     send_local_ipc_command(IPC_COMMAND_CHECK_FOR_UPDATES)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_iphone_wifi_preparation() -> anyhow::Result<()> {
+    send_local_ipc_command(IPC_COMMAND_PREPARE_IPHONE_WIFI)
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1796,6 +1805,11 @@ fn parse_local_ipc_command(message: &str) -> Option<LocalIpcCommand> {
     #[cfg(target_os = "macos")]
     if message == IPC_COMMAND_CHECK_FOR_UPDATES {
         return Some(LocalIpcCommand::CheckForUpdates);
+    }
+
+    #[cfg(target_os = "macos")]
+    if message == IPC_COMMAND_PREPARE_IPHONE_WIFI {
+        return Some(LocalIpcCommand::PrepareIphoneWifi);
     }
 
     if message == IPC_COMMAND_SETTINGS_BOOTSTRAP {
@@ -4236,6 +4250,31 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iphone_wifi_preparation_ipc_requires_matching_challenge_and_has_no_arguments() {
+        let challenge = "0123456789abcdef0123456789abcdef";
+        let request = format!("{challenge}:{IPC_COMMAND_PREPARE_IPHONE_WIFI}");
+        assert_eq!(
+            parse_local_ipc_challenge_response(&request, challenge),
+            Some(LocalIpcCommand::PrepareIphoneWifi)
+        );
+        assert_eq!(
+            parse_local_ipc_challenge_response(&request, "fedcba9876543210fedcba9876543210"),
+            None
+        );
+        assert_eq!(
+            parse_local_ipc_challenge_response(IPC_COMMAND_PREPARE_IPHONE_WIFI, challenge),
+            None
+        );
+        for suffix in [":device", " directory", "\nactivate", "\0"] {
+            assert_eq!(
+                parse_local_ipc_challenge_response(&format!("{request}{suffix}"), challenge),
+                None
+            );
+        }
+    }
+
     #[cfg(all(target_os = "macos", unix))]
     #[test]
     fn local_ipc_accepts_challenge_response_command() {
@@ -4247,6 +4286,10 @@ mod tests {
             (
                 IPC_COMMAND_CHECK_FOR_UPDATES,
                 LocalIpcCommand::CheckForUpdates,
+            ),
+            (
+                IPC_COMMAND_PREPARE_IPHONE_WIFI,
+                LocalIpcCommand::PrepareIphoneWifi,
             ),
         ] {
             let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
