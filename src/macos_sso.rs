@@ -541,21 +541,66 @@ fn valid_number(number: &str) -> bool {
 // Entra can call Microsoft Authenticator simply "your Authenticator app".
 fn provider_from_number_match_instruction(text: &str) -> Option<AuthenticatorProvider> {
     let instruction = text
-        .split_whitespace()
+        .split(|c: char| c.is_whitespace() || c == '\u{200b}')
+        .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
-    let app = instruction
-        .trim_end_matches('.')
-        .strip_suffix(" and enter the number shown to sign in")?
-        .trim_end_matches(',');
-    match app {
+    let mut clauses = instruction
+        .split(['.', ',', ';'])
+        .flat_map(|sentence| sentence.split(" and "))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty());
+    if !matches!(
+        clauses.next()?,
         "open your authenticator app"
-        | "open your microsoft authenticator app"
-        | "open the microsoft authenticator app"
-        | "open microsoft authenticator" => Some(AuthenticatorProvider::MicrosoftAuthenticator),
-        _ => None,
+            | "open your microsoft authenticator app"
+            | "open the microsoft authenticator app"
+            | "open microsoft authenticator"
+    ) {
+        return None;
     }
+
+    // The selected app and the instruction to enter a number are separate
+    // pieces of evidence. Microsoft can add approval steps or change the
+    // wording after “number” while displaying the same challenge controls.
+    let mut enter_number = false;
+    for clause in clauses {
+        let action = clause.strip_prefix("then ").unwrap_or(clause);
+        let words: Vec<_> = action.split_whitespace().collect();
+        match words.as_slice() {
+            ["enter", "the" | "this", "number", rest @ ..] if refers_to_displayed_number(rest) => {
+                enter_number = true;
+            }
+            ["approve", "the" | "this" | "your", "request" | "notification"]
+            | ["approve", "the" | "this" | "your", "sign-in", "request"]
+            | ["if" | "when", "prompted"] => {}
+            _ => return None,
+        }
+    }
+    enter_number.then_some(AuthenticatorProvider::MicrosoftAuthenticator)
+}
+
+// Identify which number is requested before any timing or purpose clause
+// (e.g. “if prompted” or “to sign in”). An app-generated code goes the other way.
+fn refers_to_displayed_number(words: &[&str]) -> bool {
+    if words.contains(&"or") {
+        return false;
+    }
+    let reference = words
+        .split(|word| matches!(*word, "if" | "when" | "to"))
+        .next()
+        .unwrap_or_default();
+    let location = match reference {
+        ["shown" | "displayed", location @ ..] => location,
+        location => location,
+    };
+    matches!(
+        location,
+        [] | ["here" | "below" | "above"]
+            | ["on", "this" | "the" | "your", "screen"]
+            | ["on", "this" | "the" | "your", "sign-in", "screen"]
+    )
 }
 
 #[cfg(test)]
@@ -568,10 +613,16 @@ mod tests {
             "Open your Authenticator app, and enter the number shown to sign in.",
             "Open the Microsoft Authenticator app and enter the number shown to sign in.",
             "Open your Microsoft Authenticator app,\nand enter the number shown to sign in.",
+            "Open your Authenticator app and approve the request. Enter the number if prompted.\u{200b}\u{200b}",
+            "Open the Microsoft Authenticator app. If prompted, enter the number displayed here.",
+            "OPEN MICROSOFT AUTHENTICATOR, then enter\u{00a0}the\u{200b}number.",
+            "Open your Authenticator app and enter this number to continue.",
+            "Open your Microsoft Authenticator app and approve the sign-in request. When prompted, enter the number shown on the screen.",
         ] {
             assert_eq!(
                 provider_from_number_match_instruction(instruction),
-                Some(AuthenticatorProvider::MicrosoftAuthenticator)
+                Some(AuthenticatorProvider::MicrosoftAuthenticator),
+                "{instruction}"
             );
         }
         for other in [
@@ -580,8 +631,18 @@ mod tests {
             "Open your Duo Authenticator app, and enter the number shown to sign in.",
             "Open your Microsoft Authenticator app or Duo, and enter the number shown to sign in.",
             "Enter the verification code from your Microsoft Authenticator app.",
+            "Open your Authenticator app and approve the request.",
+            "Open your Duo Authenticator app and approve the request. Enter the number if prompted.",
+            "Open your Microsoft Authenticator app. Do not enter the number.",
+            "Open your Authenticator app and enter the numbers shown.",
+            "Open your Authenticator app and enter the verification code.",
+            "Open your Authenticator app and enter the number from the app.",
+            "Open your Authenticator app and enter the number shown on your phone.",
+            "Open your Authenticator app and enter the number in Duo.",
+            "Open your Authenticator app and use Duo to enter the number.",
+            "Open your Authenticator app or another method. Enter the number if prompted.",
         ] {
-            assert_eq!(provider_from_number_match_instruction(other), None);
+            assert_eq!(provider_from_number_match_instruction(other), None, "{other}");
         }
     }
 
