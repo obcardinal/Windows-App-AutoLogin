@@ -1,5 +1,5 @@
 //! Offline recognition through Vision and the same classifier used on captured windows.
-use super::{classify, visit_line, Line, LockScreenObservation};
+use super::{visit_account_line, FrameRead, LockScreenObservation};
 use core_foundation::base::CFRelease;
 use objc2::{
     rc::{autoreleasepool, Retained},
@@ -57,15 +57,45 @@ fn observe_editor(
     tile_caption: Option<&str>,
     underline: &str,
 ) -> LockScreenObservation {
+    read_editor(
+        (width, height),
+        editor_width,
+        placeholder,
+        underline,
+        GuestCaptions {
+            instruction,
+            tile_caption,
+            qualified_user: None,
+        },
+        &[],
+    )
+}
+
+#[derive(Default)]
+struct GuestCaptions<'a> {
+    instruction: Option<(&'a str, usize, usize, usize)>,
+    tile_caption: Option<&'a str>,
+    qualified_user: Option<&'a str>,
+}
+
+fn read_editor(
+    (width, height): (usize, usize),
+    editor_width: usize,
+    placeholder: &str,
+    underline: &str,
+    captions: GuestCaptions<'_>,
+    accounts: &[&str],
+) -> LockScreenObservation {
     // Window and editor sizes vary independently, as they do when resizing the RDP client.
     let center = width as f64 / 2.;
-    let (extra_text, instruction_x, instruction_y, instruction_size) =
-        instruction.unwrap_or(("", width / 2, height / 5, 28));
+    let (extra_text, instruction_x, instruction_y, instruction_size) = captions
+        .instruction
+        .unwrap_or(("", width / 2, height / 5, 28));
     let top = (height as f64 * 0.56).round();
     let scale = editor_width as f64 / 300.;
     let name_size = 36_f64.max(18. / scale);
     let password_size = 15_f64.max(9. / scale);
-    let tile = tile_caption.map_or_else(String::new, |caption| {
+    let tile = captions.tile_caption.map_or_else(String::new, |caption| {
         let tile_x = 38. * scale;
         let tile_y = height as f64 - 85. * scale;
         format!(
@@ -75,14 +105,50 @@ fn observe_editor(
             </g>"#
         )
     });
+    let (wallpaper, account) = if let Some(qualified_user) = captions.qualified_user {
+        // Decorative captions stay on the periphery, with distinct edges and
+        // tones crossing behind the centered account and password controls.
+        let wallpaper = format!(
+            r##"<g transform="scale({width} {height})">
+                 <path fill="#5f6556" d="M0 .08 Q.33 .23 .56 .02 T1 .12 V1 H0Z"/>
+                 <path fill="#414b4a" d="M0 .21 Q.2 .58 .43 .38 T1 .29 V1 H0Z"/>
+                 <path fill="#565b52" d="M0 .69 Q.25 .32 .54 .48 T1 .34 V1 H0Z"/>
+                 <path fill="#353d43" d="M0 .82 Q.23 .48 .44 .54 T1 .43 V1 H0Z"/>
+                 <path fill="#49534d" d="M0 .9 Q.15 .63 .49 .70 T1 .57 V1 H0Z"/>
+               </g>
+               <g font-family="Helvetica" fill="#dedfda">
+                 <g transform="translate({left} {upper})"><text font-size="28">Northern Range</text>
+                   <text y="34" font-size="19">Along the ridge trail</text></g>
+                 <g transform="translate({right} {lower})" text-anchor="end"><text font-size="26">Mountain Atlas</text>
+                   <text y="32" font-size="18">Winter edition</text></g>
+               </g>"##,
+            left = width * 6 / 100,
+            upper = height * 27 / 100,
+            right = width * 94 / 100,
+            lower = height * 55 / 100,
+        );
+        let account = format!(
+            r#"<text y="-52" text-anchor="middle" font-size="32">Lee, Rowan</text>
+               <text y="-25" text-anchor="middle" font-size="15" font-family="Menlo">{qualified_user}</text>"#
+        );
+        (wallpaper, account)
+    } else {
+        (
+            String::new(),
+            format!(
+                r#"<text y="-40" text-anchor="middle" font-size="{name_size}">Example Person</text>"#
+            ),
+        )
+    };
     let svg = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">
           <rect width="100%" height="100%" fill="#263452"/>
+          {wallpaper}
           <g font-family="Helvetica" fill="#eeeeee">
             <text x="{instruction_x}" y="{instruction_y}" text-anchor="middle" font-size="{instruction_size}">{extra_text}</text>
             {tile}
             <g transform="translate({center} {top}) scale({scale})">
-              <text x="0" y="-40" text-anchor="middle" font-size="{name_size}">Example Person</text>
+              {account}
               <rect x="-150" y="0" width="300" height="35" fill="#181d32"/>
               <rect x="-150" y="33" width="300" height="2" fill="{underline}"/>
               <text x="-138" y="23" font-size="{password_size}">{placeholder}</text>
@@ -99,7 +165,7 @@ fn observe_editor(
         let vector = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(svg.as_bytes()))
             .expect("synthetic SVG");
         let tiff = vector.TIFFRepresentation().expect("synthetic bitmap");
-        let mut lines: Vec<Line> = Vec::new();
+        let mut frame = FrameRead::new(accounts);
         // NSData is toll-free bridged to CFData. ImageIO retains it for the source's lifetime.
         let success = unsafe {
             let source = CGImageSourceCreateWithData(Retained::as_ptr(&tiff).cast(), ptr::null());
@@ -111,8 +177,11 @@ fn observe_editor(
                 (CGImageGetWidth(image), CGImageGetHeight(image)),
                 (width, height)
             );
-            let success =
-                waal_recognize_lock_frame(image, visit_line, (&mut lines as *mut Vec<Line>).cast());
+            let success = waal_recognize_lock_frame(
+                image,
+                visit_account_line,
+                ptr::from_mut(&mut frame).cast(),
+            );
             CFRelease(image);
             success
         };
@@ -120,8 +189,72 @@ fn observe_editor(
             success,
             "could not process the synthetic {width}×{height} frame"
         );
-        classify(&lines)
+        frame.observation(success)
     })
+}
+
+#[test]
+fn recognizes_a_qualified_account_caption_on_wallpaper_at_different_guest_scales() {
+    let accounts = ["robin.lee@example.test", "rowan.lee@example.test"];
+    for (width, height, editor, underline) in [
+        (1366, 768, 300, "#3173d0"),
+        (2560, 1440, 600, "#767676"),
+        (2880, 1800, 510, "#767676"),
+    ] {
+        assert_eq!(
+            read_editor(
+                (width, height),
+                editor,
+                "Password",
+                underline,
+                GuestCaptions {
+                    qualified_user: Some(r"LAB\rowan.lee@example.test"),
+                    ..Default::default()
+                },
+                &accounts,
+            ),
+            LockScreenObservation::AccountPassword(1),
+            "{width}×{height}, editor {editor}px"
+        );
+    }
+}
+
+#[test]
+fn rejects_a_wrong_qualified_user_and_competing_sign_in_controls() {
+    let expected = ["rowan.lee@example.test"];
+    for (qualified_user, placeholder, tile, instruction) in [
+        (r"LAB\rowan.lee@example.net", "Password", None, None),
+        (
+            r"LAB\rowan.lee@example.test",
+            "Password",
+            Some("Other user"),
+            None,
+        ),
+        (
+            r"LAB\rowan.lee@example.test",
+            "Password",
+            None,
+            Some(("Sign-in options", 683, 518, 18)),
+        ),
+        (r"LAB\rowan.lee@example.test", "PIN", None, None),
+    ] {
+        assert_eq!(
+            read_editor(
+                (1366, 768),
+                300,
+                placeholder,
+                "#3173d0",
+                GuestCaptions {
+                    qualified_user: Some(qualified_user),
+                    tile_caption: tile,
+                    instruction
+                },
+                &expected,
+            ),
+            LockScreenObservation::Other,
+            "{qualified_user:?}, {placeholder:?}, {tile:?}, {instruction:?}"
+        );
+    }
 }
 
 #[test]

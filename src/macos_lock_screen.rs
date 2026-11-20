@@ -10,6 +10,7 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockScreenObservation {
     Password,
+    AccountPassword(usize),
     Other,
     Unavailable,
 }
@@ -98,23 +99,21 @@ fn request_permission(
     false
 }
 
-pub(crate) fn observe(pid: i32, window_id: u32) -> LockScreenObservation {
-    let mut lines = Vec::<Line>::new();
-    // The native bridge calls visit_line synchronously, finishes all visits
-    // before returning, and never registers the context with async callbacks.
+mod directory;
+use directory::{visit_account_line, FrameRead};
+
+pub(crate) fn observe(pid: i32, window_id: u32, usernames: &[&str]) -> LockScreenObservation {
+    let mut frame = FrameRead::new(usernames);
+    // The native bridge completes all callbacks before the borrowed frame goes out of scope.
     let success = unsafe {
         waal_observe_lock_screen(
             pid,
             window_id,
-            visit_line,
-            (&mut lines as *mut Vec<Line>).cast(),
+            visit_account_line,
+            std::ptr::from_mut(&mut frame).cast(),
         )
     };
-    if success {
-        classify(&lines)
-    } else {
-        LockScreenObservation::Unavailable
-    }
+    frame.observation(success)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +122,7 @@ enum Label {
     MaskedField,
     EditorBounds,
     Name,
+    Address,
     Conflict,
     SmallMark,
     IconFragment,
@@ -167,7 +167,7 @@ extern "C" fn visit_line(
             let utf8 = unsafe { slice::from_raw_parts(bytes, len) };
             let text = str::from_utf8(utf8);
             let label = text.map_or(Label::Conflict, label);
-            if kind == LAYOUT_TEXT && label != Label::Conflict {
+            if kind == LAYOUT_TEXT && !matches!(label, Label::Conflict | Label::Address) {
                 // Windows displays the input language as a short uppercase
                 // abbreviation. Only a confident native read may clear a
                 // garbled reading of these same glyphs by fast OCR.
@@ -182,8 +182,9 @@ extern "C" fn visit_line(
             }
             // The accurate corner pass can veto an alternative sign-in method,
             // even when fast OCR misses the tile or garbles its caption.
-            if (kind == CORNER_TEXT && label != Label::Conflict)
-                || (kind == ACCOUNT_TEXT && !matches!(label, Label::Conflict | Label::Name))
+            let veto = matches!(label, Label::Conflict | Label::Address);
+            if (kind == CORNER_TEXT && !veto)
+                || (kind == ACCOUNT_TEXT && !veto && label != Label::Name)
             {
                 return;
             }
@@ -277,8 +278,7 @@ fn label(raw: &str) -> Label {
         return Label::Password;
     }
     let lower = text.to_lowercase();
-    let conflict = lower.contains('@')
-        || lower.contains("://")
+    let conflict = lower.contains("://")
         || [
             "password",
             "other user",
@@ -300,6 +300,9 @@ fn label(raw: &str) -> Label {
             .any(|word| matches!(word, "pin" | "passcode" | "www"));
     if conflict {
         return Label::Conflict;
+    }
+    if text.contains('@') {
+        return Label::Address;
     }
     let mut words = text.split_whitespace();
     let count = words.clone().count();
@@ -355,10 +358,19 @@ fn placeholder_in_editor(line: &Line, editor: Option<&Line>) -> bool {
         && (0.15..=0.9).contains(&(line.height / e.height))
 }
 
+fn valid_line(line: &Line) -> bool {
+    (0.0..=1.0).contains(&line.confidence)
+        && [line.x, line.y, line.width, line.height]
+            .iter()
+            .all(|v| (0.0..=1.0).contains(v))
+        && line.width > 0.0
+        && line.height > 0.0
+}
+
 fn classify(lines: &[Line]) -> LockScreenObservation {
     use LockScreenObservation::{Other, Password};
 
-    if lines.is_empty() || lines.len() > 16 {
+    if lines.is_empty() || lines.len() > 16 || !lines.iter().all(valid_line) {
         return Other;
     }
     let mut account = None;
@@ -377,18 +389,8 @@ fn classify(lines: &[Line]) -> LockScreenObservation {
         return Other;
     }
     for line in lines {
-        if !line.confidence.is_finite()
-            || !(0.0..=1.0).contains(&line.confidence)
-            || ![line.x, line.y, line.width, line.height]
-                .iter()
-                .all(|v| (0.0..=1.0).contains(v))
-            || line.width == 0.0
-            || line.height == 0.0
-        {
-            return Other;
-        }
         // Only guest pixels reach the classifier, including the very top row.
-        if line.label == Label::Conflict {
+        if matches!(line.label, Label::Conflict | Label::Address) {
             return Other;
         }
         if line.label == Label::EditorBounds {

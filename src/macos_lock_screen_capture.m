@@ -12,7 +12,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
-enum { OverviewText, MaskedField, VerifiedPlaceholder, EditorBounds, CornerText, AccountText, LayoutText, AmbiguousText };
+enum { OverviewText, MaskedField, VerifiedPlaceholder, EditorBounds, CornerText, AccountText, LayoutText,
+       AmbiguousText, PairedAccountText };
 typedef void (*WaalTextVisitor)(void *, int, const char *, size_t, float, double, double, double, double);
 
 bool waal_lock_capture_supported(void) {
@@ -395,7 +396,7 @@ static CGRect readPassword(CGImageRef source, CGRect region, float *confidence) 
     return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 48.0 / pixels.size.height)), NULL, NULL, confidence);
 }
 
-static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int kind,
+static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int kind, NSUInteger limit,
                             WaalTextVisitor visitor, void *context) {
     double w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     pixels = CGRectIntersection(CGRectIntegral(pixels), CGRectMake(0, 0, w, h));
@@ -405,14 +406,14 @@ static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int 
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:detail options:@{}];
     CGImageRelease(detail);
     VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
-    NSUInteger limit = kind == AccountText || kind == LayoutText ? 1 : 16;
     if (![handler performRequests:@[request] error:nil] || !request.results) return false;
-    if (kind == AccountText && request.results.count > 1) {
+    if (request.results.count > limit) {
+        if (kind != AccountText) return false;
         visitor(context, AmbiguousText, NULL, 0, 1.0, CGRectGetMidX(pixels) / w,
                 1.0 - CGRectGetMidY(pixels) / h, pixels.size.width / w, pixels.size.height / h);
         return true;
     }
-    if (request.results.count > limit) return false;
+    if (kind == AccountText && request.results.count == 2) kind = PairedAccountText;
     for (VNRecognizedTextObservation *observation in request.results) {
         VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
         NSString *text = candidate.string;
@@ -558,6 +559,7 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
     WaalFieldKind kind = waal_password_field(source, &field);
     if (kind == WaalFieldUnavailable) return false;
     if (kind == WaalFieldAmbiguous) return true;
+    bool measuredField = !CGRectIsEmpty(field);
     double scale = fmin(1920.0 / w, 1440.0 / h);
     if (!CGRectIsEmpty(field)) {
         // A 100% Windows desktop on a 5K monitor can still have a 290px editor.
@@ -584,7 +586,8 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
         placeholder = unfocusedPassword(source, existing, visitor, context, &editorCenter, &confidence);
         if (CGRectIsEmpty(placeholder)) return true;
         field = waal_neutral_password_field(source, placeholder);
-        if (CGRectIsEmpty(field)) {
+        measuredField = !CGRectIsEmpty(field);
+        if (!measuredField) {
             // On a centered form the measured word inset gives the scale for
             // the context reads. A shifted form requires its visible outline.
             if (fabs(editorCenter - .5) > .035) return true;
@@ -612,25 +615,26 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
     double cornerHeight = fmin(floor(h / 3.0), ew);
     CGRect corner = CGRectMake(0, h - cornerHeight, fmin(w / 3.0, 1.5 * ew), cornerHeight);
     double detailScale = eh < 32 ? fmin(5.0, 48.0 / eh) : 1.0;
-    if (!visitDetailText(source, corner, detailScale, CornerText, visitor, context)) return false;
+    if (!visitDetailText(source, corner, detailScale, CornerText, 16, visitor, context)) return false;
     // Vision can turn the input-language abbreviation into a longer word
     // when the guest is scaled to fit a window. Re-read the indicator in
     // original pixels. This optional read can only repair a matching line.
     CGRect layout = CGRectMake(w - 0.38 * ew, h - 1.51 * eh, 0.13 * ew, 0.64 * eh);
-    visitDetailText(source, layout, detailScale, LayoutText, visitor, context);
+    visitDetailText(source, layout, detailScale, LayoutText, 1, visitor, context);
     // Fast can misread a centered name even on a large remote display
     // resized to a wide window. Read its native pixels at every guest DPI.
     CGRect name = CGRectMake(CGRectGetMidX(field) * w - 0.8 * ew,
                              (1.0 - CGRectGetMidY(field)) * h - 3.1 * eh,
                              1.6 * ew, 2.45 * eh);
-    if (!visitDetailText(source, name, 1.0, AccountText, visitor, context)) return false;
+    // A two-line caption needs an independent editor measurement to anchor both lines.
+    if (!visitDetailText(source, name, 1.0, AccountText, measuredField ? 2 : 1, visitor, context)) return false;
     if (eh < 32) {
         // A compressed "Other user" or instruction just below the editor
         // may also disappear from the fast window-wide pass.
         CGRect below = CGRectMake(CGRectGetMidX(field) * w - 0.85 * ew,
                                   (1.0 - field.origin.y) * h + 0.05 * eh,
                                   1.7 * ew, 3.8 * eh);
-        if (!visitDetailText(source, below, detailScale, OverviewText, visitor, context)) return false;
+        if (!visitDetailText(source, below, detailScale, OverviewText, 16, visitor, context)) return false;
     }
     CGRect box = kind == WaalFieldMasked ? field : placeholder;
     if (kind == WaalFieldPlaceholderCandidate) {

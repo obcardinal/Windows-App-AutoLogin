@@ -307,11 +307,27 @@ impl ReturnMonitor {
             if cancelled() {
                 return;
             }
-            let observation = macos_lock_screen::observe(probe.pid, probe.window_id);
-            if observation != LockScreenObservation::Password {
-                tracing::debug!(?observation, "No Windows password screen detected");
-                return;
-            }
+            // Preserve account indices for the independent session-binding check.
+            // A disabled duplicate must not mask the enabled account's login.
+            let usernames: Vec<_> = accounts
+                .iter()
+                .map(|account| {
+                    if account.locked_vm_reconnect_enabled() {
+                        account.username.as_str()
+                    } else {
+                        ""
+                    }
+                })
+                .collect();
+            let observation = macos_lock_screen::observe(probe.pid, probe.window_id, &usernames);
+            let visible_account = match observation {
+                LockScreenObservation::Password => None,
+                LockScreenObservation::AccountPassword(index) => Some(&accounts[index].id),
+                _ => {
+                    tracing::debug!(?observation, "No Windows password screen detected");
+                    return;
+                }
+            };
             tracing::debug!(
                 recognition_ms = detection_started.elapsed().as_millis(),
                 "Recognized locked desktop"
@@ -335,6 +351,12 @@ impl ReturnMonitor {
                     return;
                 }
             };
+            if visible_account.is_some_and(|id| id != &session.account_id) {
+                tracing::debug!(
+                    "The Windows sign-in account differs from the linked desktop account"
+                );
+                return;
+            }
             let account_key = AttemptTarget::Account(session.account_id.clone());
             let Ok(mut deadlines) = attempts.lock() else {
                 return;
