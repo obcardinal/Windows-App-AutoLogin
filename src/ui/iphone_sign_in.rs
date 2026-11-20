@@ -1,5 +1,5 @@
 //! Account authentication choices and details for the iPhone shared by this Mac.
-use crate::iphone_setup_info::{self, PairedPhone, SetupInfo};
+use crate::iphone_setup_info::{self, HelperFiles, PairedPhone, SetupInfo};
 use crate::ui::theme;
 use eframe::egui;
 use std::sync::{Arc, OnceLock};
@@ -109,6 +109,14 @@ pub(super) fn summary(ui: &mut egui::Ui) {
             "Connect iPhone…",
         ),
         Some(SetupInfo::Selected {
+            helper_files: HelperFiles::NeedsSetup,
+            ..
+        }) => (
+            "Mac helper needs setup",
+            PhonePage::Details,
+            "Sign-in details…",
+        ),
+        Some(SetupInfo::Selected {
             wifi_connected: true,
             ..
         }) => (
@@ -202,8 +210,14 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
             ui.add_space(12.0);
             super::settings::section(ui, "MICROSOFT AUTHENTICATOR", |ui| {
                 let snapshot = DeviceSnapshot::get(ui.ctx());
-                if matches!(snapshot.0.get(), Some(SetupInfo::Selected { helper_installed: false, .. })) {
-                    ui.label("To use this iPhone for sign-in, set up the Mac helper.");
+                match snapshot.0.get() {
+                    Some(SetupInfo::Selected { helper_files: HelperFiles::NotInstalled, .. }) => {
+                        ui.label("To use this iPhone for sign-in, set up the Mac helper.");
+                    }
+                    Some(SetupInfo::Selected { helper_files: HelperFiles::NeedsSetup, .. }) => {
+                        ui.label("Run setup again to update or repair the Mac helper.");
+                    }
+                    _ => {}
                 }
                 if ui.add(theme::secondary_button("Set up automation…")).clicked() {
                     open_page(ui.ctx(), PhonePage::Helper);
@@ -469,7 +483,7 @@ fn show_setup(ui: &mut egui::Ui) {
     if matches!(
         snapshot.0.get(),
         Some(SetupInfo::Selected {
-            helper_installed: false,
+            helper_files: HelperFiles::NotInstalled | HelperFiles::NeedsSetup,
             ..
         })
     ) {
@@ -741,7 +755,7 @@ mod tests {
         let offline = SetupInfo::Selected {
             id: "AAAAAAAA-1234567890000002".into(),
             name: None,
-            helper_installed: false,
+            helper_files: HelperFiles::NotInstalled,
             wifi_connected: false,
         };
         form.suggest_phone(Some(&offline));
@@ -760,7 +774,7 @@ mod tests {
             id: other.id.clone(),
             name: Some(other.name.clone()),
             wifi_connected: true,
-            helper_installed: false,
+            helper_files: HelperFiles::NotInstalled,
         };
         form.suggest_phone(Some(&saved));
         assert_eq!(form.draft.as_ref(), Some(&other.id));
@@ -888,7 +902,7 @@ mod tests {
                 id: "AAAAAAAA-1234567890000001".into(),
                 name: Some("Work iPhone".into()),
                 wifi_connected: false,
-                helper_installed: true,
+                helper_files: HelperFiles::Current,
             })
             .unwrap();
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("iphone_setup_info"), view));

@@ -235,35 +235,7 @@ fn verified_node_command() -> anyhow::Result<Command> {
                 .is_some_and(|name| name == "node"),
         "iPhone runtime path is invalid"
     );
-    // Setup installs these exact modules. A stale or modified helper must be
-    // updated explicitly; the app never executes a user-provided script path.
-    for (name, expected) in [
-        (
-            "support.mjs",
-            include_bytes!("../script/iphone-automation/support.mjs").as_slice(),
-        ),
-        (
-            "bridge.mjs",
-            include_bytes!("../script/iphone-automation/bridge.mjs").as_slice(),
-        ),
-        (
-            "wda.mjs",
-            include_bytes!("../script/iphone-automation/wda.mjs").as_slice(),
-        ),
-        (
-            "authenticator.mjs",
-            include_bytes!("../script/iphone-automation/authenticator.mjs").as_slice(),
-        ),
-        (
-            "run-request.mjs",
-            include_bytes!("../script/iphone-automation/run-request.mjs").as_slice(),
-        ),
-    ] {
-        anyhow::ensure!(
-            private_file(&root.join(name), 128 * 1024)? == expected,
-            "iPhone helper needs setup"
-        );
-    }
+    crate::iphone_setup_info::verify_helper_files(&root)?;
     let mut command = Command::new(&config.node_path);
     command
         .current_dir(&root)

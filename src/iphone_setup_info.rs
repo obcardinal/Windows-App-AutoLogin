@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelperFiles {
+    NotInstalled,
+    NeedsSetup,
+    Current,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SetupInfo {
     NotConfigured,
@@ -19,7 +26,7 @@ pub(crate) enum SetupInfo {
         id: String,
         name: Option<String>,
         wifi_connected: bool,
-        helper_installed: bool,
+        helper_files: HelperFiles,
     },
 }
 
@@ -38,7 +45,7 @@ fn root() -> Result<PathBuf, SetupInfo> {
 }
 
 pub(crate) fn read() -> SetupInfo {
-    let (selected, installed) = match root().and_then(|path| selected_id(&path)) {
+    let (selected, helper_files) = match root().and_then(|path| selected_id(&path)) {
         Ok(selection) => selection,
         Err(status) => return status,
     };
@@ -51,7 +58,7 @@ pub(crate) fn read() -> SetupInfo {
         id: selected,
         wifi_connected: device.as_ref().is_some_and(|p| p.wifi_connected),
         name: device.map(|p| p.name),
-        helper_installed: installed,
+        helper_files,
     }
 }
 
@@ -164,7 +171,41 @@ fn config_value(path: &Path) -> anyhow::Result<Option<Value>> {
     }
 }
 
-fn selected_id(root: &Path) -> Result<(String, bool), SetupInfo> {
+// The signed app and Settings use the same list to identify an installed helper.
+const HELPER_MODULES: &[(&str, &[u8])] = &[
+    (
+        "support.mjs",
+        include_bytes!("../script/iphone-automation/support.mjs").as_slice(),
+    ),
+    (
+        "bridge.mjs",
+        include_bytes!("../script/iphone-automation/bridge.mjs").as_slice(),
+    ),
+    (
+        "wda.mjs",
+        include_bytes!("../script/iphone-automation/wda.mjs").as_slice(),
+    ),
+    (
+        "authenticator.mjs",
+        include_bytes!("../script/iphone-automation/authenticator.mjs").as_slice(),
+    ),
+    (
+        "run-request.mjs",
+        include_bytes!("../script/iphone-automation/run-request.mjs").as_slice(),
+    ),
+];
+
+pub(crate) fn verify_helper_files(root: &Path) -> anyhow::Result<()> {
+    for &(name, expected) in HELPER_MODULES {
+        anyhow::ensure!(
+            crate::iphone_sso::private_file(&root.join(name), 128 * 1024)? == expected,
+            "iPhone helper needs setup"
+        );
+    }
+    Ok(())
+}
+
+fn selected_id(root: &Path) -> Result<(String, HelperFiles), SetupInfo> {
     if let Err(e) = check_dir(root) {
         return Err(
             if e.downcast_ref::<io::Error>()
@@ -182,12 +223,18 @@ fn selected_id(root: &Path) -> Result<(String, bool), SetupInfo> {
     if let Some(config) =
         config_value(&root.join("config.json")).map_err(|_| SetupInfo::ConfigUnavailable)?
     {
-        return id_from_document(&config).map(|id| (id, true));
+        let id = id_from_document(&config)?;
+        let helper_files = if verify_helper_files(root).is_ok() {
+            HelperFiles::Current
+        } else {
+            HelperFiles::NeedsSetup
+        };
+        return Ok((id, helper_files));
     }
     let pending = pending
         .map_err(|_| SetupInfo::ConfigUnavailable)?
         .ok_or(SetupInfo::NotConfigured)?;
-    id_from_document(&pending).map(|id| (id, false))
+    id_from_document(&pending).map(|id| (id, HelperFiles::NotInstalled))
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {
@@ -519,7 +566,10 @@ mod tests {
             std::env::temp_dir().join(format!("waal-selection-test-{}", uuid::Uuid::new_v4()));
         let other = "AAAAAAAA-0000000000000002";
         save_selection(&root, ID).unwrap();
-        assert_eq!(selected_id(&root), Ok((ID.into(), false)));
+        assert_eq!(
+            selected_id(&root),
+            Ok((ID.into(), HelperFiles::NotInstalled))
+        );
         assert!(!root.join("config.json").exists());
         let config = json!({"schema_version":1,"device_udid":null,"runtime_dir":"preserve-me"});
         crate::storage::write_private_file_atomic(
@@ -530,13 +580,39 @@ mod tests {
         .unwrap();
         assert_eq!(selected_id(&root), Err(SetupInfo::NoDeviceSelected));
         save_selection(&root, other).unwrap();
-        assert_eq!(selected_id(&root), Ok((other.into(), true)));
+        assert_eq!(
+            selected_id(&root),
+            Ok((other.into(), HelperFiles::NeedsSetup))
+        );
         assert_eq!(
             config_value(&root.join("config.json")).unwrap().unwrap()["runtime_dir"],
             "preserve-me"
         );
         assert!(connect_phone_at(&root, "bad").is_err());
-        assert_eq!(selected_id(&root), Ok((other.into(), true)));
+        assert_eq!(
+            selected_id(&root),
+            Ok((other.into(), HelperFiles::NeedsSetup))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_phone_reports_stale_helper_files_after_an_update() {
+        let root = std::env::temp_dir().join(format!("waal-helper-test-{}", uuid::Uuid::new_v4()));
+        save_selection(&root, ID).unwrap();
+        fs::rename(root.join("pending-device.json"), root.join("config.json")).unwrap();
+        for &(name, bytes) in HELPER_MODULES {
+            crate::storage::write_private_file_atomic(&root.join(name), "test", bytes).unwrap();
+        }
+        assert_eq!(selected_id(&root), Ok((ID.into(), HelperFiles::Current)));
+
+        crate::storage::write_private_file_atomic(
+            &root.join("support.mjs"),
+            "test",
+            b"older helper",
+        )
+        .unwrap();
+        assert_eq!(selected_id(&root), Ok((ID.into(), HelperFiles::NeedsSetup)));
         fs::remove_dir_all(root).unwrap();
     }
 
