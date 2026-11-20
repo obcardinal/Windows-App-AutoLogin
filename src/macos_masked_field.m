@@ -89,7 +89,10 @@ static bool submitArrow(Frame frame, Ink arrow, int mid, int height, int thresho
                 }
             }
         }
-        if (abs(y - mid) <= h * .25 + 1 && maximum > thickest) thickest = maximum;
+        // A one-wing glyph can put the shaft at an extreme of its bounding
+        // box. Require ink to extend in both directions from the shaft itself.
+        if (abs(y - mid) <= h * .25 + 1 && y - arrow.top >= h * .24 &&
+            arrow.bottom - y >= h * .24 && maximum > thickest) thickest = maximum;
     }
     return thickest >= w * .70 && upper > 0 && lower > 0;
 }
@@ -174,10 +177,10 @@ static WaalFieldKind editor(Frame frame, int left, int right, int y, CGRect *res
     int arrowLeft = left + (int)(w * .894), arrowRight = left + (int)(w * .982);
     Ink arrow = measure(frame, arrowLeft, arrowRight, glyphTop, glyphBottom, brightInk);
     if (!submitArrow(frame, arrow, mid, h, brightInk, -1)) {
-        // On small controls the subpixel shaft blends into the dark fill.
-        // Require a bright core, then check the same shaft and wings with
-        // a threshold one third of the way from the fill to that core.
-        if (h > 30 || !arrow.count) return WaalFieldNone;
+        // Resampling can dim the shaft even at the control's native height.
+        // Use its measured contrast with the fill; submitArrow still requires
+        // a continuous shaft and both wings proportional to this editor.
+        if (!arrow.count) return WaalFieldNone;
         Pixel fill = *at(frame, arrowLeft, glyphTop);
         int base = fmin(fill.r, fmin(fill.g, fill.b));
         if (arrow.brightest - base < 64) return WaalFieldNone;
@@ -327,8 +330,10 @@ CGRect waal_neutral_password_field(CGImageRef image, CGRect verifiedPassword) {
     if (!image || CGRectIsEmpty(verifiedPassword) ||
         !CGRectContainsRect(CGRectMake(0, 0, 1, 1), verifiedPassword)) return CGRectNull;
     size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    // Guest DPI determines the word's pixel size independently of the display
+    // width. Check its native height and aspect before measuring the borders.
     if (w < 160 || h < 85 || w > 16384 || h > 16384 || w * h > 8192u * 4320u ||
-        verifiedPassword.size.width < .045 || verifiedPassword.size.width > .20) return CGRectNull;
+        verifiedPassword.size.width > .20) return CGRectNull;
     double textX = verifiedPassword.origin.x * w, textW = verifiedPassword.size.width * w;
     double mid = (1.0 - CGRectGetMidY(verifiedPassword)) * h, textH = verifiedPassword.size.height * h;
     if (textH < 5 || textH > 128 || textW < 3 * textH || textW > 10 * textH) return CGRectNull;

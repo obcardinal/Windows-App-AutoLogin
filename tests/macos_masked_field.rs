@@ -303,6 +303,40 @@ fn identifies_a_small_antialiased_arrow_only_with_its_shaft() {
 }
 
 #[test]
+fn recognizes_a_faint_shaft_on_a_resampled_35_pixel_editor_only_with_both_wings() {
+    let (size, top) = (298, 800);
+    for lower_wing in [true, false] {
+        let mut frame = Fixture::new(2560, 1440);
+        let left = (frame.width - size) / 2;
+        frame.editor(top, size, 0, false, true, true);
+        // Resampling preserves the bright junction and arrowhead, while the
+        // shaft toward the left blends with the dark editor fill.
+        for y in 0..35 {
+            for x in size * 9 / 10..size {
+                let pixel = &mut frame.data[(top + y) * frame.width + left + x];
+                if pixel[0] == 229 {
+                    if !lower_wing && y > 20 {
+                        *pixel = [24, 29, 50, 255];
+                    } else if x < size * 94 / 100 {
+                        *pixel = [100, 103, 105, 255];
+                    }
+                }
+            }
+        }
+        let expected = if lower_wing {
+            FieldKind::PlaceholderCandidate
+        } else {
+            FieldKind::None
+        };
+        assert_eq!(
+            frame.detect().0,
+            expected,
+            "lower wing present: {lower_wing}"
+        );
+    }
+}
+
+#[test]
 fn an_unavailable_frame_is_distinct_from_a_completed_scan_with_no_field() {
     let mut field = Box2d::default();
     let kind = unsafe { waal_password_field(std::ptr::null(), &mut field) };
@@ -504,4 +538,28 @@ fn measures_shifted_unfocused_editor_only_when_all_four_sides_enclose_the_word()
             assert!((rect.w * w as f64 - (right - left) as f64).abs() <= 5.);
         }
     }
+}
+
+#[test]
+fn requires_a_measured_outline_for_a_small_unfocused_editor_on_a_wide_display() {
+    let (width, height, size, top) = (2880, 1800, 510, 1000);
+    let left = (width - size) / 2;
+    let mut frame = Fixture::new(width, height);
+    frame.editor(top, size, 0, false, true, false);
+    // The legible 112px word occupies under four percent of this display.
+    let word = Box2d {
+        x: (left + 20) as f64 / width as f64,
+        y: 1. - (top + 40) as f64 / height as f64,
+        w: 112. / width as f64,
+        h: 20. / height as f64,
+    };
+    let read = |image| unsafe { waal_neutral_password_field(image, word) };
+    let outline = frame.with_image(read);
+    assert!((outline.w * width as f64 - size as f64).abs() <= 2.);
+    // Extend the fill beyond the word-relative search band. With the right
+    // border missing, the other three sides cannot identify the control.
+    for row in top..top + 60 {
+        frame.data[row * width + left + size..(row + 1) * width].fill([24, 29, 50, 255]);
+    }
+    assert!(frame.with_image(read).x.is_infinite());
 }
