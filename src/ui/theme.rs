@@ -12,6 +12,7 @@ pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(246, 247, 250);
 pub const STROKE: egui::Color32 = egui::Color32::from_rgb(216, 221, 229);
 const TAB_RAIL: egui::Color32 = egui::Color32::from_rgb(238, 240, 245);
 const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(226, 230, 238);
+const WINDOW_MARGIN: i8 = 9;
 const SEMIBOLD: &str = "Inter Semibold";
 
 pub fn apply(ctx: &egui::Context) {
@@ -96,7 +97,7 @@ fn apply_fonts(ctx: &egui::Context) {
 pub fn top_bar_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(egui::Color32::WHITE)
-        .inner_margin(egui::Margin::symmetric(18, 7))
+        .inner_margin(egui::Margin::same(WINDOW_MARGIN))
 }
 
 pub fn tab_group_frame() -> egui::Frame {
@@ -142,9 +143,9 @@ pub fn content_frame() -> egui::Frame {
 }
 
 pub fn tab_content_frame() -> egui::Frame {
-    let mut frame = content_frame();
-    frame.inner_margin.bottom = frame.inner_margin.left;
-    frame
+    egui::Frame::new()
+        .fill(SURFACE)
+        .inner_margin(egui::Margin::same(WINDOW_MARGIN))
 }
 
 pub fn glass_frame() -> egui::Frame {
