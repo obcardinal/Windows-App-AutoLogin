@@ -70,6 +70,8 @@ const ACCOUNT_EDITOR_LABEL_ICON_GAP: f32 = 4.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
 #[cfg(target_os = "macos")]
 const ACCOUNT_2FA_HELP: &str = "AutoLogin enters the Microsoft Authenticator number on your unlocked iPhone over Wi-Fi. Use Face ID if prompted.";
+#[cfg(target_os = "macos")]
+const RECONNECT_HELP: &str = "When you return to a locked VM, AutoLogin closes and reopens its window to reconnect.";
 const ACTION_ICON_SIZE: f32 = 16.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
 const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
@@ -3221,7 +3223,7 @@ fn show_locked_vm_reconnect(
             enabled,
             label,
             hint,
-            |_| {},
+            |ui| account_info_button(ui, label, RECONNECT_HELP, None),
         );
         if !supported {
             account_editor_help(ui, "Automatic reconnect requires macOS 14 or later.");
@@ -3267,10 +3269,8 @@ fn show_locked_vm_reconnect(
                     );
                 }
                 ui.ctx().request_repaint_after(Duration::from_secs(2));
-                return;
             }
         }
-        account_editor_help(ui, hint);
     });
 }
 
@@ -5204,6 +5204,28 @@ mod tests {
             "Automatic reconnect requires macOS 14 or later."
         )
         .is_empty());
+        let info = tree
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("About Reconnect when locked"))
+                .then(|| node.bounds().unwrap())
+            })
+            .expect("reconnect info button");
+        let info_center = egui::pos2(
+            ((info.x0 + info.x1) / 2.0) as f32,
+            ((info.y0 + info.y1) / 2.0) as f32,
+        );
+        assert!(visible_text_rects(&unsupported, super::RECONNECT_HELP).is_empty());
+        render(&mut account, click(info_center));
+        let opened = render(&mut account, vec![]);
+        assert_eq!(visible_text_rects(&opened, super::RECONNECT_HELP).len(), 1);
+        assert!(!account.reconnect_locked_vm);
+        assert_eq!(opens.get(), 0);
+        render(&mut account, click(info_center));
+        let closed = render(&mut account, vec![]);
+        assert!(visible_text_rects(&closed, super::RECONNECT_HELP).is_empty());
         assert_eq!(checks.get(), 1);
         assert_eq!(requests.get(), 0);
         supported.set(true);
@@ -5238,7 +5260,7 @@ mod tests {
         assert_eq!(label_color, Some(crate::ui::theme::TEXT));
         assert!(visible_text_rects(&granted, settings_hint).is_empty());
         assert!(visible_text_rects(&granted, "Open System Settings…").is_empty());
-        assert!(!visible_text_rects(
+        assert!(visible_text_rects(
             &granted,
             "AutoLogin reconnects when you return to the locked desktop."
         )
@@ -5257,7 +5279,14 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        render(&mut account, vec![key_press(egui::Key::Tab)]);
+        let tab = render(&mut account, vec![key_press(egui::Key::Tab)]);
+        if tab.platform_output.accesskit_update.unwrap().focus != *switch_id {
+            let next = render(&mut account, vec![key_press(egui::Key::Tab)]);
+            assert_eq!(
+                next.platform_output.accesskit_update.unwrap().focus,
+                *switch_id
+            );
+        }
         render(&mut account, vec![key_press(egui::Key::Space)]);
         assert!(!account.reconnect_locked_vm);
         render(&mut account, vec![key_press(egui::Key::Enter)]);
@@ -8161,10 +8190,12 @@ mod tests {
                 )
             };
             let vm_info = info_for("About VM device");
+            let reconnect_info = info_for("About Reconnect when locked");
             let iphone_info = info_for("About Use iPhone");
             assert_eq!(vm_info.size(), egui::vec2(24.0, ACCOUNT_EDITOR_CONTROL_HEIGHT));
             for (caption, info) in [
                 ("VM device", vm_info),
+                ("Reconnect when locked", reconnect_info),
                 ("Use iPhone", iphone_info),
             ] {
                 assert_eq!(info.size(), vm_info.size());
