@@ -2911,11 +2911,18 @@ fn show_monitor_control(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
     if ui.add(theme::monitor_button(state)).clicked() {
         app.toggle_monitor_from_ui(ui.ctx());
     }
-    ui.label(
-        egui::RichText::new("Monitor:")
-            .size(13.0)
-            .color(theme::MUTED),
-    );
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(
+            egui::RichText::new("Monitor")
+                .size(13.0)
+                .color(theme::MUTED),
+        );
+        ui.add(
+            theme::toolbar_icon(egui::include_image!("../assets/icons/activity.svg"))
+                .tint(theme::MUTED),
+        );
+    });
 }
 
 fn show_accessibility_onboarding(ui: &mut egui::Ui, app: &mut AutoLoginApp) {
@@ -5717,7 +5724,7 @@ mod tests {
 
         assert!(rendered_text.contains(ACCESSIBILITY_SETTINGS_INSTRUCTIONS));
         assert!(rendered_text.contains("Windows App AutoLogin"));
-        assert!(rendered_text.contains("Monitor:"));
+        assert!(rendered_text.lines().any(|line| line == "Monitor"));
         assert!(rendered_text.contains("Start"));
         assert!(rendered_text.contains("Request Accessibility Access"));
         assert!(rendered_text.contains("Open Accessibility Settings"));
