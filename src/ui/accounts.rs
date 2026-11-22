@@ -47,9 +47,11 @@ const ACCOUNT_TRANSACTION_IN_PROGRESS_REASON: &str =
 
 const STATE_COLUMN_WIDTH: f32 = 68.0;
 const TABLE_SPACING: f32 = 8.0;
-const ACTION_BUTTON_SIZE: f32 = 30.0;
-const ACTIONS_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 4.0 + TABLE_SPACING * 3.0;
-const ACCOUNT_ROW_HEIGHT: f32 = 49.0;
+const ACCOUNT_TILE_SIZE: f32 = 31.0;
+const ACCOUNT_ROW_PADDING: i8 = 9;
+const ACTIONS_COLUMN_WIDTH: f32 = ACCOUNT_TILE_SIZE * 4.0 + TABLE_SPACING * 3.0;
+const ADD_ACCOUNT_DIAMETER: f32 = 24.0;
+const ACCOUNT_ROW_HEIGHT: f32 = ACCOUNT_TILE_SIZE + 2.0 * ACCOUNT_ROW_PADDING as f32;
 const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
 const MAX_VISIBLE_ACCOUNT_ROWS: usize = 5;
 const ACCOUNT_EDITOR_WIDTH: f32 = 480.0;
@@ -106,46 +108,45 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
         .editing_account
         .as_ref()
         .is_some_and(|draft| !app.config.accounts.iter().any(|saved| saved.id == draft.id));
-    let add_account = show_accounts_page_header(ui, launch_controls_enabled || adding_account);
-    if with_transaction_disabled_reason(add_account, launch_controls_disabled_reason(&availability))
-        .clicked()
-    {
-        open_account_editor(ui.ctx(), app, Account::new(""));
+    let can_add = launch_controls_enabled || adding_account;
+    let mut card = theme::compact_frame();
+    if !app.config.accounts.is_empty() {
+        card.inner_margin = egui::Margin {
+            top: ACCOUNT_ROW_PADDING,
+            ..egui::Margin::symmetric(ACCOUNT_ROW_PADDING, 0)
+        };
     }
-
-    if app.config.accounts.is_empty() {
-        theme::compact_frame().show(ui, |ui| {
+    let add_account = card
+        .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                ui.add_space(18.0);
-                let (tile, _) =
-                    ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::hover());
-                ui.painter().rect_filled(tile, 12, theme::ACCENT_SOFT);
-                egui::Image::new(egui::include_image!("../../assets/icons/users.svg"))
-                    .tint(theme::ACCENT)
-                    .paint_at(ui, tile.shrink(10.0));
-                ui.label(
-                    egui::RichText::new("No accounts yet")
-                        .size(17.0)
-                        .strong()
-                        .color(theme::TEXT),
-                );
-                ui.label(
-                    egui::RichText::new("Add an account to fill matching sign-in prompts.")
-                        .size(13.0)
-                        .color(theme::MUTED),
-                );
-                ui.add_space(18.0);
-            });
-        });
-    } else {
-        let count = app.config.accounts.len();
-        let desired_rows_height = visible_account_rows_height(count);
-        theme::compact_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            if app.config.accounts.is_empty() {
+                return ui
+                    .vertical_centered(|ui| {
+                        ui.add_space(18.0);
+                        let (tile, _) =
+                            ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::hover());
+                        ui.painter().rect_filled(tile, 12, theme::ACCENT_SOFT);
+                        egui::Image::new(egui::include_image!("../../assets/icons/users.svg"))
+                            .tint(theme::ACCENT)
+                            .paint_at(ui, tile.shrink(10.0));
+                        ui.label(
+                            egui::RichText::new("No accounts yet")
+                                .size(17.0)
+                                .line_height(Some(21.0))
+                                .strong()
+                                .color(theme::TEXT),
+                        );
+                        ui.add_space(4.0);
+                        let add = ui.add_enabled(can_add, theme::primary_button("Add Account"));
+                        ui.add_space(18.0);
+                        add
+                    })
+                    .inner;
+            }
+            let count = app.config.accounts.len();
+            let desired_rows_height = visible_account_rows_height(count);
             ui.spacing_mut().item_spacing = egui::vec2(TABLE_SPACING, 0.0);
-            show_accounts_header(ui);
-            ui.add(egui::Separator::default().spacing(1.0));
+            let add = show_accounts_header(ui, can_add);
 
             ui.visuals_mut().clip_rect_margin = 0.0;
             let rows = egui::ScrollArea::vertical()
@@ -188,7 +189,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
             // A short window clips the table on this pass. Its ideal height
             // still includes every row up to the cap so the window can grow.
             clipped_rows_height = (desired_rows_height - rows.inner_rect.height()).max(0.0);
-        });
+            add
+        })
+        .inner;
+    if with_transaction_disabled_reason(add_account, launch_controls_disabled_reason(&availability))
+        .clicked()
+    {
+        open_account_editor(ui.ctx(), app, Account::new(""));
     }
 
     if !availability.toggle_controls_ready {
@@ -1931,16 +1938,13 @@ fn storage_prepare_failure_status(
     }
 }
 
-fn show_accounts_page_header(ui: &mut egui::Ui, controls_enabled: bool) -> egui::Response {
-    let response = theme::tab_heading(ui, "Accounts", |ui| {
-        ui.add_enabled(controls_enabled, add_account_button)
-    });
-    ui.add_space(6.0);
-    response
-}
-
 pub(super) fn add_account_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(34.0), egui::Sense::click());
+    use egui::emath::GuiRounding as _;
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ACCOUNT_TILE_SIZE, ADD_ACCOUNT_DIAMETER),
+        egui::Sense::click(),
+    );
     let label = "Add Account";
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
@@ -1954,15 +1958,15 @@ pub(super) fn add_account_button(ui: &mut egui::Ui) -> egui::Response {
             0.0
         };
         let fill = theme::ACCENT.lerp_to_gamma(egui::Color32::BLACK, shade);
-        let center = rect.center();
+        let icon_rect = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(16.0))
+            .round_to_pixels(ui.pixels_per_point());
+        let center = icon_rect.center();
         let painter = ui.painter();
-        painter.circle_filled(center, 15.0, fill);
-        egui::Image::new(egui::include_image!("../../assets/icons/plus.svg")).paint_at(
-            ui,
-            egui::Rect::from_center_size(center, egui::Vec2::splat(20.0)),
-        );
+        painter.circle_filled(center, ADD_ACCOUNT_DIAMETER * 0.5, fill);
+        egui::Image::new(egui::include_image!("../../assets/icons/plus.svg"))
+            .paint_at(ui, icon_rect);
         if response.has_focus() {
-            painter.circle_stroke(center, 16.5, egui::Stroke::new(1.0, theme::TEXT));
+            painter.circle_stroke(center, 13.5, egui::Stroke::new(1.0, theme::TEXT));
         }
     }
     response
@@ -1976,14 +1980,15 @@ struct AccountColumns {
     actions: f32,
 }
 
-fn show_accounts_header(ui: &mut egui::Ui) {
-    show_table_row(ui, 27.0, |ui, cells| {
+fn show_accounts_header(ui: &mut egui::Ui, can_add: bool) -> egui::Response {
+    show_table_row(ui, ADD_ACCOUNT_DIAMETER, |ui, cells| {
+        let email_label = cells.email.left() + ACCOUNT_TILE_SIZE + TABLE_SPACING;
         show_cell(
             ui,
-            cells.email,
+            cells.email.with_min_x(email_label.min(cells.email.right())),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(theme::section_label("EMAIL ADDRESS"));
+                ui.add(egui::Label::new(theme::section_label("EMAIL ADDRESS")).truncate());
             },
         );
         show_cell(
@@ -1999,7 +2004,7 @@ fn show_accounts_header(ui: &mut egui::Ui) {
         );
         show_cell(
             ui,
-            cells.actions,
+            cells.actions.shrink2(egui::vec2(ACCOUNT_TILE_SIZE, 0.0)),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_sized(
@@ -2008,7 +2013,15 @@ fn show_accounts_header(ui: &mut egui::Ui) {
                 );
             },
         );
-    });
+        show_cell(
+            ui,
+            cells
+                .actions
+                .with_min_x(cells.actions.right() - ACCOUNT_TILE_SIZE),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| ui.add_enabled(can_add, add_account_button),
+        )
+    })
 }
 
 #[derive(Default)]
@@ -2253,7 +2266,7 @@ fn open_desktop_button(
     let needs_setup = device_needs_setup(account);
     if !cfg!(target_os = "macos") && needs_setup {
         // Keep the remaining actions aligned with those of linked accounts.
-        ui.add_space(ACTION_BUTTON_SIZE + ui.spacing().item_spacing.x);
+        ui.add_space(ACCOUNT_TILE_SIZE + ui.spacing().item_spacing.x);
         return false;
     }
     let tip = if needs_setup {
@@ -2320,7 +2333,8 @@ fn account_monogram(ui: &mut egui::Ui, account: &Account) {
             Color32::from_rgb(39, 100, 130),
         ),
     ];
-    let (tile, _) = ui.allocate_exact_size(egui::vec2(31.0, 31.0), egui::Sense::hover());
+    let (tile, _) =
+        ui.allocate_exact_size(egui::Vec2::splat(ACCOUNT_TILE_SIZE), egui::Sense::hover());
     if !ui.is_rect_visible(tile) {
         return;
     }
@@ -2352,11 +2366,11 @@ struct AccountCellRects {
     actions: egui::Rect,
 }
 
-fn show_table_row(
+fn show_table_row<R>(
     ui: &mut egui::Ui,
     height: f32,
-    add_contents: impl FnOnce(&mut egui::Ui, AccountCellRects),
-) {
+    add_contents: impl FnOnce(&mut egui::Ui, AccountCellRects) -> R,
+) -> R {
     let width = ui.available_width();
     let (row_rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let columns = account_columns(width);
@@ -2379,19 +2393,19 @@ fn show_table_row(
             state,
             actions,
         },
-    );
+    )
 }
 
-fn show_cell(
+fn show_cell<R>(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     layout: egui::Layout,
-    add_contents: impl FnOnce(&mut egui::Ui),
-) {
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     // The row already reserved its full height. Cell contents must not move
     // the table cursor back to the bottom of a shorter, centered control.
     let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
-    add_contents(&mut cell);
+    add_contents(&mut cell)
 }
 
 fn account_columns(width: f32) -> AccountColumns {
@@ -3451,7 +3465,7 @@ fn account_action_button(
     };
     let response = ui.add_enabled(enabled, |ui: &mut egui::Ui| {
         let (rect, response) =
-            ui.allocate_exact_size(egui::Vec2::splat(ACTION_BUTTON_SIZE), egui::Sense::click());
+            ui.allocate_exact_size(egui::Vec2::splat(ACCOUNT_TILE_SIZE), egui::Sense::click());
         let hovered = response.hover_pos().is_some_and(|pos| rect.contains(pos));
         if ui.is_rect_visible(rect) {
             let focused = response.enabled() && response.has_focus();
@@ -4652,7 +4666,7 @@ mod tests {
             (rect, frame)
         };
         let (button, _) = render(None);
-        assert_eq!(button.size(), egui::Vec2::splat(30.0));
+        assert_eq!(button.size(), egui::Vec2::splat(super::ACCOUNT_TILE_SIZE));
         for (offset, expected_hover) in [(-0.25, true), (0.25, false)] {
             let (_, frame) = render(Some(button.right_center() + egui::vec2(offset, 0.0)));
             let painted = frame.shapes.iter().any(|item| {
@@ -4743,7 +4757,7 @@ mod tests {
         for row in 0..open.len() {
             let buttons = [open[row], copy[row], edit[row], delete[row]];
             for button in buttons {
-                assert_eq!(button.size(), egui::Vec2::splat(super::ACTION_BUTTON_SIZE));
+                assert_eq!(button.size(), egui::Vec2::splat(super::ACCOUNT_TILE_SIZE));
                 assert_eq!(button.top(), open[row].top());
             }
             for pair in buttons.windows(2) {
@@ -5185,6 +5199,55 @@ mod tests {
     }
 
     #[test]
+    fn add_account_opens_a_new_draft_from_the_empty_card_and_table_header() {
+        for populated in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::theme::apply(&ctx);
+            let mut config = AppConfig::default();
+            if populated {
+                config.accounts.push(Account::new("existing@example.test"));
+            }
+            let mut app = account_test_app(config);
+            let mut render = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(420.0, 320.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        super::show(ui, &mut app);
+                    },
+                )
+            };
+            let frame = render(vec![]);
+            let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+            let mut buttons = tree.nodes.iter().map(|(_, node)| node).filter(|node| {
+                node.role() == egui::accesskit::Role::Button && node.label() == Some("Add Account")
+            });
+            let bounds = buttons.next().unwrap().bounds().unwrap();
+            assert!(buttons.next().is_none());
+            let center = egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            assert!(visible_text_rects(&frame, "Accounts").is_empty());
+            if populated {
+                let header = visible_text_rects(&frame, "ACTIONS")[0];
+                assert!(header.y_range().contains(center.y) && header.right() < bounds.x0 as f32);
+            } else {
+                assert!(visible_text_rects(&frame, "No accounts yet")[0].bottom() < center.y);
+            }
+            render(click(center));
+            assert!(app.editing_account.as_ref().unwrap().username.is_empty());
+        }
+    }
+
+    #[test]
     fn account_table_grows_to_five_rows_even_from_a_short_viewport() {
         let ctx = egui::Context::default();
         crate::ui::theme::apply(&ctx);
@@ -5220,61 +5283,162 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_the_account_rows_preserves_the_header_and_reaches_the_last_account() {
-        let ctx = egui::Context::default();
-        crate::ui::theme::apply(&ctx);
-        let mut config = AppConfig::default();
-        config.accounts = (1..=9)
-            .map(|idx| Account::new(format!("row{idx}@example.test")))
-            .collect();
-        let mut app = account_test_app(config);
-        let mut render = |events| {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(560.0, 430.0),
-                )),
-                events,
-                ..Default::default()
+    fn table_headers_and_controls_align_at_both_ends_of_the_list() {
+        for (width, count, scale) in [
+            (586.0, 2, 1.0),
+            (586.0, 2, 2.0),
+            (420.0, 8, 1.0),
+            (420.0, 8, 2.0),
+        ] {
+            let ctx = egui::Context::default();
+            crate::ui::theme::apply(&ctx);
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
+            let mut config = AppConfig::default();
+            config.accounts = (0..count)
+                .map(|idx| Account::new(format!("r{idx}@a.test")))
+                .collect();
+            let mut app = account_test_app(config);
+            let mut render = |events| {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .native_pixels_per_point = Some(scale);
+                ctx.run_ui(input, |ui| {
+                    super::show(ui, &mut app);
+                })
             };
-            ctx.run_ui(input, |ui| {
-                super::show(ui, &mut app);
-            })
-        };
-        let visible_text = |output: &egui::FullOutput, label: &str| {
-            output.shapes.iter().find_map(|clipped| {
-                if let egui::Shape::Text(text) = &clipped.shape {
-                    let rect = text.visual_bounding_rect();
-                    if text.galley.text() == label && clipped.clip_rect.contains_rect(rect) {
-                        return Some(rect);
+            let frame = render(vec![]);
+            let text = |frame: &egui::FullOutput, label: &str| visible_text_rects(frame, label)[0];
+            let close = |a: f32, b: f32| assert!((a - b).abs() <= 1.0, "{a} vs {b}");
+            let card = frame
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.fill == egui::Color32::WHITE
+                            && r.stroke.color == crate::ui::theme::STROKE =>
+                    {
+                        Some(r.rect)
                     }
+                    _ => None,
+                })
+                .unwrap();
+            let header = text(&frame, "EMAIL ADDRESS");
+            let first = text(&frame, "r0@a.test");
+            close(header.left(), first.left());
+            let add = frame
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Circle(circle) if circle.fill == crate::ui::theme::ACCENT => {
+                        Some(circle.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .expect("add button background");
+            let first_tile = frame
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.rect.size() == egui::Vec2::splat(super::ACCOUNT_TILE_SIZE)
+                            && r.rect.right() < first.left()
+                            && r.rect.y_range().contains(first.center().y) =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .expect("first row's monogram");
+            close(header.center().y, add.center().y);
+            let inset = first_tile.left() - (card.left() + 1.0);
+            assert_eq!(add.top() - (card.top() + 1.0), inset);
+            assert_eq!(first_tile.top() - add.bottom(), inset);
+            let mut last = frame;
+            if count > super::MAX_VISIBLE_ACCOUNT_ROWS {
+                assert!(!visible_text_rects(&last, "r4@a.test").is_empty());
+                assert!(visible_text_rects(&last, "r5@a.test").is_empty());
+                render(vec![
+                    egui::Event::PointerMoved(first.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Page,
+                        delta: egui::vec2(0.0, -4.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+                for _ in 0..32 {
+                    last = render(vec![]);
                 }
-                None
-            })
-        };
-        let first_frame = render(vec![]);
-        let header = visible_text(&first_frame, "EMAIL ADDRESS").unwrap();
-        let first_row = visible_text(&first_frame, "row1@example.test").unwrap();
-        assert!(visible_text(&first_frame, "row5@example.test").is_some());
-        assert!(visible_text(&first_frame, "row6@example.test").is_none());
-        render(vec![
-            egui::Event::PointerMoved(first_row.center()),
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Page,
-                delta: egui::vec2(0.0, -4.0),
-                phase: egui::TouchPhase::Move,
-                modifiers: egui::Modifiers::NONE,
-            },
-        ]);
-        let mut last_frame = render(vec![]);
-        for _ in 0..20 {
-            if visible_text(&last_frame, "row9@example.test").is_some() {
-                break;
             }
-            last_frame = render(vec![]);
+            assert_eq!(text(&last, "EMAIL ADDRESS"), header);
+            let last_text = text(&last, &format!("r{}@a.test", count - 1));
+            close(last_text.left(), header.left());
+            let track = last
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.rect.size() == egui::vec2(32.0, 18.0)
+                            && (r.rect.center().y - last_text.center().y).abs() <= 2.0 =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            close(text(&last, "ENABLED").center().x, track.center().x);
+            close(
+                track.center().y,
+                card.bottom() - 1.0 - super::ACCOUNT_ROW_HEIGHT * 0.5,
+            );
+            let monogram = last
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.rect.size() == egui::Vec2::splat(super::ACCOUNT_TILE_SIZE)
+                            && r.rect.right() < last_text.left()
+                            && r.rect.y_range().contains(track.center().y) =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .expect("last row's monogram");
+            assert_eq!(
+                monogram.left() - card.left(),
+                card.bottom() - monogram.bottom()
+            );
+
+            let pointer = egui::pos2(card.right() - super::ACCOUNT_TILE_SIZE, track.center().y);
+            let hovered = render(vec![egui::Event::PointerMoved(pointer)]);
+            let delete = hovered
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.fill == crate::ui::theme::DANGER_SOFT && r.rect.contains(pointer) =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .expect("last row's delete button hover background");
+            assert_eq!(
+                card.right() - delete.right(),
+                card.bottom() - delete.bottom()
+            );
         }
-        assert_eq!(visible_text(&last_frame, "EMAIL ADDRESS"), Some(header));
-        assert!(visible_text(&last_frame, "row9@example.test").is_some());
     }
 
     fn account_test_app_with_mode(config: AppConfig, settings_window_mode: bool) -> AutoLoginApp {
