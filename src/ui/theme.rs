@@ -12,6 +12,7 @@ pub const SURFACE: egui::Color32 = egui::Color32::from_rgb(246, 247, 250);
 pub const STROKE: egui::Color32 = egui::Color32::from_rgb(216, 221, 229);
 const TAB_RAIL: egui::Color32 = egui::Color32::from_rgb(238, 240, 245);
 const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(226, 230, 238);
+const TAB_PRESSED: egui::Color32 = egui::Color32::from_rgb(205, 213, 225);
 const WINDOW_MARGIN: i8 = 9;
 const SEMIBOLD: &str = "Inter Semibold";
 
@@ -100,24 +101,79 @@ pub fn top_bar_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(WINDOW_MARGIN))
 }
 
-pub fn tab_group_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(TAB_RAIL)
-        .corner_radius(8)
-        .inner_margin(3)
-}
-
-pub fn apply_toolbar_style(ui: &mut egui::Ui) {
+fn apply_toolbar_style(ui: &mut egui::Ui) {
     let visuals = ui.visuals_mut();
     visuals.override_text_color = Some(MUTED);
     visuals.selection.bg_fill = egui::Color32::WHITE;
     visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-    visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.hovered.weak_bg_fill = TOOLBAR_HOVER;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, STROKE);
-    visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    for (state, fill) in [
+        (&mut visuals.widgets.inactive, egui::Color32::TRANSPARENT),
+        (&mut visuals.widgets.hovered, TOOLBAR_HOVER),
+        (&mut visuals.widgets.active, TOOLBAR_HOVER),
+    ] {
+        state.weak_bg_fill = fill;
+        state.bg_stroke = egui::Stroke::NONE;
+        state.expansion = 0.0;
+    }
+}
+
+fn navigation_button(button: egui::Button<'_>, radius: u8) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| {
+        let mut button = button.corner_radius(radius);
+        // The selected tab normally paints white, including while the pointer is over it.
+        if ui
+            .ctx()
+            .read_response(ui.next_auto_id())
+            .is_some_and(|r| r.is_pointer_button_down_on())
+        {
+            button = button.fill(TAB_PRESSED);
+        }
+        let response = ui.add(button);
+        if response.is_pointer_button_down_on() && response.has_focus() {
+            response.surrender_focus();
+        } else if response.has_focus() {
+            ui.painter().rect_stroke(
+                response.rect,
+                radius,
+                egui::Stroke::new(1.5, MUTED),
+                egui::StrokeKind::Inside,
+            );
+        }
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+pub fn segmented_control(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(TAB_RAIL)
+        .corner_radius(8)
+        .inner_margin(3)
+        .show(ui, |ui| {
+            apply_toolbar_style(ui);
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
+            ui.horizontal(contents);
+        });
+}
+
+pub fn segment(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: Option<egui::ImageSource<'static>>,
+    selected: bool,
+) -> egui::Response {
+    let mut contents =
+        egui::Atoms::new(egui::RichText::new(label).text_style(egui::TextStyle::Button));
+    if let Some(icon) = icon {
+        contents.push_left(toolbar_icon(icon));
+    }
+    ui.add(navigation_button(
+        egui::Button::selectable(selected, contents)
+            .image_tint_follows_text_color(true)
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .min_size(egui::vec2(0.0, 28.0)),
+        6,
+    ))
 }
 
 pub(super) fn section_switcher<T: Copy + PartialEq>(
@@ -166,8 +222,7 @@ pub(super) fn section_switcher<T: Copy + PartialEq>(
         let label = egui::RichText::new(label).text_style(egui::TextStyle::Button);
         let button = egui::Button::selectable(value == selected, label).truncate();
         if controls
-            .place(rect, button.corner_radius(radius - INSET as u8))
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .place(rect, navigation_button(button, radius - INSET as u8))
             .clicked()
         {
             next = value;
@@ -500,6 +555,120 @@ mod tests {
                 assert!(!text.galley.elided);
                 assert!(rail.contains_rect(text.visual_bounding_rect()));
             }
+            let pointer = rail.right_center() - egui::vec2(16.0, 0.0);
+            let hovered = render(vec![egui::Event::PointerMoved(pointer)]);
+            assert!(capsule(&hovered, TOOLBAR_HOVER).contains(pointer));
+            assert_eq!(capsule(&hovered, egui::Color32::WHITE), selected);
+        }
+    }
+
+    #[test]
+    fn navigation_feedback_preserves_tab_geometry_and_reserves_outlines_for_keyboard_focus() {
+        for toolbar in [true, false] {
+            let tabs = if toolbar {
+                [(0, "Accounts"), (1, "Settings")]
+            } else {
+                [(0, "System"), (1, "Windows App")]
+            };
+            let ctx = egui::Context::default();
+            apply(&ctx);
+            let mut selected = 0;
+            let mut render = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if toolbar {
+                            let icon = egui::include_image!("../../assets/icons/settings.svg");
+                            segmented_control(ui, |ui| {
+                                for (value, label) in tabs {
+                                    if segment(ui, label, Some(icon.clone()), selected == value)
+                                        .clicked()
+                                    {
+                                        selected = value;
+                                    }
+                                }
+                            });
+                        } else {
+                            selected = section_switcher(ui, &tabs, selected);
+                        }
+                    },
+                )
+            };
+            let label = |frame: &egui::FullOutput| {
+                frame
+                    .shapes
+                    .iter()
+                    .find_map(|item| match &item.shape {
+                        egui::Shape::Text(t) if t.galley.text() == tabs[1].1 => {
+                            Some(t.visual_bounding_rect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let idle = render(vec![]);
+            let bounds = label(&idle);
+            let pos = bounds.center();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let painted = |frame: &egui::FullOutput| {
+                assert_eq!(label(frame), bounds);
+                let mut background = None;
+                for item in &frame.shapes {
+                    let egui::Shape::Rect(r) = &item.shape else {
+                        continue;
+                    };
+                    if !r.rect.contains(pos) {
+                        continue;
+                    }
+                    assert!(r.stroke.is_empty(), "pointer drew outline {:?}", r.stroke);
+                    if r.fill != TAB_RAIL && r.fill != egui::Color32::TRANSPARENT {
+                        background = Some((r.rect, r.fill));
+                    }
+                }
+                background
+            };
+            assert!(painted(&idle).is_none());
+            let (rect, hover) = painted(&render(vec![egui::Event::PointerMoved(pos)])).unwrap();
+            let (pressed_rect, pressed) = painted(&render(vec![button(pos, true)])).unwrap();
+            assert_eq!(rect, pressed_rect);
+            assert_ne!(hover, pressed);
+            painted(&render(vec![button(pos, false)]));
+            let (selected_rect, fill) = painted(&render(vec![egui::Event::PointerGone])).unwrap();
+            assert_eq!(rect, selected_rect);
+            assert_ne!(fill, hover);
+            assert_ne!(fill, pressed);
+
+            render(vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let focus_ring = |frame: &egui::FullOutput| {
+                frame.shapes.iter().find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r) if r.stroke.color == MUTED && !r.stroke.is_empty() => {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+            };
+            let focused = focus_ring(&render(vec![])).expect("Tab shows the keyboard focus ring");
+            let pos = focused.center();
+            assert_eq!(
+                focus_ring(&render(vec![egui::Event::PointerMoved(pos)])),
+                Some(focused)
+            );
+            assert!(focus_ring(&render(vec![button(pos, true)])).is_none());
+            assert!(focus_ring(&render(vec![button(pos, false)])).is_none());
         }
     }
 

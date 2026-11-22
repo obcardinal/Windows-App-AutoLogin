@@ -2665,10 +2665,7 @@ impl eframe::App for AutoLoginApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     if accessibility_ready {
-                        theme::tab_group_frame().show(ui, |ui| {
-                            theme::apply_toolbar_style(ui);
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            ui.spacing_mut().button_padding = egui::vec2(9.0, 3.0);
+                        theme::segmented_control(ui, |ui| {
                             for (tab, label, icon) in [
                                 (
                                     Tab::Accounts,
@@ -2684,20 +2681,8 @@ impl eframe::App for AutoLoginApp {
                                 (Tab::Diagnose, "Diagnose", None),
                             ] {
                                 let selected = self.selected_tab == tab;
-                                let mut contents = egui::Atoms::new(
-                                    egui::RichText::new(label).text_style(egui::TextStyle::Button),
-                                );
-                                if let Some(icon) = icon {
-                                    contents.push_left(theme::toolbar_icon(icon));
-                                }
-                                let response = ui.add(
-                                    egui::Button::selectable(selected, contents)
-                                        .image_tint_follows_text_color(true)
-                                        .wrap_mode(egui::TextWrapMode::Extend)
-                                        .corner_radius(6)
-                                        .min_size(egui::vec2(0.0, 28.0)),
-                                );
-                                if response.clicked() && !selected {
+                                if theme::segment(ui, label, icon, selected).clicked() && !selected
+                                {
                                     self.selected_tab = tab;
                                     // Paint the tab selection and its contents together on this frame.
                                     ctx.request_discard("tab selection changed");
