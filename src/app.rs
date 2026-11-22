@@ -532,6 +532,8 @@ pub(crate) struct AutoLoginApp {
     #[cfg(target_os = "macos")]
     macos_presentation: crate::macos_panel::Presentation,
     #[cfg(target_os = "macos")]
+    desktop_shortcuts: Option<crate::desktop_shortcuts::AccountShortcuts>,
+    #[cfg(target_os = "macos")]
     _macos_reopen_registration: Option<crate::macos_reopen::ReopenRegistration>,
     #[cfg(target_os = "macos")]
     macos_panel_focus: Option<crate::macos_panel::PanelFocusObserver>,
@@ -665,6 +667,8 @@ impl AutoLoginApp {
             #[cfg(target_os = "macos")]
             macos_presentation: crate::macos_panel::Presentation::Window,
             #[cfg(target_os = "macos")]
+            desktop_shortcuts: None,
+            #[cfg(target_os = "macos")]
             _macos_reopen_registration: None,
             #[cfg(target_os = "macos")]
             macos_panel_focus: None,
@@ -733,6 +737,30 @@ impl AutoLoginApp {
         self.macos_presentation = presentation;
         self.macos_panel_acquired_focus = false;
         self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_desktop_shortcuts(
+        mut self,
+        shortcuts: Option<crate::desktop_shortcuts::AccountShortcuts>,
+    ) -> Self {
+        self.desktop_shortcuts = shortcuts;
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_desktop_shortcuts(&mut self) {
+        let ready = self.editing_account.is_none()
+            && self.confirm_delete_account.is_none()
+            && !self.quit_requested
+            && !self.storage_recovery_blocked
+            && self.pending_account_transaction.is_none();
+        if let Some(bindings) = &mut self.desktop_shortcuts {
+            if let Some(message) = bindings.update(if ready { &self.config.accounts } else { &[] })
+            {
+                self.set_status(message);
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1884,6 +1912,15 @@ impl AutoLoginApp {
     fn process_tray_commands(&mut self, ctx: &egui::Context) {
         while let Ok(cmd) = self.tray_rx.try_recv() {
             match cmd {
+                #[cfg(target_os = "macos")]
+                TrayCommand::OpenDesktopShortcut(id, shortcut) => {
+                    if !self.quit_requested
+                        && !self.storage_recovery_blocked
+                        && self.pending_account_transaction.is_none()
+                    {
+                        crate::ui::accounts::open_desktop_by_shortcut(ctx, self, &id, shortcut);
+                    }
+                }
                 TrayCommand::OpenAccounts => self.present_tab(ctx, Tab::Accounts, || {}),
                 TrayCommand::OpenSettings => self.present_tab(ctx, Tab::Settings, || {}),
                 TrayCommand::OpenAbout => {
@@ -2594,6 +2631,7 @@ impl eframe::App for AutoLoginApp {
         self.keep_settings_window_open_through_ui_pass = false;
         #[cfg(target_os = "macos")]
         {
+            self.sync_desktop_shortcuts();
             self.macos_presentation_requested_this_pass = false;
             if let Some((press_id, left_press_location)) = self
                 .macos_panel_focus

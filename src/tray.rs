@@ -11,6 +11,8 @@ mod windows_visibility;
 
 #[derive(Debug, Clone)]
 pub(crate) enum TrayCommand {
+    #[cfg(target_os = "macos")]
+    OpenDesktopShortcut(String, crate::models::DesktopShortcut),
     OpenAccounts,
     OpenSettings,
     OpenAbout,

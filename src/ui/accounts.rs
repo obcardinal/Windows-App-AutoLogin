@@ -11,7 +11,7 @@ use crate::app::{
     CONFIG_MUTATION_RECOVERY_REASON,
 };
 #[cfg(target_os = "macos")]
-use crate::models::canonical_remote_pc;
+use crate::models::{canonical_remote_pc, DesktopShortcut};
 use crate::models::{Account, AccountId, AppConfig};
 use crate::single_instance;
 use crate::storage::{
@@ -2097,13 +2097,33 @@ fn device_needs_setup(account: &Account) -> bool {
     {
         !crate::windows_device_launch::validate_target(&account.vm_target)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        !crate::desktop_shortcuts::linked_desktop(account)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         account.vm_target.trim().is_empty()
-            || (cfg!(target_os = "macos")
-                && account.vm_device_id.is_empty()
-                && account.vm_profile.trim().is_empty())
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_desktop_by_shortcut(
+    ctx: &egui::Context,
+    app: &mut AutoLoginApp,
+    account_id: &str,
+    shortcut: DesktopShortcut,
+) {
+    if !app.accessibility_ready()
+        || app.editing_account.is_some()
+        || app.confirm_delete_account.is_some()
+        || crate::desktop_shortcuts::bound_account(&app.config.accounts, account_id, shortcut)
+            .is_none()
+        || poll_device_launch(ctx, app)
+    {
+        return;
+    }
+    enter_account(ctx, app, account_id);
 }
 
 fn enter_account(ctx: &egui::Context, app: &mut AutoLoginApp, id: &str) {
@@ -2281,6 +2301,13 @@ fn open_desktop_button(
     } else {
         "Open desktop in Windows App"
     };
+    #[cfg(target_os = "macos")]
+    let tip_with_shortcut = account
+        .desktop_shortcut
+        .filter(|_| !needs_setup)
+        .map(|shortcut| format!("{tip} ({shortcut})"));
+    #[cfg(target_os = "macos")]
+    let tip = tip_with_shortcut.as_deref().unwrap_or(tip);
     account_action_button(
         ui,
         AccountActionIcon::OpenDesktop,

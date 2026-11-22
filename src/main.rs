@@ -24,6 +24,8 @@ pub(crate) mod background;
 pub(crate) mod config;
 pub(crate) mod debug_fill;
 #[cfg(target_os = "macos")]
+mod desktop_shortcuts;
+#[cfg(target_os = "macos")]
 mod iphone_node;
 #[cfg(target_os = "macos")]
 mod iphone_pairing;
@@ -299,6 +301,8 @@ fn run_lightweight_supervisor() -> anyhow::Result<()> {
         // Native startup/keychain work can already service Apple events.
         // Retain the handler registered before that work, and refresh after
         // native startup as well as after finishLaunching.
+        supervisor.desktop_shortcuts =
+            desktop_shortcuts::AccountShortcuts::install(supervisor.tray_tx.clone(), None);
         supervisor.reopen_registration = reopen_registration;
         if let Some(registration) = &supervisor.reopen_registration {
             registration.refresh();
@@ -422,6 +426,11 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
                     None
                 }
             };
+            #[cfg(target_os = "macos")]
+            let shortcuts = desktop_shortcuts::AccountShortcuts::install(
+                tray_tx.clone(),
+                Some(cc.egui_ctx.clone()),
+            );
             spawn_full_ui_control_reader(tray_tx, cc.egui_ctx.clone())?;
             let app = app::AutoLoginApp::new(
                 worker_tx,
@@ -435,6 +444,7 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
             .with_storage_recovery_state(storage_recovery_ready);
             #[cfg(target_os = "macos")]
             let app = app
+                .with_desktop_shortcuts(shortcuts)
                 .with_macos_presentation(presentation)
                 .with_macos_window_observers(
                     reopen_registration,
@@ -1014,6 +1024,12 @@ struct LightweightSupervisor {
     #[cfg(target_os = "macos")]
     connection_center: macos_ax::connection_watch::ConnectionWatch,
     #[cfg(target_os = "macos")]
+    desktop_shortcuts: Option<desktop_shortcuts::AccountShortcuts>,
+    #[cfg(target_os = "macos")]
+    shortcut_launch: Option<std::thread::JoinHandle<anyhow::Result<bool>>>,
+    #[cfg(target_os = "macos")]
+    last_shortcut_launch: Option<Instant>,
+    #[cfg(target_os = "macos")]
     pending_update_check: bool,
     #[cfg(target_os = "macos")]
     update_resume_monitor: Option<bool>,
@@ -1084,6 +1100,12 @@ impl LightweightSupervisor {
             iphone_preparation: None,
             #[cfg(target_os = "macos")]
             connection_center: Default::default(),
+            #[cfg(target_os = "macos")]
+            desktop_shortcuts: None,
+            #[cfg(target_os = "macos")]
+            shortcut_launch: None,
+            #[cfg(target_os = "macos")]
+            last_shortcut_launch: None,
             #[cfg(target_os = "macos")]
             pending_update_check: false,
             #[cfg(target_os = "macos")]
@@ -1239,6 +1261,10 @@ impl LightweightSupervisor {
                     if let Some(tray) = &self.tray {
                         tray.show_context_menu();
                     }
+                }
+                #[cfg(target_os = "macos")]
+                tray::TrayCommand::OpenDesktopShortcut(id, shortcut) => {
+                    self.open_desktop_shortcut(&id, shortcut);
                 }
                 tray::TrayCommand::OpenAccounts => self.open_accounts_window(),
                 tray::TrayCommand::OpenSettings => self.open_settings_window(),
@@ -1459,6 +1485,73 @@ impl LightweightSupervisor {
                 .iter()
                 .any(|account| account.enabled && account.iphone_authenticator_enabled);
         preparation.poll(Instant::now(), eligible, trigger);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_desktop_shortcut(&mut self, id: &str, chord: models::DesktopShortcut) {
+        if self.settings_child.is_some()
+            || self.settings_mutation_active
+            || !self.storage_recovery_ready
+            || self.storage_recovery_sticky_blocked
+            || self.shortcut_launch.is_some()
+            || self
+                .last_shortcut_launch
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        let Some(account) = desktop_shortcuts::bound_account(&self.config.accounts, id, chord)
+        else {
+            return;
+        };
+        if !self.accessibility_trusted {
+            self.open_accounts_window();
+            return;
+        }
+        let launch = macos_ax::desktops::DesktopLaunch::for_account(account, &self.config.accounts);
+        match std::thread::Builder::new()
+            .name("shortcut-open-desktop".into())
+            .spawn(move || launch.open_and_check_preparation())
+        {
+            Ok(task) => {
+                self.last_shortcut_launch = Some(Instant::now());
+                self.shortcut_launch = Some(task);
+            }
+            Err(error) => tracing::warn!(%error, "Could not start opening the desktop"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_desktop_shortcuts(&mut self) {
+        if let Some(shortcuts) = &mut self.desktop_shortcuts {
+            let owns_bindings = self.settings_child.is_none()
+                && !self.exit_requested
+                && self.storage_recovery_ready
+                && !self.storage_recovery_sticky_blocked;
+            if let Some(message) = shortcuts.update(if owns_bindings {
+                &self.config.accounts
+            } else {
+                &[]
+            }) {
+                tracing::warn!(%message, "Could not register a desktop shortcut");
+            }
+        }
+        if self
+            .shortcut_launch
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            match self.shortcut_launch.take().unwrap().join() {
+                Ok(Ok(true)) => {
+                    self.poll_iphone_preparation(iphone_preparation::Trigger::DesktopConnect)
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Could not open the desktop with its shortcut")
+                }
+                Err(_) => tracing::error!("Desktop shortcut launch thread failed"),
+            }
+        }
     }
 
     fn process_worker_events(&mut self) {
@@ -2661,6 +2754,11 @@ impl LightweightSupervisor {
 
         match spawn(pending.initial_tab, &session_token) {
             Ok(child) => {
+                // Release the parent's keys before the child can complete its bootstrap.
+                #[cfg(target_os = "macos")]
+                if let Some(shortcuts) = &mut self.desktop_shortcuts {
+                    shortcuts.update(&[]);
+                }
                 self.settings_child_acknowledgements = None;
                 self.settings_child_control_broken = false;
                 self.pending_settings_presentation = None;
@@ -3225,6 +3323,8 @@ impl ApplicationHandler<SupervisorEvent> for LightweightSupervisor {
             }
         }
         self.poll_settings_window();
+        #[cfg(target_os = "macos")]
+        self.poll_desktop_shortcuts();
         #[cfg(target_os = "macos")]
         self.connection_center.update(
             !self.exit_requested
