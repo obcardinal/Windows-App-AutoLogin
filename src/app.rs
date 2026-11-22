@@ -13,7 +13,7 @@ use crate::models::{
 use crate::single_instance::{self, MonitorControlCommand};
 use crate::tray::TrayCommand;
 use crate::ui::theme;
-use eframe::egui;
+use eframe::egui::{self, emath::GuiRounding as _};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
@@ -22,11 +22,13 @@ use tokio::sync::mpsc::Sender as TokioSender;
 use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
-pub(crate) const MAIN_WINDOW_WIDTH: f32 = 586.0;
+pub(crate) const MAIN_WINDOW_WIDTH: f32 = 608.0;
 pub(crate) const FULL_WINDOW_HEIGHT: f32 = 500.0;
 // Leave room for the toolbar and navigation on compact tabs.
 // A single account or preference card can fit in less than 200 points.
 pub(crate) const MIN_WINDOW_HEIGHT: f32 = 128.0;
+// Native size limits take both dimensions. Leave height available for manual resizing.
+pub(crate) const MAX_WINDOW_HEIGHT: f32 = 32_768.0;
 #[cfg(not(target_os = "macos"))]
 const TAB_RESIZE_SECONDS: f64 = 0.18;
 const ACCESSIBILITY_REQUEST_BUTTON_SIZE: [f32; 2] = [278.0, 34.0];
@@ -481,7 +483,7 @@ impl TabHeightTransition {
 pub(crate) struct AutoLoginApp {
     pub(crate) config: AppConfig,
     pub(crate) selected_tab: Tab,
-    last_requested_window_height: Option<f32>,
+    last_requested_window_size: Option<egui::Vec2>,
     #[cfg(not(target_os = "macos"))]
     last_laid_out_tab: Tab,
     #[cfg(not(target_os = "macos"))]
@@ -612,7 +614,7 @@ impl AutoLoginApp {
         let mut app = Self {
             config,
             selected_tab: initial_tab,
-            last_requested_window_height: None,
+            last_requested_window_size: None,
             #[cfg(not(target_os = "macos"))]
             last_laid_out_tab: initial_tab,
             #[cfg(not(target_os = "macos"))]
@@ -1941,7 +1943,7 @@ impl AutoLoginApp {
         {
             if !self.macos_window_visible {
                 // The native panel can skip a queued resize while hidden.
-                self.last_requested_window_height = None;
+                self.last_requested_window_size = None;
             }
             self.macos_window_visible = true;
             self.macos_panel_acquired_focus = false;
@@ -2777,7 +2779,7 @@ impl AutoLoginApp {
             )
         });
         if managed_by_os {
-            self.last_requested_window_height = None;
+            self.last_requested_window_size = None;
             #[cfg(not(target_os = "macos"))]
             {
                 self.last_laid_out_tab = self.selected_tab;
@@ -2790,31 +2792,35 @@ impl AutoLoginApp {
         let height = height.ceil().max(MIN_WINDOW_HEIGHT);
         #[cfg(not(target_os = "macos"))]
         let height = self.tab_transition_height(ctx, current_size.y, height);
-        let native_height = height * ctx.zoom_factor();
-        // Resize on content changes. Repaints should not fight a manual resize or an OS size limit.
-        let previous = self.last_requested_window_height.replace(native_height);
-        if previous == Some(native_height) {
+        let size = egui::vec2(MAIN_WINDOW_WIDTH, height);
+        let native_size = size * ctx.zoom_factor();
+        // A pending native resize can take several frames to appear.
+        let previous = self.last_requested_window_size.replace(native_size);
+        if previous == Some(native_size) {
             return;
+        }
+        if previous.is_some_and(|previous| previous.x != native_size.x) {
+            // Keyboard zoom changes the native width of an egui point.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                MAIN_WINDOW_WIDTH,
+                MIN_WINDOW_HEIGHT,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+                MAIN_WINDOW_WIDTH,
+                MAX_WINDOW_HEIGHT,
+            )));
         }
         #[cfg(target_os = "macos")]
         if let crate::macos_panel::Presentation::Panel(anchor) = self.macos_presentation {
-            match crate::macos_panel::resize_anchored_panel(
-                _frame,
-                anchor,
-                height,
-                ctx.zoom_factor(),
-            ) {
+            match crate::macos_panel::resize_anchored_panel(_frame, anchor, native_size) {
                 Ok(()) => return,
                 Err(error) => {
                     tracing::warn!(%error, "Could not resize the anchored menu bar panel")
                 }
             }
         }
-        if previous.is_some() || (current_size.y - height).abs() >= 0.5 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                current_size.x,
-                height,
-            )));
+        if previous.is_some() || current_size.round_to_pixels(ctx.pixels_per_point()) != size {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
     }
 
@@ -2831,14 +2837,11 @@ impl AutoLoginApp {
         if switched {
             // A native resize can lag a few frames. Reverse an ongoing transition
             // from the last queued height so those frames still join smoothly.
-            let from_height = match (
-                &self.tab_height_transition,
-                self.last_requested_window_height,
-            ) {
-                (Some(_), Some(queued)) => queued / ctx.zoom_factor(),
+            let from_height = match (&self.tab_height_transition, self.last_requested_window_size) {
+                (Some(_), Some(queued)) => queued.y / ctx.zoom_factor(),
                 _ => current_height,
             };
-            self.tab_height_transition = (self.last_requested_window_height.is_some()
+            self.tab_height_transition = (self.last_requested_window_size.is_some()
                 && (from_height - target).abs() >= 1.0
                 && !reduce_tab_motion())
             .then_some(TabHeightTransition {
@@ -2990,19 +2993,24 @@ mod tests {
         let mut app = mutation_test_app(true);
         let ctx = egui::Context::default();
         let frame = eframe::Frame::_new_kittest();
-        let mut heights = Vec::new();
-        for (tab, measured, viewport) in [
-            (Tab::Accounts, 280.0, 280.0),
-            (Tab::Settings, 600.0, 280.0),
-            (Tab::Settings, 600.0, 280.0),
-            (Tab::Accounts, 280.0, 600.0),
-            (Tab::Accounts, 280.0, 600.0),
+        let width = super::MAIN_WINDOW_WIDTH;
+        let mut sizes = Vec::new();
+        for (tab, measured, viewport_width, viewport_height) in [
+            // A restored window can already have the right height at an older width.
+            (Tab::Accounts, 280.0, width + 100.0, 280.0),
+            (Tab::Accounts, 280.0, width + 100.0, 280.0),
+            (Tab::Settings, 600.0, width, 280.0),
+            (Tab::Settings, 600.0, width, 280.0),
+            // A manual vertical drag remains until the content height changes.
+            (Tab::Settings, 600.0, width, 650.0),
+            (Tab::Accounts, 280.0, width, 600.0),
+            (Tab::Accounts, 280.0, width, 600.0),
         ] {
             app.selected_tab = tab;
             ctx.begin_pass(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(super::MAIN_WINDOW_WIDTH, viewport),
+                    egui::vec2(viewport_width, viewport_height),
                 )),
                 ..Default::default()
             });
@@ -3010,11 +3018,14 @@ mod tests {
             let output = ctx.end_pass();
             for cmd in &output.viewport_output[&egui::ViewportId::ROOT].commands {
                 if let egui::ViewportCommand::InnerSize(size) = cmd {
-                    heights.push(size.y);
+                    sizes.push(*size);
                 }
             }
         }
-        assert_eq!(heights, [600.0, 280.0]);
+        assert_eq!(
+            sizes,
+            [280.0, 600.0, 280.0].map(|height| egui::vec2(width, height))
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

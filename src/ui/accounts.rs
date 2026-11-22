@@ -5283,6 +5283,31 @@ mod tests {
     }
 
     #[test]
+    fn main_window_fits_a_long_work_email_on_one_line() {
+        let email = "alexandra.robertson@engineering.example";
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut config = AppConfig::default();
+        config.accounts.push(Account::new(email));
+        let mut app = account_test_app(config);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 320.0),
+            )),
+            ..Default::default()
+        };
+        let frame = ctx.run_ui(input, |ui| {
+            crate::ui::theme::tab_content_frame().show(ui, |ui| super::show(ui, &mut app));
+        });
+        assert!(frame.shapes.iter().any(|item| matches!(
+            &item.shape, egui::Shape::Text(t) if t.galley.text() == email
+                && t.galley.rows.len() == 1 && !t.galley.elided
+                && item.clip_rect.contains_rect(t.visual_bounding_rect())
+        )));
+    }
+
+    #[test]
     fn table_headers_and_controls_align_at_both_ends_of_the_list() {
         for (width, count, scale) in [
             (586.0, 2, 1.0),

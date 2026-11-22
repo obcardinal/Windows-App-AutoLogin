@@ -5,7 +5,7 @@ use eframe::egui;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{
     NSApplication, NSColor, NSEvent, NSFloatingWindowLevel, NSNormalWindowLevel, NSStatusItem,
-    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDidResignKeyNotification,
+    NSView, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowDidResignKeyNotification,
     NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -117,7 +117,7 @@ pub(crate) enum Presentation {
 struct PendingPanelResize {
     window_number: isize,
     anchor: PanelAnchor,
-    height: f64,
+    size: NSSize,
 }
 
 thread_local! {
@@ -271,8 +271,7 @@ pub(crate) fn apply(
 pub(crate) fn resize_anchored_panel(
     handle: &impl HasWindowHandle,
     anchor: PanelAnchor,
-    height: f32,
-    zoom_factor: f32,
+    native_size: egui::Vec2,
 ) -> anyhow::Result<()> {
     let window = native_window(handle)?;
     anyhow::ensure!(
@@ -281,15 +280,14 @@ pub(crate) fn resize_anchored_panel(
             .intersects(NSWindowStyleMask::Titled | NSWindowStyleMask::FullScreen),
         "anchored resizing requires a borderless panel"
     );
-    let height = f64::from(height) * f64::from(zoom_factor);
     anyhow::ensure!(
-        anchor.is_valid() && height.is_finite() && height > 0.0,
+        anchor.is_valid() && native_size.is_finite() && native_size.min_elem() > 0.0,
         "invalid panel geometry"
     );
     let pending = PendingPanelResize {
         window_number: window.windowNumber(),
         anchor,
-        height,
+        size: NSSize::new(f64::from(native_size.x), f64::from(native_size.y)),
     };
     if PENDING_PANEL_RESIZE.replace(Some(pending)).is_none() {
         // The renderer still has to present this frame at its original size.
@@ -328,8 +326,7 @@ fn apply_pending_panel_resize() {
     // setContentSize keeps the bottom edge of a borderless window fixed. Move
     // and size it together so the top stays beneath the icon as the content grows.
     let current = window.frame();
-    let size = NSSize::new(current.size.width, pending.height);
-    let frame = NSRect::new(pending.anchor.origin_for_size(size), size);
+    let frame = NSRect::new(pending.anchor.origin_for_size(pending.size), pending.size);
     if frame != current {
         window.setFrame_display(frame, false);
         window.invalidateShadow();
@@ -455,7 +452,13 @@ fn apply_to_window(window: &NSWindow, presentation: Presentation) -> anyhow::Res
             window.setMovableByWindowBackground(false);
             window.setLevel(NSNormalWindowLevel);
             window.setHidesOnDeactivate(false);
-            window.setCollectionBehavior(NSWindowCollectionBehavior::Default);
+            window.setCollectionBehavior(
+                NSWindowCollectionBehavior::FullScreenNone
+                    | NSWindowCollectionBehavior::FullScreenDisallowsTiling,
+            );
+            if let Some(button) = window.standardWindowButton(NSWindowButton::ZoomButton) {
+                button.setEnabled(false);
+            }
             if let Some(screen) = window.screen() {
                 let frame = window.constrainFrameRect_toScreen(window.frame(), Some(&screen));
                 window.setFrameOrigin(frame.origin);
