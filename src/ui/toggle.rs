@@ -2,6 +2,7 @@ use crate::ui::theme;
 use eframe::egui;
 
 pub(super) const SWITCH_SIZE: egui::Vec2 = egui::vec2(40.0, 30.0);
+pub(super) const SWITCH_TRACK_SIZE: egui::Vec2 = egui::vec2(32.0, 18.0);
 
 /// A checkbox with a compact switch appearance and a larger interaction target.
 pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
@@ -16,7 +17,7 @@ pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Respo
     });
 
     if ui.is_rect_visible(rect) {
-        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(32.0, 18.0));
+        let track = egui::Rect::from_center_size(rect.center(), SWITCH_TRACK_SIZE);
         let emphasized = response.enabled() && (response.hovered() || response.has_focus());
         let fill = if *checked {
             if emphasized {

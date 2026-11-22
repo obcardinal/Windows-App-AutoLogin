@@ -10,11 +10,13 @@ use crate::storage::{
     pending_storage_recovery_user_status, storage_mode_migration_error_requires_recovery,
     StorageModeMigration,
 };
-use crate::ui::{theme, toggle::labeled_switch};
+use crate::ui::{theme, toggle};
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 use tracing::warn;
+
+const SETTINGS_CARD_PADDING: i8 = 9;
 
 const SETTINGS_BEGIN_FAILED_REASON: &str =
     "Configuration controls are unavailable because the monitor could not pause safely. Restart the app to try again.";
@@ -204,7 +206,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
             #[cfg(target_os = "macos")]
             SettingsSection::WindowsApp => preference_card(ui, app, |ui, settings| {
                 let hint = "Your remote desktop stays open.";
-                let changed = labeled_switch(
+                let changed = preference_switch(
                     ui,
                     &mut settings.close_connection_center_after_connect,
                     "Close device list after connecting",
@@ -215,7 +217,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
             }),
             SettingsSection::Security => preference_card(ui, app, |ui, settings| {
                 let hint = "When off, passwords use an encrypted local file. Its key stays in the system credential store.";
-                let changed = labeled_switch(
+                let changed = preference_switch(
                     ui,
                     &mut settings.use_keyring,
                     "Use system secure storage",
@@ -248,7 +250,10 @@ fn preference_card(
     }
     let before = app.settings_draft.clone();
     let response = ui.add_enabled_ui(reason.is_none(), |ui| {
-        settings_card(ui, |ui| contents(ui, &mut app.settings_draft))
+        settings_card(ui, egui::Margin::ZERO, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            contents(ui, &mut app.settings_draft)
+        })
     });
     if let Some(reason) = reason {
         response.response.on_disabled_hover_text(reason);
@@ -259,14 +264,14 @@ fn preference_card(
 }
 
 fn system_preferences(ui: &mut egui::Ui, settings: &mut AppSettings) -> bool {
-    let mut changed = labeled_switch(
+    let mut changed = preference_switch(
         ui,
         &mut settings.auto_start,
         "Open at Login",
         "Start Windows App AutoLogin when you sign in.",
     );
     row_divider(ui);
-    changed |= labeled_switch(
+    changed |= preference_switch(
         ui,
         &mut settings.start_minimized,
         "Hide main window at launch",
@@ -281,11 +286,11 @@ fn system_preferences(ui: &mut egui::Ui, settings: &mut AppSettings) -> bool {
             "Hide menu bar icon"
         };
         let hint = "To restore the icon, reopen the app and turn this off.";
-        changed |= labeled_switch(ui, &mut settings.hide_menu_bar_icon, label, hint);
+        changed |= preference_switch(ui, &mut settings.hide_menu_bar_icon, label, hint);
         preference_hint(ui, hint);
     }
     row_divider(ui);
-    changed |= labeled_switch(
+    changed |= preference_switch(
         ui,
         &mut settings.show_menu_diagnostics,
         "Show diagnostic info in menu",
@@ -294,12 +299,33 @@ fn system_preferences(ui: &mut egui::Ui, settings: &mut AppSettings) -> bool {
     changed
 }
 
+fn preference_switch(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) -> bool {
+    // Align the visible track with the divider while retaining its larger click target.
+    let hit_padding = ((toggle::SWITCH_SIZE.x - toggle::SWITCH_TRACK_SIZE.x) * 0.5) as i8;
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            right: SETTINGS_CARD_PADDING - hit_padding,
+            ..egui::Margin::symmetric(SETTINGS_CARD_PADDING, 0)
+        })
+        .show(ui, |ui| toggle::labeled_switch(ui, value, label, hint))
+        .inner
+}
+
 fn preference_hint(ui: &mut egui::Ui, hint: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(hint).small().color(theme::MUTED)).wrap());
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            top: 0,
+            ..egui::Margin::same(SETTINGS_CARD_PADDING)
+        })
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(hint).small().color(theme::MUTED)).wrap());
+        });
 }
 
 fn row_divider(ui: &mut egui::Ui) {
-    ui.add(egui::Separator::default().spacing(8.0));
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(SETTINGS_CARD_PADDING, 0))
+        .show(ui, |ui| ui.add(egui::Separator::default().spacing(1.0)));
 }
 
 fn settings_disabled_reason(app: &AutoLoginApp) -> Option<String> {
@@ -1055,15 +1081,16 @@ fn storage_cleanup_warning(from_use_keyring: bool, to_use_keyring: bool) -> Stri
 #[cfg(target_os = "macos")]
 pub(super) fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     ui.label(theme::section_label(title));
-    settings_card(ui, add_contents);
+    settings_card(ui, egui::Margin::same(SETTINGS_CARD_PADDING), add_contents);
 }
 
 fn settings_card<R>(
     ui: &mut egui::Ui,
+    margin: egui::Margin,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     theme::compact_frame()
-        .inner_margin(egui::Margin::symmetric(20, 12))
+        .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 3.0;
@@ -1156,6 +1183,67 @@ mod tests {
         assert_eq!(app.settings_draft, app.config.settings);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn system_card_aligns_switches_labels_and_dividers_when_the_hint_wraps() {
+        for width in [crate::app::MAIN_WINDOW_WIDTH, 250.0] {
+            let ctx = egui::Context::default();
+            crate::ui::theme::apply(&ctx);
+            let mut app = settings_test_app(false);
+            let frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 450.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| super::preference_card(ui, &mut app, super::system_preferences),
+            );
+            let mut tracks = Vec::new();
+            let mut dividers = Vec::new();
+            let mut labels = Vec::new();
+            let mut inner = None;
+            for clipped in &frame.shapes {
+                match &clipped.shape {
+                    egui::Shape::Rect(r) if r.stroke.color == crate::ui::theme::STROKE => {
+                        inner = Some(r.rect.shrink(r.stroke.width));
+                    }
+                    egui::Shape::Rect(r) if r.rect.size() == super::toggle::SWITCH_TRACK_SIZE => {
+                        tracks.push(r.rect);
+                    }
+                    egui::Shape::LineSegment { points, .. } => dividers.push(*points),
+                    egui::Shape::Text(text) => {
+                        assert!(clipped.clip_rect.contains_rect(text.visual_bounding_rect()));
+                        labels.push(text);
+                    }
+                    _ => {}
+                }
+            }
+            let inner = inner.expect("settings card border");
+            let inset = inner.shrink(9.0);
+            assert_eq!(tracks.len(), 4);
+            assert_eq!(tracks[0].top(), inset.top());
+            assert_eq!(tracks[3].bottom(), inset.bottom());
+            assert!(tracks.iter().all(|track| track.right() == inset.right()));
+            assert_eq!(labels.len(), 5);
+            assert!(labels.iter().all(|text| text.pos.x == inset.left()));
+            assert_eq!(dividers.len(), 3);
+            assert!(dividers
+                .iter()
+                .all(|[left, right]| left.x == inset.left() && right.x == inset.right()));
+            let hint = labels
+                .iter()
+                .find(|text| text.galley.text().starts_with("To restore the icon"))
+                .unwrap();
+            assert_eq!(hint.galley.rows.len() > 1, width == 250.0);
+            let hint_bounds = hint.visual_bounding_rect();
+            assert!(inner.contains_rect(hint_bounds));
+            assert!(tracks[2].bottom() < hint_bounds.top());
+            assert!(hint_bounds.bottom() < dividers[2][0].y);
+        }
+    }
+
     #[test]
     fn only_the_enabled_switch_changes_a_preference() {
         for enabled in [true, false] {
@@ -1174,7 +1262,7 @@ mod tests {
                     };
                     let _ = ctx.run_ui(input, |ui| {
                         let row = ui.add_enabled_ui(enabled, |ui| {
-                            super::labeled_switch(ui, &mut checked, "Open at Login", "")
+                            super::preference_switch(ui, &mut checked, "Open at Login", "")
                         });
                         result = Some((row.response.rect, row.inner, checked));
                     });
