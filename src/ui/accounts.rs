@@ -2,6 +2,8 @@
 #[path = "remote_pc_import.rs"]
 mod remote_pc_import;
 #[cfg(target_os = "macos")]
+mod shortcut_editor;
+#[cfg(target_os = "macos")]
 use crate::macos_ax::desktops::{DeviceChoice, DeviceChoices};
 #[cfg(target_os = "macos")]
 use remote_pc_import::RemotePcLookup;
@@ -1408,6 +1410,16 @@ fn execute_account_transaction(
                 .accounts
                 .iter()
                 .find(|existing| existing.id == account.id);
+            #[cfg(target_os = "macos")]
+            if let Err(message) = validate_desktop_shortcut(&account, &config.accounts) {
+                return AccountTransactionResult {
+                    config,
+                    status: Some(message),
+                    applied: false,
+                    refresh_passwords: false,
+                    recovery_pending: false,
+                };
+            }
             let effective_enabled = existing.map_or(account.enabled, |existing| existing.enabled);
             if effective_enabled
                 && config.accounts.iter().any(|other| {
@@ -2864,7 +2876,7 @@ pub(crate) fn show_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp) {
         "Add Account"
     };
     let initial_height = if cfg!(target_os = "macos") {
-        428.0
+        462.0
     } else {
         173.0
     };
@@ -2909,6 +2921,8 @@ pub(crate) fn show_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp) {
         }
         if close_editor {
             #[cfg(target_os = "macos")]
+            shortcut_editor::close(ui.ctx());
+            #[cfg(target_os = "macos")]
             ui.ctx().data_mut(|data| {
                 data.remove_by_type::<RemotePcLookup>();
                 data.remove_by_type::<DeviceTask<DeviceChoices>>();
@@ -2934,6 +2948,8 @@ fn account_editor_contents(
     account: &mut Account,
     is_existing: bool,
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    shortcut_editor::poll(ui.ctx(), account, &app.config.accounts);
     if !egui::Popup::is_any_open(ui.ctx())
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
@@ -3010,8 +3026,11 @@ fn account_editor_contents(
                     let label = account_editor_field_label(ui, "Remote PC");
                     remote_pc_display(ui, &account.remote_pc, field_width).labelled_by(label.id);
                     ui.end_row();
+                    shortcut_editor::field(ui, account, field_width);
+                    ui.end_row();
                 });
         });
+        shortcut_editor::feedback(ui);
         remote_pc_import::show_result(ui, account);
         account_editor_help(ui, "Use Import to match this account to its desktop. Optional if you have only one account.");
         ui.add_space(6.0);
@@ -3327,6 +3346,7 @@ fn show_device_picker(
                 account.vm_profile.clear();
                 account.vm_device_id.clear();
                 account.remote_pc.clear();
+                shortcut_editor::close(ui.ctx());
                 ui.close();
                 return;
             }
@@ -3642,6 +3662,14 @@ fn rebase_editor_enabled_state(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn validate_desktop_shortcut(account: &Account, accounts: &[Account]) -> Result<(), String> {
+    if let Some(shortcut) = account.desktop_shortcut {
+        shortcut_editor::check_duplicate(shortcut, &account.id, accounts)?;
+    }
+    Ok(())
+}
+
 fn save_edited_account(
     app: &mut AutoLoginApp,
     ctx: &egui::Context,
@@ -3653,6 +3681,21 @@ fn save_edited_account(
     }
     if account.username.trim().is_empty() {
         return Err("Email is required".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        validate_desktop_shortcut(account, &app.config.accounts)?;
+        let previous = app
+            .config
+            .accounts
+            .iter()
+            .find(|other| other.id == account.id);
+        if let Some(shortcut) = account
+            .desktop_shortcut
+            .filter(|shortcut| previous.and_then(|other| other.desktop_shortcut) != Some(*shortcut))
+        {
+            crate::macos_shortcuts::check_available(shortcut).map_err(|error| error.to_string())?;
+        }
     }
     #[cfg(target_os = "macos")]
     let remote_pc = if account.remote_pc.trim().is_empty() {
@@ -3782,6 +3825,7 @@ fn save_edited_account_transaction(
                 && existing.vm_target == account.vm_target
                 && existing.vm_profile == account.vm_profile
                 && existing.vm_device_id == account.vm_device_id
+                && existing.desktop_shortcut == account.desktop_shortcut
                 && existing.reconnect_locked_vm == account.reconnect_locked_vm
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
@@ -7209,6 +7253,17 @@ mod tests {
             }
         });
         let config = config_with_account(true);
+        #[cfg(target_os = "macos")]
+        let config = {
+            let mut config = config;
+            let account = &mut config.accounts[0];
+            account.vm_profile = "Work".into();
+            account.vm_target = "Test desktop".into();
+            account.reconnect_locked_vm = false;
+            account.desktop_shortcut =
+                super::DesktopShortcut::new(super::DesktopShortcut::CONTROL, '7');
+            config
+        };
         let account = config.accounts[0].clone();
         let mut app = account_test_app(config.clone());
         // Hold the mutation queue in memory so no worker touches storage.
@@ -7236,6 +7291,22 @@ mod tests {
             );
             assert!(visible_text_rects(&root, "Save").is_empty());
             render(&mut app);
+            #[cfg(target_os = "macos")]
+            {
+                let rect = visible_text_rects(&child_frame.borrow(), "Clear")[0];
+                events.replace(click(rect.center()));
+                render(&mut app);
+                assert!(app
+                    .editing_account
+                    .as_ref()
+                    .unwrap()
+                    .desktop_shortcut
+                    .is_none());
+                assert_eq!(
+                    app.config.accounts[0].desktop_shortcut,
+                    account.desktop_shortcut
+                );
+            }
             if action == "Close" {
                 close_requested.set(true);
             } else {
@@ -7264,6 +7335,12 @@ mod tests {
                 app.queued_account_transactions.len(),
                 usize::from(action == "Save")
             );
+            #[cfg(target_os = "macos")]
+            if let Some(AccountTransactionIntent::Save { account, .. }) =
+                app.queued_account_transactions.front()
+            {
+                assert!(account.desktop_shortcut.is_none());
+            }
             let root = render(&mut app);
             assert!(!root.viewport_output.contains_key(&editor_id));
             assert!(!root.viewport_output[&egui::ViewportId::ROOT]
@@ -7299,6 +7376,42 @@ mod tests {
             assert_eq!(rebased.vm_profile, "Work profile");
             assert!(rebased.iphone_authenticator_enabled);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_shortcut_must_be_unique_in_editor_and_authoritative_save() {
+        let mut owner = Account::new("first@example.test");
+        owner.vm_profile = "Work".into();
+        owner.vm_target = "First desktop".into();
+        owner.enabled = false;
+        owner.desktop_shortcut = super::DesktopShortcut::new(super::DesktopShortcut::OPTION, '2');
+        let config = AppConfig {
+            accounts: vec![owner.clone()],
+            ..Default::default()
+        };
+        assert!(super::validate_desktop_shortcut(&owner, &config.accounts).is_ok());
+        let mut draft = Account::new("second@example.test");
+        draft.desktop_shortcut = super::DesktopShortcut::new(super::DesktopShortcut::OPTION, '3');
+        assert!(super::validate_desktop_shortcut(&draft, &config.accounts).is_ok());
+        draft.desktop_shortcut = owner.desktop_shortcut;
+        let ctx = egui::Context::default();
+        let mut app = account_test_app(config.clone());
+        let message = super::save_edited_account(&mut app, &ctx, &draft, false).unwrap_err();
+        assert!(message.contains("first@example.test"));
+        assert!(app.queued_account_transactions.is_empty());
+        let result = super::execute_account_transaction(
+            config,
+            AccountTransactionIntent::Save {
+                sequence: 1,
+                account: draft,
+                was_existing: false,
+                password: None,
+            },
+        );
+        assert!(!result.applied);
+        assert_eq!(result.status, Some(message));
+        assert_eq!(result.config.accounts, [owner]);
     }
 
     #[cfg(target_os = "windows")]
@@ -7814,6 +7927,8 @@ mod tests {
         for name in [
             "CONNECTION",
             "Remote PC",
+            "Open desktop",
+            "Record Shortcut",
             "VM device",
             "Choose device…",
             "Import",
@@ -7851,6 +7966,9 @@ mod tests {
             let vm = field_for("Choose device…");
             let import = field_for("Import");
             let remote_pc = field_for("https://invalid.example");
+            let shortcut = field_for("Record Shortcut");
+            assert_eq!(shortcut.x_range(), remote_pc.x_range());
+            assert!(shortcut.top() > remote_pc.bottom());
             assert_eq!(vm.left(), remote_pc.left());
             assert!(vm.right() < import.left());
             assert_eq!(import.right(), remote_pc.right());
@@ -7893,7 +8011,10 @@ mod tests {
         assert!(visible_text_rects(&frame, "Microsoft Authenticator").is_empty());
         assert!(visible_text_rects(&frame, "Desktop ID").is_empty());
         for card in white_cards {
-            assert!((card.left() - 18.0).abs() < 0.6 && (card.right() - panel_right).abs() < 0.6);
+            assert!(
+                (card.left() - 18.0).abs() < 0.6 && (card.right() - panel_right).abs() < 0.6,
+                "card {card:?}, panel right {panel_right}"
+            );
         }
         let save_button = frame
             .shapes
@@ -8091,7 +8212,10 @@ mod tests {
             {
                 let vm = text_rect("Choose device…");
                 let host = text_rect(expected_host);
-                assert!((email.left() - vm.left()).abs() <= 1.0);
+                assert!(
+                    (email.left() - vm.left()).abs() <= 1.0,
+                    "email {email:?}, vm {vm:?}"
+                );
                 assert!((host.left() - vm.left()).abs() <= 1.0);
                 assert!((host.center().y - text_rect("Remote PC").center().y).abs() <= 1.0);
                 assert!(
