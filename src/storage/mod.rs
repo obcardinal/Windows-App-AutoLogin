@@ -1,4 +1,6 @@
-use crate::models::{Account, AccountId, AppConfig, AppSettings, FIXED_POLL_INTERVAL_SECS};
+use crate::models::{
+    Account, AccountId, AppConfig, AppSettings, DesktopShortcut, FIXED_POLL_INTERVAL_SECS,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -404,6 +406,8 @@ struct StoredAccountWire {
     vm_profile: String,
     #[serde(default)]
     vm_device_id: String,
+    #[serde(default, deserialize_with = "DesktopShortcut::deserialize_optional")]
+    desktop_shortcut: Option<DesktopShortcut>,
     #[serde(default = "crate::models::default_true")]
     reconnect_locked_vm: bool,
     #[serde(default)]
@@ -465,6 +469,7 @@ impl From<StoredAppConfigWire> for AppConfig {
                     vm_target: account.vm_target,
                     vm_profile: account.vm_profile,
                     vm_device_id: account.vm_device_id,
+                    desktop_shortcut: account.desktop_shortcut,
                     reconnect_locked_vm: account.reconnect_locked_vm,
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
@@ -762,7 +767,18 @@ where
     let value: serde_json::Value = serde_json::from_str(&content)?;
     if value.get("accounts").is_some() || value.get("settings").is_some() {
         let stored: StoredAppConfigWire = serde_json::from_value(value)?;
-        return Ok(normalize_config(stored.into()));
+        let mut config = AppConfig::from(stored);
+        let conflicts = duplicate_desktop_shortcuts(&config.accounts);
+        if !conflicts.is_empty() {
+            // A manually duplicated binding has no unambiguous target.
+            for account in &mut config.accounts {
+                account.desktop_shortcut = account
+                    .desktop_shortcut
+                    .filter(|key| !conflicts.contains(key));
+            }
+            warn!("Ignored desktop shortcuts assigned to multiple accounts");
+        }
+        return Ok(normalize_config(config));
     }
     if !legacy_config_has_recognized_field(&value) {
         anyhow::bail!("config does not match the current or recognized legacy schema");
@@ -1041,8 +1057,31 @@ pub(crate) fn save_config(config: &AppConfig) -> anyhow::Result<()> {
 }
 
 fn save_config_to_file(config: &AppConfig, path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        duplicate_desktop_shortcuts(&config.accounts).is_empty(),
+        "Desktop shortcut is already assigned to another account"
+    );
+    for shortcut in config
+        .accounts
+        .iter()
+        .filter_map(|account| account.desktop_shortcut)
+    {
+        anyhow::ensure!(
+            DesktopShortcut::new(shortcut.modifiers, shortcut.key) == Some(shortcut),
+            "Invalid desktop shortcut"
+        );
+    }
     let content = serde_json::to_string_pretty(config)?;
     write_private_file_atomic(path, "json.tmp", content.as_bytes())
+}
+
+fn duplicate_desktop_shortcuts(accounts: &[Account]) -> HashSet<DesktopShortcut> {
+    let mut seen = HashSet::new();
+    accounts
+        .iter()
+        .filter_map(|account| account.desktop_shortcut)
+        .filter(|shortcut| !seen.insert(*shortcut))
+        .collect()
 }
 
 fn normalize_config(mut config: AppConfig) -> AppConfig {
@@ -5748,7 +5787,7 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{validate_private_dir, validate_private_file_for_read};
-    use crate::models::{Account, AppConfig, FIXED_POLL_INTERVAL_SECS};
+    use crate::models::{Account, AppConfig, DesktopShortcut, FIXED_POLL_INTERVAL_SECS};
     #[cfg(target_os = "windows")]
     use base64::Engine as _;
     use std::cell::{Cell, RefCell};
@@ -6027,6 +6066,7 @@ mod tests {
         assert!(config.accounts[0].vm_target.is_empty());
         assert!(config.accounts[0].vm_profile.is_empty());
         assert!(config.accounts[0].vm_device_id.is_empty());
+        assert_eq!(config.accounts[0].desktop_shortcut, None);
         assert!(config.accounts[0].reconnect_locked_vm);
         assert_eq!(config.settings.poll_interval_secs, FIXED_POLL_INTERVAL_SECS);
         assert!(config.settings.use_keyring);
@@ -6093,6 +6133,7 @@ mod tests {
         account.vm_target = "My Cloud PC".to_string();
         account.vm_profile = "Example work profile".to_string();
         account.vm_device_id = "workspace:1483e80a-a091-4973-880c-ab3f1181b03b".to_string();
+        account.desktop_shortcut = DesktopShortcut::new(DesktopShortcut::OPTION, '9');
         let mut config = AppConfig {
             accounts: vec![account],
             ..AppConfig::default()
@@ -6110,6 +6151,66 @@ mod tests {
             save_config_to_file(&config, &path).unwrap();
             assert_eq!(load_config_from_path(&path).unwrap(), config);
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_or_ambiguous_desktop_shortcuts_do_not_block_account_loading() {
+        use serde_json::json;
+
+        let root = temp_storage_test_dir("desktop-shortcut-load");
+        let path = root.join("config.json");
+        let bindings = [
+            json!({ "modifiers": 1, "key": "x" }),
+            json!({ "modifiers": 1, "key": "X" }),
+            json!({ "modifiers": 2, "key": "b" }),
+            json!({ "modifiers": 4, "key": "b" }),
+            json!({ "modifiers": 17, "key": "F2" }),
+            json!({ "modifiers": 1, "key": "A", "sequence": 2 }),
+            json!("unsupported"),
+            json!(null),
+        ];
+        let accounts: Vec<_> = bindings.into_iter().enumerate().map(|(index, binding)| {
+            json!({ "id": index.to_string(), "username": format!("user{index}"), "desktop_shortcut": binding })
+        }).collect();
+        write_test_private_text(
+            &path,
+            json!({"accounts": accounts, "settings": {}}).to_string(),
+        );
+
+        let config = load_config_from_path(&path).unwrap();
+        assert_eq!(config.accounts.len(), accounts.len());
+        for (index, account) in config.accounts.iter().enumerate() {
+            let expected = if index == 2 {
+                DesktopShortcut::new(DesktopShortcut::OPTION, 'B')
+            } else {
+                None
+            };
+            assert_eq!(account.desktop_shortcut, expected);
+            assert_eq!(account.username, format!("user{index}"));
+            assert!(account.enabled);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflicting_desktop_shortcuts_are_rejected_before_writing() {
+        let root = temp_storage_test_dir("desktop-shortcut-save");
+        let path = root.join("config.json");
+        let mut first = Account::new("one");
+        first.desktop_shortcut = DesktopShortcut::new(DesktopShortcut::CONTROL, 'A');
+        let mut second = Account::new("two");
+        second.enabled = false;
+        let saved = AppConfig {
+            accounts: vec![first, second],
+            ..AppConfig::default()
+        };
+        save_config_to_file(&saved, &path).unwrap();
+        let mut changed = saved.clone();
+        changed.accounts[1].desktop_shortcut = changed.accounts[0].desktop_shortcut;
+
+        assert!(save_config_to_file(&changed, &path).is_err());
+        assert_eq!(load_config_from_path(&path).unwrap(), saved);
         let _ = std::fs::remove_dir_all(root);
     }
 
