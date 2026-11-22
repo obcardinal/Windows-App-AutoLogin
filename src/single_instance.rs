@@ -532,6 +532,15 @@ pub(crate) fn try_lock_telegram_link() -> anyhow::Result<std::fs::File> {
     acquire_named_file_lock(&root, "telegram-link.lock", "Telegram link is busy")
 }
 
+// A menu-bar shortcut can still be opening a desktop while ownership of
+// keyboard shortcuts moves to (or from) the Accounts window.
+#[cfg(target_os = "macos")]
+pub(crate) fn acquire_desktop_launch_lock() -> anyhow::Result<std::fs::File> {
+    let root = lock_root()?;
+    prepare_lock_root(&root)?;
+    acquire_named_file_lock(&root, "desktop-launch", "Another desktop is already opening.")
+}
+
 fn prepare_lock_root(root: &Path) -> std::io::Result<()> {
     secure_lock_root_parent_if_app_runtime(root)?;
     match std::fs::symlink_metadata(root) {

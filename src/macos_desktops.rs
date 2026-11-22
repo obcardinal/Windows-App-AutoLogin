@@ -160,6 +160,17 @@ impl DesktopLaunch {
     }
 
     pub(crate) fn open(&self) -> Result<()> {
+        if self.open_and_check_preparation()? {
+            // The full UI requests preparation from the resident supervisor.
+            let _ = std::thread::Builder::new()
+                .name("iphone-wifi-request".into())
+                .spawn(crate::single_instance::request_iphone_wifi_preparation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn open_and_check_preparation(&self) -> Result<bool> {
+        let _launch_lock = crate::single_instance::acquire_desktop_launch_lock()?;
         let account = &self.account;
         let focus = |title: &str| self.focus_if_unshared(title, focus_open_session);
         let outcome = open_with(
@@ -187,14 +198,7 @@ impl DesktopLaunch {
                 })
             },
         )?;
-        if outcome.should_prepare_iphone(account) {
-            // Windows App has accepted Connect. The optional supervisor request
-            // must not keep the Enter control busy while awaiting its reply.
-            let _ = std::thread::Builder::new()
-                .name("iphone-wifi-request".into())
-                .spawn(crate::single_instance::request_iphone_wifi_preparation);
-        }
-        Ok(())
+        Ok(outcome.should_prepare_iphone(account))
     }
 
     fn unshared_title(&self, title: &str) -> bool {
