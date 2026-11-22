@@ -67,6 +67,17 @@ pub(super) fn refresh_device_info(ctx: &egui::Context) {
     DeviceSnapshot::invalidate(ctx);
 }
 
+#[cfg(test)]
+pub(super) fn set_connected_phone_for_test(ctx: &egui::Context) {
+    let snapshot = DeviceSnapshot(Arc::new(OnceLock::from(SetupInfo::Selected {
+        id: "test".into(),
+        name: Some("Test iPhone".into()),
+        wifi_connected: true,
+        helper_files: HelperFiles::Current,
+    })));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("iphone_setup_info"), snapshot));
+}
+
 pub(crate) fn close_details(ctx: &egui::Context) {
     crate::ui::iphone_setup_guide::cancel(ctx);
     ctx.data_mut(|data| data.remove::<PhonePage>(details_id()));

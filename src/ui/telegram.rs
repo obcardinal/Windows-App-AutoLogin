@@ -66,6 +66,14 @@ fn open_telegram(link: &str) -> bool {
 }
 
 impl TelegramSettings {
+    #[cfg(test)]
+    pub(super) fn linked_for_test() -> Self {
+        Self {
+            state: Some(LinkState::Linked),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn change_in_progress(&self) -> bool {
         self.worker.as_ref().is_some_and(|worker| {
             (worker.operation.changes_link() || self.queued_cancel.is_some())

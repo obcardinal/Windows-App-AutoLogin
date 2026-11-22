@@ -2789,9 +2789,12 @@ impl AutoLoginApp {
         }
         // On macOS each native resize can temporarily display a Metal drawable
         // from the preceding frame. Request the measured height in one step.
-        let height = height.ceil().max(MIN_WINDOW_HEIGHT);
+        let height = height.max(MIN_WINDOW_HEIGHT);
         #[cfg(not(target_os = "macos"))]
         let height = self.tab_transition_height(ctx, current_size.y, height);
+        // Round outward: even a fractional shortfall enables egui's scroll bar.
+        let pixels_per_point = ctx.pixels_per_point();
+        let height = (height * pixels_per_point).ceil() / pixels_per_point;
         let size = egui::vec2(MAIN_WINDOW_WIDTH, height);
         let native_size = size * ctx.zoom_factor();
         // A pending native resize can take several frames to appear.
@@ -3003,6 +3006,7 @@ mod tests {
             (Tab::Settings, 600.0, width, 280.0),
             // A manual vertical drag remains until the content height changes.
             (Tab::Settings, 600.0, width, 650.0),
+            (Tab::Settings, 178.0625, width, 600.0),
             (Tab::Accounts, 280.0, width, 600.0),
             (Tab::Accounts, 280.0, width, 600.0),
         ] {
@@ -3024,7 +3028,7 @@ mod tests {
         }
         assert_eq!(
             sizes,
-            [280.0, 600.0, 280.0].map(|height| egui::vec2(width, height))
+            [280.0, 600.0, 179.0, 280.0].map(|height| egui::vec2(width, height))
         );
     }
 

@@ -2788,4 +2788,97 @@ mod tests {
         account.has_saved_password = true;
         account
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_factor_scrolls_only_when_its_content_exceeds_the_native_window() {
+        use crate::ui::{iphone_sign_in, telegram, theme};
+
+        for scale in [1.0, 2.0] {
+            let width = crate::app::MAIN_WINDOW_WIDTH;
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            theme::apply(&ctx);
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
+            iphone_sign_in::set_connected_phone_for_test(&ctx);
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("selected_settings_section"),
+                    super::SettingsSection::TwoFactor,
+                )
+            });
+            let mut app = settings_test_app(false);
+            app.accessibility_status.trusted = true;
+            app.telegram_settings = telegram::TelegramSettings::linked_for_test();
+            let mut native_frame = eframe::Frame::_new_kittest();
+            let mut render = |height, events| {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .native_pixels_per_point = Some(scale);
+                ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut native_frame))
+            };
+            let scrollbar = |frame: &egui::FullOutput| {
+                let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+                tree.nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == egui::accesskit::Role::ScrollBar)
+            };
+            let notification_y = |frame: &egui::FullOutput| {
+                frame
+                    .shapes
+                    .iter()
+                    .find_map(|item| match &item.shape {
+                        egui::Shape::Text(t) if t.galley.text() == "NOTIFICATIONS" => {
+                            Some(t.visual_bounding_rect().center().y)
+                        }
+                        _ => None,
+                    })
+                    .expect("visible Notifications heading")
+            };
+            let initial = render(600.0, vec![]);
+            let fitted = initial.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    egui::ViewportCommand::InnerSize(size) => Some(size.y),
+                    _ => None,
+                })
+                .expect("window measured from both 2FA cards");
+            let hover = egui::Event::PointerMoved(egui::pos2(width - 12.0, fitted * 0.6));
+            let _ = render(fitted, vec![hover]);
+            let full = render(fitted, vec![]);
+            let top = notification_y(&full);
+            assert!(
+                !scrollbar(&full),
+                "spurious scrollbar on {scale}× at {fitted} pt"
+            );
+
+            let shorter = fitted - 48.0;
+            let _ = render(shorter, vec![]);
+            assert!(scrollbar(&render(shorter, vec![])));
+            let _ = render(
+                shorter,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Page,
+                    delta: egui::vec2(0.0, -1.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            for _ in 0..20 {
+                let _ = render(shorter, vec![]);
+            }
+            assert!(notification_y(&render(shorter, vec![])) < top - 20.0);
+        }
+    }
 }
