@@ -1,11 +1,11 @@
 # iPhone Authenticator helper
 
 This optional macOS integration assists Microsoft Authenticator number matching
-for an account's Windows App sign-in. In **Settings → iPhone Authentication**,
+for an account's Windows App sign-in. In **Settings → 2FA → Devices**,
 click **Connect iPhone…**, choose your phone by name, and click **Connect iPhone**.
 AutoLogin checks that this phone responds over Wi-Fi before saving its device
 identifier on this Mac. All participating accounts use that phone. To change
-the selection, return to **Settings → iPhone Authentication**.
+the selection, return to **Settings → 2FA → Devices**.
 In **Accounts**, open an account, turn on **2FA → Use iPhone**, and save.
 AutoLogin identifies Microsoft Authenticator from the instructions next to the
 two-digit number in Windows App. Other methods require manual sign-in.
@@ -160,7 +160,7 @@ and does not open Authenticator.
 ## Select and prepare the physical iPhone
 
 1. Unlock the iPhone and connect it and the Mac to the same Wi-Fi network.
-   Open **Settings → iPhone Authentication → Connect iPhone…** in AutoLogin.
+   Open **Settings → 2FA → Devices → Connect iPhone…** in AutoLogin.
 2. If the phone has never been paired with this Mac, click **Open device pairing…**.
    In Xcode 27’s Device Hub, an iPhone running iOS 27 or later can pair wirelessly
    using **+ → Pair Nearby Device…**. Confirm the trust prompt on the iPhone.

@@ -28,7 +28,7 @@ These checks run on your computer. The Microsoft client handles authentication. 
 | Windows 10/11, x64 | [Windows v0.4.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.0) | Extract the ZIP and run `WindowsAppAutoLogin.exe`. Keep `WindowsAppAutoLoginUI.exe` in the same folder. Both executables are unsigned. |
 
 1. Open AutoLogin. On macOS, grant it **Accessibility** under **System Settings → Privacy & Security** so it can read and fill the sign-in prompt.
-2. In **Accounts**, click **+** (Add Account). Save the email that Windows App shows at sign-in and the password for that account.
+2. In **Accounts**, click **Add Account** for your first account. To add another, click **+** in the table header. Save the email that Windows App shows at sign-in and the password for that account.
 3. If monitoring is paused, choose **Start Monitor**. Open the remote desktop and leave its sign-in prompt in front. Enable **Settings → System → Open at Login** if you want AutoLogin to start with your computer.
 
 On macOS, right-click the menu bar icon and choose **Check for Updates…** to get future releases. If you use v0.4.1 or earlier, install the latest macOS ZIP once to enable this option. When installing the ZIP over a copy named `WindowsAppAutoLogin.app`, quit the app and rename that copy to `Windows App AutoLogin.app` in Applications so Finder can replace it.
@@ -47,13 +47,13 @@ Choose the desktop under **Connection → VM device** in the account editor. Wit
 
 ### Confirm a sign-in on your iPhone
 
-In **Settings → iPhone Authentication → Connect iPhone…**, choose your phone and click **Connect iPhone**. AutoLogin checks the Wi-Fi connection and remembers that iPhone for your accounts. For first-time pairing, click **Open device pairing…** and follow Apple’s prompts. Connecting requires Xcode but no signing certificate.
+In **Settings → 2FA → Devices → Connect iPhone…**, choose your phone and click **Connect iPhone**. AutoLogin checks the Wi-Fi connection and remembers that iPhone for your accounts. For first-time pairing, click **Open device pairing…** and follow Apple’s prompts. Connecting requires Xcode but no signing certificate.
 
 Open **Sign-in details… → Set up automation…** to prepare UI Automation. The setup screen guides you through Developer Mode, Enable UI Automation and adding your own Apple Account in Xcode. Choose your signing account and click **Set up automation**. AutoLogin installs the required tools, signs the helper for your iPhone and checks that it can run over Wi-Fi.
 
 Turn on **2FA → Use iPhone** for each participating account. AutoLogin enters the number from Windows App in Microsoft Authenticator. Complete Face ID on the phone if prompted. [iPhone setup and requirements](docs/iphone-authenticator.md#host-setup)
 
-**Optional Telegram reminder.** Select **Settings → 2FA Notifications → Link Telegram…** and tap **Start** in the bot chat. Only a matching two-factor request triggers a reminder, which can wake the phone if lock-screen notifications are enabled. The notification service sees when a reminder is requested and uses a link token to reach your chat. The request excludes your work email, password, sign-in number and screen contents.
+**Optional Telegram reminder.** Select **Settings → 2FA → Notifications → Link Telegram…** and tap **Start** in the bot chat. Only a matching two-factor request triggers a reminder, which can wake the phone if lock-screen notifications are enabled. The notification service sees when a reminder is requested and uses a link token to reach your chat. The request excludes your work email, password, sign-in number and screen contents.
 
 ## Development
 
