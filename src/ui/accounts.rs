@@ -2171,11 +2171,10 @@ fn show_account_row(
 
         show_cell(
             ui,
-            cells.state,
+            egui::Rect::from_center_size(cells.state.center(), crate::ui::toggle::SWITCH_SIZE),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let mut enabled = displayed_enabled;
-                ui.add_space((STATE_COLUMN_WIDTH - 40.0) / 2.0);
                 let response = ui
                     .add_enabled_ui(controls.toggle, |ui| {
                         crate::ui::toggle::switch(

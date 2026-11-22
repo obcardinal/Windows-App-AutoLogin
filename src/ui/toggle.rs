@@ -1,9 +1,11 @@
 use crate::ui::theme;
 use eframe::egui;
 
+pub(super) const SWITCH_SIZE: egui::Vec2 = egui::vec2(40.0, 30.0);
+
 /// A checkbox with a compact switch appearance and a larger interaction target.
 pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
-    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(40.0, 30.0), egui::Sense::click());
+    let (rect, mut response) = ui.allocate_exact_size(SWITCH_SIZE, egui::Sense::click());
     // Sense::click also supplies the standard focused Space/Enter activation.
     if response.clicked() {
         *checked = !*checked;
