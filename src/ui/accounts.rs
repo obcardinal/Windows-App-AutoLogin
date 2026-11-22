@@ -3127,7 +3127,7 @@ fn account_info_button(ui: &mut egui::Ui, title: &str, body: &str, note: Option<
     let icon = theme::toolbar_icon(egui::include_image!("../../assets/icons/info.svg"))
         .alt_text(&label)
         .tint(theme::MUTED);
-    let response = ui.scope(|ui| {
+    let response = account_editor_input_scope(ui, |ui| {
         ui.spacing_mut().button_padding = egui::Vec2::ZERO;
         ui.add_sized(
             egui::vec2(24.0, ACCOUNT_EDITOR_CONTROL_HEIGHT),
@@ -8203,6 +8203,27 @@ mod tests {
                 let gap = info.left() - text.right();
                 assert!((gap - 4.0).abs() <= 1.0, "{caption} gap is {gap}");
                 assert!((info.center().y - text.center().y).abs() <= 2.0);
+                let (hovered, _, _) =
+                    render(&mut app, vec![egui::Event::PointerMoved(info.center())]);
+                assert_eq!(
+                    hovered.platform_output.cursor_icon,
+                    egui::CursorIcon::PointingHand,
+                    "{caption}"
+                );
+                let highlight = hovered
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect) if rect.rect == info => Some(rect),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing hover on {caption} info button"));
+                assert_eq!(highlight.fill, crate::ui::theme::SURFACE, "{caption}");
+                assert_eq!(
+                    highlight.stroke,
+                    egui::Stroke::new(1.0, crate::ui::theme::STROKE),
+                    "{caption}"
+                );
             }
             assert_eq!(remote_pc.x_range(), email.x_range());
             assert_eq!(remote_pc.top() - vm.bottom(), row_gap);
