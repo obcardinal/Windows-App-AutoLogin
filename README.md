@@ -24,11 +24,11 @@ These checks run on your computer. The Microsoft client handles authentication. 
 
 | Platform | Download | Install |
 | --- | --- | --- |
-| macOS 11+, Apple Silicon | [macOS v1.0.3](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.3) | Extract the ZIP and move `Windows App AutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
+| macOS 11+, Apple Silicon | [macOS v1.0.4](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.4) | Extract the ZIP and move `Windows App AutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
 | Windows 10/11, x64 | [Windows v0.4.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.0) | Extract the ZIP and run `WindowsAppAutoLogin.exe`. Keep `WindowsAppAutoLoginUI.exe` in the same folder. Both executables are unsigned. |
 
 1. Open AutoLogin. On macOS, grant it **Accessibility** under **System Settings → Privacy & Security** so it can read and fill the sign-in prompt.
-2. In **Accounts**, click **Add Account** for your first account. To add another, click **+** in the table header. Save the email that Windows App shows at sign-in and the password for that account.
+2. In **Accounts**, click **Add Account**. Save the email that Windows App shows at sign-in and the password for that account. To add another account on macOS, click **+** in the table header.
 3. If monitoring is paused, choose **Start Monitor**. Open the remote desktop and leave its sign-in prompt in front. Enable **Settings → System → Open at Login** if you want AutoLogin to start with your computer.
 
 On macOS, right-click the menu bar icon and choose **Check for Updates…** to get future releases. If you use v0.4.1 or earlier, install the latest macOS ZIP once to enable this option. When installing the ZIP over a copy named `WindowsAppAutoLogin.app`, quit the app and rename that copy to `Windows App AutoLogin.app` in Applications so Finder can replace it.
@@ -37,7 +37,11 @@ The Windows version also recognizes Microsoft Remote Desktop and the built-in Re
 
 ## Linked desktops and two-factor sign-in on macOS
 
-Under **Connection** in the account editor, click **Record Shortcut**, press the keys, then click **Save**. You can choose the **VM device** now or later. Once the device is saved, the shortcut opens it from any app while AutoLogin is running.
+### Open a desktop with a keyboard shortcut
+
+In **Accounts**, edit the account and choose its desktop under **Connection → VM device**. Click **Record Shortcut**, then press a letter or number with Control, Option or Command. If the shortcut is already in use, choose another combination. Click **Save**.
+
+While AutoLogin is running, press the shortcut from any app to open the linked desktop or bring its window forward. You can also record the shortcut first and choose the desktop later. To remove the shortcut, click **Clear**, then **Save**.
 
 When a new remote desktop connects, AutoLogin closes the Windows App device list. Your desktop stays open, and you can reopen the list at any time. To keep the list open after every connection, turn off **Settings → Windows App → Close device list after connecting**.
 
