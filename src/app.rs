@@ -22,7 +22,7 @@ use tokio::sync::mpsc::Sender as TokioSender;
 use zeroize::Zeroizing;
 
 const MAX_LOG_ENTRIES: usize = 200;
-pub(crate) const MAIN_WINDOW_WIDTH: f32 = 608.0;
+pub(crate) const MIN_MAIN_WINDOW_WIDTH: f32 = 500.0;
 pub(crate) const FULL_WINDOW_HEIGHT: f32 = 500.0;
 // Leave room for the toolbar and navigation on compact tabs.
 // A single account or preference card can fit in less than 200 points.
@@ -2795,21 +2795,28 @@ impl AutoLoginApp {
         // Round outward: even a fractional shortfall enables egui's scroll bar.
         let pixels_per_point = ctx.pixels_per_point();
         let height = (height * pixels_per_point).ceil() / pixels_per_point;
-        let size = egui::vec2(MAIN_WINDOW_WIDTH, height);
+        let width = crate::ui::accounts::main_window_width(ctx, &self.config.accounts);
+        let width = ctx.input(|input| {
+            input
+                .viewport()
+                .monitor_size
+                .map_or(width, |screen| width.min(screen.x))
+        });
+        let size = egui::vec2(width, height);
         let native_size = size * ctx.zoom_factor();
         // A pending native resize can take several frames to appear.
         let previous = self.last_requested_window_size.replace(native_size);
         if previous == Some(native_size) {
             return;
         }
-        if previous.is_some_and(|previous| previous.x != native_size.x) {
-            // Keyboard zoom changes the native width of an egui point.
+        if previous.is_none_or(|previous| previous.x != native_size.x) {
+            // Keep the window fixed horizontally as accounts or display scale change.
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                MAIN_WINDOW_WIDTH,
+                width,
                 MIN_WINDOW_HEIGHT,
             )));
             ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
-                MAIN_WINDOW_WIDTH,
+                width,
                 MAX_WINDOW_HEIGHT,
             )));
         }
@@ -2996,7 +3003,7 @@ mod tests {
         let mut app = mutation_test_app(true);
         let ctx = egui::Context::default();
         let frame = eframe::Frame::_new_kittest();
-        let width = super::MAIN_WINDOW_WIDTH;
+        let width = super::MIN_MAIN_WINDOW_WIDTH;
         let mut sizes = Vec::new();
         for (tab, measured, viewport_width, viewport_height) in [
             // A restored window can already have the right height at an older width.

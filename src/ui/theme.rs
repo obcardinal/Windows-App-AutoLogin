@@ -509,7 +509,7 @@ mod tests {
             (2, "Security"),
             (3, "2FA"),
         ];
-        for width in [280.0, crate::app::MAIN_WINDOW_WIDTH] {
+        for width in [280.0, crate::app::MIN_MAIN_WINDOW_WIDTH] {
             let ctx = egui::Context::default();
             apply(&ctx);
             let render = |events| {

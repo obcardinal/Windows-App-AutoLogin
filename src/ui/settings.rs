@@ -1132,7 +1132,7 @@ mod tests {
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 480.0),
+                        egui::vec2(crate::app::MIN_MAIN_WINDOW_WIDTH, 480.0),
                     )),
                     events,
                     ..Default::default()
@@ -1186,7 +1186,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn system_card_aligns_switches_labels_and_dividers_when_the_hint_wraps() {
-        for width in [crate::app::MAIN_WINDOW_WIDTH, 250.0] {
+        for width in [crate::app::MIN_MAIN_WINDOW_WIDTH, 250.0] {
             let ctx = egui::Context::default();
             crate::ui::theme::apply(&ctx);
             let mut app = settings_test_app(false);
@@ -2795,7 +2795,7 @@ mod tests {
         use crate::ui::{iphone_sign_in, telegram, theme};
 
         for scale in [1.0, 2.0] {
-            let width = crate::app::MAIN_WINDOW_WIDTH;
+            let width = crate::app::MIN_MAIN_WINDOW_WIDTH;
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             theme::apply(&ctx);

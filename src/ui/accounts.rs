@@ -45,11 +45,13 @@ const ACCOUNT_TOGGLE_JOB_DISCONNECTED_REASON: &str =
 const ACCOUNT_TRANSACTION_IN_PROGRESS_REASON: &str =
     "Wait for the current account or settings update to finish.";
 
-const STATE_COLUMN_WIDTH: f32 = 68.0;
+const STATE_COLUMN_WIDTH: f32 = 56.0;
+const ACCOUNT_EMAIL_FONT_SIZE: f32 = 14.0;
 const TABLE_SPACING: f32 = 8.0;
 const ACCOUNT_TILE_SIZE: f32 = 31.0;
 const ACCOUNT_ROW_PADDING: i8 = 9;
 const ACTIONS_COLUMN_WIDTH: f32 = ACCOUNT_TILE_SIZE * 4.0 + TABLE_SPACING * 3.0;
+const FIXED_TABLE_WIDTH: f32 = STATE_COLUMN_WIDTH + ACTIONS_COLUMN_WIDTH + 2.0 * TABLE_SPACING;
 const ADD_ACCOUNT_DIAMETER: f32 = 24.0;
 const ACCOUNT_ROW_HEIGHT: f32 = ACCOUNT_TILE_SIZE + 2.0 * ACCOUNT_ROW_PADDING as f32;
 const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
@@ -2176,7 +2178,12 @@ fn show_account_row(
                     (email, theme::TEXT)
                 };
                 ui.add(
-                    egui::Label::new(egui::RichText::new(name).size(14.0).color(color)).truncate(),
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .size(ACCOUNT_EMAIL_FONT_SIZE)
+                            .color(color),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(name);
             },
@@ -2408,11 +2415,34 @@ fn show_cell<R>(
     add_contents(&mut cell)
 }
 
+pub(crate) fn main_window_width(ctx: &egui::Context, accounts: &[Account]) -> f32 {
+    let longest = ctx.fonts_mut(|fonts| {
+        accounts
+            .iter()
+            .map(|account| {
+                fonts
+                    .layout_no_wrap(
+                        account.username.trim().to_owned(),
+                        egui::FontId::proportional(ACCOUNT_EMAIL_FONT_SIZE),
+                        theme::TEXT,
+                    )
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max)
+    });
+    let margins = theme::tab_content_frame().total_margin().sum().x
+        + 2.0 * (f32::from(ACCOUNT_ROW_PADDING) + theme::compact_frame().stroke.width);
+    let avatar = ACCOUNT_TILE_SIZE + TABLE_SPACING;
+    // The email and its column edges can round to different device pixels.
+    (margins + FIXED_TABLE_WIDTH + avatar + longest + 1.0)
+        .ceil()
+        .max(crate::app::MIN_MAIN_WINDOW_WIDTH)
+}
+
 fn account_columns(width: f32) -> AccountColumns {
-    let spacing = TABLE_SPACING * 2.0;
-    let fixed_width = STATE_COLUMN_WIDTH + ACTIONS_COLUMN_WIDTH + spacing;
     AccountColumns {
-        email: (width - fixed_width).max(0.0),
+        email: (width - FIXED_TABLE_WIDTH).max(0.0),
         state: STATE_COLUMN_WIDTH,
         actions: ACTIONS_COLUMN_WIDTH,
     }
@@ -4524,7 +4554,7 @@ mod tests {
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 268.0),
+                        egui::vec2(crate::app::MIN_MAIN_WINDOW_WIDTH, 268.0),
                     )),
                     events,
                     ..Default::default()
@@ -4701,7 +4731,7 @@ mod tests {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 450.0),
+                    egui::vec2(crate::app::MIN_MAIN_WINDOW_WIDTH, 450.0),
                 )),
                 events,
                 ..Default::default()
@@ -4763,7 +4793,7 @@ mod tests {
             for pair in buttons.windows(2) {
                 assert_eq!(pair[1].left() - pair[0].right(), super::TABLE_SPACING);
             }
-            assert!(delete[row].right() <= crate::app::MAIN_WINDOW_WIDTH);
+            assert!(delete[row].right() <= crate::app::MIN_MAIN_WINDOW_WIDTH);
         }
         render(click(open[0].center()), true, &mut actions);
         assert_eq!(
@@ -4801,7 +4831,7 @@ mod tests {
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 450.0),
+                        egui::vec2(crate::app::MIN_MAIN_WINDOW_WIDTH, 450.0),
                     )),
                     events,
                     ..Default::default()
@@ -5284,27 +5314,104 @@ mod tests {
 
     #[test]
     fn main_window_fits_a_long_work_email_on_one_line() {
-        let email = "alexandra.robertson@engineering.example";
-        let ctx = egui::Context::default();
-        crate::ui::theme::apply(&ctx);
-        let mut config = AppConfig::default();
-        config.accounts.push(Account::new(email));
-        let mut app = account_test_app(config);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 320.0),
-            )),
-            ..Default::default()
-        };
-        let frame = ctx.run_ui(input, |ui| {
-            crate::ui::theme::tab_content_frame().show(ui, |ui| super::show(ui, &mut app));
-        });
-        assert!(frame.shapes.iter().any(|item| matches!(
-            &item.shape, egui::Shape::Text(t) if t.galley.text() == email
-                && t.galley.rows.len() == 1 && !t.galley.elided
-                && item.clip_rect.contains_rect(t.visual_bounding_rect())
-        )));
+        for scale in [1.0, 2.0] {
+            for widest in [
+                "ALEXANDER.GREEN@EXAMPLE.TEST",
+                "alexandra.robertson@engineering.example",
+            ] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                crate::ui::theme::apply(&ctx);
+                let emails = ["lilli.lillie.lilli@example.test", widest];
+                let mut app = account_test_app(AppConfig {
+                    accounts: emails
+                        .map(|email| Account {
+                            vm_target: uuid::Uuid::new_v4().to_string(),
+                            ..Account::new(email)
+                        })
+                        .into(),
+                    ..Default::default()
+                });
+                let input = |width| {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 320.0),
+                        )),
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .get_mut(&egui::ViewportId::ROOT)
+                        .unwrap()
+                        .native_pixels_per_point = Some(scale);
+                    input
+                };
+                let _ = ctx.run_ui(input(crate::app::MIN_MAIN_WINDOW_WIDTH), |_| {});
+                let width = super::main_window_width(&ctx, &app.config.accounts);
+                let frame = ctx.run_ui(input(width), |ui| {
+                    crate::ui::theme::tab_content_frame().show(ui, |ui| super::show(ui, &mut app));
+                });
+                let nodes = &frame
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes;
+                let bounds_for = |label: &str| {
+                    nodes
+                        .iter()
+                        .map(|(_, node)| node)
+                        .find(|node| node.label() == Some(label))
+                        .unwrap()
+                        .bounds()
+                        .unwrap()
+                };
+                let switch = bounds_for(&format!("Enable account {widest}"));
+                let email_right = ((switch.x0 + switch.x1) * 0.5) as f32
+                    - super::STATE_COLUMN_WIDTH * 0.5
+                    - super::TABLE_SPACING;
+                for email in emails {
+                    let label = frame
+                        .shapes
+                        .iter()
+                        .find_map(|item| match &item.shape {
+                            egui::Shape::Text(text)
+                                if text.galley.text() == email
+                                    && item
+                                        .clip_rect
+                                        .contains_rect(text.visual_bounding_rect()) =>
+                            {
+                                Some(text)
+                            }
+                            _ => None,
+                        })
+                        .expect("visible account email");
+                    assert_eq!(label.galley.rows.len(), 1);
+                    assert!(!label.galley.elided);
+                    if email == widest {
+                        let slack = email_right - label.visual_bounding_rect().right();
+                        assert!(
+                            (-1.0..=4.0).contains(&slack),
+                            "{email} at {scale}x: {slack}"
+                        );
+                    }
+                }
+                for label in [
+                    "Open desktop",
+                    "Copy email",
+                    "Edit account",
+                    "Delete account",
+                ] {
+                    let button = bounds_for(label);
+                    assert!(
+                        button.x0 >= switch.x1 && button.x1 <= f64::from(width),
+                        "{label}"
+                    );
+                    assert_eq!(button.width(), f64::from(super::ACCOUNT_TILE_SIZE));
+                }
+            }
+        }
     }
 
     #[test]

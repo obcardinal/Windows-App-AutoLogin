@@ -376,9 +376,9 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
         models::Tab::Diagnose => app::FULL_WINDOW_HEIGHT,
     };
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([app::MAIN_WINDOW_WIDTH, initial_height])
-        .with_min_inner_size([app::MAIN_WINDOW_WIDTH, app::MIN_WINDOW_HEIGHT])
-        .with_max_inner_size([app::MAIN_WINDOW_WIDTH, app::MAX_WINDOW_HEIGHT])
+        .with_inner_size([app::MIN_MAIN_WINDOW_WIDTH, initial_height])
+        .with_min_inner_size([app::MIN_MAIN_WINDOW_WIDTH, app::MIN_WINDOW_HEIGHT])
+        .with_max_inner_size([app::MIN_MAIN_WINDOW_WIDTH, app::MAX_WINDOW_HEIGHT])
         .with_maximize_button(false)
         .with_icon(load_icon()?)
         .with_visible(true)
