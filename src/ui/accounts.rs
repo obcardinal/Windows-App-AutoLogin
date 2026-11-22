@@ -65,9 +65,11 @@ const ACCOUNT_EDITOR_SPACING: i8 = 8;
 #[cfg(test)]
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
 const ACCOUNT_EDITOR_CONTROL_HEIGHT: f32 = 28.0;
+#[cfg(target_os = "macos")]
+const ACCOUNT_EDITOR_LABEL_ICON_GAP: f32 = 4.0;
 const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
 #[cfg(target_os = "macos")]
-const ACCOUNT_2FA_HELP: &str = "AutoLogin recognizes Microsoft Authenticator requests and enters the sign-in number on your unlocked iPhone over Wi-Fi. Complete Face ID if prompted.";
+const ACCOUNT_2FA_HELP: &str = "AutoLogin enters the Microsoft Authenticator number on your unlocked iPhone over Wi-Fi. Use Face ID if prompted.";
 const ACTION_ICON_SIZE: f32 = 16.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
 const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
@@ -3010,7 +3012,7 @@ fn account_editor_contents(
     account_editor_card(ui, "CONNECTION", |ui| {
         let account_count = app.config.accounts.len() + usize::from(!is_existing);
         account_editor_fields(ui, "account_connection_fields", |ui, width| {
-            show_device_target_field(ui, account, width);
+            show_device_target_field(ui, account, width, account_count);
             ui.end_row();
 
             let label = account_editor_field_label(ui, "Remote PC");
@@ -3018,9 +3020,6 @@ fn account_editor_contents(
             ui.end_row();
         });
         remote_pc_import::show_result(ui, account);
-        account_editor_field_note(ui, |ui| {
-            account_editor_help(ui, "Use Import to match this account to its desktop. Optional if you have only one account.");
-        });
         show_locked_vm_reconnect(
             ui,
             account,
@@ -3043,13 +3042,21 @@ fn account_editor_contents(
 
     #[cfg(target_os = "macos")]
     account_editor_card(ui, "2FA", |ui| {
-        crate::ui::toggle::labeled_switch(
+        account_editor_switch(
             ui,
             &mut account.iphone_authenticator_enabled,
+            true,
             "Use iPhone",
             "Use the iPhone selected in Settings for this account.",
+            |ui| {
+                account_info_button(
+                    ui,
+                    "Use iPhone",
+                    ACCOUNT_2FA_HELP,
+                    Some("Choose your iPhone in Settings → 2FA → Devices."),
+                )
+            },
         );
-        account_editor_help(ui, ACCOUNT_2FA_HELP);
     });
 
     let feedback_id = password_editor_id.with("validation");
@@ -3113,6 +3120,43 @@ fn account_editor_fields(
 }
 
 #[cfg(target_os = "macos")]
+fn account_info_button(ui: &mut egui::Ui, title: &str, body: &str, note: Option<&str>) {
+    let label = format!("About {title}");
+    let icon = theme::toolbar_icon(egui::include_image!("../../assets/icons/info.svg"))
+        .alt_text(&label)
+        .tint(theme::MUTED);
+    let response = ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+        ui.add_sized(
+            egui::vec2(24.0, ACCOUNT_EDITOR_CONTROL_HEIGHT),
+            egui::Button::new(icon).frame_when_inactive(false),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    })
+    .inner;
+    let popup = egui::Popup::from_toggle_button_response(&response)
+        .align(egui::emath::RectAlign::BOTTOM_START)
+        .gap(4.0)
+        .frame(
+            egui::Frame::popup(ui.style())
+                .inner_margin(10)
+                .corner_radius(8),
+        )
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let shown = popup.show(|ui| {
+        ui.set_width(266.0);
+        ui.label(egui::RichText::new(title).strong());
+        ui.add(egui::Label::new(body).wrap());
+        if let Some(note) = note {
+            account_editor_help(ui, note);
+        }
+    });
+    if shown.is_none() {
+        response.on_hover_text(label);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn account_editor_field_note(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .inner_margin(egui::Margin {
@@ -3120,6 +3164,32 @@ fn account_editor_field_note(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui:
             ..egui::Margin::ZERO
         })
         .show(ui, contents);
+}
+
+#[cfg(target_os = "macos")]
+fn account_editor_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    enabled: bool,
+    label: &str,
+    hint: &str,
+    after_label: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    use crate::ui::toggle;
+    // Align the painted track with the fields while keeping its full hit area.
+    let inset = (toggle::SWITCH_SIZE.x - toggle::SWITCH_TRACK_SIZE.x) * 0.5;
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            right: -(inset as i8),
+            ..egui::Margin::ZERO
+        })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = ACCOUNT_EDITOR_LABEL_ICON_GAP;
+            toggle::labeled_switch(
+                ui, value, enabled, label, hint, toggle::SWITCH_SIZE.y, after_label,
+            )
+        })
+        .inner
 }
 
 #[cfg(target_os = "macos")]
@@ -3140,61 +3210,68 @@ fn show_locked_vm_reconnect(
     if device_needs_setup(account) {
         return;
     }
-    let label = "Reconnect when locked";
-    let hint = "Reconnect the selected desktop when Windows App shows its lock screen.";
-    let changed = ui
-        .add_enabled_ui(supported || account.reconnect_locked_vm, |ui| {
-            crate::ui::toggle::labeled_switch(ui, &mut account.reconnect_locked_vm, label, hint)
-        })
-        .inner;
-    if !supported {
-        account_editor_help(ui, "Automatic reconnect requires macOS 14 or later.");
-        return;
-    }
-    if account.reconnect_locked_vm {
-        if account_count > 1 && account.remote_pc.trim().is_empty() {
-            account_editor_help(ui, "Select Import next to VM device so AutoLogin can match this account to the locked desktop.");
-        }
-        // Only an explicit opt-in can present the system permission dialog.
-        // While the editor is open, notice changes in System Settings without
-        // consulting the macOS permission service on every animation frame.
-        let permission_id = egui::Id::new("locked_vm_screen_recording_permission");
-        let cached = ui
-            .ctx()
-            .data(|data| data.get_temp::<(Instant, bool)>(permission_id));
-        let allowed = match cached {
-            Some((checked, allowed)) if !changed && checked.elapsed() < Duration::from_secs(2) => {
-                allowed
-            }
-            _ => {
-                let allowed = permission_allowed() || (changed && request_permission());
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(permission_id, (Instant::now(), allowed)));
-                allowed
-            }
-        };
-        if !allowed {
-            account_editor_help(ui, "Allow Screen Recording for Windows App AutoLogin.");
-            let open_failed = permission_id.with("open_settings_failed");
-            if theme::settings_button(ui, "Open System Settings…").clicked() {
-                let failed = !open_settings();
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(open_failed, failed));
-            }
-            if ui.ctx().data(|data| data.get_temp(open_failed)) == Some(true) {
-                account_editor_help(
-                    ui,
-                    "Open Privacy & Security → Screen & System Audio Recording in System Settings.",
-                );
-            }
-            ui.ctx().request_repaint_after(Duration::from_secs(2));
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let label = "Reconnect when locked";
+        let hint = "AutoLogin reconnects when you return to the locked desktop.";
+        let enabled = supported || account.reconnect_locked_vm;
+        let changed = account_editor_switch(
+            ui,
+            &mut account.reconnect_locked_vm,
+            enabled,
+            label,
+            hint,
+            |_| {},
+        );
+        if !supported {
+            account_editor_help(ui, "Automatic reconnect requires macOS 14 or later.");
             return;
         }
-    }
-    account_editor_help(
-        ui,
-        "Windows App reconnects when you return to the locked desktop.",
-    );
+        if account.reconnect_locked_vm {
+            if account_count > 1 && account.remote_pc.trim().is_empty() {
+                account_editor_help(
+                    ui,
+                    "Import the Remote PC address to identify this locked desktop.",
+                );
+            }
+            // Only an explicit opt-in can present the system permission dialog.
+            // While the editor is open, notice changes in System Settings without
+            // consulting the macOS permission service on every animation frame.
+            let permission_id = egui::Id::new("locked_vm_screen_recording_permission");
+            let cached = ui
+                .ctx()
+                .data(|data| data.get_temp::<(Instant, bool)>(permission_id));
+            let allowed = match cached {
+                Some((checked, allowed)) if !changed && checked.elapsed() < Duration::from_secs(2) => {
+                    allowed
+                }
+                _ => {
+                    let allowed = permission_allowed() || (changed && request_permission());
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(permission_id, (Instant::now(), allowed)));
+                    allowed
+                }
+            };
+            if !allowed {
+                account_editor_help(ui, "Allow Screen Recording for Windows App AutoLogin.");
+                let open_failed = permission_id.with("open_settings_failed");
+                if theme::settings_button(ui, "Open System Settings…").clicked() {
+                    let failed = !open_settings();
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(open_failed, failed));
+                }
+                if ui.ctx().data(|data| data.get_temp(open_failed)) == Some(true) {
+                    account_editor_help(
+                        ui,
+                        "Open Privacy & Security → Screen & System Audio Recording in System Settings.",
+                    );
+                }
+                ui.ctx().request_repaint_after(Duration::from_secs(2));
+                return;
+            }
+        }
+        account_editor_help(ui, hint);
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -3227,8 +3304,23 @@ fn remote_pc_display(ui: &mut egui::Ui, host: &str, width: f32) -> egui::Respons
 }
 
 #[cfg(target_os = "macos")]
-fn show_device_target_field(ui: &mut egui::Ui, account: &mut Account, field_width: f32) {
-    let label = account_editor_field_label(ui, "VM device");
+fn show_device_target_field(
+    ui: &mut egui::Ui,
+    account: &mut Account,
+    field_width: f32,
+    account_count: usize,
+) {
+    let label = account_editor_label_slot(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = ACCOUNT_EDITOR_LABEL_ICON_GAP;
+        let label = ui.label("VM device");
+        let note = if account_count <= 1 {
+            "With one account, importing the address is optional."
+        } else {
+            "With multiple accounts, import the address for each desktop you want to reconnect when locked."
+        };
+        account_info_button(ui, "VM device", "Enter and your shortcut open the selected desktop. Import reads its address from Windows App to match the session to this account.", Some(note));
+        label
+    });
     let response = show_device_picker(ui, account, field_width).labelled_by(label.id);
     let focus_request = egui::Id::new(("focus_vm_target", &account.id));
     if ui
@@ -3474,13 +3566,20 @@ fn show_device_group(
 }
 
 fn account_editor_field_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    account_editor_label_slot(ui, |ui| ui.label(text))
+}
+
+fn account_editor_label_slot(
+    ui: &mut egui::Ui,
+    content: impl FnOnce(&mut egui::Ui) -> egui::Response,
+) -> egui::Response {
     let slot_size = egui::vec2(ACCOUNT_EDITOR_LABEL_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT);
     ui.allocate_ui_with_layout(
         slot_size,
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.set_min_size(slot_size);
-            ui.label(text)
+            content(ui)
         },
     )
     .inner
@@ -5141,11 +5240,11 @@ mod tests {
         assert!(visible_text_rects(&granted, "Open System Settings…").is_empty());
         assert!(!visible_text_rects(
             &granted,
-            "Windows App reconnects when you return to the locked desktop."
+            "AutoLogin reconnects when you return to the locked desktop."
         )
         .is_empty());
         assert_eq!(requests.get(), 2);
-        let host_hint = "Select Import next to VM device so AutoLogin can match this account to the locked desktop.";
+        let host_hint = "Import the Remote PC address to identify this locked desktop.";
         assert!(visible_text_rects(&granted, host_hint).is_empty());
         account_count.set(2);
         assert!(!visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
@@ -8045,10 +8144,40 @@ mod tests {
             let import = field_for("Import");
             let remote_pc = field_for("https://invalid.example");
             let shortcut = field_for("Record Shortcut");
+            let info_for = |label: &str| {
+                let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+                let bounds = tree
+                    .nodes
+                    .iter()
+                    .find_map(|(_, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some(label))
+                        .then(|| node.bounds().unwrap())
+                    })
+                    .unwrap_or_else(|| panic!("missing information button {label}"));
+                egui::Rect::from_min_max(
+                    egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                    egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+                )
+            };
+            let vm_info = info_for("About VM device");
+            let iphone_info = info_for("About Use iPhone");
+            assert_eq!(vm_info.size(), egui::vec2(24.0, ACCOUNT_EDITOR_CONTROL_HEIGHT));
+            for (caption, info) in [
+                ("VM device", vm_info),
+                ("Use iPhone", iphone_info),
+            ] {
+                assert_eq!(info.size(), vm_info.size());
+                let text = visible_text_rects(&frame, caption)[0];
+                let gap = info.left() - text.right();
+                assert!((gap - 4.0).abs() <= 1.0, "{caption} gap is {gap}");
+                assert!((info.center().y - text.center().y).abs() <= 2.0);
+            }
             assert_eq!(remote_pc.x_range(), email.x_range());
             assert_eq!(remote_pc.top() - vm.bottom(), row_gap);
             assert_eq!(vm.left(), email.left());
             assert_eq!(import.left() - vm.right(), row_gap);
+            assert!(vm_info.right() < vm.left());
             assert_eq!(import.width(), 90.0);
             assert_eq!(import.right(), email.right());
             assert_eq!(vm.y_range(), import.y_range());
@@ -8074,6 +8203,33 @@ mod tests {
             )));
             assert_eq!(shortcut.x_range(), remote_pc.x_range());
 
+            let vm_help = "Enter and your shortcut open the selected desktop. Import reads its address from Windows App to match the session to this account.";
+            assert!(visible_text_rects(&frame, vm_help).is_empty());
+            for (saved_accounts, dismiss, guidance) in [
+                (
+                    vec![],
+                    escape(),
+                    "With one account, importing the address is optional.",
+                ),
+                (
+                    vec![Account::new("other@example.test")],
+                    click(heading),
+                    "With multiple accounts, import the address for each desktop you want to reconnect when locked.",
+                ),
+            ] {
+                app.config.accounts = saved_accounts;
+                assert!(!render(&mut app, click(vm_info.center())).1);
+                let (opened, _, _) = render(&mut app, vec![]);
+                assert_eq!(visible_text_rects(&opened, vm_help).len(), 1);
+                assert_eq!(visible_text_rects(&opened, guidance).len(), 1);
+                assert!(!egui::Popup::is_id_open(&ctx, picker_id.with("menu")));
+                assert_eq!(ctx.data(|d| d.count::<super::RemotePcLookup>()), 0);
+                assert!(!render(&mut app, dismiss).1);
+                let (closed, _, _) = render(&mut app, vec![]);
+                assert!(visible_text_rects(&closed, vm_help).is_empty());
+                assert!(visible_text_rects(&closed, guidance).is_empty());
+            }
+
             let switch_node = |output: &egui::FullOutput| {
                 let tree = output.platform_output.accesskit_update.as_ref().unwrap();
                 let (_, node) = tree
@@ -8095,8 +8251,37 @@ mod tests {
             let label = visible_text_rects(&frame, "Use iPhone")[0];
             assert!(label.right() < bounds.x0 as f32);
             assert!((label.center().y - pos.y).abs() < 2.0);
-            let help = visible_text_rects(&frame, super::ACCOUNT_2FA_HELP)[0];
-            assert!(bounds.y1 as f32 <= help.top() && help.bottom() < save.top());
+            let track = frame
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(r)
+                        if r.rect.contains(pos)
+                            && r.rect.size() == crate::ui::toggle::SWITCH_TRACK_SIZE =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .expect("2FA switch track");
+            assert_eq!(track.right(), remote_pc.right());
+            assert!(iphone_info.right() < bounds.x0 as f32);
+            assert!(visible_text_rects(&frame, super::ACCOUNT_2FA_HELP).is_empty());
+            assert!(!render(&mut app, click(iphone_info.center())).1);
+            let (opened, _, _) = render(&mut app, vec![]);
+            assert_eq!(
+                visible_text_rects(&opened, "Choose your iPhone in Settings → 2FA → Devices.")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                visible_text_rects(&opened, super::ACCOUNT_2FA_HELP).len(),
+                1
+            );
+            assert_eq!(switch_node(&opened).1, egui::accesskit::Toggled::False);
+            assert!(!render(&mut app, escape()).1);
+            let (closed, _, _) = render(&mut app, vec![]);
+            assert!(visible_text_rects(&closed, super::ACCOUNT_2FA_HELP).is_empty());
             for expected in [
                 egui::accesskit::Toggled::True,
                 egui::accesskit::Toggled::False,

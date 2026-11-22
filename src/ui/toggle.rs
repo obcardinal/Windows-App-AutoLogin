@@ -46,9 +46,17 @@ pub fn switch(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Respo
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-pub(super) fn labeled_switch(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) -> bool {
+pub(super) fn labeled_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    enabled: bool,
+    label: &str,
+    hint: &str,
+    height: f32,
+    after_label: impl FnOnce(&mut egui::Ui),
+) -> bool {
     let (_, switch_response) = egui::containers::Sides::new()
-        .height(36.0)
+        .height(height)
         .shrink_left()
         .wrap()
         .show(
@@ -57,9 +65,15 @@ pub(super) fn labeled_switch(ui: &mut egui::Ui, value: &mut bool, label: &str, h
                 ui.add(
                     egui::Label::new(egui::RichText::new(label).color(theme::TEXT))
                         .selectable(false),
-                )
+                );
+                after_label(ui);
             },
-            |ui| switch(ui, value, label).on_hover_text(hint),
+            |ui| {
+                if !enabled {
+                    ui.disable();
+                }
+                switch(ui, value, label).on_hover_text(hint)
+            },
         );
     switch_response.changed()
 }
@@ -128,7 +142,7 @@ mod tests {
                 };
                 let output = ctx.run_ui(input, |ui| {
                     ui.add_enabled_ui(enabled, |ui| {
-                        labeled_switch(ui, &mut checked, "Open at Login", "");
+                        labeled_switch(ui, &mut checked, true, "Open at Login", "", 36.0, |_| {});
                     });
                 });
                 output

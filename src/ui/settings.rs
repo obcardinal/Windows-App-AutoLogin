@@ -307,7 +307,9 @@ fn preference_switch(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &st
             right: SETTINGS_CARD_PADDING - hit_padding,
             ..egui::Margin::symmetric(SETTINGS_CARD_PADDING, 0)
         })
-        .show(ui, |ui| toggle::labeled_switch(ui, value, label, hint))
+        .show(ui, |ui| {
+            toggle::labeled_switch(ui, value, true, label, hint, 36.0, |_| {})
+        })
         .inner
 }
 
