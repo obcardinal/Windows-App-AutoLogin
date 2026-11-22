@@ -361,15 +361,19 @@ fn run_full_ui(initial_tab: models::Tab) -> anyhow::Result<()> {
     let (tray_tx, tray_rx) = std_channel::<tray::TrayCommand>();
 
     // Seed the native window before its first layout. The UI then measures the
-    // actual heading, card, status messages, and platform fonts on each frame.
-    let initial_height = if initial_tab == models::Tab::Accounts {
-        let card_bottom = match config.accounts.len() {
-            0 => 258.0,
-            count => 154.0 + ui::accounts::visible_account_rows_height(count),
-        };
-        card_bottom + ui::theme::tab_content_frame().total_margin().bottom
-    } else {
-        app::FULL_WINDOW_HEIGHT
+    // actual controls, cards, status messages, and platform fonts on each frame.
+    let initial_height = match initial_tab {
+        models::Tab::Accounts => {
+            let card_height = match config.accounts.len() {
+                0 => 167.0,
+                count => 43.0 + ui::accounts::visible_account_rows_height(count),
+            };
+            (52.0 + ui::theme::tab_content_frame().total_margin().sum().y + card_height)
+                .max(app::MIN_WINDOW_HEIGHT)
+        }
+        models::Tab::Settings => 344.0,
+        #[cfg(feature = "diagnostics-ui")]
+        models::Tab::Diagnose => app::FULL_WINDOW_HEIGHT,
     };
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([app::MAIN_WINDOW_WIDTH, initial_height])

@@ -24,7 +24,9 @@ use zeroize::Zeroizing;
 const MAX_LOG_ENTRIES: usize = 200;
 pub(crate) const MAIN_WINDOW_WIDTH: f32 = 586.0;
 pub(crate) const FULL_WINDOW_HEIGHT: f32 = 500.0;
-pub(crate) const MIN_WINDOW_HEIGHT: f32 = 200.0;
+// Leave room for the toolbar and navigation on compact tabs.
+// A single account or preference card can fit in less than 200 points.
+pub(crate) const MIN_WINDOW_HEIGHT: f32 = 128.0;
 #[cfg(not(target_os = "macos"))]
 const TAB_RESIZE_SECONDS: f64 = 0.18;
 const ACCESSIBILITY_REQUEST_BUTTON_SIZE: [f32; 2] = [278.0, 34.0];
