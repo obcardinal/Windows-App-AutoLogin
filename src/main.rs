@@ -49,6 +49,8 @@ pub(crate) mod macos_panel;
 #[cfg(target_os = "macos")]
 mod macos_reopen;
 #[cfg(target_os = "macos")]
+mod macos_shortcuts;
+#[cfg(target_os = "macos")]
 mod macos_updates;
 pub(crate) mod models;
 pub(crate) mod monitor;
