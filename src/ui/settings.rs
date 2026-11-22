@@ -147,6 +147,41 @@ enum SettingsSaveCompletion {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+enum SettingsSection {
+    #[default]
+    System,
+    #[cfg(target_os = "macos")]
+    WindowsApp,
+    Security,
+    #[cfg(target_os = "macos")]
+    TwoFactor,
+}
+
+impl SettingsSection {
+    const TABS: &'static [(Self, &'static str)] = &[
+        (Self::System, "System"),
+        #[cfg(target_os = "macos")]
+        (Self::WindowsApp, "Windows App"),
+        (Self::Security, "Security"),
+        #[cfg(target_os = "macos")]
+        (Self::TwoFactor, "2FA"),
+    ];
+}
+
+fn section_picker(ui: &mut egui::Ui) -> SettingsSection {
+    let id = egui::Id::new("selected_settings_section");
+    let current = ui
+        .data(|data| data.get_temp::<SettingsSection>(id))
+        .unwrap_or_default();
+    let selected = theme::section_switcher(ui, SettingsSection::TABS, current);
+    if selected != current {
+        ui.data_mut(|data| data.insert_temp(id, selected));
+        ui.ctx().request_discard("settings section changed");
+    }
+    selected
+}
+
 pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
     let content_top = ui.cursor().top();
     #[cfg(target_os = "macos")]
@@ -154,107 +189,109 @@ pub fn show(ui: &mut egui::Ui, app: &mut AutoLoginApp) -> f32 {
         app.telegram_settings.leave();
         return height;
     }
-    let settings_before_input = app.settings_draft.clone();
-    let mut settings_changed = false;
-    let disabled_reason = settings_disabled_reason(app);
-    theme::tab_heading(ui, "Settings", |_| {});
 
-    let sections = egui::ScrollArea::vertical()
-        .id_salt("settings_scroll")
+    let selected = section_picker(ui);
+    ui.add_space(4.0);
+    #[cfg(target_os = "macos")]
+    if selected != SettingsSection::TwoFactor {
+        app.telegram_settings.leave();
+    }
+    let section_body = egui::ScrollArea::vertical()
+        .id_salt(("settings_scroll", selected))
         .auto_shrink([false, true])
-        .show(ui, |ui| {
-            if let Some(reason) = disabled_reason.as_deref() {
-                ui.label(egui::RichText::new(reason).small().color(theme::MUTED));
-            }
-            let controls = ui.add_enabled_ui(disabled_reason.is_none(), |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                section(ui, "SYSTEM", |ui| {
-                    settings_changed |= labeled_switch(
-                        ui,
-                        &mut app.settings_draft.auto_start,
-                        "Open at Login",
-                        "Start Windows App AutoLogin when you sign in.",
-                    );
-                    row_divider(ui);
-                    settings_changed |= labeled_switch(
-                        ui,
-                        &mut app.settings_draft.start_minimized,
-                        "Hide main window at launch",
-                        "Start in the background when you open the app.",
-                    );
-                    #[cfg(any(target_os = "macos", target_os = "windows"))]
-                    {
-                        row_divider(ui);
-                        let label = if cfg!(target_os = "windows") {
-                            "Hide system tray icon"
-                        } else {
-                            "Hide menu bar icon"
-                        };
-                        let restore_hint = "To restore the icon, reopen the app and turn this off.";
-                        settings_changed |= labeled_switch(
-                            ui,
-                            &mut app.settings_draft.hide_menu_bar_icon,
-                            label,
-                            restore_hint,
-                        );
-                        preference_hint(ui, restore_hint);
-                    }
-                    row_divider(ui);
-                    settings_changed |= labeled_switch(
-                        ui,
-                        &mut app.settings_draft.show_menu_diagnostics,
-                        "Show diagnostic info in menu",
-                        "Include password storage status and the last fill result in the menu.",
-                    );
-                });
-
-                #[cfg(target_os = "macos")]
-                {
-                    ui.add_space(12.0);
-                    section(ui, "WINDOWS APP", |ui| {
-                        let hint = "Your remote desktop stays open.";
-                        settings_changed |= labeled_switch(
-                            ui,
-                            &mut app.settings_draft.close_connection_center_after_connect,
-                            "Close device list after connecting",
-                            hint,
-                        );
-                        preference_hint(ui, hint);
-                    });
-                }
-
-                ui.add_space(12.0);
-                section(ui, "SECURITY", |ui| {
-                    let storage_hint = "When off, passwords use an encrypted local file. Its key stays in the system credential store.";
-                    settings_changed |= labeled_switch(
-                        ui,
-                        &mut app.settings_draft.use_keyring,
-                        "Use system secure storage",
-                        storage_hint,
-                    );
-                    preference_hint(ui, storage_hint);
-                });
-            });
-            if let Some(reason) = disabled_reason.as_deref() {
-                controls.response.on_disabled_hover_text(reason);
-            }
-
+        .show(ui, |ui| match selected {
+            SettingsSection::System => preference_card(ui, app, system_preferences),
             #[cfg(target_os = "macos")]
-            {
+            SettingsSection::WindowsApp => preference_card(ui, app, |ui, settings| {
+                let hint = "Your remote desktop stays open.";
+                let changed = labeled_switch(
+                    ui,
+                    &mut settings.close_connection_center_after_connect,
+                    "Close device list after connecting",
+                    hint,
+                );
+                preference_hint(ui, hint);
+                changed
+            }),
+            SettingsSection::Security => preference_card(ui, app, |ui, settings| {
+                let hint = "When off, passwords use an encrypted local file. Its key stays in the system credential store.";
+                let changed = labeled_switch(
+                    ui,
+                    &mut settings.use_keyring,
+                    "Use system secure storage",
+                    hint,
+                );
+                preference_hint(ui, hint);
+                changed
+            }),
+            #[cfg(target_os = "macos")]
+            SettingsSection::TwoFactor => {
+                section(ui, "DEVICES", crate::ui::iphone_sign_in::summary);
                 ui.add_space(12.0);
-                section(ui, "IPHONE AUTHENTICATION", crate::ui::iphone_sign_in::summary);
-                ui.add_space(12.0);
-                section(ui, "2FA NOTIFICATIONS", |ui| {
+                section(ui, "NOTIFICATIONS", |ui| {
                     let closing = app.window_closing_mutations_disabled_reason().is_some();
                     ui.add_enabled_ui(!closing, |ui| app.telegram_settings.show(ui));
                 });
             }
         });
+    section_body.inner_rect.top() - content_top + section_body.content_size.y
+}
 
-    if settings_changed {
-        queue_or_start_background_save(app, ui.ctx(), &settings_before_input);
+fn preference_card(
+    ui: &mut egui::Ui,
+    app: &mut AutoLoginApp,
+    contents: impl FnOnce(&mut egui::Ui, &mut AppSettings) -> bool,
+) {
+    let reason = settings_disabled_reason(app);
+    if let Some(reason) = reason.as_deref() {
+        ui.label(egui::RichText::new(reason).small().color(theme::MUTED));
     }
-    sections.inner_rect.top() - content_top + sections.content_size.y
+    let before = app.settings_draft.clone();
+    let response = ui.add_enabled_ui(reason.is_none(), |ui| {
+        settings_card(ui, |ui| contents(ui, &mut app.settings_draft))
+    });
+    if let Some(reason) = reason {
+        response.response.on_disabled_hover_text(reason);
+    }
+    if response.inner {
+        queue_or_start_background_save(app, ui.ctx(), &before);
+    }
+}
+
+fn system_preferences(ui: &mut egui::Ui, settings: &mut AppSettings) -> bool {
+    let mut changed = labeled_switch(
+        ui,
+        &mut settings.auto_start,
+        "Open at Login",
+        "Start Windows App AutoLogin when you sign in.",
+    );
+    row_divider(ui);
+    changed |= labeled_switch(
+        ui,
+        &mut settings.start_minimized,
+        "Hide main window at launch",
+        "Start in the background when you open the app.",
+    );
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        row_divider(ui);
+        let label = if cfg!(target_os = "windows") {
+            "Hide system tray icon"
+        } else {
+            "Hide menu bar icon"
+        };
+        let hint = "To restore the icon, reopen the app and turn this off.";
+        changed |= labeled_switch(ui, &mut settings.hide_menu_bar_icon, label, hint);
+        preference_hint(ui, hint);
+    }
+    row_divider(ui);
+    changed |= labeled_switch(
+        ui,
+        &mut settings.show_menu_diagnostics,
+        "Show diagnostic info in menu",
+        "Include password storage status and the last fill result in the menu.",
+    );
+    changed
 }
 
 fn preference_hint(ui: &mut egui::Ui, hint: &str) {
@@ -1015,8 +1052,16 @@ fn storage_cleanup_warning(from_use_keyring: bool, to_use_keyring: bool) -> Stri
     )
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     ui.label(theme::section_label(title));
+    settings_card(ui, add_contents);
+}
+
+fn settings_card<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     theme::compact_frame()
         .inner_margin(egui::Margin::symmetric(20, 12))
         .show(ui, |ui| {
@@ -1024,8 +1069,9 @@ pub(super) fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.visuals_mut().widgets.noninteractive.bg_stroke.color =
                 theme::STROKE.gamma_multiply(0.70);
-            add_contents(ui);
-        });
+            add_contents(ui)
+        })
+        .inner
 }
 
 #[cfg(test)]
@@ -1048,6 +1094,67 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc::channel as tokio_channel;
+
+    #[test]
+    fn settings_navigation_switches_visible_preferences_without_saving() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let mut app = settings_test_app(false);
+        let mut render = |events| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(crate::app::MAIN_WINDOW_WIDTH, 480.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    super::show(ui, &mut app);
+                },
+            );
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_owned(),
+                        text.visual_bounding_rect().center(),
+                    )),
+                    _ => None,
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let system = render(vec![]);
+        assert!(system.contains_key("Open at Login"));
+        assert!(!system.contains_key("Use system secure storage"));
+        let tabs = super::SettingsSection::TABS;
+        for pair in tabs.windows(2) {
+            let left = system[pair[0].1];
+            let right = system[pair[1].1];
+            assert!(
+                left.x < right.x && (left.y - right.y).abs() < 3.0,
+                "unexpected tab centers {left:?}, {right:?}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(tabs.last().unwrap().1, "2FA");
+        let pos = system["Security"];
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(vec![egui::Event::PointerMoved(pos), button(true)]);
+        render(vec![button(false)]);
+        let security = render(vec![]);
+        assert!(security.contains_key("Use system secure storage"));
+        assert!(!security.contains_key("Open at Login"));
+        assert!(app.pending_settings_save.is_none());
+        assert_eq!(app.settings_draft, app.config.settings);
+    }
 
     #[test]
     fn only_the_enabled_switch_changes_a_preference() {

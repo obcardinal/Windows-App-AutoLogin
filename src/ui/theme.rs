@@ -120,6 +120,63 @@ pub fn apply_toolbar_style(ui: &mut egui::Ui) {
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
 }
 
+pub(super) fn section_switcher<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    tabs: &[(T, &str)],
+    selected: T,
+) -> T {
+    const HEIGHT: f32 = 34.0;
+    const INSET: f32 = 3.0;
+    const GAP: f32 = 2.0;
+
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widths: Vec<f32> = tabs
+        .iter()
+        .map(|(_, label)| {
+            ui.painter()
+                .layout_no_wrap((*label).into(), font.clone(), MUTED)
+                .size()
+                .x
+                .ceil()
+                + 24.0
+        })
+        .collect();
+    let total: f32 = widths.iter().sum();
+    let spacing = 2.0 * INSET + GAP * tabs.len().saturating_sub(1) as f32;
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEIGHT),
+        egui::Sense::hover(),
+    );
+    let width = row.width().min(total + spacing);
+    let rail = egui::Rect::from_center_size(row.center(), egui::vec2(width, HEIGHT));
+    let radius = (HEIGHT * 0.5) as u8;
+    ui.painter().rect_filled(rail, radius, TAB_RAIL);
+
+    let mut controls = ui.new_child(egui::UiBuilder::new().max_rect(rail));
+    apply_toolbar_style(&mut controls);
+    controls.spacing_mut().button_padding = egui::Vec2::ZERO;
+    let scale = ((width - spacing) / total).clamp(0.0, 1.0);
+    let mut next = selected;
+    let mut left = rail.left() + INSET;
+    for (&(value, label), natural_width) in tabs.iter().zip(widths) {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, rail.top() + INSET),
+            egui::vec2(natural_width * scale, HEIGHT - 2.0 * INSET),
+        );
+        let label = egui::RichText::new(label).text_style(egui::TextStyle::Button);
+        let button = egui::Button::selectable(value == selected, label).truncate();
+        if controls
+            .place(rect, button.corner_radius(radius - INSET as u8))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            next = value;
+        }
+        left = rect.right() + GAP;
+    }
+    next
+}
+
 #[cfg(target_os = "macos")]
 pub fn picker_popup_style(style: &mut egui::Style) {
     let widgets = &mut style.visuals.widgets;
@@ -388,6 +445,63 @@ pub fn message_color(msg: &str) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_switcher_centers_capsules_and_keeps_all_labels_visible() {
+        let tabs = [
+            (0, "System"),
+            (1, "Windows App"),
+            (2, "Security"),
+            (3, "2FA"),
+        ];
+        for width in [280.0, crate::app::MAIN_WINDOW_WIDTH] {
+            let ctx = egui::Context::default();
+            apply(&ctx);
+            let render = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 80.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        section_switcher(ui, &tabs, 0);
+                    },
+                )
+            };
+            let capsule = |frame: &egui::FullOutput, fill| {
+                frame
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(r) if r.fill == fill => {
+                            assert!(f32::from(r.corner_radius.nw) >= r.rect.height() * 0.5);
+                            Some(r.rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("visible capsule")
+            };
+            let idle = render(vec![]);
+            let rail = capsule(&idle, TAB_RAIL);
+            assert!((rail.center().x - width * 0.5).abs() <= 0.5);
+            let selected = capsule(&idle, egui::Color32::WHITE);
+            assert_eq!(rail.top() + 3.0, selected.top());
+            let mut labels = idle.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            });
+            for (_, label) in tabs {
+                let text = labels.next().unwrap();
+                assert_eq!(text.galley.text(), label);
+                assert!(!text.galley.elided);
+                assert!(rail.contains_rect(text.visual_bounding_rect()));
+            }
+        }
+    }
 
     #[test]
     fn action_buttons_change_fill_and_preserve_sizing_and_keyboard_activation() {
