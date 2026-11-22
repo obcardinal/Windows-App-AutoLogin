@@ -242,9 +242,8 @@ pub fn status_text(text: impl Into<String>) -> egui::RichText {
 }
 
 enum ButtonKind {
-    Primary,
+    Filled(egui::Color32),
     Secondary,
-    Danger,
 }
 
 pub struct ActionButton {
@@ -269,12 +268,12 @@ impl ActionButton {
 impl egui::Widget for ActionButton {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         let (idle, hover, active, outline, active_outline) = match self.kind {
-            ButtonKind::Primary => (
-                ACCENT,
-                ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.12),
-                ACCENT.lerp_to_gamma(egui::Color32::BLACK, 0.24),
-                ACCENT,
-                ACCENT,
+            ButtonKind::Filled(color) => (
+                color,
+                color.lerp_to_gamma(egui::Color32::BLACK, 0.12),
+                color.lerp_to_gamma(egui::Color32::BLACK, 0.24),
+                color,
+                color,
             ),
             ButtonKind::Secondary => (
                 egui::Color32::WHITE,
@@ -282,13 +281,6 @@ impl egui::Widget for ActionButton {
                 ACCENT_SOFT,
                 STROKE,
                 ACCENT,
-            ),
-            ButtonKind::Danger => (
-                DANGER_SOFT,
-                DANGER_SOFT.lerp_to_gamma(DANGER, 0.12),
-                DANGER_SOFT.lerp_to_gamma(DANGER, 0.24),
-                egui::Color32::from_rgb(235, 177, 177),
-                DANGER,
             ),
         };
         ui.scope(|ui| {
@@ -310,13 +302,21 @@ impl egui::Widget for ActionButton {
     }
 }
 
-pub fn primary_button(text: impl Into<String>) -> ActionButton {
+fn filled_button(text: impl Into<String>, color: egui::Color32) -> ActionButton {
     let button = egui::Button::new(
         egui::RichText::new(text.into())
             .text_style(egui::TextStyle::Button)
             .color(egui::Color32::WHITE),
     );
-    ActionButton::new(button, ButtonKind::Primary)
+    ActionButton::new(button, ButtonKind::Filled(color))
+}
+
+pub fn primary_button(text: impl Into<String>) -> ActionButton {
+    filled_button(text, ACCENT)
+}
+
+pub fn danger_button(text: impl Into<String>) -> ActionButton {
+    filled_button(text, DANGER)
 }
 
 #[cfg(target_os = "macos")]
@@ -374,13 +374,6 @@ pub fn monitor_button(state: MonitorControlState) -> impl egui::Widget {
         });
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
-}
-
-pub fn danger_button(text: impl Into<String>) -> ActionButton {
-    ActionButton::new(
-        egui::Button::new(egui::RichText::new(text.into()).color(DANGER)),
-        ButtonKind::Danger,
-    )
 }
 
 pub fn message_color(msg: &str) -> egui::Color32 {
