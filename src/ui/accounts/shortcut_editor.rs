@@ -1,5 +1,5 @@
 use super::{
-    account_editor_help, theme, ACCOUNT_EDITOR_CONTROL_HEIGHT, ACCOUNT_EDITOR_LABEL_WIDTH,
+    account_editor_field_label, account_editor_help, theme, ACCOUNT_EDITOR_CONTROL_HEIGHT,
 };
 use crate::models::{Account, DesktopShortcut};
 use block2::RcBlock;
@@ -203,15 +203,7 @@ pub(super) fn poll(ctx: &egui::Context, draft: &mut Account, accounts: &[Account
 }
 
 pub(super) fn field(ui: &mut egui::Ui, account: &mut Account, field_width: f32) {
-    let label = ui.add_sized(
-        [ACCOUNT_EDITOR_LABEL_WIDTH, ACCOUNT_EDITOR_CONTROL_HEIGHT],
-        egui::Label::new(
-            egui::RichText::new("Open desktop")
-                .size(12.0)
-                .line_height(Some(14.0)),
-        )
-        .halign(egui::Align::Min),
-    );
+    let label = account_editor_field_label(ui, "Open desktop");
     let active = recording();
     ui.horizontal(|ui| {
         let button_text = if active {
@@ -233,7 +225,7 @@ pub(super) fn field(ui: &mut egui::Ui, account: &mut Account, field_width: f32) 
                 theme::secondary_button(button_text),
             )
             .labelled_by(label.id)
-            .on_hover_text("Record a global keyboard shortcut to open this VM in Windows App.");
+            .on_hover_text("This shortcut opens the VM device you choose for this account.");
         if button.clicked() {
             close(ui.ctx());
             if !active {
@@ -259,6 +251,10 @@ pub(super) fn field(ui: &mut egui::Ui, account: &mut Account, field_width: f32) 
             close(ui.ctx());
         }
     });
+}
+
+pub(super) fn has_feedback(ctx: &egui::Context) -> bool {
+    recording() || ctx.data(|data| data.get_temp::<String>(state_id()).is_some())
 }
 
 pub(super) fn feedback(ui: &mut egui::Ui) {

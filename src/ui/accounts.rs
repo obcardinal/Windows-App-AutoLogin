@@ -59,9 +59,9 @@ const ACCOUNT_ROW_HEIGHT: f32 = ACCOUNT_TILE_SIZE + 2.0 * ACCOUNT_ROW_PADDING as
 const ACCOUNT_ROW_DIVIDER_HEIGHT: f32 = 1.0;
 const MAX_VISIBLE_ACCOUNT_ROWS: usize = 5;
 const ACCOUNT_EDITOR_WIDTH: f32 = 480.0;
-const ACCOUNT_EDITOR_MARGIN: i8 = 18;
-const ACCOUNT_EDITOR_LABEL_WIDTH: f32 = 82.0;
-const ACCOUNT_EDITOR_COLUMN_GAP: f32 = 12.0;
+const ACCOUNT_EDITOR_MARGIN: i8 = theme::WINDOW_MARGIN;
+const ACCOUNT_EDITOR_LABEL_WIDTH: f32 = 100.0;
+const ACCOUNT_EDITOR_SPACING: i8 = 8;
 #[cfg(test)]
 const ACCOUNT_EDITOR_FIELD_WIDTH: f32 = 332.0;
 const ACCOUNT_EDITOR_CONTROL_HEIGHT: f32 = 28.0;
@@ -2957,108 +2957,88 @@ fn account_editor_contents(
     }
 
     let password_editor_id = password_editor_id(&account.id);
+    ui.spacing_mut().item_spacing = egui::Vec2::splat(f32::from(ACCOUNT_EDITOR_SPACING));
     account_editor_card(ui, "SIGN-IN", |ui| {
-        let field_width =
-            ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - ACCOUNT_EDITOR_COLUMN_GAP;
-        account_editor_input_scope(ui, |ui| {
-            egui::Grid::new("account_sign_in_fields")
-                .num_columns(2)
-                .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
-                .show(ui, |ui| {
-                    let label = account_editor_field_label(ui, "Email");
-                    ui.add_sized(
-                        [field_width, ACCOUNT_EDITOR_CONTROL_HEIGHT],
-                        egui::TextEdit::singleline(&mut account.username)
-                            .margin(egui::Margin::symmetric(
-                                ui.spacing().button_padding.x as i8,
-                                2,
-                            ))
-                            .vertical_align(egui::Align::Center)
-                            .hint_text("user@domain.com"),
-                    )
-                    .labelled_by(label.id);
-                    ui.end_row();
+        account_editor_fields(ui, "account_sign_in_fields", |ui, field_width| {
+            let label = account_editor_field_label(ui, "Email");
+            ui.add_sized(
+                [field_width, ACCOUNT_EDITOR_CONTROL_HEIGHT],
+                egui::TextEdit::singleline(&mut account.username)
+                    .margin(egui::Margin::symmetric(
+                        ui.spacing().button_padding.x as i8,
+                        2,
+                    ))
+                    .vertical_align(egui::Align::Center)
+                    .hint_text("user@domain.com"),
+            )
+            .labelled_by(label.id);
+            ui.end_row();
 
-                    let label = account_editor_field_label(ui, "Password");
-                    let mut password_response = secure_password_editor(
-                        ui,
-                        &mut app.temp_password,
-                        password_editor_id,
-                        if is_existing {
-                            "Leave blank to keep saved password"
-                        } else {
-                            "Password"
-                        },
-                        app.show_password,
-                        field_width,
-                    );
-                    password_response.field = password_response.field.labelled_by(label.id);
-                    let tooltip = if app.show_password {
-                        "Hide password"
-                    } else {
-                        "Show password"
-                    };
-                    if password_response
-                        .visibility
-                        .on_hover_text(tooltip)
-                        .clicked()
-                    {
-                        app.show_password = !app.show_password;
-                        password_response.field.request_focus();
-                        ui.ctx().request_repaint();
-                    }
-                    ui.end_row();
-                });
+            let label = account_editor_field_label(ui, "Password");
+            let mut password_response = secure_password_editor(
+                ui,
+                &mut app.temp_password,
+                password_editor_id,
+                if is_existing {
+                    "Leave blank to keep saved password"
+                } else {
+                    "Password"
+                },
+                app.show_password,
+                field_width,
+            );
+            password_response.field = password_response.field.labelled_by(label.id);
+            let tooltip = if app.show_password {
+                "Hide password"
+            } else {
+                "Show password"
+            };
+            if password_response
+                .visibility
+                .on_hover_text(tooltip)
+                .clicked()
+            {
+                app.show_password = !app.show_password;
+                password_response.field.request_focus();
+                ui.ctx().request_repaint();
+            }
+            ui.end_row();
         });
     });
 
     #[cfg(target_os = "macos")]
     account_editor_card(ui, "CONNECTION", |ui| {
-        let field_width =
-            ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - ACCOUNT_EDITOR_COLUMN_GAP;
-        account_editor_input_scope(ui, |ui| {
-            egui::Grid::new("account_connection_fields")
-                .num_columns(2)
-                .spacing([ACCOUNT_EDITOR_COLUMN_GAP, 6.0])
-                .show(ui, |ui| {
-                    show_device_target_field(ui, account, field_width);
-                    ui.end_row();
-                    let label = account_editor_field_label(ui, "Remote PC");
-                    remote_pc_display(ui, &account.remote_pc, field_width).labelled_by(label.id);
-                    ui.end_row();
-                    shortcut_editor::field(ui, account, field_width);
-                    ui.end_row();
-                });
+        let account_count = app.config.accounts.len() + usize::from(!is_existing);
+        account_editor_fields(ui, "account_connection_fields", |ui, width| {
+            show_device_target_field(ui, account, width);
+            ui.end_row();
+
+            let label = account_editor_field_label(ui, "Remote PC");
+            remote_pc_display(ui, &account.remote_pc, width).labelled_by(label.id);
+            ui.end_row();
         });
-        shortcut_editor::feedback(ui);
         remote_pc_import::show_result(ui, account);
-        account_editor_help(ui, "Use Import to match this account to its desktop. Optional if you have only one account.");
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("With a linked VM, AutoLogin can:")
-                .text_style(egui::TextStyle::Button)
-                .size(12.5)
-                .color(theme::TEXT),
-        );
-        for message in [
-            "Match the active remote desktop session to this account.",
-            "Open the VM when you click the Open desktop arrow in Accounts.",
-        ] {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(egui::RichText::new("•").small().color(theme::MUTED));
-                account_editor_help(ui, message);
-            });
-        }
+        account_editor_field_note(ui, |ui| {
+            account_editor_help(ui, "Use Import to match this account to its desktop. Optional if you have only one account.");
+        });
         show_locked_vm_reconnect(
             ui,
             account,
-            app.config.accounts.len() + usize::from(!is_existing),
+            account_count,
             crate::macos_lock_screen::supported(),
             crate::macos_lock_screen::screen_recording_allowed,
             crate::macos_lock_screen::request_screen_recording_on_opt_in,
             crate::macos_lock_screen::open_screen_recording_settings,
         );
+
+        ui.add(egui::Separator::default().spacing(1.0));
+        account_editor_fields(ui, "account_shortcut_field", |ui, width| {
+            shortcut_editor::field(ui, account, width);
+            ui.end_row();
+        });
+        if shortcut_editor::has_feedback(ui.ctx()) {
+            account_editor_field_note(ui, shortcut_editor::feedback);
+        }
     });
 
     #[cfg(target_os = "macos")]
@@ -3076,7 +3056,6 @@ fn account_editor_contents(
     if let Some(message) = ui.ctx().data(|data| data.get_temp::<String>(feedback_id)) {
         ui.add(egui::Label::new(egui::RichText::new(message).color(theme::DANGER)).wrap());
     }
-    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let ready = app.account_transaction_ready();
@@ -3109,11 +3088,38 @@ fn account_editor_contents(
 }
 
 fn account_editor_card(ui: &mut egui::Ui, section: &str, contents: impl FnOnce(&mut egui::Ui)) {
-    theme::compact_frame().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.label(theme::section_label(section));
-        contents(ui);
+    theme::compact_frame()
+        .inner_margin(ACCOUNT_EDITOR_SPACING)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(theme::section_label(section));
+            contents(ui);
+        });
+}
+
+fn account_editor_fields(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    rows: impl FnOnce(&mut egui::Ui, f32),
+) {
+    let spacing = ui.spacing().item_spacing;
+    let width = ui.available_width() - ACCOUNT_EDITOR_LABEL_WIDTH - spacing.x;
+    account_editor_input_scope(ui, |ui| {
+        egui::Grid::new(id)
+            .num_columns(2)
+            .spacing(spacing)
+            .show(ui, |ui| rows(ui, width));
     });
+}
+
+#[cfg(target_os = "macos")]
+fn account_editor_field_note(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: (ACCOUNT_EDITOR_LABEL_WIDTH + ui.spacing().item_spacing.x) as i8,
+            ..egui::Margin::ZERO
+        })
+        .show(ui, contents);
 }
 
 #[cfg(target_os = "macos")]
@@ -3134,7 +3140,6 @@ fn show_locked_vm_reconnect(
     if device_needs_setup(account) {
         return;
     }
-    ui.separator();
     let label = "Reconnect when locked";
     let hint = "Reconnect the selected desktop when Windows App shows its lock screen.";
     let changed = ui
@@ -5197,6 +5202,7 @@ mod tests {
             ctx.data_mut(|data| {
                 data.insert_temp(egui::Id::new(("windows_app_devices", &account.id)), task)
             });
+            let picker_bounds = Cell::new(egui::Rect::NOTHING);
             let render = |events, draft: &mut Account| {
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -5207,7 +5213,7 @@ mod tests {
                     ..Default::default()
                 };
                 ctx.run_ui(input, |ui| {
-                    super::show_device_picker(ui, draft, 332.0);
+                    picker_bounds.set(super::show_device_picker(ui, draft, 332.0).rect);
                 })
             };
             render(vec![], &mut draft);
@@ -5231,7 +5237,7 @@ mod tests {
             assert_eq!(message.galley.job.halign, egui::Align::Min);
             assert!(!message.galley.job.justify, "wrapped notices stretch words");
             let row = visible_text_rects(&menu, "Selected desktop")[0];
-            let right_edge = visible_text_rects(&editor, "Import")[0].right();
+            let right_edge = picker_bounds.get().right() - 16.0;
             assert!(right_edge > row.right());
             let hit = egui::pos2(right_edge, row.center().y);
             render(vec![egui::Event::PointerMoved(hit)], &mut draft);
@@ -7291,9 +7297,32 @@ mod tests {
             );
             assert!(visible_text_rects(&root, "Save").is_empty());
             render(&mut app);
+            {
+                let child = child_frame.borrow();
+                let section = visible_text_rects(&child, "SIGN-IN")[0];
+                let card = child
+                    .shapes
+                    .iter()
+                    .find_map(|item| match &item.shape {
+                        egui::Shape::Rect(card)
+                            if card.fill == egui::Color32::WHITE
+                                && card.rect.contains_rect(section) =>
+                        {
+                            Some(card.rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("sign-in card");
+                let margin = crate::ui::theme::tab_content_frame().total_margin();
+                assert_eq!(card.min, egui::pos2(margin.left, margin.top));
+                assert_eq!(card.right(), super::ACCOUNT_EDITOR_WIDTH - margin.right);
+            }
             #[cfg(target_os = "macos")]
             {
                 let rect = visible_text_rects(&child_frame.borrow(), "Clear")[0];
+                let reconnect =
+                    visible_text_rects(&child_frame.borrow(), "Reconnect when locked")[0];
+                assert!(reconnect.bottom() < rect.top());
                 events.replace(click(rect.center()));
                 render(&mut app);
                 assert!(app
@@ -7863,16 +7892,47 @@ mod tests {
             ""
         });
         draft.remote_pc = "https://invalid.example".into();
+        let escape = || {
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        #[cfg(target_os = "macos")]
+        {
+            draft.vm_target = "Selected desktop".into();
+            draft.vm_device_id = "workspace:selected".into();
+            draft.reconnect_locked_vm = false;
+        }
         app.temp_password.push_str("fixture");
         let mut height = if cfg!(target_os = "macos") {
             428.0
         } else {
             173.0
         };
-        let margin = f32::from(super::ACCOUNT_EDITOR_MARGIN);
+        let panel_frame = crate::ui::theme::tab_content_frame();
+        let margin = panel_frame.total_margin();
         #[cfg(target_os = "macos")]
         let picker_id = egui::Id::new(("windows_app_devices", &draft.id));
-        let mut render = |events| {
+        #[cfg(target_os = "macos")]
+        {
+            let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
+                super::DeviceChoices {
+                    saved: vec![super::DeviceChoice {
+                        id: "workspace:fixture".into(),
+                        name: "Desktop".into(),
+                        owner: "Work".into(),
+                        ambiguous: false,
+                    }],
+                    ..Default::default()
+                },
+            ))));
+            ctx.data_mut(|data| data.insert_temp(picker_id, task));
+        }
+        let mut render = |app: &mut AutoLoginApp, events| {
             let mut close = false;
             let size = egui::vec2(super::ACCOUNT_EDITOR_WIDTH, height);
             let input = egui::RawInput {
@@ -7882,28 +7942,24 @@ mod tests {
             };
             let frame = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default()
-                    .frame(
-                        crate::ui::theme::content_frame()
-                            .inner_margin(super::ACCOUNT_EDITOR_MARGIN),
-                    )
+                    .frame(panel_frame)
                     .show_inside(ui, |ui| {
                         let body = egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                close =
-                                    super::account_editor_contents(ui, &mut app, &mut draft, false);
+                                close = super::account_editor_contents(ui, app, &mut draft, false);
                             });
                         if !close && !ui.ctx().will_discard() {
-                            height = (body.content_size.y + 2.0 * margin).ceil();
+                            height = (body.content_size.y + margin.sum().y).ceil();
                         }
                     });
             });
             (frame, close, size)
         };
-        render(vec![]);
-        let (frame, _, size) = render(vec![]);
+        render(&mut app, vec![]);
+        let (frame, _, size) = render(&mut app, vec![]);
         let save = visible_text_rects(&frame, "Save")[0];
-        let panel_right = size.x - margin;
+        let panel_right = size.x - margin.right;
         let white_cards = frame
             .shapes
             .iter()
@@ -7930,11 +7986,8 @@ mod tests {
             "Open desktop",
             "Record Shortcut",
             "VM device",
-            "Choose device…",
+            "Selected desktop",
             "Import",
-            "With a linked VM, AutoLogin can:",
-            "Match the active remote desktop session to this account.",
-            "Open the VM when you click the Open desktop arrow in Accounts.",
             "2FA",
             "Use iPhone",
         ] {
@@ -7944,36 +7997,82 @@ mod tests {
                 "{name}"
             );
         }
+        let field_for = |text| {
+            let text = visible_text_rects(&frame, text)[0];
+            frame
+                .shapes
+                .iter()
+                .find_map(|item| match &item.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.rect.contains(text.center())
+                            && (rect.rect.height() - ACCOUNT_EDITOR_CONTROL_HEIGHT).abs() < 1.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let heading = frame
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Text(text) if text.galley.text() == "SIGN-IN" => Some(text.pos),
+                _ => None,
+            })
+            .unwrap();
+        let sign_in = white_cards[0].shrink(crate::ui::theme::compact_frame().stroke.width);
+        let email = field_for(if cfg!(target_os = "macos") {
+            "user@example.test"
+        } else {
+            "user@domain.com"
+        });
+        let password = field_for("•••••••");
+        let row_gap = password.top() - email.bottom();
+        assert_eq!(row_gap, 8.0);
+        assert_eq!(email.x_range(), password.x_range());
+        assert_eq!(sign_in.right() - password.right(), row_gap);
+        assert_eq!(sign_in.bottom() - password.bottom(), row_gap);
+        for inset in [heading.x - sign_in.left(), heading.y - sign_in.top()] {
+            assert!((inset - row_gap).abs() <= 1.0, "heading inset {inset}");
+        }
+        for cards in white_cards.windows(2) {
+            assert_eq!(cards[1].top() - cards[0].bottom(), row_gap);
+        }
         #[cfg(target_os = "macos")]
         {
-            let field_for = |text| {
-                let text = visible_text_rects(&frame, text)[0];
-                frame
-                    .shapes
-                    .iter()
-                    .find_map(|item| match &item.shape {
-                        egui::Shape::Rect(rect)
-                            if rect.rect.contains(text.center())
-                                && (rect.rect.height() - ACCOUNT_EDITOR_CONTROL_HEIGHT).abs()
-                                    < 1.0 =>
-                        {
-                            Some(rect.rect)
-                        }
-                        _ => None,
-                    })
-                    .unwrap()
-            };
-            let vm = field_for("Choose device…");
+            let vm = field_for("Selected desktop");
             let import = field_for("Import");
             let remote_pc = field_for("https://invalid.example");
             let shortcut = field_for("Record Shortcut");
-            assert_eq!(shortcut.x_range(), remote_pc.x_range());
-            assert!(shortcut.top() > remote_pc.bottom());
-            assert_eq!(vm.left(), remote_pc.left());
-            assert!(vm.right() < import.left());
-            assert_eq!(import.right(), remote_pc.right());
+            assert_eq!(remote_pc.x_range(), email.x_range());
+            assert_eq!(remote_pc.top() - vm.bottom(), row_gap);
+            assert_eq!(vm.left(), email.left());
+            assert_eq!(import.left() - vm.right(), row_gap);
+            assert_eq!(import.width(), 90.0);
+            assert_eq!(import.right(), email.right());
             assert_eq!(vm.y_range(), import.y_range());
             assert_eq!(vm.height(), remote_pc.height());
+            assert!(
+                visible_text_rects(&frame, "Matches the active session to this account.")
+                    .is_empty()
+            );
+            let reconnect = visible_text_rects(&frame, "Reconnect when locked")[0];
+            assert!(remote_pc.bottom() < reconnect.top());
+            let reconnect_bottom = if crate::macos_lock_screen::supported() {
+                reconnect.bottom()
+            } else {
+                let warning =
+                    visible_text_rects(&frame, "Automatic reconnect requires macOS 14 or later.")[0];
+                assert!(reconnect.bottom() < warning.top());
+                warning.bottom()
+            };
+            assert!(frame.shapes.iter().any(|item| matches!(
+                &item.shape, egui::Shape::LineSegment { points: [left, right], .. }
+                    if left.y == right.y && reconnect_bottom < left.y && left.y < shortcut.top()
+                        && left.x < remote_pc.left() && right.x == remote_pc.right()
+            )));
+            assert_eq!(shortcut.x_range(), remote_pc.x_range());
 
             let switch_node = |output: &egui::FullOutput| {
                 let tree = output.platform_output.accesskit_update.as_ref().unwrap();
@@ -8002,7 +8101,7 @@ mod tests {
                 egui::accesskit::Toggled::True,
                 egui::accesskit::Toggled::False,
             ] {
-                let (changed, close, _) = render(click(pos));
+                let (changed, close, _) = render(&mut app, click(pos));
                 assert!(!close);
                 assert_eq!(switch_node(&changed).1, expected);
             }
@@ -8010,9 +8109,11 @@ mod tests {
         assert!(visible_text_rects(&frame, "Sign-in details…").is_empty());
         assert!(visible_text_rects(&frame, "Microsoft Authenticator").is_empty());
         assert!(visible_text_rects(&frame, "Desktop ID").is_empty());
+        assert!(visible_text_rects(&frame, "With a linked VM, AutoLogin can:").is_empty());
+        assert!(visible_text_rects(&frame, "•").is_empty());
         for card in white_cards {
             assert!(
-                (card.left() - 18.0).abs() < 0.6 && (card.right() - panel_right).abs() < 0.6,
+                (card.left() - margin.left).abs() < 0.6 && (card.right() - panel_right).abs() < 0.6,
                 "card {card:?}, panel right {panel_right}"
             );
         }
@@ -8030,11 +8131,12 @@ mod tests {
             })
             .unwrap();
         assert!((save_button.right() - panel_right).abs() < 0.6);
+        assert!((size.y - save_button.bottom() - margin.bottom).abs() <= 1.0);
         assert!(visible_text_rects(&frame, "Cancel")[0].right() < save.left());
-        let (_, close, _) = render(click(save.center()));
+        let (_, close, _) = render(&mut app, click(save.center()));
         assert!(!close);
-        render(vec![]); // Measure the validation message before the viewport resizes.
-        let (frame, _, size) = render(vec![]);
+        render(&mut app, vec![]); // Measure the validation message before the viewport resizes.
+        let (frame, _, size) = render(&mut app, vec![]);
         let message = if cfg!(target_os = "macos") {
             "Import a valid Remote PC address or clear the device selection."
         } else {
@@ -8043,40 +8145,124 @@ mod tests {
         assert_eq!(visible_text_rects(&frame, message).len(), 1);
         let save = visible_text_rects(&frame, "Save")[0];
         assert!(save.right() < size.x && save.bottom() < size.y);
-        let escape = || {
-            vec![egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }]
-        };
         #[cfg(target_os = "macos")]
         {
-            let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
-                super::DeviceChoices {
-                    saved: vec![super::DeviceChoice {
-                        id: "workspace:fixture".into(),
-                        name: "Desktop".into(),
-                        owner: "Work".into(),
-                        ambiguous: false,
-                    }],
-                    ..Default::default()
-                },
-            ))));
-            ctx.data_mut(|data| data.insert_temp(picker_id, task));
-            let choose = visible_text_rects(&frame, "Choose device…")[0];
-            render(click(choose.center()));
-            let (menu, _, _) = render(vec![]);
+            let choose = visible_text_rects(&frame, "Selected desktop")[0];
+            render(&mut app, click(choose.center()));
+            let (menu, _, _) = render(&mut app, vec![]);
             assert_eq!(visible_text_rects(&menu, "Desktop").len(), 1);
-            assert!(!render(escape()).1);
-            render(vec![]);
+            assert!(!render(&mut app, escape()).1);
+            render(&mut app, vec![]);
         }
-        assert!(render(escape()).1);
+        assert!(render(&mut app, escape()).1);
         assert_eq!(draft.remote_pc, "https://invalid.example");
         assert_eq!(app.temp_password.as_str(), "fixture");
         assert_eq!(app.status_message, original_status);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn account_editor_allows_shortcuts_before_vm_setup_and_preserves_them_when_unlinked() {
+        for is_existing in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::theme::apply(&ctx);
+            let mut draft = Account::new("user@example.test");
+            draft.reconnect_locked_vm = false;
+            let shortcut =
+                super::DesktopShortcut::new(super::DesktopShortcut::CONTROL, '7').unwrap();
+            let chord_label = shortcut.to_string();
+            let mut config = AppConfig::default();
+            if is_existing {
+                draft.has_saved_password = true;
+                draft.desktop_shortcut = Some(shortcut);
+                config.accounts.push(draft.clone());
+            }
+            let mut app = account_test_app(config.clone());
+            app.pending_account_toggle = Some(PendingAccountToggle::inert_for_test(config));
+            let picker_id = egui::Id::new(("windows_app_devices", &draft.id));
+            let choices = super::DeviceChoices {
+                saved: vec![super::DeviceChoice {
+                    id: "workspace:test".into(),
+                    name: "Test desktop".into(),
+                    owner: "Work".into(),
+                    ambiguous: false,
+                }],
+                ..Default::default()
+            };
+            let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(choices))));
+            ctx.data_mut(|data| data.insert_temp(picker_id, task));
+            let mut render = |draft: &mut Account, events| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(super::ACCOUNT_EDITOR_WIDTH, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| {
+                    super::account_editor_contents(ui, &mut app, draft, is_existing);
+                })
+            };
+            let assert_recorder = |frame: &egui::FullOutput, title: &str| {
+                let caption = visible_text_rects(frame, "Open desktop")[0];
+                assert_eq!(visible_text_rects(frame, title).len(), 1);
+                let tree = frame.platform_output.accesskit_update.as_ref().unwrap();
+                let node = tree
+                    .nodes
+                    .iter()
+                    .map(|(_, node)| node)
+                    .find(|node| {
+                        node.role() == egui::accesskit::Role::Button && node.label() == Some(title)
+                    })
+                    .expect("accessible shortcut button");
+                assert!(!node.is_disabled());
+                let connection = visible_text_rects(frame, "CONNECTION")[0];
+                assert!(frame.shapes.iter().any(|item| matches!(
+                    &item.shape, egui::Shape::LineSegment { points: [a, b], .. }
+                        if a.y == b.y && b.x - a.x > 300.0 && connection.bottom() < a.y && a.y < caption.top()
+                )));
+            };
+            render(&mut draft, vec![]);
+            let frame = render(&mut draft, vec![]);
+            if is_existing {
+                assert_recorder(&frame, &chord_label);
+                assert_eq!(draft.desktop_shortcut, Some(shortcut));
+            } else {
+                assert_recorder(&frame, "Record Shortcut");
+                draft.desktop_shortcut = Some(shortcut);
+                assert_recorder(&render(&mut draft, vec![]), &chord_label);
+            }
+            assert!(draft.remote_pc.is_empty());
+            let picker = visible_text_rects(&frame, "Choose device…")[0];
+            render(&mut draft, click(picker.center()));
+            let menu = render(&mut draft, vec![]);
+            let device = visible_text_rects(&menu, "Test desktop")[0];
+            render(&mut draft, click(device.center()));
+            let linked = render(&mut draft, vec![]);
+            assert!(draft.remote_pc.is_empty());
+            assert_recorder(&linked, &chord_label);
+
+            render(&mut draft, click(picker.center()));
+            let menu = render(&mut draft, vec![]);
+            let clear = visible_text_rects(&menu, "Clear selection")[0];
+            render(&mut draft, click(clear.center()));
+            assert_recorder(&render(&mut draft, vec![]), &chord_label);
+            assert_eq!(draft.desktop_shortcut, Some(shortcut));
+            assert!(draft.vm_target.is_empty());
+            if is_existing {
+                super::save_edited_account(&mut app, &ctx, &draft, true).unwrap();
+                let Some(AccountTransactionIntent::Save { account, .. }) =
+                    app.queued_account_transactions.front()
+                else {
+                    panic!("saving an unlinked account must queue its shortcut");
+                };
+                assert_eq!(account.desktop_shortcut, Some(shortcut));
+                assert!(account.vm_target.is_empty());
+                assert!(account.remote_pc.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -8142,7 +8328,8 @@ mod tests {
         let render = |draft: &mut Account, app: &mut AutoLoginApp, is_existing| {
             ctx.run_ui(Default::default(), |ui| {
                 ui.set_width(
-                    super::ACCOUNT_EDITOR_WIDTH - 2.0 * f32::from(super::ACCOUNT_EDITOR_MARGIN),
+                    super::ACCOUNT_EDITOR_WIDTH
+                        - crate::ui::theme::tab_content_frame().total_margin().sum().x,
                 );
                 super::account_editor_contents(ui, app, draft, is_existing);
             })
@@ -8227,6 +8414,7 @@ mod tests {
                     node.role() == egui::accesskit::Role::Label
                         && node.value() == Some(expected_host)
                 }));
+                assert_eq!(visible_text_rects(&frame, "VM device").len(), 1);
             }
             #[cfg(not(target_os = "macos"))]
             assert!(visible_text_rects(&frame, expected_host).is_empty());

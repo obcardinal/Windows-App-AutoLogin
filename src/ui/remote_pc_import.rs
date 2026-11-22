@@ -145,7 +145,7 @@ pub(super) fn show_result(ui: &mut egui::Ui, account: &mut Account) {
         ui.ctx().request_repaint();
     }
 
-    match &lookup.state {
+    super::account_editor_field_note(ui, |ui| match &lookup.state {
         LookupState::Confirm(host) => {
             super::account_editor_help(ui, "Windows App already has connection details open. Use this address for this account?");
             ui.label(egui::RichText::new(host).monospace());
@@ -166,7 +166,7 @@ pub(super) fn show_result(ui: &mut egui::Ui, account: &mut Account) {
             ui.add(egui::Label::new(egui::RichText::new(message).color(theme::DANGER)).wrap());
         }
         LookupState::Pending(_) => {}
-    }
+    });
 }
 
 #[cfg(test)]

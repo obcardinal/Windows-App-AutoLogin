@@ -13,7 +13,7 @@ pub const STROKE: egui::Color32 = egui::Color32::from_rgb(216, 221, 229);
 const TAB_RAIL: egui::Color32 = egui::Color32::from_rgb(238, 240, 245);
 const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(226, 230, 238);
 const TAB_PRESSED: egui::Color32 = egui::Color32::from_rgb(205, 213, 225);
-const WINDOW_MARGIN: i8 = 9;
+pub(super) const WINDOW_MARGIN: i8 = 9;
 const SEMIBOLD: &str = "Inter Semibold";
 
 pub fn apply(ctx: &egui::Context) {
