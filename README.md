@@ -37,6 +37,8 @@ The Windows version also recognizes Microsoft Remote Desktop and the built-in Re
 
 ## Linked desktops and two-factor sign-in on macOS
 
+Under **Connection** in the account editor, click **Record Shortcut**, press the keys, then click **Save**. You can choose the **VM device** now or later. Once the device is saved, the shortcut opens it from any app while AutoLogin is running.
+
 When a new remote desktop connects, AutoLogin closes the Windows App device list. Your desktop stays open, and you can reopen the list at any time. To keep the list open after every connection, turn off **Settings → Windows App → Close device list after connecting**.
 
 ### Reconnect to a locked desktop
