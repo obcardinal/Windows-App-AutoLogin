@@ -675,8 +675,7 @@ fn requirement_string_literal(value: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn run_command_with_timeout(
+pub(crate) fn run_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> anyhow::Result<std::process::Output> {

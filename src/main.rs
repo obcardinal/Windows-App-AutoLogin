@@ -125,6 +125,10 @@ pub(crate) fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     if let Some(command) = args.first().map(String::as_str) {
         match command {
+            macos_lock_screen::PREPARE_OCR_ARG => {
+                anyhow::ensure!(args.len() == 1, "OCR preparation takes no arguments.");
+                return macos_lock_screen::prepare_recognition_sample();
+            }
             "--link-telegram-stdin" | "--test-telegram-notification" if args.len() != 1 => {
                 anyhow::bail!("The Telegram command takes no additional arguments.");
             }

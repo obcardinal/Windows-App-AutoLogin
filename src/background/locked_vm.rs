@@ -158,9 +158,33 @@ enum AttemptTarget {
 }
 
 #[derive(Default)]
+struct RecognitionRecovery {
+    running: bool,
+    rescan: bool,
+    retry_after: Option<Instant>,
+}
+
+impl RecognitionRecovery {
+    fn begin(&mut self, now: Instant) -> bool {
+        if self.running || self.retry_after.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        self.running = true;
+        true
+    }
+
+    fn finish(&mut self, now: Instant, success: bool) {
+        self.running = false;
+        self.retry_after = Some(now + Duration::from_secs(60));
+        self.rescan = success;
+    }
+}
+
+#[derive(Default)]
 pub(super) struct ReturnMonitor {
     visit: ReturnWindow,
     attempted: Arc<Mutex<HashMap<AttemptTarget, Instant>>>,
+    recognition_recovery: Arc<Mutex<RecognitionRecovery>>,
     warmup_started: bool,
     next_warmup_permission_check: Option<Instant>,
 }
@@ -206,6 +230,19 @@ impl ReturnMonitor {
         let Some(snapshot) = snapshot else {
             return false;
         };
+        {
+            let Ok(mut recovery) = self.recognition_recovery.lock() else {
+                return false;
+            };
+            if recovery.running {
+                return false;
+            }
+            if std::mem::take(&mut recovery.rescan) {
+                // Resume through the normal foreground and user-presence checks.
+                // Never act on the frame that preceded model preparation.
+                self.visit = ReturnWindow::default();
+            }
+        }
         if snapshot.process_found && snapshot.target_frontmost.is_none() {
             return false;
         }
@@ -261,6 +298,7 @@ impl ReturnMonitor {
         let accounts = accounts.to_vec();
         let requested_title = requested_title.to_owned();
         let attempts = self.attempted.clone();
+        let recognition_recovery = self.recognition_recovery.clone();
         let pause = pause.clone();
         let events = events.clone();
         std::thread::spawn(move || {
@@ -323,6 +361,27 @@ impl ReturnMonitor {
             let visible_account = match observation {
                 LockScreenObservation::Password => None,
                 LockScreenObservation::AccountPassword(index) => Some(&accounts[index].id),
+                LockScreenObservation::RecognitionFailed => {
+                    let Ok(mut recovery) = recognition_recovery.lock() else {
+                        return;
+                    };
+                    if !recovery.begin(Instant::now()) {
+                        return;
+                    }
+                    drop(recovery);
+                    // Only the local sample is read by the child. Release the
+                    // automation slot so other operations and Pause stay responsive.
+                    drop(_active);
+                    drop(_permit);
+                    let result = macos_lock_screen::recover_recognition();
+                    if let Err(err) = &result {
+                        tracing::warn!(reason = %err, "Could not restore lock screen recognition");
+                    }
+                    if let Ok(mut recovery) = recognition_recovery.lock() {
+                        recovery.finish(Instant::now(), result.is_ok());
+                    }
+                    return;
+                }
                 _ => {
                     tracing::debug!(?observation, "No Windows password screen detected");
                     return;
@@ -407,6 +466,22 @@ impl ReturnMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognition_recovery_coalesces_failures_and_rearms_after_success() {
+        let start = Instant::now();
+        let mut recovery = RecognitionRecovery::default();
+        assert!(recovery.begin(start));
+        assert!(!recovery.begin(start + Duration::from_secs(90)));
+        recovery.finish(start + Duration::from_secs(90), false);
+        assert!(!recovery.rescan);
+        assert!(!recovery.begin(start + Duration::from_secs(100)));
+        let retry = start + Duration::from_secs(150);
+        assert!(recovery.begin(retry));
+        recovery.finish(retry, true);
+        assert!(recovery.rescan);
+        assert!(!recovery.begin(retry));
+    }
 
     #[test]
     fn same_titled_fullscreen_transition_and_replacement_rearm_a_bounded_scan() {

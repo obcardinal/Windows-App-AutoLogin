@@ -13,6 +13,7 @@ pub(crate) enum LockScreenObservation {
     AccountPassword(usize),
     Other,
     Unavailable,
+    RecognitionFailed,
 }
 
 #[link(name = "waal_lock_screen_capture", kind = "static")]
@@ -21,6 +22,7 @@ unsafe extern "C" {
     fn waal_lock_capture_supported() -> bool;
     fn waal_lock_capture_allowed() -> bool;
     fn waal_prepare_lock_recognition();
+    fn waal_prepare_lock_recognition_sample() -> bool;
     fn waal_lock_capture_request() -> bool;
     fn waal_record_capture_request() -> bool;
     fn waal_open_capture_preferences() -> bool;
@@ -29,7 +31,7 @@ unsafe extern "C" {
         window_id: u32,
         visitor: extern "C" fn(*mut c_void, i32, *const u8, usize, f32, f64, f64, f64, f64),
         context: *mut c_void,
-    ) -> bool;
+    ) -> i32;
 }
 
 pub(crate) fn supported() -> bool {
@@ -45,6 +47,29 @@ pub(crate) fn screen_recording_allowed() -> bool {
 pub(crate) fn prepare_recognition() {
     // The native worker loads Vision using only its own fixed in-memory sample.
     unsafe { waal_prepare_lock_recognition() }
+}
+
+pub(crate) const PREPARE_OCR_ARG: &str = "--prepare-lock-ocr";
+
+pub(crate) fn prepare_recognition_sample() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        unsafe { waal_prepare_lock_recognition_sample() },
+        "Vision could not read its preparation sample."
+    );
+    Ok(())
+}
+
+pub(crate) fn recover_recognition() -> anyhow::Result<()> {
+    // Vision can retain handles to models that macOS has evicted. A fresh
+    // instance of the same executable rebuilds them in this app's cache.
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg(PREPARE_OCR_ARG);
+    let outcome = crate::macos_identity::run_command_with_timeout(
+        &mut command,
+        std::time::Duration::from_secs(180),
+    )?;
+    anyhow::ensure!(outcome.status.success(), "Vision preparation failed.");
+    Ok(())
 }
 
 pub(crate) fn request_screen_recording() -> bool {
@@ -105,7 +130,7 @@ use directory::{visit_account_line, FrameRead};
 pub(crate) fn observe(pid: i32, window_id: u32, usernames: &[&str]) -> LockScreenObservation {
     let mut frame = FrameRead::new(usernames);
     // The native bridge completes all callbacks before the borrowed frame goes out of scope.
-    let success = unsafe {
+    let result = unsafe {
         waal_observe_lock_screen(
             pid,
             window_id,
@@ -113,7 +138,11 @@ pub(crate) fn observe(pid: i32, window_id: u32, usernames: &[&str]) -> LockScree
             std::ptr::from_mut(&mut frame).cast(),
         )
     };
-    frame.observation(success)
+    match result {
+        -1 => LockScreenObservation::RecognitionFailed,
+        1 => frame.observation(true),
+        _ => LockScreenObservation::Unavailable,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

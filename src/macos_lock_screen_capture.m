@@ -292,30 +292,39 @@ static VNRecognizeTextRequest *englishTextRequest(VNRequestTextRecognitionLevel 
     return request;
 }
 
+// The recovery subprocess receives no screenshot. A successful read of this
+// fixed sample also proves that Vision can execute its newly prepared models.
+bool waal_prepare_lock_recognition_sample(void) {
+    @autoreleasepool {
+        NSBitmapImageRep *sample = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+            pixelsWide:240 pixelsHigh:48 bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES
+            isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        NSGraphicsContext *graphics = sample ? [NSGraphicsContext graphicsContextWithBitmapImageRep:sample] : nil;
+        if (!graphics) return false;
+        [NSGraphicsContext saveGraphicsState];
+        NSGraphicsContext.currentContext = graphics;
+        [NSColor.blackColor setFill];
+        NSRectFill(NSMakeRect(0, 0, 240, 48));
+        [@"Sample" drawAtPoint:NSMakePoint(8, 10) withAttributes:@{
+            NSFontAttributeName: [NSFont systemFontOfSize:22],
+            NSForegroundColorAttributeName: NSColor.whiteColor
+        }];
+        [NSGraphicsContext restoreGraphicsState];
+        CGImageRef image = sample.CGImage;
+        if (!image) return false;
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
+        VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
+        if (![handler performRequests:@[request] error:nil] || request.results.count != 1) return false;
+        VNRecognizedText *word = [request.results.firstObject topCandidates:1].firstObject;
+        return [word.string isEqualToString:@"Sample"];
+    }
+}
+
 void waal_prepare_lock_recognition(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        @autoreleasepool {
-            // A real observation can start first. It never waits for this task.
-            if (atomic_exchange_explicit(&accurateRecognitionStarted, true, memory_order_relaxed)) return;
-            NSBitmapImageRep *sample = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
-                pixelsWide:240 pixelsHigh:48 bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES
-                isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
-            NSGraphicsContext *graphics = sample ? [NSGraphicsContext graphicsContextWithBitmapImageRep:sample] : nil;
-            if (!graphics) return;
-            [NSGraphicsContext saveGraphicsState];
-            NSGraphicsContext.currentContext = graphics;
-            [NSColor.blackColor setFill];
-            NSRectFill(NSMakeRect(0, 0, 240, 48));
-            [@"Sample" drawAtPoint:NSMakePoint(8, 10) withAttributes:@{
-                NSFontAttributeName: [NSFont systemFontOfSize:22],
-                NSForegroundColorAttributeName: NSColor.whiteColor
-            }];
-            [NSGraphicsContext restoreGraphicsState];
-            CGImageRef image = sample.CGImage;
-            if (!image) return;
-            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
-            [handler performRequests:@[englishTextRequest(VNRequestTextRecognitionLevelAccurate)] error:nil];
-        }
+        // A real observation can start first. It never waits for this task.
+        if (!atomic_exchange_explicit(&accurateRecognitionStarted, true, memory_order_relaxed))
+            waal_prepare_lock_recognition_sample();
     });
 }
 
@@ -352,8 +361,18 @@ static CGImageRef copyDetail(CGImageRef source, CGRect pixels, double scale) {
     return bitmap;
 }
 
+// A failed Vision request is distinct from a successful read with no matches.
+// Keep failures local to this captured frame, including optional detail reads.
+static bool performTextRequest(VNImageRequestHandler *handler, VNRecognizeTextRequest *request,
+                               bool *visionFailed) {
+    if (*visionFailed) return false;
+    if ([handler performRequests:@[request] error:nil] && request.results) return true;
+    *visionFailed = true;
+    return false;
+}
+
 static CGRect readPasswordPixels(CGImageRef source, CGRect pixels, double scale, WaalTextVisitor veto,
-                                 void *context, float *confidence) {
+                                 void *context, float *confidence, bool *visionFailed) {
     size_t w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     CGImageRef detail = copyDetail(source, pixels, scale);
     if (!detail) return CGRectNull;
@@ -361,7 +380,7 @@ static CGRect readPasswordPixels(CGImageRef source, CGRect pixels, double scale,
     CGImageRelease(detail);
     VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
     if (veto) request.minimumTextHeight = .004;
-    if (![handler performRequests:@[request] error:nil] || request.results.count > (veto ? 8u : 1u)) return CGRectNull;
+    if (!performTextRequest(handler, request, visionFailed) || request.results.count > (veto ? 8u : 1u)) return CGRectNull;
     CGRect result = CGRectNull;
     for (VNRecognizedTextObservation *observation in request.results) {
         VNRecognizedText *word = [observation topCandidates:1].firstObject;
@@ -385,7 +404,7 @@ static CGRect readPasswordPixels(CGImageRef source, CGRect pixels, double scale,
     return result;
 }
 
-static CGRect readPassword(CGImageRef source, CGRect region, float *confidence) {
+static CGRect readPassword(CGImageRef source, CGRect region, float *confidence, bool *visionFailed) {
     size_t w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     // CGImage crops have their origin at the top left; Vision's is at the bottom left.
     CGRect pixels = CGRectIntegral(CGRectMake(CGRectGetMinX(region) * w, (1 - CGRectGetMaxY(region)) * h,
@@ -393,11 +412,11 @@ static CGRect readPassword(CGImageRef source, CGRect region, float *confidence) 
     pixels = CGRectIntersection(pixels, CGRectMake(0, 0, w, h));
     if (CGRectIsEmpty(pixels)) return CGRectNull;
     // Give Vision a readable raster for small controls on low-resolution sessions.
-    return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 48.0 / pixels.size.height)), NULL, NULL, confidence);
+    return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 48.0 / pixels.size.height)), NULL, NULL, confidence, visionFailed);
 }
 
 static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int kind, NSUInteger limit,
-                            WaalTextVisitor visitor, void *context) {
+                            WaalTextVisitor visitor, void *context, bool *visionFailed) {
     double w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     pixels = CGRectIntersection(CGRectIntegral(pixels), CGRectMake(0, 0, w, h));
     if (CGRectIsEmpty(pixels)) return false;
@@ -406,7 +425,7 @@ static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int 
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:detail options:@{}];
     CGImageRelease(detail);
     VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelAccurate);
-    if (![handler performRequests:@[request] error:nil] || !request.results) return false;
+    if (!performTextRequest(handler, request, visionFailed)) return false;
     if (request.results.count > limit) {
         if (kind != AccountText) return false;
         visitor(context, AmbiguousText, NULL, 0, 1.0, CGRectGetMidX(pixels) / w,
@@ -429,10 +448,10 @@ static bool visitDetailText(CGImageRef source, CGRect pixels, double scale, int 
     return true;
 }
 
-static VNRecognizeTextRequest *overviewRequest(CGImageRef image) {
+static VNRecognizeTextRequest *overviewRequest(CGImageRef image, bool *visionFailed) {
     VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
     VNRecognizeTextRequest *request = englishTextRequest(VNRequestTextRecognitionLevelFast);
-    if (![handler performRequests:@[request] error:nil] || !request.results || request.results.count > 64)
+    if (!performTextRequest(handler, request, visionFailed) || request.results.count > 64)
         return nil;
     return request;
 }
@@ -466,13 +485,13 @@ static bool visitOverviewText(VNRecognizeTextRequest *request, CGRect core, CGRe
 }
 
 static bool visitOverview(CGImageRef image, VNRecognizeTextRequest *existing, CGRect masked,
-                          WaalTextVisitor visitor, void *context) {
+                          WaalTextVisitor visitor, void *context, bool *visionFailed) {
     size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
     CGSize size = CGSizeMake(w, h);
     CGRect full = CGRectMake(0, 0, w, h);
     size_t count = 0;
     if (w <= 4096 && h <= 2400) {
-        VNRecognizeTextRequest *request = existing ?: overviewRequest(image);
+        VNRecognizeTextRequest *request = existing ?: overviewRequest(image, visionFailed);
         return request && visitOverviewText(request, full, full, size, masked, &count, visitor, context);
     }
     // Fast Vision can omit a fixed-size account name on a whole 8K image.
@@ -487,7 +506,7 @@ static bool visitOverview(CGImageRef image, VNRecognizeTextRequest *existing, CG
                 CGRect crop = CGRectIntersection(full, CGRectInset(core, -256, -96));
                 CGImageRef bitmap = copyDetail(image, crop, 1.0);
                 if (!bitmap) return false;
-                VNRecognizeTextRequest *request = overviewRequest(bitmap);
+                VNRecognizeTextRequest *request = overviewRequest(bitmap, visionFailed);
                 CGImageRelease(bitmap);
                 if (!request || !visitOverviewText(request, core, crop, size, masked, &count, visitor, context))
                     return false;
@@ -500,19 +519,19 @@ static bool visitOverview(CGImageRef image, VNRecognizeTextRequest *existing, CG
 // At low guest DPI the fast overview may miss both the name and the prompt.
 // Restrict an accurate read to the left half of the centered editor band.
 // Full guest context is still checked after recovering the native word.
-static CGRect findSmallPassword(CGImageRef source, WaalTextVisitor veto, void *context, float *confidence) {
+static CGRect findSmallPassword(CGImageRef source, WaalTextVisitor veto, void *context, float *confidence, bool *visionFailed) {
     double w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     double left = fmax(0.06 * w, 0.50 * w - 1024);
     CGRect pixels = CGRectIntegral(CGRectMake(left, 0.42 * h, 0.51 * w - left, 0.38 * h));
     double scale = fmin(4.0, fmax(1.0, 1536.0 / pixels.size.width));
-    return readPasswordPixels(source, pixels, scale, veto, context, confidence);
+    return readPasswordPixels(source, pixels, scale, veto, context, confidence, visionFailed);
 }
 
 // The unfocused editor can lose both its blue underline and a reliable fast
 // OCR reading of the placeholder. Use the centered account caption to choose
 // a native search region. Its pixel height tracks the guest DPI.
 static CGRect unfocusedPassword(CGImageRef source, VNRecognizeTextRequest *overview,
-                               WaalTextVisitor veto, void *context, double *editorCenter, float *confidence) {
+                               WaalTextVisitor veto, void *context, double *editorCenter, float *confidence, bool *visionFailed) {
     double w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     CGRect caption = CGRectNull, fastWord = CGRectNull;
     unsigned centeredCaptions = 0;
@@ -536,10 +555,10 @@ static CGRect unfocusedPassword(CGImageRef source, VNRecognizeTextRequest *overv
     }
     *editorCenter = centeredCaptions == 1 ? CGRectGetMidX(caption) : 0.5;
     if (!CGRectIsNull(fastWord)) {
-        CGRect exact = readPassword(source, fastWord, confidence);
+        CGRect exact = readPassword(source, fastWord, confidence, visionFailed);
         if (!CGRectIsEmpty(exact)) return exact;
     }
-    if (centeredCaptions == 0 && overview.results.count <= 8) return findSmallPassword(source, veto, context, confidence);
+    if (centeredCaptions == 0 && overview.results.count <= 8) return findSmallPassword(source, veto, context, confidence, visionFailed);
     if (centeredCaptions != 1) return CGRectNull;
     double font = caption.size.height * h, cx = *editorCenter * w;
     double top = (1.0 - CGRectGetMinY(caption)) * h;
@@ -548,10 +567,10 @@ static CGRect unfocusedPassword(CGImageRef source, VNRecognizeTextRequest *overv
     CGRect pixels = CGRectIntersection(CGRectIntegral(CGRectMake(cx - 11 * font, top + .10 * font,
                                              12 * font, 4 * font)), CGRectMake(0, 0, w, h));
     if (CGRectIsEmpty(pixels)) return CGRectNull;
-    return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 36.0 / font)), veto, context, confidence);
+    return readPasswordPixels(source, pixels, fmin(4.0, fmax(1.0, 36.0 / font)), veto, context, confidence, visionFailed);
 }
 
-bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void *context) {
+static bool recognizeFrame(CGImageRef source, WaalTextVisitor visitor, void *context, bool *visionFailed) {
     if (!source || !visitor || !context) return false;
     size_t w = CGImageGetWidth(source), h = CGImageGetHeight(source);
     if (!w || !h) return false;
@@ -573,17 +592,17 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
     if (kind == WaalFieldPlaceholderCandidate) {
         CGRect region = field;
         region.size.width *= .75; // Exclude the reveal and submit buttons.
-        placeholder = readPassword(source, region, &confidence);
+        placeholder = readPassword(source, region, &confidence, visionFailed);
         if (CGRectIsEmpty(placeholder)) return true;
     }
     id overview = CFBridgingRelease(copyScaledImage(source, lround(w * scale), lround(h * scale)));
     if (!overview) return false;
     VNRecognizeTextRequest *existing = nil;
     if (kind == WaalFieldNone) {
-        existing = overviewRequest((__bridge CGImageRef)overview);
+        existing = overviewRequest((__bridge CGImageRef)overview, visionFailed);
         if (!existing) return false;
         double editorCenter;
-        placeholder = unfocusedPassword(source, existing, visitor, context, &editorCenter, &confidence);
+        placeholder = unfocusedPassword(source, existing, visitor, context, &editorCenter, &confidence, visionFailed);
         if (CGRectIsEmpty(placeholder)) return true;
         field = waal_neutral_password_field(source, placeholder);
         measuredField = !CGRectIsEmpty(field);
@@ -609,32 +628,32 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
         }
     }
     CGRect masked = kind == WaalFieldMasked ? CGRectInset(field, -.002, -.002) : CGRectNull;
-    if (!visitOverview((__bridge CGImageRef)overview, existing, masked, visitor, context)) return false;
+    if (!visitOverview((__bridge CGImageRef)overview, existing, masked, visitor, context, visionFailed)) return false;
     double ew = field.size.width * w, eh = field.size.height * h;
     // The overview may omit small account tiles, including "Other user".
     double cornerHeight = fmin(floor(h / 3.0), ew);
     CGRect corner = CGRectMake(0, h - cornerHeight, fmin(w / 3.0, 1.5 * ew), cornerHeight);
     double detailScale = eh < 32 ? fmin(5.0, 48.0 / eh) : 1.0;
-    if (!visitDetailText(source, corner, detailScale, CornerText, 16, visitor, context)) return false;
+    if (!visitDetailText(source, corner, detailScale, CornerText, 16, visitor, context, visionFailed)) return false;
     // Vision can turn the input-language abbreviation into a longer word
     // when the guest is scaled to fit a window. Re-read the indicator in
     // original pixels. This optional read can only repair a matching line.
     CGRect layout = CGRectMake(w - 0.38 * ew, h - 1.51 * eh, 0.13 * ew, 0.64 * eh);
-    visitDetailText(source, layout, detailScale, LayoutText, 1, visitor, context);
+    visitDetailText(source, layout, detailScale, LayoutText, 1, visitor, context, visionFailed);
     // Fast can misread a centered name even on a large remote display
     // resized to a wide window. Read its native pixels at every guest DPI.
     CGRect name = CGRectMake(CGRectGetMidX(field) * w - 0.8 * ew,
                              (1.0 - CGRectGetMidY(field)) * h - 3.1 * eh,
                              1.6 * ew, 2.45 * eh);
     // A two-line caption needs an independent editor measurement to anchor both lines.
-    if (!visitDetailText(source, name, 1.0, AccountText, measuredField ? 2 : 1, visitor, context)) return false;
+    if (!visitDetailText(source, name, 1.0, AccountText, measuredField ? 2 : 1, visitor, context, visionFailed)) return false;
     if (eh < 32) {
         // A compressed "Other user" or instruction just below the editor
         // may also disappear from the fast window-wide pass.
         CGRect below = CGRectMake(CGRectGetMidX(field) * w - 0.85 * ew,
                                   (1.0 - field.origin.y) * h + 0.05 * eh,
                                   1.7 * ew, 3.8 * eh);
-        if (!visitDetailText(source, below, detailScale, OverviewText, 16, visitor, context)) return false;
+        if (!visitDetailText(source, below, detailScale, OverviewText, 16, visitor, context, visionFailed)) return false;
     }
     CGRect box = kind == WaalFieldMasked ? field : placeholder;
     if (kind == WaalFieldPlaceholderCandidate) {
@@ -647,14 +666,28 @@ bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void 
     return true;
 }
 
-bool waal_observe_lock_screen(pid_t pid, uint32_t windowID, WaalTextVisitor visitor, void *context) {
+// Rust discards all observations for a failed frame. -1 additionally allows
+// the supervisor to repair Vision after macOS evicts compiled model files.
+static int frameStatus(CGImageRef source, WaalTextVisitor visitor, void *context) {
+    bool visionFailed = false;
+    bool read = recognizeFrame(source, visitor, context, &visionFailed);
+    return visionFailed ? -1 : read;
+}
+
+// In-memory frame fixtures share the same failure semantics as a live capture.
+bool waal_recognize_lock_frame(CGImageRef source, WaalTextVisitor visitor, void *context) {
+    return frameStatus(source, visitor, context) == 1;
+}
+
+int waal_observe_lock_screen(pid_t pid, uint32_t windowID, WaalTextVisitor visitor, void *context) {
     @autoreleasepool {
         if (!visitor || !context || !windowID || pid <= 0 || !waal_lock_capture_allowed() ||
             !isFrontmost(pid)) return false;
         if (@available(macOS 14.0, *)) {
             id image = copyWindowImage(pid, windowID);
             if (!image || !isFrontmost(pid)) return false;
-            return waal_recognize_lock_frame((__bridge CGImageRef)image, visitor, context) && isFrontmost(pid);
+            int status = frameStatus((__bridge CGImageRef)image, visitor, context);
+            return isFrontmost(pid) ? status : 0;
         }
         return false;
     }
