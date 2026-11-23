@@ -3,6 +3,8 @@
 
 use std::{
     ffi::c_void,
+    process::{Child, Command, Stdio},
+    ptr::NonNull,
     slice, str,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -23,6 +25,9 @@ unsafe extern "C" {
     fn waal_lock_capture_allowed() -> bool;
     fn waal_prepare_lock_recognition();
     fn waal_prepare_lock_recognition_sample() -> bool;
+    fn waal_model_cache_watch_start() -> *mut c_void;
+    fn waal_model_cache_watch_take_loss(watch: *mut c_void) -> bool;
+    fn waal_model_cache_watch_stop(watch: *mut c_void);
     fn waal_lock_capture_request() -> bool;
     fn waal_record_capture_request() -> bool;
     fn waal_open_capture_preferences() -> bool;
@@ -59,17 +64,37 @@ pub(crate) fn prepare_recognition_sample() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn recover_recognition() -> anyhow::Result<()> {
+pub(crate) struct ModelCacheWatch(NonNull<c_void>);
+
+// SAFETY: All native filesystem state is accessed on the watch's serial queue.
+// The worker has exclusive ownership of the stream handle.
+unsafe impl Send for ModelCacheWatch {}
+
+impl ModelCacheWatch {
+    pub(crate) fn start() -> Option<Self> {
+        NonNull::new(unsafe { waal_model_cache_watch_start() }).map(Self)
+    }
+
+    pub(crate) fn take_loss(&self) -> bool {
+        unsafe { waal_model_cache_watch_take_loss(self.0.as_ptr()) }
+    }
+}
+
+impl Drop for ModelCacheWatch {
+    fn drop(&mut self) {
+        unsafe { waal_model_cache_watch_stop(self.0.as_ptr()) }
+    }
+}
+
+pub(crate) fn start_recognition_repair() -> std::io::Result<Child> {
     // Vision can retain handles to models that macOS has evicted. A fresh
     // instance of the same executable rebuilds them in this app's cache.
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command.arg(PREPARE_OCR_ARG);
-    let outcome = crate::macos_identity::run_command_with_timeout(
-        &mut command,
-        std::time::Duration::from_secs(180),
-    )?;
-    anyhow::ensure!(outcome.status.success(), "Vision preparation failed.");
-    Ok(())
+    Command::new(std::env::current_exe()?)
+        .arg(PREPARE_OCR_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
 }
 
 pub(crate) fn request_screen_recording() -> bool {

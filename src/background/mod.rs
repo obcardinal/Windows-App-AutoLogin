@@ -1772,6 +1772,9 @@ pub(crate) fn spawn(
                 enforce_pause(&event_tx, &mut running, &generation).await;
             }
 
+            #[cfg(target_os = "macos")]
+            locked_vm.maintain_model_cache(&accounts);
+
             if !running {
                 no_prompt_tracker.reset();
                 #[cfg(target_os = "macos")]
@@ -1805,7 +1808,7 @@ pub(crate) fn spawn(
                 continue;
             };
             #[cfg(target_os = "macos")]
-            locked_vm.prepare_recognition(&accounts);
+            locked_vm.prepare_recognition();
             if current_generation != pre_password_generation {
                 no_prompt_tracker.reset();
                 #[cfg(target_os = "macos")]

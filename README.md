@@ -51,6 +51,8 @@ Choose the desktop under **Connection → VM device** in the account editor. Wit
 
 **Reconnect when locked** is on by default for linked desktops on macOS 14+. It uses **Screen Recording** to recognize the English Windows password screen in the foreground VM window. The image is processed in memory on your Mac and discarded. Recognition triggers a reconnect. Password entry takes place in Windows App's verified credential prompt.
 
+While at least one active linked account uses this option, AutoLogin restores missing recognition models in the background, even when no desktop is open.
+
 ### Confirm a sign-in on your iPhone
 
 In **Settings → 2FA → Devices → Connect iPhone…**, choose your phone and click **Connect iPhone**. AutoLogin checks the Wi-Fi connection and remembers that iPhone for your accounts. For first-time pairing, click **Open device pairing…** and follow Apple’s prompts. Connecting requires Xcode but no signing certificate.

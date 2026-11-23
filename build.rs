@@ -47,11 +47,13 @@ fn main() {
         println!("cargo:rerun-if-changed=src/macos_masked_field.m");
         println!("cargo:rerun-if-changed=src/macos_guest_viewport.h");
         println!("cargo:rerun-if-changed=src/macos_guest_viewport.m");
+        println!("cargo:rerun-if-changed=src/macos_model_cache_watch.m");
         let mut native = cc::Build::new();
         native
             .file(bridge)
             .file("src/macos_masked_field.m")
             .file("src/macos_guest_viewport.m")
+            .file("src/macos_model_cache_watch.m")
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .compile("waal_lock_screen_capture");
@@ -73,6 +75,7 @@ fn main() {
         println!("cargo:rustc-link-arg={runtime}");
         println!("cargo:rustc-link-arg=-Wl,-weak_framework,ScreenCaptureKit");
         println!("cargo:rustc-link-lib=framework=Vision");
+        println!("cargo:rustc-link-lib=framework=CoreServices");
     }
     let icon = Path::new("assets/icon.png");
     let tray_icon = Path::new("assets/icon_tray.png");
