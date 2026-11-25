@@ -140,6 +140,52 @@ fn launch_card_name<'a, T>(
     matched.context("No Cloud PC in the selected Windows App profile matches this account’s Remote PC. Check the address or choose the device in the account editor.")
 }
 
+enum ReconnectFocus<W> {
+    Transition,
+    OriginalDesktop,
+    Center(W),
+}
+
+// AX focus can move back to the original VM even while its device card is being
+// read. Discard that read and request the center at most once per dismissal.
+fn with_reconnect_center<W, T>(
+    mut focus: impl FnMut() -> Result<ReconnectFocus<W>>,
+    mut request_center: impl FnMut() -> Result<bool>,
+    same_window: impl Fn(&W, &W) -> bool,
+    mut read: impl FnMut(&W) -> Result<Option<T>>,
+) -> Result<T> {
+    let timeout = Duration::from_secs(5);
+    let mut deadline = Instant::now() + timeout;
+    let mut requested = false;
+    loop {
+        let observed = match focus()? {
+            ReconnectFocus::Center(window) => {
+                let result = read(&window);
+                let after = focus()?;
+                if matches!(&after, ReconnectFocus::Center(current) if same_window(&window, current))
+                {
+                    if let Some(value) = result? {
+                        return Ok(value);
+                    }
+                }
+                after
+            }
+            other => other,
+        };
+        if matches!(observed, ReconnectFocus::OriginalDesktop) && !requested && request_center()? {
+            requested = true;
+            // Reading a renamed card can itself wait for a native popup to close.
+            // Give the single delivered command its own time to bring the list back.
+            deadline = Instant::now() + timeout;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Windows App did not restore the selected account’s device list."
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Preflight a window-only binding through the client's current Devices view
 /// before disconnecting. Only a verified endpoint can authorize a profile switch.
 pub(super) fn verify_window_device(
@@ -147,43 +193,101 @@ pub(super) fn verify_window_device(
     name: &str,
     email: &str,
     only_open_session: bool,
+    is_original: impl Fn(&AxElement) -> bool,
     before_switch: impl FnOnce() -> Result<()>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<VerifiedWindowDevice> {
+    let desktop_changed = "The active desktop changed.";
+    let focus = || {
+        ensure!(
+            !cancelled() && app.bool_attr(AX_FRONTMOST) == Some(true),
+            desktop_changed
+        );
+        let Some(window) = app.element_attr("AXFocusedWindow") else {
+            return Ok(ReconnectFocus::Transition);
+        };
+        if is_original(&window) {
+            return Ok(ReconnectFocus::OriginalDesktop);
+        }
+        ensure!(is_center_window(&window), desktop_changed);
+        Ok(match key_center(app).filter(|w| w.same_element(&window)) {
+            Some(center) => ReconnectFocus::Center(center),
+            None => ReconnectFocus::Transition,
+        })
+    };
+    let request_center = || {
+        let Some(command) = show_center_command(app) else {
+            return Ok(false);
+        };
+        if matches!(focus()?, ReconnectFocus::OriginalDesktop) {
+            // AXPress can time out after delivery. Observe the window before proceeding.
+            command.perform_action(AX_PRESS);
+            if let Some(center) =
+                center_window(app).filter(|w| w.bool_attr("AXMinimized") == Some(true))
+            {
+                if !cancelled()
+                    && app.bool_attr(AX_FRONTMOST) == Some(true)
+                    && app
+                        .element_attr("AXFocusedWindow")
+                        .is_some_and(|w| w.same_element(&center) || is_original(&w))
+                {
+                    center.set_bool_attr("AXMinimized", false);
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    };
     ensure!(
-        !cancelled() && app.bool_attr(AX_FRONTMOST) == Some(true),
-        "The active desktop changed."
+        matches!(focus()?, ReconnectFocus::OriginalDesktop),
+        desktop_changed
     );
-    let (list, profile) = prepare_profile_devices(app, email, || {
+    let center = with_reconnect_center(focus, request_center, AxElement::same_element, |window| {
+        Ok(Some(window.clone()))
+    })?;
+    let center_focused = || {
+        ensure!(
+            matches!(focus()?, ReconnectFocus::Center(current) if current.same_element(&center)),
+            desktop_changed
+        );
+        Ok(())
+    };
+    show_devices(app, &center, center_focused)?;
+    center_focused()?;
+    let (profile, switched) = enter_profile::select_device_profile(app, &center, email, || {
         ensure!(!cancelled(), "Cancelled.");
         before_switch()
     })?;
-    let check_center = || {
-        ensure!(
-            !cancelled()
-                && app.bool_attr(AX_FRONTMOST) == Some(true)
-                && app
-                    .element_attr("AXFocusedWindow")
-                    .is_some_and(|w| w.same_element(&list.window)),
-            "The Windows App Devices view lost focus."
-        );
-        list.ensure_profile(&profile)
-    };
-    let card = reconnect_card(&list.devices, name, only_open_session, |item| {
-        check_center()?;
-        let entries = super::device_windows::session_entries(app)?;
-        ensure!(
-            matches!(entries.as_slice(), [(title, _)] if title == name),
-            "The connected desktop changed."
-        );
-        connected::connected_card(app, &list.window, item)
-    })?;
-    check_center()?;
-    ensure!(!card.trim().is_empty(), SELECTION_ERROR);
-    Ok(VerifiedWindowDevice {
-        center: list.window,
-        profile,
-        card: card.to_owned(),
+    with_reconnect_center(focus, request_center, AxElement::same_element, |center| {
+        let Ok((_, current)) = profile_label(center) else {
+            return Ok(None);
+        };
+        if current != profile {
+            ensure!(switched, PROFILE_ERROR);
+            return Ok(None);
+        }
+        let Some((_, cards)) = read_cards(center)? else {
+            return Ok(None);
+        };
+        let card = reconnect_card(&cards, name, only_open_session, |item| {
+            ensure!(
+                !cancelled() && profile_label(center)?.1 == profile,
+                PROFILE_ERROR
+            );
+            let entries = super::device_windows::session_entries(app)?;
+            ensure!(
+                matches!(entries.as_slice(), [(title, _)] if title == name),
+                "The connected desktop changed."
+            );
+            connected::connected_card(app, center, item)
+        })?;
+        ensure!(!card.trim().is_empty(), SELECTION_ERROR);
+        ensure!(profile_label(center)?.1 == profile, PROFILE_ERROR);
+        Ok(Some(VerifiedWindowDevice {
+            center: center.clone(),
+            profile: profile.clone(),
+            card: card.to_owned(),
+        }))
     })
 }
 
@@ -459,7 +563,7 @@ fn devices_window(app: &AxElement) -> Result<AxElement> {
         None
     })
     .context("Windows App did not bring its device list to the front.")?;
-    show_devices(app, &window)?;
+    show_devices(app, &window, || Ok(()))?;
     Ok(window)
 }
 
@@ -474,9 +578,14 @@ fn devices_from_window(app: AxElement, window: AxElement) -> Result<DeviceList> 
     })
 }
 
-fn show_devices(app: &AxElement, window: &AxElement) -> Result<()> {
+fn show_devices(
+    app: &AxElement,
+    window: &AxElement,
+    before_select: impl Fn() -> Result<()>,
+) -> Result<()> {
     if let Some(row) = devices_sidebar_row(window) {
         if row.bool_attr("AXSelected") != Some(true) {
+            before_select()?;
             ensure!(
                 row.set_bool_attr("AXSelected", true),
                 "Could not switch Windows App to Devices."
@@ -492,6 +601,7 @@ fn show_devices(app: &AxElement, window: &AxElement) -> Result<()> {
                 .filter(|item| item.bool_attr(AX_ENABLED) == Some(true))
         })
         .context("The Devices view is unavailable in Windows App.")?;
+        before_select()?;
         ensure!(
             devices.perform_action(AX_PRESS),
             "Could not switch Windows App to Devices."
@@ -672,6 +782,81 @@ pub(super) fn menu_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_recovers_once_when_dismissal_returns_to_the_original_vm() {
+        use ReconnectFocus::*;
+        let mut focus = [
+            OriginalDesktop,
+            Transition,
+            OriginalDesktop,
+            Center(1),
+            Center(1),
+        ]
+        .into_iter();
+        let mut requests = 0;
+        let card = with_reconnect_center(
+            || Ok(focus.next().unwrap()),
+            || {
+                requests += 1;
+                Ok(true)
+            },
+            PartialEq::eq,
+            |window| Ok(Some(*window)),
+        )
+        .unwrap();
+        assert_eq!((requests, card), (1, 1));
+    }
+
+    #[test]
+    fn reconnect_discards_cards_read_while_the_center_loses_focus() {
+        use ReconnectFocus::*;
+        let mut focus = [Center(1), OriginalDesktop, Center(2), Center(2)].into_iter();
+        let mut reads = Vec::new();
+        let mut requests = 0;
+        let card = with_reconnect_center(
+            || Ok(focus.next().unwrap()),
+            || {
+                requests += 1;
+                Ok(true)
+            },
+            PartialEq::eq,
+            |window| {
+                reads.push(*window);
+                Ok(Some(*window))
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, [1, 2]);
+        assert_eq!((requests, card), (1, 2));
+    }
+
+    #[test]
+    fn reconnect_uses_a_ready_center_without_requesting_focus() {
+        let card = with_reconnect_center(
+            || Ok(ReconnectFocus::Center(1)),
+            || panic!("center already focused"),
+            PartialEq::eq,
+            |window| Ok(Some(*window)),
+        )
+        .unwrap();
+        assert_eq!(card, 1);
+    }
+
+    #[test]
+    fn reconnect_stops_if_focus_leaves_windows_app_or_moves_to_another_vm() {
+        for reason in ["another app", "another VM", "monitor paused"] {
+            let mut focus =
+                [Ok(ReconnectFocus::Center(1)), Err(anyhow::anyhow!(reason))].into_iter();
+            let result = with_reconnect_center(
+                || focus.next().unwrap(),
+                || panic!("must not request focus after leaving"),
+                PartialEq::eq,
+                |window| Ok(Some(*window)),
+            );
+            assert_eq!(result.unwrap_err().to_string(), reason);
+        }
+    }
 
     #[test]
     fn a_shared_connected_card_can_focus_only_its_sole_stable_session() {

@@ -396,6 +396,7 @@ fn restore_after_card_check(
     session: &LockedSession,
     app: &AxElement,
     original: &AxElement,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
     // Return only from Windows App's own Connection Center to the exact
     // original VM. Never reactivate the app after the user leaves it.
@@ -411,7 +412,8 @@ fn restore_after_card_check(
             app,
             session.title(),
             &|| {
-                app.bool_attr(AX_FRONTMOST) != Some(true)
+                cancelled()
+                    || app.bool_attr(AX_FRONTMOST) != Some(true)
                     || app
                         .element_attr("AXFocusedWindow")
                         .is_some_and(|w| !w.same_element(original) && !w.same_element(&center))
@@ -448,6 +450,13 @@ fn preflight_reconnect<'a>(
                 title,
                 &session.username,
                 session.other_sessions.is_empty(),
+                |focused| {
+                    focused.same_element(original)
+                        && window_id(focused) == Some(session.window_id)
+                        && focused
+                            .optional_relationship_array_attr_result(AX_SHEETS)
+                            .is_ok_and(|sheets| sheets.is_empty())
+                },
                 || verify_profile_switch(accounts, &account.id, verified_host),
                 cancelled,
             )
@@ -468,7 +477,7 @@ fn preflight_reconnect<'a>(
                 .map(|()| ReconnectTarget::Saved(device))
         }
     };
-    restore_after_card_check(session, app, original)?;
+    restore_after_card_check(session, app, original, cancelled)?;
     let target = verified?;
     same_focused_session(session, app)?;
     Ok(target)

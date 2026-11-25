@@ -111,13 +111,13 @@ fn inspect_selector<T>(
     result
 }
 
-pub(super) fn prepare_profile_devices(
+pub(super) fn select_device_profile(
     app: &AxElement,
+    center: &AxElement,
     email: &str,
     before_switch: impl FnOnce() -> Result<()>,
-) -> Result<(DeviceList, String)> {
-    let center = devices_window(app)?;
-    let (label, switched) = inspect_selector(app, &center, |sheet, active| {
+) -> Result<(String, bool)> {
+    inspect_selector(app, center, |sheet, active| {
         let rows = wait_for(|| profile_rows(sheet)).context(PROFILE_ERROR)?;
         let (target, selected) = target_profile(&rows, active, email)?;
         if !selected {
@@ -125,8 +125,8 @@ pub(super) fn prepare_profile_devices(
                 row,
                 email_text: text,
             } = &target.controls;
-            connected::click_profile_email(app, &center, sheet, row, text, || {
-                ensure!(profile_label(&center)?.1 == active, PROFILE_ERROR);
+            connected::click_profile_email(app, center, sheet, row, text, || {
+                ensure!(profile_label(center)?.1 == active, PROFILE_ERROR);
                 let current = profile_rows(sheet).context(PROFILE_ERROR)?;
                 let (fresh, selected) = target_profile(&current, active, email)?;
                 ensure!(
@@ -144,14 +144,23 @@ pub(super) fn prepare_profile_devices(
             let until = Instant::now() + Duration::from_millis(500);
             while Instant::now() < until
                 && app.bool_attr(AX_FRONTMOST) == Some(true)
-                && profile_label(&center).is_ok_and(|(_, label)| label != target.label)
-                && children(&center)?.iter().any(|w| w.same_element(sheet))
+                && profile_label(center).is_ok_and(|(_, label)| label != target.label)
+                && children(center)?.iter().any(|w| w.same_element(sheet))
             {
                 std::thread::sleep(Duration::from_millis(35));
             }
         }
         Ok((target.label.clone(), !selected))
-    })?;
+    })
+}
+
+pub(super) fn prepare_profile_devices(
+    app: &AxElement,
+    email: &str,
+    before_switch: impl FnOnce() -> Result<()>,
+) -> Result<(DeviceList, String)> {
+    let center = devices_window(app)?;
+    let (label, switched) = select_device_profile(app, &center, email, before_switch)?;
     let center = if switched {
         // Dismissing the selector can restore a fullscreen VM or rebuild the
         // center. Resolve the live window under the already verified profile.
