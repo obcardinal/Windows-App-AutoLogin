@@ -269,7 +269,7 @@ pub(super) fn verify_window_device(
         let Some((_, cards)) = read_cards(center)? else {
             return Ok(None);
         };
-        let card = reconnect_card(&cards, name, only_open_session, |item| {
+        let Some(card) = reconnect_card(&cards, name, only_open_session, |item| {
             ensure!(
                 !cancelled() && profile_label(center)?.1 == profile,
                 PROFILE_ERROR
@@ -280,7 +280,10 @@ pub(super) fn verify_window_device(
                 "The connected desktop changed."
             );
             connected::connected_card(app, center, item)
-        })?;
+        })?
+        else {
+            return Ok(None);
+        };
         ensure!(!card.trim().is_empty(), SELECTION_ERROR);
         ensure!(profile_label(center)?.1 == profile, PROFILE_ERROR);
         Ok(Some(VerifiedWindowDevice {
@@ -296,30 +299,33 @@ fn reconnect_card<'a, T>(
     title: &str,
     only_open_session: bool,
     mut connected: impl FnMut(&T) -> Result<bool>,
-) -> Result<&'a str> {
+) -> Result<Option<&'a str>> {
     if let Some((name, _)) = cards.iter().find(|(name, _)| name == title) {
         exact_device(cards, name)?;
-        return Ok(name);
+        return Ok(Some(name));
     }
-    // Windows App may keep the original title in the open window. When
-    // exactly one session is open, its connected card identifies that VM.
-    if only_open_session {
-        let mut matched = None;
-        for (name, item) in cards {
-            if connected(item)? {
-                ensure!(
-                    matched.is_none(),
-                    "Windows App shows several connected desktops."
-                );
-                exact_device(cards, name)?;
-                matched = Some(name.as_str());
-            }
-        }
-        if let Some(name) = matched {
-            return Ok(name);
+    // The account label may be ready before its collection is populated.
+    // With several open sessions only an exact title can identify the card.
+    if cards.is_empty() || !only_open_session {
+        return Ok(None);
+    }
+    // With a single renamed session, inspect the connected state once.
+    let mut matched = None;
+    for (name, item) in cards {
+        if connected(item)? {
+            ensure!(
+                matched.is_none(),
+                "Windows App shows several connected desktops."
+            );
+            exact_device(cards, name)?;
+            matched = Some(name.as_str());
         }
     }
-    anyhow::bail!("Windows App could not identify the connected desktop in Devices.")
+    ensure!(
+        matched.is_some(),
+        "Windows App could not identify the connected desktop in Devices."
+    );
+    Ok(matched)
 }
 
 pub(super) fn verify_saved_card(
@@ -931,19 +937,40 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_waits_for_the_exact_card_when_multiple_sessions_are_open() {
+        let previous = [("Other desktop".to_owned(), ())];
+        let loaded = [("Selected desktop".to_owned(), ())];
+        let mut snapshots = [&previous[..0], &previous[..], &loaded[..]].into_iter();
+        let result = with_reconnect_center(
+            || Ok(ReconnectFocus::Center(1)),
+            || panic!("center remains focused"),
+            PartialEq::eq,
+            |_| {
+                reconnect_card(snapshots.next().unwrap(), "Selected desktop", false, |_| {
+                    panic!("do not open or inspect a different desktop")
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result, "Selected desktop");
+    }
+
+    #[test]
     fn reconnect_uses_the_connected_card_for_a_single_renamed_session() {
         let cards = vec![("Offline".to_owned(), false), ("New name".to_owned(), true)];
         assert_eq!(
             reconnect_card(&cards, "Old name", true, |state| Ok(*state)).unwrap(),
-            "New name"
+            Some("New name")
         );
         assert!(
-            reconnect_card(&cards, "Old name", false, |_| panic!("ambiguous session")).is_err()
+            reconnect_card(&cards, "Old name", false, |_| panic!("ambiguous session"))
+                .unwrap()
+                .is_none()
         );
         assert!(reconnect_card(&cards[..1], "Old name", true, |state| Ok(*state)).is_err());
         assert_eq!(
             reconnect_card(&cards, "New name", false, |_| panic!("exact name")).unwrap(),
-            "New name"
+            Some("New name")
         );
         assert!(reconnect_card(&cards, "Old name", true, |_| Ok(true)).is_err());
         let duplicate = vec![
