@@ -14,6 +14,7 @@ use tokio::sync::{mpsc::Sender, Semaphore};
 
 const RETURN_WINDOW: Duration = Duration::from_secs(12);
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
+const FOREGROUND_RECHECK_INTERVAL: Duration = Duration::from_secs(12);
 const RECONNECT_COOLDOWN: Duration = Duration::from_secs(90);
 const HID_SYSTEM_STATE: i32 = 1;
 const LEFT_MOUSE_DOWN: u32 = 1;
@@ -34,7 +35,6 @@ fn local_idle() -> Option<Duration> {
 struct ReturnWindow {
     focused: Option<(i32, String)>,
     presentation: Option<SessionPresentation>,
-    observed_away: bool,
     idle: bool,
     deadline: Option<Instant>,
     last_scan: Option<Instant>,
@@ -53,7 +53,6 @@ impl ReturnWindow {
         let Some((pid, title, presentation)) = target else {
             self.focused = None;
             self.presentation = None;
-            self.observed_away = true;
             self.deadline = None;
             self.idle = false;
             self.last_click = None;
@@ -66,8 +65,6 @@ impl ReturnWindow {
             .is_some_and(|(previous_pid, previous_title)| {
                 *previous_pid == pid && previous_title == title
             });
-        let returned_to_window = changed && (self.observed_away || self.focused.is_some());
-        self.observed_away = false;
         if changed {
             self.focused = Some((pid, title.to_owned()));
             self.presentation = None;
@@ -80,32 +77,19 @@ impl ReturnWindow {
         }
         self.idle = idle >= RETURN_WINDOW;
         self.observe_click(clicks, now);
-        let in_return_window = self.deadline.is_some_and(|deadline| now < deadline);
         let recent_click = self
             .pending_click
             .is_some_and(|click| now.duration_since(click) < RETURN_WINDOW);
-        // Windows can lock while the same fullscreen Space stays foreground.
-        // After the initial burst, new physical input (including movement or
-        // typing) gets one check, then at most one per return interval.
-        let active_fullscreen = presentation.is_some_and(|p| p.fullscreen == Some(true));
-        let fullscreen_retry = active_fullscreen
-            && self
-                .last_scan
-                .zip(self.deadline)
-                .is_some_and(|(last, end)| {
-                    let elapsed = now.duration_since(last);
-                    now >= end
-                    && (last < end || elapsed >= RETURN_WINDOW)
-                    // Only an input newer than the last scan can trigger it.
-                    // Allow for scheduling jitter between querying HID and
-                    // sampling the clock in consecutive passes.
-                    && elapsed > idle.saturating_add(Duration::from_millis(50))
-                });
-        (returned_to_window || idle < RETURN_WINDOW)
-            && (in_return_window || recent_click || fullscreen_retry)
-            && self
-                .last_scan
-                .is_none_or(|last| now.duration_since(last) >= SCAN_INTERVAL)
+        // Windows can lock without any macOS focus or input event. Keep
+        // sampling the focused VM after the faster checks on return.
+        self.last_scan.is_none_or(|last| {
+            let interval = if recent_click || self.deadline.is_some_and(|end| last < end) {
+                SCAN_INTERVAL
+            } else {
+                FOREGROUND_RECHECK_INTERVAL
+            };
+            now.duration_since(last) >= interval
+        })
     }
 
     fn observe_presentation(&mut self, current: Option<SessionPresentation>) -> bool {
@@ -267,7 +251,7 @@ impl ReturnMonitor {
             fullscreen = presentation.and_then(|p| p.fullscreen),
             linked = linked_target.is_some(),
             due,
-            "Checking for a return to Windows App"
+            "Checking the focused Windows desktop"
         );
         if !due {
             return false;
@@ -444,147 +428,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_titled_fullscreen_transition_and_replacement_rearm_a_bounded_scan() {
+    fn focused_vm_is_checked_throughout_inactivity_in_each_window_mode() {
+        for mode in [Some(true), Some(false), None] {
+            let start = Instant::now();
+            let vm = Some((
+                12,
+                "VM",
+                Some(SessionPresentation {
+                    window_id: 5,
+                    fullscreen: mode,
+                }),
+            ));
+            let mut visit = ReturnWindow::default();
+            let mut scans = Vec::new();
+            for second in 0..=60 {
+                let now = start + Duration::from_secs(second);
+                if visit.due(vm, Duration::MAX, Some(0), now) {
+                    visit.scanned(now);
+                    scans.push(second);
+                }
+            }
+            assert_eq!(scans, [0, 2, 4, 6, 8, 10, 12, 24, 36, 48, 60]);
+        }
+    }
+
+    #[test]
+    fn losing_focus_stops_checks_until_return_even_if_idle() {
+        let start = Instant::now();
+        let vm = Some((12, "VM", None));
+        let mut visit = ReturnWindow::default();
+        assert!(visit.due(vm, Duration::MAX, None, start));
+        visit.scanned(start);
+        for second in 1..=60 {
+            assert!(!visit.due(
+                None,
+                Duration::ZERO,
+                Some(second as u32),
+                start + Duration::from_secs(second)
+            ));
+        }
+        let back = start + Duration::from_secs(61);
+        assert!(visit.due(vm, Duration::MAX, None, back));
+        visit.scanned(back);
+        assert!(!visit.due(vm, Duration::MAX, None, back + Duration::from_secs(1)));
+        assert!(visit.due(vm, Duration::MAX, None, back + SCAN_INTERVAL));
+    }
+
+    #[test]
+    fn visible_background_vm_is_excluded_from_reconnect() {
+        let snapshot = MacosMonitorSnapshot {
+            process_found: true,
+            target_process_id: Some(12),
+            target_window_title: Some("VM".into()),
+            target_frontmost: Some(false),
+            target_window_observed: true,
+            session_presentation: Some(SessionPresentation {
+                window_id: 5,
+                fullscreen: Some(false),
+            }),
+            selected_prompt_present: false,
+            prompt_candidate_count: 0,
+        };
+        let mut account = Account::new("user@example.test");
+        account.vm_target = "VM".into();
+        account.vm_device_id = "open-window".into();
+        account.has_saved_password = true;
+        let mut monitor = ReturnMonitor {
+            recognition: Some(RecognitionMaintenance::default()),
+            ..Default::default()
+        };
+        monitor.visit.focused = Some((12, "VM".into()));
+        let (events, _) = tokio::sync::mpsc::channel(1);
+        assert!(!monitor.poll(
+            Some(&snapshot),
+            &[account],
+            &Arc::new(Semaphore::new(0)),
+            &WorkerActivityTracker::default(),
+            &crate::background::WorkerInvalidator::new().pause_latch(),
+            0,
+            &events,
+        ));
+        assert!(monitor.visit.focused.is_none());
+        assert!(monitor.visit.last_scan.is_none());
+    }
+
+    #[test]
+    fn presentation_changes_restart_fast_checks_while_idle() {
         let start = Instant::now();
         let mut visit = ReturnWindow::default();
-        let mut tick = |second, id: Option<u32>, fullscreen, idle| {
+        let mut tick = |second, id: Option<u32>, fullscreen| {
             let now = start + Duration::from_secs(second);
             let presentation = id.map(|window_id| SessionPresentation {
                 window_id,
                 fullscreen,
             });
-            let due = visit.due(Some((12, "VM", presentation)), idle, Some(3), now);
+            let due = visit.due(Some((12, "VM", presentation)), Duration::MAX, None, now);
             if due {
                 visit.scanned(now);
             }
             due
         };
-        let active = Duration::ZERO;
-        assert!(tick(0, Some(5), Some(false), active));
-        assert!(!tick(13, Some(5), None, active));
-        assert!(!tick(14, None, None, active));
-        assert!(tick(15, Some(5), Some(true), active));
-        assert!(tick(28, Some(5), Some(false), active));
-        assert!(!tick(41, Some(5), Some(false), active));
-        assert!(tick(42, Some(6), Some(false), active));
-        assert!(!tick(55, Some(6), Some(false), active));
-        // A background-triggered resize or replacement cannot establish user presence.
-        assert!(!tick(56, Some(6), Some(true), RETURN_WINDOW));
-        assert!(!tick(57, Some(7), Some(true), RETURN_WINDOW));
-        assert!(tick(58, Some(7), Some(true), active));
+        assert!(tick(0, Some(5), Some(false)));
+        assert!(tick(12, Some(5), Some(false)));
+        assert!(!tick(14, Some(5), None));
+        assert!(!tick(15, None, None));
+        assert!(tick(16, Some(5), Some(true)));
+        assert!(tick(28, Some(5), Some(true)));
+        assert!(!tick(30, Some(5), Some(true)));
+        assert!(tick(31, Some(6), Some(true)));
     }
 
     #[test]
-    fn staying_fullscreen_rechecks_new_hid_activity_without_a_click_or_focus_change() {
-        let start = Instant::now();
-        let mut visit = ReturnWindow::default();
-        let fullscreen = Some(SessionPresentation {
-            window_id: 5,
-            fullscreen: Some(true),
-        });
-        let mut tick = |second, input_second| {
-            let now = start + Duration::from_secs(second);
-            let due = visit.due(
-                Some((12, "VM", fullscreen)),
-                Duration::from_secs(second - input_second),
-                Some(10),
-                now,
-            );
-            if due {
-                visit.scanned(now);
-            }
-            due
-        };
-        // Initial return burst, identical mouse-down count throughout.
-        for t in 0..12 {
-            assert_eq!(tick(t, 0), t % 2 == 0);
-        }
-        // The same old input never starts a scan after the return burst.
-        assert!(!tick(12, 4));
-        assert!(!tick(13, 5));
-        // A movement/key press after the last scan immediately gets one try.
-        assert!(tick(14, 14));
-        for t in 15..26 {
-            assert!(!tick(t, t));
-        }
-        assert!(tick(26, 26));
-        // A stale sample remains ineligible at expiry even if clock skew
-        // makes it appear a few milliseconds younger than the last scan.
-        let retry = start + Duration::from_secs(38);
-        assert!(!visit.due(
-            Some((12, "VM", fullscreen)),
-            RETURN_WINDOW - Duration::from_millis(4),
-            Some(10),
-            retry
-        ));
-        assert!(!visit.due(
-            Some((12, "VM", fullscreen)),
-            RETURN_WINDOW + Duration::from_secs(1),
-            Some(10),
-            retry + Duration::from_secs(1)
-        ));
-        assert!(visit.due(
-            Some((12, "VM", fullscreen)),
-            Duration::ZERO,
-            Some(10),
-            retry + Duration::from_secs(2)
-        ));
-    }
-
-    #[test]
-    fn sustained_activity_in_a_window_or_an_unknown_space_does_not_run_fullscreen_checks() {
-        for mode in [Some(false), None] {
-            let start = Instant::now();
-            let presentation = Some(SessionPresentation {
-                window_id: 1,
-                fullscreen: mode,
-            });
-            let vm = Some((12, "VM", presentation));
-            let mut visit = ReturnWindow::default();
-            assert!(visit.due(vm, Duration::ZERO, Some(1), start));
-            visit.scanned(start);
-            assert!(!visit.due(vm, Duration::ZERO, Some(1), start + RETURN_WINDOW));
-            assert!(!visit.due(vm, Duration::ZERO, Some(1), start + RETURN_WINDOW * 2));
-        }
-    }
-
-    #[test]
-    fn only_scan_in_a_bounded_window_after_return_and_space_out_samples() {
-        let now = Instant::now();
-        let vm = Some((12, "VM", None));
-        let active = Duration::ZERO;
-        let mut visit = ReturnWindow::default();
-        assert!(visit.due(vm, active, None, now));
-        visit.scanned(now);
-        assert!(!visit.due(vm, active, None, now + Duration::from_secs(1)));
-        assert!(visit.due(vm, active, None, now + SCAN_INTERVAL));
-        assert!(!visit.due(vm, active, None, now + RETURN_WINDOW));
-        assert!(!visit.due(None, active, None, now + RETURN_WINDOW));
-        assert!(visit.due(vm, active, None, now + RETURN_WINDOW));
-    }
-
-    #[test]
-    fn leaving_a_locked_vm_foreground_does_not_unlock_it_while_user_is_away() {
-        let now = Instant::now();
-        let vm = Some((12, "VM", None));
-        let mut visit = ReturnWindow::default();
-        assert!(!visit.due(vm, RETURN_WINDOW, None, now));
-        assert!(!visit.due(vm, RETURN_WINDOW * 2, None, now + RETURN_WINDOW));
-        assert!(visit.due(vm, Duration::ZERO, None, now + RETURN_WINDOW * 2));
-    }
-
-    #[test]
-    fn returning_to_a_window_via_accessibility_needs_no_physical_mouse_event() {
-        let now = Instant::now();
-        let vm = Some((12, "VM", None));
-        let mut visit = ReturnWindow::default();
-        assert!(!visit.due(None, RETURN_WINDOW * 2, None, now));
-        assert!(visit.due(vm, RETURN_WINDOW * 2, None, now + SCAN_INTERVAL));
-        assert!(!visit.due(vm, RETURN_WINDOW * 2, None, now + SCAN_INTERVAL * 2));
-    }
-
-    #[test]
-    fn clicking_the_same_vm_after_the_deadline_enables_one_check_per_burst() {
+    fn a_new_click_can_run_before_the_next_periodic_check() {
         let start = Instant::now();
         let vm = Some((12, "VM", None));
         let mut visit = ReturnWindow::default();
@@ -597,14 +552,12 @@ mod tests {
             due
         };
         assert!(tick(0, 100));
-        assert!(!tick(12, 100));
+        assert!(tick(12, 100));
+        assert!(!tick(16, 100));
         assert!(tick(18, 101));
         for i in 1..=25 {
-            assert!(!tick(18 + i, (101 + i) as u32));
+            assert_eq!(tick(18 + i, (101 + i) as u32), i % 12 == 0);
         }
-        assert!(!tick(60, 126));
-        assert!(tick(61, 127));
-        assert!(!tick(64, 127));
     }
 
     #[test]
@@ -644,12 +597,15 @@ mod tests {
         let mut visit = ReturnWindow::default();
         assert!(visit.due(vm, Duration::ZERO, None, now));
         visit.scanned(now);
+        let idle = now + Duration::from_secs(15);
+        assert!(visit.due(vm, Duration::from_secs(15), None, idle));
+        visit.scanned(idle);
         assert!(!visit.due(
             vm,
-            Duration::from_secs(15),
+            Duration::from_secs(18),
             None,
-            now + Duration::from_secs(15)
+            idle + Duration::from_secs(3)
         ));
-        assert!(visit.due(vm, Duration::ZERO, None, now + Duration::from_secs(16)));
+        assert!(visit.due(vm, Duration::ZERO, None, idle + Duration::from_secs(4)));
     }
 }

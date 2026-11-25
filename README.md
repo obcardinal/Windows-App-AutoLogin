@@ -49,7 +49,7 @@ When a new remote desktop connects, AutoLogin closes the Windows App device list
 
 Choose the desktop under **Connection → VM device** in the account editor. With multiple accounts, use **Import** to match the Remote PC address to the account. With one account, the address is optional.
 
-**Reconnect when locked** is on by default for linked desktops on macOS 14+. It uses **Screen Recording** to recognize the English Windows password screen in the foreground VM window. The image is processed in memory on your Mac and discarded. Recognition triggers a reconnect. Password entry takes place in Windows App's verified credential prompt.
+**Reconnect when locked** is on by default for linked desktops on macOS 14+. While the VM window is in focus, AutoLogin uses **Screen Recording** to check for the English Windows password screen, even if you step away. It processes the image in memory on your Mac and discards it. If it recognizes the password screen, it reconnects. Password entry takes place in Windows App's verified credential prompt.
 
 While at least one active linked account uses this option, AutoLogin restores missing recognition models in the background, even when no desktop is open.
 

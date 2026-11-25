@@ -89,7 +89,7 @@ pub struct Account {
         skip_serializing_if = "Option::is_none"
     )]
     pub desktop_shortcut: Option<DesktopShortcut>,
-    /// Reconnect this linked VM through Windows App when returning to its locked session on macOS.
+    /// Reconnect this linked VM on macOS when its focused window shows the Windows password screen.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub reconnect_locked_vm: bool,
     #[serde(default, skip_serializing_if = "is_false")]

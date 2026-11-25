@@ -71,7 +71,7 @@ const ACCOUNT_EDITOR_TOGGLE_WIDTH: f32 = 38.0;
 #[cfg(target_os = "macos")]
 const ACCOUNT_2FA_HELP: &str = "AutoLogin enters the Microsoft Authenticator number on your unlocked iPhone over Wi-Fi. Use Face ID if prompted.";
 #[cfg(target_os = "macos")]
-const RECONNECT_HELP: &str = "When you return to a locked VM, AutoLogin closes and reopens its window to reconnect.";
+const RECONNECT_HELP: &str = "While this VM is in focus, AutoLogin checks for the Windows password screen, even if you step away. When it detects the screen, it closes and reopens the VM window.";
 const ACTION_ICON_SIZE: f32 = 16.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
 const PASSWORD_EDITOR_ID_SALT: &str = "account_password_editor";
@@ -3215,7 +3215,7 @@ fn show_locked_vm_reconnect(
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         let label = "Reconnect when locked";
-        let hint = "AutoLogin reconnects when you return to the locked desktop.";
+        let hint = "Reconnect this desktop when its window is in focus and Windows is locked.";
         let enabled = supported || account.reconnect_locked_vm;
         let changed = account_editor_switch(
             ui,
@@ -5262,7 +5262,7 @@ mod tests {
         assert!(visible_text_rects(&granted, "Open System Settings…").is_empty());
         assert!(visible_text_rects(
             &granted,
-            "AutoLogin reconnects when you return to the locked desktop."
+            "Reconnect this desktop when its window is in focus and Windows is locked."
         )
         .is_empty());
         assert_eq!(requests.get(), 2);
