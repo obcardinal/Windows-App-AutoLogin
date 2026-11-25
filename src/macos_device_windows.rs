@@ -160,16 +160,20 @@ pub(super) fn focus_session_in_app(
                     .context("The selected desktop has disconnected.")?;
                 if item.bool_attr(AX_ENABLED) == Some(true) {
                     ensure!(!cancelled(), "Cancelled.");
-                    ensure!(
-                        item.perform_action(AX_PRESS),
-                        "Windows App could not bring the session to the front."
-                    );
+                    let acknowledged = item.perform_action(AX_PRESS);
                     selected = true;
                     if !frontmost {
+                        ensure!(
+                            acknowledged,
+                            "Windows App could not bring the session to the front."
+                        );
                         if let Some(notify) = handoff.take() {
                             notify();
                         }
                     }
+                    // When restoring a foreground VM, the Window menu may finish
+                    // switching Spaces after AXPress times out. Observe the key
+                    // window on the next iteration without selecting it twice.
                 }
             }
             SessionFocusAction::ActivateApp => {
