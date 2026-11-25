@@ -5,6 +5,7 @@ use super::{
     device_windows, remote_pc_info, usernames_match, AXUIElementRef, AxElement, AX_ENABLED,
     AX_FRONTMOST, AX_PRESS, AX_SHEETS, AX_TITLE, AX_WINDOWS,
 };
+use crate::macos_lock_screen::log_reconnect;
 use crate::models::{canonical_remote_pc, Account};
 use anyhow::{ensure, Context, Result};
 use std::time::{Duration, Instant};
@@ -477,7 +478,13 @@ fn preflight_reconnect<'a>(
                 .map(|()| ReconnectTarget::Saved(device))
         }
     };
-    restore_after_card_check(session, app, original, cancelled)?;
+    log_reconnect(if verified.is_ok() {
+        c"Reconnect device verified"
+    } else {
+        c"Reconnect device verification failed"
+    });
+    restore_after_card_check(session, app, original, cancelled)
+        .inspect_err(|_| log_reconnect(c"Could not restore original desktop focus"))?;
     verified
 }
 
@@ -556,12 +563,19 @@ pub(crate) fn reconnect(
             );
             Ok((count == 1).then_some(close))
         },
-    )?;
+    )
+    .inspect_err(|_| log_reconnect(c"Original desktop or Close command unavailable"))?;
     // AX can time out after accepting a press. Observe the exact window and its
     // native session entry to establish disconnection before issuing Connect.
     before_disconnect()?;
-    close.perform_action(AX_PRESS);
+    let acknowledged = close.perform_action(AX_PRESS);
+    log_reconnect(if acknowledged {
+        c"Close acknowledged"
+    } else {
+        c"Close sent without acknowledgement"
+    });
     wait_for_disconnect(session, &app, &window)?;
+    log_reconnect(c"Original desktop disconnected");
     // Once the selected session has closed, restore that same device even if
     // the user stopped Monitor in the meantime. Never choose another profile.
     let can_reopen = || {

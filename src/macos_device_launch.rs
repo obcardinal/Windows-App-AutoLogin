@@ -257,6 +257,9 @@ pub(super) fn verify_window_device(
     let (profile, switched) = enter_profile::select_device_profile(app, &center, email, || {
         ensure!(!cancelled(), "Cancelled.");
         before_switch()
+    })
+    .inspect_err(|_| {
+        crate::macos_lock_screen::log_reconnect(c"Could not verify Windows App profile")
     })?;
     with_reconnect_center(focus, request_center, AxElement::same_element, |center| {
         let Ok((_, current)) = profile_label(center) else {
@@ -291,6 +294,9 @@ pub(super) fn verify_window_device(
             profile: profile.clone(),
             card: card.to_owned(),
         }))
+    })
+    .inspect_err(|_| {
+        crate::macos_lock_screen::log_reconnect(c"Could not verify Windows App device card")
     })
 }
 

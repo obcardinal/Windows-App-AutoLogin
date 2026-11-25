@@ -2,7 +2,7 @@
 //! visual evidence only. It does not attest the guest desktop or its identity.
 
 use std::{
-    ffi::c_void,
+    ffi::{c_char, c_void, CStr},
     process::{Child, Command, Stdio},
     ptr::NonNull,
     slice, str,
@@ -21,6 +21,7 @@ pub(crate) enum LockScreenObservation {
 #[link(name = "waal_lock_screen_capture", kind = "static")]
 #[link(name = "Vision", kind = "framework")]
 unsafe extern "C" {
+    fn waal_log_reconnect_event(event: *const c_char);
     fn waal_lock_capture_supported() -> bool;
     fn waal_lock_capture_allowed() -> bool;
     fn waal_prepare_lock_recognition();
@@ -37,6 +38,11 @@ unsafe extern "C" {
         visitor: extern "C" fn(*mut c_void, i32, *const u8, usize, f32, f64, f64, f64, f64),
         context: *mut c_void,
     ) -> i32;
+}
+
+/// Record only fixed stage names, never window titles, account details or OCR text.
+pub(crate) fn log_reconnect(event: &'static CStr) {
+    unsafe { waal_log_reconnect_event(event.as_ptr()) }
 }
 
 pub(crate) fn supported() -> bool {

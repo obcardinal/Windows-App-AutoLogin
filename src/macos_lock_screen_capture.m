@@ -7,6 +7,7 @@
 #include "macos_masked_field.h"
 
 #import <ApplicationServices/ApplicationServices.h>
+#import <os/log.h>
 #include <dlfcn.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -15,6 +16,15 @@
 enum { OverviewText, MaskedField, VerifiedPlaceholder, EditorBounds, CornerText, AccountText, LayoutText,
        AmbiguousText, PairedAccountText };
 typedef void (*WaalTextVisitor)(void *, int, const char *, size_t, float, double, double, double, double);
+
+void waal_log_reconnect_event(const char *event) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        log = os_log_create("com.obcardinal.WindowsAppAutoLogin", "Reconnect");
+    });
+    os_log(log, "%{public}s", event);
+}
 
 bool waal_lock_capture_supported(void) {
     if (@available(macOS 14.0, *)) return true;

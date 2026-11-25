@@ -326,6 +326,7 @@ impl ReturnMonitor {
                     // The maintenance worker coalesces this failure with cache
                     // events, after this thread gives up the automation slot.
                     recognition_failed.store(true, Ordering::Release);
+                    macos_lock_screen::log_reconnect(c"Lock screen recognition failed");
                     return;
                 }
                 _ => {
@@ -345,18 +346,22 @@ impl ReturnMonitor {
             };
             deadlines.insert(window_key, Instant::now() + RETURN_WINDOW);
             drop(deadlines);
+            macos_lock_screen::log_reconnect(c"Password screen recognized");
             let session = match probe.identify_locked(&accounts, &cancelled) {
                 Ok(Some(session)) => session,
                 Ok(None) => {
+                    macos_lock_screen::log_reconnect(c"No unique account for this connection");
                     tracing::debug!("The active Remote PC has no unique enabled desktop binding");
                     return;
                 }
                 Err(err) => {
+                    macos_lock_screen::log_reconnect(c"Could not confirm the locked session");
                     tracing::debug!(reason = %err, "Could not confirm the locked desktop");
                     return;
                 }
             };
             if visible_account.is_some_and(|id| id != &session.account_id) {
+                macos_lock_screen::log_reconnect(c"Sign-in account did not match");
                 tracing::debug!(
                     "The Windows sign-in account differs from the linked desktop account"
                 );
@@ -390,13 +395,17 @@ impl ReturnMonitor {
             drop(_permit);
             match result {
                 Ok(()) => {
+                    macos_lock_screen::log_reconnect(c"Reconnect requested");
                     let _ = events.try_send(log_event(
                         LogLevel::Info,
                         "Requested reconnection to the locked desktop.",
                     ));
                 }
-                Err(_) if cancelled() => {}
+                Err(_) if cancelled() => {
+                    macos_lock_screen::log_reconnect(c"Reconnect cancelled");
+                }
                 Err(err) => {
+                    macos_lock_screen::log_reconnect(c"Reconnect stopped");
                     tracing::warn!(reason = %err, "Locked desktop reconnect stopped");
                     let _ = events.try_send(log_event(
                         LogLevel::Warn,
