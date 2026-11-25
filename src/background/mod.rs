@@ -2572,6 +2572,7 @@ mod tests {
             target_frontmost: Some(true),
             target_window_observed: true,
             session_presentation: None,
+            split_focus_desktop: None,
             selected_prompt_present: false,
             prompt_candidate_count: 0,
         };

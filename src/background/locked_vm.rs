@@ -221,31 +221,17 @@ impl ReturnMonitor {
         if snapshot.process_found && snapshot.target_frontmost.is_none() {
             return false;
         }
-        let target = if snapshot.target_frontmost == Some(true)
-            && snapshot.target_window_observed
-            && snapshot.prompt_candidate_count == 0
-        {
-            snapshot
-                .target_process_id
-                .zip(snapshot.target_window_title.as_deref())
-        } else {
-            None
-        };
+        let target = reconnect_target(snapshot);
         let now = Instant::now();
         let idle = target.and_then(|_| local_idle()).unwrap_or(Duration::MAX);
-        let linked_target = target.filter(|(_, title)| {
-            locked_session::should_probe(accounts, title, snapshot.session_presentation.is_some())
+        let linked_target = target.filter(|(_, title, presentation)| {
+            locked_session::should_probe(accounts, title, presentation.is_some())
         });
         let clicks = linked_target.map(|_| unsafe {
             CGEventSourceCounterForEventType(HID_SYSTEM_STATE, LEFT_MOUSE_DOWN)
         });
-        let presentation = linked_target.and(snapshot.session_presentation);
-        let due = self.visit.due(
-            linked_target.map(|(pid, title)| (pid, title, presentation)),
-            idle,
-            clicks,
-            now,
-        );
+        let presentation = linked_target.and_then(|(_, _, p)| p);
+        let due = self.visit.due(linked_target, idle, clicks, now);
         tracing::trace!(
             foreground = target.is_some(),
             fullscreen = presentation.and_then(|p| p.fullscreen),
@@ -256,7 +242,7 @@ impl ReturnMonitor {
         if !due {
             return false;
         }
-        let Some((requested_pid, requested_title)) = linked_target else {
+        let Some((requested_pid, requested_title, _)) = linked_target else {
             return false;
         };
         if !macos_lock_screen::screen_recording_allowed() {
@@ -423,6 +409,27 @@ impl ReturnMonitor {
     }
 }
 
+fn reconnect_target(
+    snapshot: &MacosMonitorSnapshot,
+) -> Option<(i32, &str, Option<SessionPresentation>)> {
+    if snapshot.prompt_candidate_count != 0 || snapshot.selected_prompt_present {
+        return None;
+    }
+    let pid = snapshot.target_process_id?;
+    if snapshot.target_frontmost == Some(true) && snapshot.target_window_observed {
+        return Some((
+            pid,
+            snapshot.target_window_title.as_deref()?,
+            snapshot.session_presentation,
+        ));
+    }
+    let desktop = snapshot
+        .split_focus_desktop
+        .as_ref()
+        .filter(|d| d.process_id == pid)?;
+    Some((pid, &desktop.title, Some(desktop.presentation)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +482,44 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_admits_the_verified_key_desktop_only_without_credential_candidates() {
+        let presentation = SessionPresentation {
+            window_id: 51,
+            fullscreen: Some(true),
+        };
+        let mut snapshot = MacosMonitorSnapshot {
+            process_found: true,
+            target_process_id: Some(12),
+            target_window_title: Some("Connection Center".into()),
+            target_frontmost: Some(false),
+            target_window_observed: true,
+            session_presentation: None,
+            split_focus_desktop: Some(crate::macos_ax::ReconnectDesktop {
+                process_id: 12,
+                title: "VM".into(),
+                presentation,
+            }),
+            selected_prompt_present: false,
+            prompt_candidate_count: 0,
+        };
+        assert_eq!(
+            reconnect_target(&snapshot),
+            Some((12, "VM", Some(presentation)))
+        );
+        snapshot.prompt_candidate_count = 2;
+        assert!(reconnect_target(&snapshot).is_none());
+        snapshot.prompt_candidate_count = 0;
+        snapshot.selected_prompt_present = true;
+        assert!(reconnect_target(&snapshot).is_none());
+        snapshot.selected_prompt_present = false;
+        snapshot.target_process_id = Some(13);
+        assert!(reconnect_target(&snapshot).is_none());
+        snapshot.target_process_id = Some(12);
+        snapshot.split_focus_desktop = None;
+        assert!(reconnect_target(&snapshot).is_none());
+    }
+
+    #[test]
     fn visible_background_vm_is_excluded_from_reconnect() {
         let snapshot = MacosMonitorSnapshot {
             process_found: true,
@@ -486,6 +531,7 @@ mod tests {
                 window_id: 5,
                 fullscreen: Some(false),
             }),
+            split_focus_desktop: None,
             selected_prompt_present: false,
             prompt_candidate_count: 0,
         };

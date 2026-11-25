@@ -32,6 +32,7 @@ pub(crate) struct MacosMonitorSnapshot {
     pub(crate) target_frontmost: Option<bool>,
     pub(crate) target_window_observed: bool,
     pub(crate) session_presentation: Option<crate::macos_ax::SessionPresentation>,
+    pub(crate) split_focus_desktop: Option<crate::macos_ax::ReconnectDesktop>,
     pub(crate) selected_prompt_present: bool,
     pub(crate) prompt_candidate_count: usize,
 }
@@ -249,6 +250,7 @@ fn macos_monitor_snapshot(inspection: &crate::macos_ax::MacosInspection) -> Maco
         target_frontmost: target.map(|target| target.frontmost),
         target_window_observed,
         session_presentation: inspection.foreground_session_presentation(),
+        split_focus_desktop: inspection.split_focus_desktop.clone(),
         selected_prompt_present: inspection.prompt.is_some(),
         prompt_candidate_count: inspection.prompts.len(),
     }
@@ -461,6 +463,7 @@ mod tests {
                 target_frontmost: None,
                 target_window_observed: false,
                 session_presentation: None,
+                split_focus_desktop: None,
                 selected_prompt_present: false,
                 prompt_candidate_count: 0,
             })

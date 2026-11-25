@@ -84,6 +84,7 @@ const CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
 pub(crate) struct MacosInspection {
     pub(crate) process_found: bool,
     pub(crate) target: Option<MacosTarget>,
+    pub(crate) split_focus_desktop: Option<ReconnectDesktop>,
     pub(crate) prompt: Option<MacosPrompt>,
     pub(crate) prompts: Vec<MacosPrompt>,
     pub(crate) has_session: bool,
@@ -109,6 +110,13 @@ pub(crate) struct MacosWindowTitle {
 pub(crate) struct SessionPresentation {
     pub(crate) window_id: u32,
     pub(crate) fullscreen: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconnectDesktop {
+    pub(crate) process_id: i32,
+    pub(crate) title: String,
+    pub(crate) presentation: SessionPresentation,
 }
 
 impl MacosInspection {
@@ -820,6 +828,9 @@ fn inspect_process(
         process_found: true,
         ..Default::default()
     };
+    let inspect_reconnect = expected_process_id.is_none()
+        && expected_window_title.is_none()
+        && process_infos.len() == 1;
     for process in process_infos
         .into_iter()
         .filter(|process| expected_process_id.is_none_or(|pid| process.pid == pid))
@@ -844,6 +855,12 @@ fn inspect_process(
             .collect::<Vec<_>>();
         let selected_window_index =
             select_unique_foreground_index(app_frontmost, &window_foreground_states);
+        if inspect_reconnect && app_frontmost && selected_window_index.is_none() {
+            if let Some(index) = split_focus_index(&window_foreground_states) {
+                inspection.split_focus_desktop =
+                    split_focus_desktop(&app, process.pid, &visible_windows, index);
+            }
+        }
 
         if inspection.target.is_none() {
             inspection.target = Some(MacosTarget {
@@ -936,6 +953,75 @@ fn inspect_process(
 
     inspection.prompt = preferred_unique_prompt(&inspection.prompts).cloned();
     Ok(inspection)
+}
+
+// AppKit can keep Connection Center as AXMain while another window is key.
+// Only reconnect uses this evidence. Credential forms retain their own rules.
+fn split_focus_index(states: &[AxForegroundState]) -> Option<usize> {
+    if states
+        .iter()
+        .any(|s| s.main.is_none() || s.focused.is_none())
+    {
+        return None;
+    }
+    let UniqueTrueIndex::One(focused) =
+        unique_true_index(states.iter().map(|s| s.focused == Some(true)))
+    else {
+        return None;
+    };
+    let UniqueTrueIndex::One(main) = unique_true_index(states.iter().map(|s| s.main == Some(true)))
+    else {
+        return None;
+    };
+    (focused != main).then_some(focused)
+}
+
+fn split_focus_desktop(
+    app: &AxElement,
+    pid: i32,
+    windows: &[&AxElement],
+    index: usize,
+) -> Option<ReconnectDesktop> {
+    let expected = *windows.get(index)?;
+    let key = app.element_attr("AXFocusedWindow")?;
+    if !key.same_element(expected) || key.bool_attr("AXMinimized") != Some(false) {
+        return None;
+    }
+    let title = key.string_attr(AX_TITLE)?;
+    let sessions = device_windows::session_entries(app).ok()?;
+    device_windows::exact_session(&sessions, &title).ok()??;
+    let center = device_launch::center_window(app);
+    for window in windows {
+        let window_title = window.string_attr(AX_TITLE)?;
+        // Credential inspection did not pick a foreground parent on this pass.
+        // Admit only native desktops and the center, without any attached sheet.
+        if window.process_id() != Some(pid)
+            || (window_title == title && !window.same_element(&key))
+            || !role_matches(window, AX_WINDOW_ROLE)
+            || window.string_attr(AX_SUBROLE).as_deref() != Some("AXStandardWindow")
+            || !sheet_candidates_for_window(window).ok()?.is_empty()
+        {
+            return None;
+        }
+        if !center.as_ref().is_some_and(|c| c.same_element(window)) {
+            device_windows::exact_session(&sessions, &window_title).ok()??;
+        } else if key.same_element(window) {
+            return None;
+        }
+    }
+    let presentation = SessionPresentation {
+        window_id: locked_session::window_id(&key)?,
+        fullscreen: key.bool_attr("AXFullScreen"),
+    };
+    (app.bool_attr(AX_FRONTMOST) == Some(true)
+        && app
+            .element_attr("AXFocusedWindow")
+            .is_some_and(|w| w.same_element(&key)))
+    .then_some(ReconnectDesktop {
+        process_id: pid,
+        title,
+        presentation,
+    })
 }
 
 fn trusted_process_infos_for_inspection(
@@ -5149,6 +5235,46 @@ mod tests {
             77,
             "Corp Desktop"
         ));
+    }
+
+    #[test]
+    fn reconnect_recovers_only_a_unique_split_between_focused_and_main_windows() {
+        let centered = super::AxForegroundState {
+            focused: Some(false),
+            main: Some(true),
+        };
+        let desktop = super::AxForegroundState {
+            focused: Some(true),
+            main: Some(false),
+        };
+        let unknown = super::AxForegroundState {
+            focused: None,
+            main: Some(false),
+        };
+        assert_eq!(super::split_focus_index(&[centered, desktop]), Some(1));
+        assert_eq!(
+            super::select_unique_foreground_index(true, &[centered, desktop]),
+            None
+        );
+        assert_eq!(
+            super::split_focus_index(&[centered, desktop, desktop]),
+            None
+        );
+        assert_eq!(
+            super::split_focus_index(&[centered, centered, desktop]),
+            None
+        );
+        assert_eq!(
+            super::split_focus_index(&[centered, desktop, unknown]),
+            None
+        );
+        assert_eq!(
+            super::split_focus_index(&[super::AxForegroundState {
+                focused: Some(true),
+                main: Some(true)
+            }]),
+            None
+        );
     }
 
     #[test]
