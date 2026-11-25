@@ -478,9 +478,28 @@ fn preflight_reconnect<'a>(
         }
     };
     restore_after_card_check(session, app, original, cancelled)?;
-    let target = verified?;
-    same_focused_session(session, app)?;
-    Ok(target)
+    verified
+}
+
+fn wait_for_close_command<T>(
+    deadline: Instant,
+    mut check_focus: impl FnMut() -> Result<()>,
+    mut read_command: impl FnMut() -> Result<Option<T>>,
+) -> Result<T> {
+    loop {
+        check_focus()?;
+        if let Some(command) = read_command()? {
+            // Reading the menu makes several AX calls. The key window can
+            // change during that read, even when Close is already enabled.
+            check_focus()?;
+            return Ok(command);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Windows App’s Window → Close command is unavailable."
+        );
+        std::thread::sleep(Duration::from_millis(60));
+    }
 }
 
 pub(crate) fn reconnect(
@@ -502,15 +521,42 @@ pub(crate) fn reconnect(
         );
     }
     let target = preflight_reconnect(session, accounts, &app, &window, verified_host, &cancelled)?;
-    let close = device_launch::menu_item(&app, &["Window", "窗口"], &["Close", "关闭"])
-        .filter(|item| {
-            item.process_id() == Some(session.pid) && item.bool_attr(AX_ENABLED) == Some(true)
-        })
-        .context("Windows App’s Window → Close command is unavailable.")?;
-    ensure!(
-        same_focused_session(session, &app)?.same_element(&window) && !cancelled(),
-        "The selected desktop changed."
-    );
+    // AppKit can return focus to the VM before its Window menu is populated.
+    // Wait only while that exact session stays in front, without raising it.
+    let close = wait_for_close_command(
+        Instant::now() + Duration::from_secs(2),
+        || {
+            ensure!(
+                app.process_id() == Some(session.pid)
+                    && device_windows::focused_session(&app, session.title()).is_some_and(|w| w
+                        .same_element(&window)
+                        && window_id(&w) == Some(session.window_id))
+                    && window
+                        .optional_relationship_array_attr_result(AX_SHEETS)?
+                        .is_empty()
+                    && !cancelled(),
+                "The selected desktop changed."
+            );
+            Ok(())
+        },
+        || {
+            let close = device_launch::menu_item(&app, &["Window", "窗口"], &["Close", "关闭"])
+                .filter(|item| {
+                    item.process_id() == Some(session.pid)
+                        && item.bool_attr(AX_ENABLED) == Some(true)
+                });
+            let Some(close) = close else { return Ok(None) };
+            let Ok(entries) = device_windows::session_entries(&app) else {
+                return Ok(None);
+            };
+            let (count, others) = session_members(session.title(), entries);
+            ensure!(
+                count <= 1 && others == session.other_sessions,
+                "The open sessions changed."
+            );
+            Ok((count == 1).then_some(close))
+        },
+    )?;
     // AX can time out after accepting a press. Observe the exact window and its
     // native session entry to establish disconnection before issuing Connect.
     before_disconnect()?;
@@ -577,6 +623,46 @@ fn wait_for_disconnect(session: &LockedSession, app: &AxElement, window: &AxElem
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_command_can_become_ready_after_the_original_session_regains_focus() {
+        let mut commands = [None, Some(19)].into_iter();
+        let mut checks = 0;
+        let command = wait_for_close_command(
+            Instant::now() + Duration::from_secs(2),
+            || {
+                checks += 1;
+                Ok(())
+            },
+            || Ok(commands.next().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(command, 19);
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn close_command_is_discarded_if_the_session_changes_during_the_menu_read() {
+        let mut focus = [true, false].into_iter();
+        let result = wait_for_close_command(
+            Instant::now() + Duration::from_secs(2),
+            || {
+                ensure!(focus.next().unwrap(), "Focus changed");
+                Ok(())
+            },
+            || Ok(Some(19)),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "Focus changed");
+    }
+
+    #[test]
+    fn unavailable_close_command_times_out_without_producing_an_action() {
+        let result = wait_for_close_command(Instant::now(), || Ok(()), || Ok(None::<u32>));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Close command is unavailable"));
+    }
 
     fn account() -> Account {
         let mut account = Account::new("owner@example.test");
