@@ -109,6 +109,10 @@ pub(crate) fn request_screen_recording() -> bool {
     if STARTUP_REQUESTED.swap(true, Ordering::Relaxed) {
         return screen_recording_allowed();
     }
+    request_screen_recording_for_reconnect()
+}
+
+pub(crate) fn request_screen_recording_for_reconnect() -> bool {
     request_access(false)
 }
 
@@ -120,10 +124,10 @@ pub(crate) fn open_screen_recording_settings() -> bool {
     supported() && unsafe { waal_open_capture_preferences() }
 }
 
-fn request_access(user_action: bool) -> bool {
+fn request_access(open_settings_on_retry: bool) -> bool {
     supported()
         && request_permission(
-            user_action,
+            open_settings_on_retry,
             screen_recording_allowed,
             || unsafe { waal_record_capture_request() },
             || unsafe { waal_lock_capture_request() },
@@ -134,7 +138,7 @@ fn request_access(user_action: bool) -> bool {
 }
 
 fn request_permission(
-    user_action: bool,
+    open_settings_on_retry: bool,
     allowed: impl Fn() -> bool,
     record_attempt: impl FnOnce() -> bool,
     request: impl FnOnce() -> bool,
@@ -148,8 +152,8 @@ fn request_permission(
         return true;
     }
     // macOS may suppress a second system prompt. An explicit retry should
-    // still give the user a way to grant access. Startup never opens Settings.
-    if user_action && previously_requested {
+    // still give the user a way to grant access from the Reconnect switch.
+    if open_settings_on_retry && previously_requested {
         open_preferences();
     }
     false
