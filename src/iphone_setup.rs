@@ -85,6 +85,7 @@ pub(crate) fn open_xcode() -> Result<(), String> {
 
 pub(crate) fn run_setup(
     team_id: &str,
+    expected_device: Option<&str>,
     mut on_progress: impl FnMut(SetupProgress),
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
@@ -104,15 +105,15 @@ pub(crate) fn run_setup(
         Some(config) => Some(config.clone()),
         None => saved_document(&root.join("pending-device.json"))?,
     };
-    if !selection
+    let selected = selection
         .as_ref()
         .and_then(|value| value["device_udid"].as_str())
-        .is_some_and(crate::iphone_setup_info::valid_id)
-    {
-        return Err(
-            "Connect your iPhone in AutoLogin before setting up its sign-in helper.".into(),
-        );
+        .filter(|id| crate::iphone_setup_info::valid_id(id))
+        .ok_or("Connect your iPhone in AutoLogin before setting up its sign-in helper.")?;
+    if expected_device.is_some_and(|id| !selected.eq_ignore_ascii_case(id)) {
+        return Err("The selected iPhone changed. Connect the iPhone again.".into());
     }
+    crate::iphone_setup_info::invalidate_preparation(&root).map_err(|_| STORAGE_ERROR)?;
     let node = match node_runtime(config.as_ref(), cancelled) {
         Some(node) => node,
         None => {
@@ -136,16 +137,19 @@ pub(crate) fn run_setup(
         &mut on_progress,
     )?;
     check_cancelled(cancelled)?;
-    on_progress(SetupProgress::Building);
-    run_helper(
-        &node,
-        &source.0.join("cli.mjs"),
-        &["prepare-device", "--parent-lifetime"],
-        "device_prepared",
-        Duration::from_secs(420),
-        cancelled,
-        &mut on_progress,
-    )?;
+    crate::iphone_setup_info::prepare_selected_device(&root, selected, team_id, || {
+        on_progress(SetupProgress::Building);
+        run_helper(
+            &node,
+            &source.0.join("cli.mjs"),
+            &["prepare-device", "--parent-lifetime"],
+            "device_prepared",
+            Duration::from_secs(420),
+            cancelled,
+            &mut on_progress,
+        )?;
+        check_cancelled(cancelled)
+    })?;
     on_progress(SetupProgress::Ready);
     Ok(())
 }
@@ -203,7 +207,7 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_lock(root: &Path) -> Result<File, String> {
+pub(super) fn setup_lock(root: &Path) -> Result<File, String> {
     let acquire = || -> anyhow::Result<File> {
         let file = OpenOptions::new()
             .create(true)

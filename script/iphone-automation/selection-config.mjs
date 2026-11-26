@@ -1,5 +1,5 @@
-// The account editor and this setup tool share a BSD flock only while changing
-// host preferences. No device operation runs under the lock.
+// Writers share a BSD flock with the Mac app. During device preparation the
+// app holds this lock to keep the selected phone and signing account stable.
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import fs from 'node:fs/promises';

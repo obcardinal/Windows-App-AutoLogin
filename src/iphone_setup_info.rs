@@ -79,13 +79,15 @@ pub(crate) fn paired_phones() -> Result<Vec<PairedPhone>, String> {
 }
 
 const UNREACHABLE: &str = "The iPhone didn’t respond. Unlock it, connect it to the same Wi-Fi as this Mac, and try again.";
+const PREPARED_CONFIG: &str = "prepared-config.json";
 
-pub(crate) fn connect_phone(id: &str) -> Result<(), String> {
+/// Returns true if this exact phone and helper configuration completed setup.
+pub(crate) fn connect_phone(id: &str) -> Result<bool, String> {
     let path = root().map_err(|_| "The iPhone preferences could not be located.")?;
     connect_phone_at(&path, id)
 }
 
-fn connect_phone_at(path: &Path, id: &str) -> Result<(), String> {
+fn connect_phone_at(path: &Path, id: &str) -> Result<bool, String> {
     if !valid_id(id) {
         return Err("Choose an iPhone from the paired devices.".into());
     }
@@ -205,6 +207,129 @@ pub(crate) fn verify_helper_files(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn runtime_present(root: &Path, config: &Value) -> bool {
+    let (Some(runtime), Some(node), Some(main)) = (
+        config["runtime_dir"].as_str().map(Path::new),
+        config["node_path"].as_str().map(Path::new),
+        config["appium_main"].as_str().map(Path::new),
+    ) else {
+        return false;
+    };
+    let modules = runtime.join("node_modules");
+    runtime == root.join(pinned_runtime_name())
+        && node.is_absolute()
+        && node
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
+        && main == modules.join("appium/index.js")
+        && main.is_file()
+        && ["appium", "appium-xcuitest-driver"].iter().all(|&package| {
+            let manifest = modules.join(package).join("package.json");
+            pinned_dependencies()[package]
+                .as_str()
+                .is_some_and(|pin| installed_package_version(&manifest).as_deref() == Some(pin))
+        })
+}
+
+fn pinned_dependencies() -> &'static Value {
+    static MANIFEST: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../script/iphone-automation/package.json"))
+            .expect("valid bundled iPhone helper manifest")
+    });
+    &MANIFEST["dependencies"]
+}
+
+fn installed_package_version(path: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Package {
+        version: String,
+    }
+    const LIMIT: u64 = 128 * 1024;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let stat = file.metadata().ok()?;
+    if !stat.is_file() || stat.len() > LIMIT {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > LIMIT {
+        return None;
+    }
+    Some(serde_json::from_slice::<Package>(&bytes).ok()?.version)
+}
+
+// The setup CLI installs npm packages into a directory named after the lockfile.
+fn pinned_runtime_name() -> &'static str {
+    use sha2::{Digest, Sha256};
+    static NAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let digest = Sha256::digest(include_bytes!(
+            "../script/iphone-automation/package-lock.json"
+        ));
+        format!("runtime-{:.16}", format!("{digest:x}"))
+    });
+    &NAME
+}
+
+fn prepared(root: &Path, config: &Value) -> bool {
+    config_value(&root.join(PREPARED_CONFIG))
+        .ok()
+        .flatten()
+        .as_ref()
+        == Some(config)
+        && verify_helper_files(root).is_ok()
+        && runtime_present(root, config)
+}
+
+pub(super) fn invalidate_preparation(root: &Path) -> io::Result<()> {
+    match fs::remove_file(root.join(PREPARED_CONFIG)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The device preparation tool reads config.json to build and launch its
+/// runner. Keep its selection stable until the successful result is recorded.
+pub(super) fn prepare_selected_device(
+    root: &Path,
+    device: &str,
+    team: &str,
+    prepare: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    const CHANGED: &str =
+        "The selected iPhone or signing account changed. Connect the iPhone again.";
+    let _lock = lock_selection(root)
+        .map_err(|_| "The iPhone selection is busy. Try connecting again.".to_owned())?;
+    let config = config_value(&root.join("config.json"))
+        .map_err(|_| CHANGED.to_owned())?
+        .ok_or(CHANGED)?;
+    if !config["device_udid"]
+        .as_str()
+        .is_some_and(|id| id.eq_ignore_ascii_case(device))
+        || config["development_team"].as_str() != Some(team)
+    {
+        return Err(CHANGED.into());
+    }
+    prepare()?;
+    if config_value(&root.join("config.json"))
+        .ok()
+        .flatten()
+        .as_ref()
+        != Some(&config)
+    {
+        return Err(CHANGED.into());
+    }
+    crate::storage::write_private_file_atomic(
+        &root.join(PREPARED_CONFIG),
+        "prepared",
+        &serde_json::to_vec(&config).map_err(|_| CHANGED.to_owned())?,
+    )
+    .map_err(|_| "Couldn’t save the completed iPhone setup. Try connecting again.".to_owned())
+}
+
 fn selected_id(root: &Path) -> Result<(String, HelperFiles), SetupInfo> {
     if let Err(e) = check_dir(root) {
         return Err(
@@ -224,7 +349,7 @@ fn selected_id(root: &Path) -> Result<(String, HelperFiles), SetupInfo> {
         config_value(&root.join("config.json")).map_err(|_| SetupInfo::ConfigUnavailable)?
     {
         let id = id_from_document(&config)?;
-        let helper_files = if verify_helper_files(root).is_ok() {
+        let helper_files = if prepared(root, &config) {
             HelperFiles::Current
         } else {
             HelperFiles::NeedsSetup
@@ -256,7 +381,7 @@ fn id_from_document(doc: &Value) -> Result<String, SetupInfo> {
     }
 }
 
-fn save_selection(root: &Path, id: &str) -> anyhow::Result<()> {
+fn save_selection(root: &Path, id: &str) -> anyhow::Result<bool> {
     anyhow::ensure!(valid_id(id), "invalid iPhone choice");
     // The application support directory contains the accounts configuration
     // and already exists by the time the Settings form is available.
@@ -266,11 +391,13 @@ fn save_selection(root: &Path, id: &str) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     }
     check_dir(root)?;
+    let _setup_lock = crate::iphone_setup::setup_lock(root).map_err(anyhow::Error::msg)?;
     let _lock = lock_selection(root)?;
     let config = root.join("config.json");
     let pending = root.join("pending-device.json");
     let (path, mut document) = if let Some(existing) = config_value(&config)? {
         match id_from_document(&existing) {
+            Ok(saved) if saved.eq_ignore_ascii_case(id) => return Ok(prepared(root, &existing)),
             Ok(_) | Err(SetupInfo::NoDeviceSelected) => {}
             Err(_) => anyhow::bail!("invalid iPhone configuration"),
         }
@@ -281,10 +408,12 @@ fn save_selection(root: &Path, id: &str) -> anyhow::Result<()> {
         }
         (pending, serde_json::json!({"schema_version":1}))
     };
+    invalidate_preparation(root)?;
     document["device_udid"] = id.into();
     let bytes = serde_json::to_vec(&document)?;
     anyhow::ensure!(bytes.len() <= 8192, "invalid iPhone configuration");
-    crate::storage::write_private_file_atomic(&path, "choice", &bytes)
+    crate::storage::write_private_file_atomic(&path, "choice", &bytes)?;
+    Ok(false)
 }
 
 fn lock_selection(root: &Path) -> anyhow::Result<File> {
@@ -597,15 +726,66 @@ mod tests {
     }
 
     #[test]
-    fn selected_phone_reports_stale_helper_files_after_an_update() {
+    fn connect_reuses_only_completed_setup_for_the_current_phone_and_runtime() {
         let root = std::env::temp_dir().join(format!("waal-helper-test-{}", uuid::Uuid::new_v4()));
-        save_selection(&root, ID).unwrap();
-        fs::rename(root.join("pending-device.json"), root.join("config.json")).unwrap();
+        assert!(!save_selection(&root, ID).unwrap());
+        let team = "ABCDEFGHI1";
+        let runtime = root.join(pinned_runtime_name());
+        let modules = runtime.join("node_modules");
+        let entry = modules.join("appium/index.js");
+        let config = json!({
+            "schema_version": 1, "device_udid": ID, "development_team": team,
+            "node_path": "/usr/bin/true", "runtime_dir": runtime, "appium_main": entry,
+        });
+        crate::storage::write_private_file_atomic(
+            &root.join("config.json"),
+            "test",
+            &serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(modules.join("appium")).unwrap();
+        fs::create_dir_all(modules.join("appium-xcuitest-driver")).unwrap();
+        fs::write(&entry, "").unwrap();
+        for package in ["appium", "appium-xcuitest-driver"] {
+            let manifest = json!({"name":package, "version":pinned_dependencies()[package]});
+            fs::write(
+                modules.join(package).join("package.json"),
+                manifest.to_string(),
+            )
+            .unwrap();
+        }
         for &(name, bytes) in HELPER_MODULES {
             crate::storage::write_private_file_atomic(&root.join(name), "test", bytes).unwrap();
         }
+        assert!(!save_selection(&root, ID).unwrap()); // host setup alone
+        let other = "AAAAAAAA-0000000000000002";
+        assert!(prepare_selected_device(&root, other, team, || panic!("wrong device")).is_err());
+        assert!(prepare_selected_device(&root, ID, team, || Err("cancelled".into())).is_err());
+        assert!(!save_selection(&root, ID).unwrap());
+        prepare_selected_device(&root, ID, team, || Ok(())).unwrap();
+        assert!(save_selection(&root, ID).unwrap());
         assert_eq!(selected_id(&root), Ok((ID.into(), HelperFiles::Current)));
-
+        let setup_lock = crate::iphone_setup::setup_lock(&root).unwrap();
+        assert!(save_selection(&root, other).is_err());
+        drop(setup_lock);
+        assert_eq!(selected_id(&root), Ok((ID.into(), HelperFiles::Current)));
+        let mut changed_config = config.clone();
+        changed_config["development_team"] = json!("ABCDEFGHI2");
+        assert!(!prepared(&root, &changed_config));
+        fs::remove_file(&entry).unwrap();
+        assert!(!save_selection(&root, ID).unwrap());
+        fs::write(&entry, "{}").unwrap();
+        let driver = modules.join("appium-xcuitest-driver/package.json");
+        let installed_driver = fs::read(&driver).unwrap();
+        for invalid in [
+            r#"{"name":"appium-xcuitest-driver","version":"0.0.1"}"#,
+            "{",
+        ] {
+            fs::write(&driver, invalid).unwrap();
+            assert!(!save_selection(&root, ID).unwrap());
+        }
+        fs::write(&driver, installed_driver).unwrap();
+        assert!(save_selection(&root, ID).unwrap());
         crate::storage::write_private_file_atomic(
             &root.join("support.mjs"),
             "test",
@@ -613,6 +793,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected_id(&root), Ok((ID.into(), HelperFiles::NeedsSetup)));
+        assert!(!save_selection(&root, other).unwrap());
+        assert!(!root.join(PREPARED_CONFIG).exists());
+        assert!(!save_selection(&root, ID).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

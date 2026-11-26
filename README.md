@@ -55,9 +55,9 @@ While at least one active linked account uses this option, AutoLogin restores mi
 
 ### Confirm a sign-in on your iPhone
 
-In **Settings → 2FA → Devices → Connect iPhone…**, choose your phone and click **Connect iPhone**. AutoLogin checks the Wi-Fi connection and remembers that iPhone for your accounts. For first-time pairing, click **Open device pairing…** and follow Apple’s prompts. Connecting requires Xcode but no signing certificate.
+In **Settings → 2FA → Devices → Connect iPhone…**, choose your unlocked phone and click **Connect iPhone**. For first-time pairing, use **Open device pairing…** and follow Apple’s prompts.
 
-Open **Sign-in details… → Set up automation…** to prepare UI Automation. The setup screen guides you through Developer Mode, Enable UI Automation and adding your own Apple Account in Xcode. Choose your signing account and click **Set up automation**. AutoLogin installs the required tools, signs the helper for your iPhone and checks that it can run over Wi-Fi.
+AutoLogin verifies the Wi-Fi connection and prepares the sign-in helper if needed. Setup uses your saved Xcode signing account or the only available one. If you need to choose an account or enable Developer Mode or UI Automation on your iPhone, follow the setup screen.
 
 Turn on **2FA → Use iPhone** for each participating account. AutoLogin enters the number from Windows App in Microsoft Authenticator. Complete Face ID on the phone if prompted. [iPhone setup and requirements](docs/iphone-authenticator.md#host-setup)
 

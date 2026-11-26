@@ -3,9 +3,9 @@
 This optional macOS integration assists Microsoft Authenticator number matching
 for an account's Windows App sign-in. In **Settings → 2FA → Devices**,
 click **Connect iPhone…**, choose your phone by name, and click **Connect iPhone**.
-AutoLogin checks that this phone responds over Wi-Fi before saving its device
-identifier on this Mac. All participating accounts use that phone. To change
-the selection, return to **Settings → 2FA → Devices**.
+AutoLogin checks that this phone responds over Wi-Fi, saves its device identifier
+on this Mac, and starts helper setup if needed. All participating accounts use
+that phone. To change the selection, return to **Settings → 2FA → Devices**.
 In **Accounts**, open an account, turn on **2FA → Use iPhone**, and save.
 AutoLogin identifies Microsoft Authenticator from the instructions next to the
 two-digit number in Windows App. Other methods require manual sign-in.
@@ -88,7 +88,14 @@ version range. Inspection did not enter a number or approve a sign-in.
 To pair an iPhone and verify its Wi-Fi connection, install Xcode and open it once
 to finish setup. This step uses Apple’s device tools and requires no signing team.
 
-To prepare UI Automation, open **Sign-in details… → Set up automation…**.
+**Connect iPhone** checks whether the helper is ready for the selected phone.
+If setup is needed, it continues with your saved Xcode signing account or the
+only available account. If there are several and no saved choice, select the
+account you want to use.
+
+Earlier releases did not record which iPhone completed setup. The first time
+you click **Connect iPhone** after upgrading, AutoLogin runs preparation once
+and reuses matching tools already on this Mac.
 
 1. On the iPhone, enable **Developer Mode** under **Settings → Privacy & Security**
    and **Enable UI Automation** under **Settings → Developer**. Add your work
@@ -96,10 +103,10 @@ To prepare UI Automation, open **Sign-in details… → Set up automation…**.
 2. In **Xcode → Settings → Accounts**, add your own Apple Account. Select its
    personal or organization team and create an **Apple Development** certificate
    under **Manage Certificates → +**. AutoLogin can open Xcode from the setup screen.
-3. Return to AutoLogin, select that signing account and click **Set up automation**.
-   Keep the selected iPhone unlocked on the same Wi-Fi. AutoLogin installs the
-   tools, asks Xcode to sign the helper for this device, and checks a UI Automation
-   session. Follow any developer trust prompts on the iPhone.
+3. Return to AutoLogin and keep the selected iPhone unlocked on the same Wi-Fi.
+   AutoLogin installs the tools, asks Xcode to sign the helper for this device,
+   and checks a UI Automation session. Follow any developer trust prompts on
+   the iPhone.
 
 Xcode uses the selected user's signing identity and keeps its private key in
 Keychain. Personal Team provisioning is time-limited by Apple, typically to seven
@@ -132,7 +139,8 @@ npm lockfile. It uses a dedicated versioned directory under:
 The directory is private to the current user and `config.json` is mode `0600`.
 Repeated setup preserves the selected iPhone and reuses a matching installed
 runtime. Setup publishes the helper modules and selected signing team together
-with the configuration. Run setup again after updating helper source.
+with the configuration. To run setup again manually, open
+**Sign-in details… → Set up automation…**.
 
 ### What happens before a sign-in
 
@@ -169,16 +177,15 @@ and does not open Authenticator.
    [Apple’s device pairing guide](https://developer.apple.com/documentation/xcode/managing-your-simulated-and-physical-devices-in-device-hub)
 3. Disconnect the cable if you used one. Return to AutoLogin, select your phone
    and click **Connect iPhone**. If it hasn't appeared, click **Refresh iPhones**.
-   AutoLogin saves your choice after the
-   Wi-Fi check succeeds, even if you haven’t installed the sign-in helper yet.
-   If the check fails, your previous choice stays in effect.
+   Once the Wi-Fi check succeeds, AutoLogin saves your choice and checks the
+   helper. If the helper is ready for this iPhone, setup is complete.
 
    For command-line setup, `node script/iphone-automation/cli.mjs select-device`
    selects the sole paired physical iPhone. With multiple paired phones, pass
    `--udid IDENTIFIER` from Xcode’s **Window → Devices and Simulators**.
 
-4. Open **Sign-in details… → Set up automation…** and complete the setup steps above.
-   Developer setup can prepare the connected, unlocked phone directly:
+4. If preparation is needed, keep the phone unlocked and follow any signing or
+   device prompts in AutoLogin. Developers using the command line can run:
 
    ```sh
    node script/iphone-automation/cli.mjs prepare-device

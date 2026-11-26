@@ -80,7 +80,23 @@ pub(super) fn set_connected_phone_for_test(ctx: &egui::Context) {
 
 pub(crate) fn close_details(ctx: &egui::Context) {
     crate::ui::iphone_setup_guide::cancel(ctx);
-    ctx.data_mut(|data| data.remove::<PhonePage>(details_id()));
+    ctx.data_mut(|data| {
+        data.remove::<PhonePage>(details_id());
+        if let Some(mut form) = data.get_temp::<PhoneForm>(details_id()) {
+            // Let an in-flight Wi-Fi check finish before accepting a new choice,
+            // but don't start setup for a connection page the user has left.
+            if form
+                .connect
+                .as_ref()
+                .is_some_and(|task| task.get().is_none())
+            {
+                form.draft = None;
+                data.insert_temp(details_id(), form);
+            } else {
+                data.remove::<PhoneForm>(details_id());
+            }
+        }
+    });
 }
 
 fn open_page(ctx: &egui::Context, page: PhonePage) {
@@ -120,12 +136,12 @@ pub(super) fn summary(ui: &mut egui::Ui) {
             "Connect iPhone…",
         ),
         Some(SetupInfo::Selected {
-            helper_files: HelperFiles::NeedsSetup,
+            helper_files: HelperFiles::NotInstalled | HelperFiles::NeedsSetup,
             ..
         }) => (
-            "Mac helper needs setup",
-            PhonePage::Details,
-            "Sign-in details…",
+            "Connect to prepare iPhone sign-in",
+            PhonePage::Setup,
+            "Connect iPhone…",
         ),
         Some(SetupInfo::Selected {
             wifi_connected: true,
@@ -168,6 +184,10 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
     let page = ui
         .ctx()
         .data(|data| data.get_temp::<PhonePage>(details_id()))?;
+    if ui.input(|input| input.viewport().close_requested()) {
+        close_details(ui.ctx());
+        return None;
+    }
     let top = ui.cursor().top();
     let (_, back) = egui::containers::Sides::new()
         .height(36.0)
@@ -203,6 +223,7 @@ pub(super) fn show_if_open(ui: &mut egui::Ui) -> Option<f32> {
             close_details(ui.ctx());
         }
         ui.ctx().request_repaint();
+        return Some(ui.cursor().top() - top);
     }
 
     let body = egui::ScrollArea::vertical()
@@ -322,13 +343,19 @@ fn show_shared_phone(ui: &mut egui::Ui) {
     }
 }
 
-type PhoneAction = Arc<OnceLock<Result<(), String>>>;
+type PhoneAction<T = ()> = Arc<OnceLock<Result<T, String>>>;
+
+#[derive(Clone, Debug)]
+enum ConnectedPhone {
+    Ready,
+    NeedsSetup(String),
+}
 
 #[derive(Clone)]
 struct PhoneForm {
     phones: Arc<OnceLock<Result<Vec<PairedPhone>, String>>>,
     draft: Option<String>,
-    connect: Option<PhoneAction>,
+    connect: Option<PhoneAction<ConnectedPhone>>,
     pairing: Option<PhoneAction>,
     refresh_after_pairing: bool,
     feedback: Option<String>,
@@ -376,6 +403,10 @@ impl PhoneForm {
 }
 
 fn show_setup(ui: &mut egui::Ui) {
+    show_setup_with(ui, super::iphone_setup_guide::prepare_after_connect);
+}
+
+fn show_setup_with(ui: &mut egui::Ui, prepare: impl FnOnce(&egui::Context, &str)) {
     let id = details_id();
     let snapshot = DeviceSnapshot::get(ui.ctx());
     let mut form = ui
@@ -385,14 +416,21 @@ fn show_setup(ui: &mut egui::Ui) {
     if let Some(result) = form.connect.as_ref().and_then(|task| task.get()).cloned() {
         form.connect = None;
         match result {
-            Ok(()) => {
+            Ok(_) if form.draft.is_none() => form = PhoneForm::discover(ui.ctx()),
+            Ok(ConnectedPhone::NeedsSetup(device)) => {
+                ui.ctx().data_mut(|data| data.remove::<PhoneForm>(id));
+                open_page(ui.ctx(), PhonePage::Helper);
+                prepare(ui.ctx(), &device);
+                return;
+            }
+            Ok(ConnectedPhone::Ready) => {
                 let name = form
                     .phones
                     .get()
                     .and_then(|r| r.as_ref().ok())
                     .and_then(|phones| phones.iter().find(|p| Some(&p.id) == form.draft.as_ref()))
                     .map_or("iPhone", |p| p.name.as_str());
-                let message = format!("{name} connected over Wi-Fi.");
+                let message = format!("{name} is ready for sign-in over Wi-Fi.");
                 form = PhoneForm::discover(ui.ctx());
                 form.feedback = Some(message);
             }
@@ -408,7 +446,9 @@ fn show_setup(ui: &mut egui::Ui) {
     }
     let returned_from_pairing = form.refresh_after_pairing
         && ui.input(|i| i.events.contains(&egui::Event::WindowFocused(true)));
-    form.suggest_phone(snapshot.0.get());
+    if form.connect.is_none() {
+        form.suggest_phone(snapshot.0.get());
+    }
     ui.label("All accounts on this Mac share the iPhone you select here.");
     ui.add_space(4.0);
     let busy = form.connect.is_some();
@@ -477,9 +517,13 @@ fn show_setup(ui: &mut egui::Ui) {
         form.connect = Some(start_task(
             ui.ctx(),
             move || {
-                iphone_setup_info::connect_phone(&device)?;
+                let ready = iphone_setup_info::connect_phone(&device)?;
                 DeviceSnapshot::invalidate(&ctx);
-                Ok(())
+                Ok(if ready {
+                    ConnectedPhone::Ready
+                } else {
+                    ConnectedPhone::NeedsSetup(device)
+                })
             },
             Err("Couldn’t connect to this iPhone. Try again.".into()),
         ));
@@ -490,21 +534,6 @@ fn show_setup(ui: &mut egui::Ui) {
     }
     if let Some(message) = &form.feedback {
         ui.add(egui::Label::new(message.as_str()).wrap());
-    }
-    if matches!(
-        snapshot.0.get(),
-        Some(SetupInfo::Selected {
-            helper_files: HelperFiles::NotInstalled | HelperFiles::NeedsSetup,
-            ..
-        })
-    ) {
-        ui.label("Set up automation to use this iPhone for sign-in.");
-        if ui
-            .add(theme::secondary_button("Set up automation…"))
-            .clicked()
-        {
-            open_page(ui.ctx(), PhonePage::Helper);
-        }
     }
     ui.ctx().data_mut(|d| d.insert_temp(id, form));
 }
@@ -609,6 +638,7 @@ fn phone_actions(
                     "Connect iPhone"
                 }),
             )
+            .on_hover_text("Connect over Wi-Fi and prepare the sign-in helper if needed.")
             .clicked()
         },
     )
@@ -792,6 +822,57 @@ mod tests {
         form.draft = Some(phone.id.clone());
         form.suggest_phone(Some(&saved));
         assert_eq!(form.draft.as_ref(), Some(&phone.id));
+    }
+
+    #[test]
+    fn connecting_an_unprepared_iphone_continues_to_setup_exactly_once() {
+        let ctx = egui::Context::default();
+        let phone = PairedPhone {
+            id: "AAAAAAAA-1234567890000001".into(),
+            name: "Work iPhone".into(),
+            wifi_connected: true,
+            selected: true,
+        };
+        let snapshot = SetupInfo::Selected {
+            id: phone.id.clone(),
+            name: Some(phone.name.clone()),
+            wifi_connected: true,
+            helper_files: HelperFiles::NotInstalled,
+        };
+        let result = Arc::new(OnceLock::new());
+        let form = PhoneForm {
+            phones: Arc::new(OnceLock::from(Ok(vec![phone.clone()]))),
+            draft: Some(phone.id.clone()),
+            connect: Some(result.clone()),
+            pairing: None,
+            refresh_after_pairing: false,
+            feedback: None,
+        };
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("iphone_setup_info"),
+                DeviceSnapshot(Arc::new(OnceLock::from(snapshot))),
+            );
+            data.insert_temp(details_id(), form);
+            data.insert_temp(details_id(), PhonePage::Setup);
+        });
+        let mut setups = Vec::new();
+        let mut frame = || {
+            ctx.run_ui(Default::default(), |ui| {
+                if ui.ctx().data(|d| d.get_temp::<PhonePage>(details_id())) == Some(PhonePage::Setup) {
+                    show_setup_with(ui, |_, device| setups.push(device.to_owned()));
+                }
+            })
+        };
+        let pending = frame();
+        assert!(text_rect(&pending, "Set up automation…").is_none());
+        result
+            .set(Ok(ConnectedPhone::NeedsSetup(phone.id.clone())))
+            .unwrap();
+        frame();
+        frame();
+        assert_eq!(setups, [phone.id]);
+        assert!(ctx.data(|d| d.get_temp::<PhonePage>(details_id())) == Some(PhonePage::Helper));
     }
 
     #[test]
