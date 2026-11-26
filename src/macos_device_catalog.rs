@@ -20,8 +20,10 @@ WITH devices (id, name, owner, profile_id, remote_pc) AS (
       AND NOT EXISTS (SELECT 1 FROM ZREMOTERESOURCEENTITY AS r WHERE r.ZID = b.ZID COLLATE NOCASE)
 )";
 const LIST_DEVICES: &str = "
-SELECT json_object('id', id, 'name', name, 'owner', owner, 'profile_id', profile_id)
-FROM devices WHERE id IS NOT NULL AND name IS NOT NULL AND name != ''
+SELECT json_object('id', id, 'name', name, 'owner', owner, 'profile_id', profile_id,
+                   'remote_pc', CASE WHEN id_count = 1 THEN remote_pc END)
+FROM (SELECT devices.*, count(*) OVER (PARTITION BY id) AS id_count FROM devices)
+WHERE id IS NOT NULL AND name IS NOT NULL AND name != ''
 ORDER BY name COLLATE NOCASE, owner COLLATE NOCASE, id;";
 
 #[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
@@ -30,6 +32,7 @@ pub(crate) struct SavedDevice {
     pub(crate) name: String,
     pub(crate) owner: String,
     profile_id: String,
+    pub(crate) remote_pc: Option<String>,
 }
 
 fn is_saved_device_id(id: &str) -> bool {
@@ -133,8 +136,9 @@ fn read_catalog(path: &Path) -> Result<Vec<SavedDevice>> {
     let output = query_catalog(path, LIST_DEVICES)?;
     let mut devices = Vec::new();
     for line in output.lines() {
-        let device: SavedDevice = serde_json::from_str(line).context(CATALOG_UNAVAILABLE)?;
+        let mut device: SavedDevice = serde_json::from_str(line).context(CATALOG_UNAVAILABLE)?;
         if is_saved_device_id(&device.id) && !device.name.trim().is_empty() {
+            device.remote_pc = device.remote_pc.as_deref().and_then(bookmark_host);
             devices.push(device);
         }
     }
@@ -194,6 +198,7 @@ impl SavedDevice {
             name: name.into(),
             owner: owner.into(),
             profile_id: String::new(),
+            remote_pc: None,
         }
     }
 }
@@ -243,7 +248,10 @@ mod tests {
              INSERT INTO ZBOOKMARKENTITY VALUES
                ('00000000-0000-4000-8000-000000000001','Same desktop','PC1',NULL),
                ('00000000-0000-4000-8000-000000000004','Expired mirror','PC2','Workspace'),
-               ('00000000-0000-4000-8000-000000000005',NULL,'local-pc',NULL);";
+               ('00000000-0000-4000-8000-000000000005',NULL,'LOCAL-PC.:3390',NULL),
+               ('00000000-0000-4000-8000-000000000006','Z copy A','pc-a',NULL),
+               ('00000000-0000-4000-8000-000000000006','Z copy B','pc-b',NULL),
+               ('00000000-0000-4000-8000-000000000007','Z gateway','rdgateway-r1.wvd.microsoft.com',NULL);";
         assert!(Command::new("/usr/bin/sqlite3")
             .args(["-init", "/dev/null", "-batch"])
             .arg(&path)
@@ -261,11 +269,15 @@ mod tests {
         assert_eq!(address(5).as_deref(), Some("local-pc"));
         assert_eq!(address(1), None); // workspace mirror sharing a published resource ID
         assert_eq!(address(4), None); // stale workspace mirror
+        assert_eq!(address(6), None); // duplicate ID
+        assert_eq!(address(7), None); // gateway
         assert_eq!(address(99), None);
         std::fs::remove_file(path).unwrap();
-        assert_eq!(devices.len(), 3);
+        assert_eq!(devices.len(), 6);
         assert!(devices[0].id.starts_with("bookmark:"));
-        assert_eq!(devices[0].name, "local-pc");
+        assert_eq!(devices[0].name, "LOCAL-PC.:3390");
+        assert_eq!(devices[0].remote_pc.as_deref(), Some("local-pc"));
+        assert!(devices[1..].iter().all(|device| device.remote_pc.is_none()));
         assert_eq!(devices[1].owner, "one@example.test");
         assert_eq!(devices[2].owner, "two@example.test");
         assert_ne!(devices[1].id, devices[2].id);

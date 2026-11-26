@@ -15,6 +15,7 @@ pub(crate) struct DeviceChoice {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) owner: String,
+    pub(crate) remote_pc: Option<String>,
     pub(crate) ambiguous: bool,
 }
 
@@ -24,6 +25,7 @@ impl DeviceChoice {
             id: device.id.clone(),
             name: device.name.clone(),
             owner: device.owner.clone(),
+            remote_pc: device.remote_pc.clone(),
             ambiguous: false,
         }
     }
@@ -72,6 +74,7 @@ fn choices_from_sources(
                 id: WINDOW_ONLY.into(),
                 name: name.clone(),
                 owner: String::new(),
+                remote_pc: None,
                 ambiguous: *count > 1,
             },
         };
@@ -394,6 +397,25 @@ mod tests {
             choices_from_sources(Ok(vec!["Desktop".into()]), Ok(vec![saved(), other])).unwrap();
         assert_eq!(choices.open[0].id, WINDOW_ONLY);
         assert_eq!(choices.saved.len(), 2);
+    }
+
+    #[test]
+    fn picker_exposes_the_bookmark_host_only_for_the_matching_device() {
+        let mut bookmark = SavedDevice::for_test("bookmark:pc", "Office PC", "");
+        bookmark.remote_pc = Some("office.example".into());
+        let closed = choices_from_sources(Ok(vec![]), Ok(vec![bookmark.clone()])).unwrap();
+        assert_eq!(closed.saved[0].remote_pc.as_deref(), Some("office.example"));
+
+        let open = choices_from_sources(Ok(vec!["Office PC".into()]), Ok(vec![bookmark.clone()]))
+            .unwrap();
+        assert_eq!(open.open[0].remote_pc.as_deref(), Some("office.example"));
+        assert!(open.saved.is_empty());
+
+        let other = SavedDevice::for_test("workspace:other", "Office PC", "other@example.test");
+        let ambiguous = choices_from_sources(Ok(vec!["Office PC".into()]), Ok(vec![bookmark, other]))
+            .unwrap();
+        assert_eq!(ambiguous.open[0].id, WINDOW_ONLY);
+        assert!(ambiguous.open[0].remote_pc.is_none());
     }
 
     #[test]

@@ -6,8 +6,6 @@ use crate::ui::theme;
 use eframe::egui;
 use std::sync::{Arc, OnceLock};
 
-pub(super) const BUTTON_WIDTH: f32 = 90.0;
-
 #[derive(Clone)]
 pub(super) struct RemotePcLookup {
     // Discard a lookup when the user edits the destination or its current value.
@@ -91,21 +89,10 @@ impl RemotePcLookup {
     }
 }
 
-pub(super) fn import_button(ui: &mut egui::Ui, account: &Account) {
-    let pending = ui
-        .ctx()
-        .data(|d| d.get_temp::<RemotePcLookup>(RemotePcLookup::id(account)))
-        .is_some_and(|query| {
-            query.input == RemotePcLookup::input(account)
-                && matches!(query.state, LookupState::Pending(_))
-        });
-    let button = theme::secondary_button(if pending { "Importing…" } else { "Import" });
+fn read_from_open_vm(ui: &mut egui::Ui, account: &Account) {
     if ui
-        .add_enabled_ui(!pending, |ui| {
-            ui.add_sized([BUTTON_WIDTH, super::ACCOUNT_EDITOR_CONTROL_HEIGHT], button)
-        })
-        .inner
-        .on_hover_text("Import the Remote PC address from Windows App")
+        .link("Read from open VM…")
+        .on_hover_text("Show Connection Information in Windows App to read this desktop’s address.")
         .clicked()
     {
         RemotePcLookup::start(ui.ctx(), account);
@@ -114,16 +101,32 @@ pub(super) fn import_button(ui: &mut egui::Ui, account: &Account) {
 
 pub(super) fn show_result(ui: &mut egui::Ui, account: &mut Account) {
     let id = RemotePcLookup::id(account);
-    let Some(mut lookup) = ui.ctx().data(|d| d.get_temp::<RemotePcLookup>(id)) else {
+    let lookup = ui.ctx().data_mut(|d| {
+        let lookup = d.get_temp::<RemotePcLookup>(id)?;
+        if lookup.input == RemotePcLookup::input(account) {
+            Some(lookup)
+        } else {
+            d.remove::<RemotePcLookup>(id);
+            None
+        }
+    });
+    let Some(mut lookup) = lookup else {
+        if !super::device_needs_setup(account)
+            && crate::models::canonical_remote_pc(&account.remote_pc)
+                .is_none_or(|host| crate::remote_pc::is_cloud_pc_gateway(&host))
+        {
+            super::account_editor_field_note(ui, |ui| read_from_open_vm(ui, account));
+        }
         return;
     };
-    if lookup.input != RemotePcLookup::input(account) {
-        ui.ctx().data_mut(|d| d.remove::<RemotePcLookup>(id));
-        return;
-    }
 
     if let LookupState::Pending(slot) = &lookup.state {
-        let Some(completed) = slot.get() else { return };
+        let Some(completed) = slot.get() else {
+            super::account_editor_field_note(ui, |ui| {
+                super::account_editor_help(ui, "Reading the address from Windows App…");
+            });
+            return;
+        };
         if completed.handoff_pid.is_some_and(|pid| {
             objc2_app_kit::NSWorkspace::sharedWorkspace()
                 .frontmostApplication()
@@ -164,6 +167,7 @@ pub(super) fn show_result(ui: &mut egui::Ui, account: &mut Account) {
         }
         LookupState::Failed(message) => {
             ui.add(egui::Label::new(egui::RichText::new(message).color(theme::DANGER)).wrap());
+            read_from_open_vm(ui, account);
         }
         LookupState::Pending(_) => {}
     });

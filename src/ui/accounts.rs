@@ -3235,7 +3235,7 @@ fn show_locked_vm_reconnect(
             if account_count > 1 && account.remote_pc.trim().is_empty() {
                 account_editor_help(
                     ui,
-                    "Import the Remote PC address to identify this locked desktop.",
+                    "Reconnect uses the Remote PC address to identify this desktop across accounts.",
                 );
             }
             // While the editor is open, notice changes in System Settings without
@@ -3293,7 +3293,7 @@ fn remote_pc_display(ui: &mut egui::Ui, host: &str, width: f32) -> egui::Respons
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     let text = if host.is_empty() {
-        egui::RichText::new("Not imported").color(theme::MUTED)
+        egui::RichText::new("No address").color(theme::MUTED)
     } else {
         egui::RichText::new(host).color(theme::TEXT)
     };
@@ -3315,11 +3315,11 @@ fn show_device_target_field(
         ui.spacing_mut().item_spacing.x = ACCOUNT_EDITOR_LABEL_ICON_GAP;
         let label = ui.label("VM device");
         let note = if account_count <= 1 {
-            "With one account, importing the address is optional."
+            "With one account, the address is optional."
         } else {
-            "With multiple accounts, import the address for each desktop you want to reconnect when locked."
+            "With multiple accounts, Reconnect uses this address to identify the locked desktop."
         };
-        account_info_button(ui, "VM device", "Enter and your shortcut open the selected desktop. Import reads its address from Windows App to match the session to this account.", Some(note));
+        account_info_button(ui, "VM device", "Enter and your shortcut open the selected desktop. AutoLogin reads its Remote PC address from Windows App when you choose it.", Some(note));
         label
     });
     let response = show_device_picker(
@@ -3382,15 +3382,7 @@ fn show_device_picker(
         format!("{} · {}", account.vm_target, account.vm_profile)
     };
     let popup_id = id.with("menu");
-    let response = ui
-        .horizontal(|ui| {
-            let picker_width =
-                field_width - remote_pc_import::BUTTON_WIDTH - ui.spacing().item_spacing.x;
-            let picker = account_picker_button(ui, popup_id, &selection, picker_width);
-            remote_pc_import::import_button(ui, account);
-            picker
-        })
-        .inner;
+    let response = account_picker_button(ui, popup_id, &selection, field_width);
     let frame = egui::Frame::popup(ui.style())
         .inner_margin(8)
         .corner_radius(9)
@@ -3575,7 +3567,9 @@ fn show_device_group(
             )
             .clicked()
         {
-            if !selected || account.vm_profile != device.owner {
+            if let Some(host) = &device.remote_pc {
+                account.remote_pc.clone_from(host);
+            } else if !selected || account.vm_profile != device.owner {
                 account.remote_pc.clear();
             }
             account.vm_device_id.clone_from(&device.id);
@@ -3830,7 +3824,7 @@ fn save_edited_account(
     } else if let Some(host) = canonical_remote_pc(&account.remote_pc) {
         host
     } else {
-        return Err("Import a valid Remote PC address or clear the device selection.".to_owned());
+        return Err("Read a valid Remote PC address from Windows App or clear the device selection.".to_owned());
     };
     let effective_enabled = app
         .config
@@ -5291,7 +5285,7 @@ mod tests {
         )
         .is_empty());
         assert_eq!(requests.get(), 2);
-        let host_hint = "Import the Remote PC address to identify this locked desktop.";
+        let host_hint = "Reconnect uses the Remote PC address to identify this desktop across accounts.";
         assert!(visible_text_rects(&granted, host_hint).is_empty());
         account_count.set(2);
         assert!(!visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
@@ -5322,10 +5316,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn device_picker_selects_and_clears_a_profile_scoped_device_in_the_draft() {
-        for (reconnect, selected_name, selected_id) in [
-            (true, "Selected desktop", "workspace:fixture"),
-            (true, "Closed desktop", "workspace:closed"),
-            (false, "Selected desktop", "workspace:fixture"),
+        for (reconnect, selected_name, selected_id, expected_host) in [
+            (true, "Selected desktop", "bookmark:fixture", "rdp.example.test"),
+            (true, "Closed desktop", "workspace:closed", ""),
+            (false, "Selected desktop", "bookmark:fixture", "rdp.example.test"),
         ] {
             let ctx = egui::Context::default();
             crate::ui::theme::apply(&ctx);
@@ -5342,15 +5336,17 @@ mod tests {
             let task = super::DeviceTask(Arc::new(std::sync::OnceLock::from(Ok(
                 super::DeviceChoices {
                     open: vec![super::DeviceChoice {
-                        id: "workspace:fixture".into(),
+                        id: "bookmark:fixture".into(),
                         name: "Selected desktop".into(),
                         owner: "Work profile".into(),
+                        remote_pc: Some("rdp.example.test".into()),
                         ambiguous: false,
                     }],
                     saved: vec![super::DeviceChoice {
                         id: "workspace:closed".into(),
                         name: "Closed desktop".into(),
                         owner: "Work profile".into(),
+                        remote_pc: None,
                         ambiguous: false,
                     }],
                     notices: vec![notice],
@@ -5418,7 +5414,7 @@ mod tests {
             assert_eq!(permission_calls.get(), usize::from(reconnect));
             assert_eq!(draft.vm_device_id, selected_id);
             assert_eq!(draft.vm_profile, "Work profile");
-            assert!(draft.remote_pc.is_empty());
+            assert_eq!(draft.remote_pc, expected_host);
             assert_eq!(draft.reconnect_locked_vm, reconnect);
             draft.remote_pc = "selected.example".into();
             let editor = render(vec![], &mut draft);
@@ -5429,9 +5425,21 @@ mod tests {
             render(vec![], &mut draft);
             let menu = render(vec![], &mut draft);
             assert_eq!(visible_text_rects(&menu, "Refresh devices").len(), 1);
+            let row = visible_text_rects(&menu, selected_name)[0];
+            render(click(row.center()), &mut draft);
+            let retained_host = if expected_host.is_empty() {
+                "selected.example"
+            } else {
+                expected_host
+            };
+            assert_eq!(draft.remote_pc, retained_host);
+            render(vec![], &mut draft);
+            render(click(bound_device), &mut draft);
+            render(vec![], &mut draft);
+            let menu = render(vec![], &mut draft);
             let clear = visible_text_rects(&menu, "Clear selection")[0].center();
             render(click(clear), &mut draft);
-            assert_eq!(permission_calls.get(), usize::from(reconnect));
+            assert_eq!(permission_calls.get(), 2 * usize::from(reconnect));
             assert!(draft.vm_target.is_empty());
             assert!(draft.vm_profile.is_empty());
             assert!(draft.vm_device_id.is_empty());
@@ -8090,6 +8098,7 @@ mod tests {
                         id: "workspace:fixture".into(),
                         name: "Desktop".into(),
                         owner: "Work".into(),
+                        remote_pc: None,
                         ambiguous: false,
                     }],
                     ..Default::default()
@@ -8152,7 +8161,7 @@ mod tests {
             "Record Shortcut",
             "VM device",
             "Selected desktop",
-            "Import",
+            "Read from open VM…",
             "2FA",
             "Use iPhone",
         ] {
@@ -8162,6 +8171,7 @@ mod tests {
                 "{name}"
             );
         }
+        assert!(visible_text_rects(&frame, "Import").is_empty());
         let field_for = |text| {
             let text = visible_text_rects(&frame, text)[0];
             frame
@@ -8207,7 +8217,6 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             let vm = field_for("Selected desktop");
-            let import = field_for("Import");
             let remote_pc = field_for("https://invalid.example");
             let shortcut = field_for("Record Shortcut");
             let info_for = |label: &str| {
@@ -8264,12 +8273,8 @@ mod tests {
             }
             assert_eq!(remote_pc.x_range(), email.x_range());
             assert_eq!(remote_pc.top() - vm.bottom(), row_gap);
-            assert_eq!(vm.left(), email.left());
-            assert_eq!(import.left() - vm.right(), row_gap);
+            assert_eq!(vm.x_range(), email.x_range());
             assert!(vm_info.right() < vm.left());
-            assert_eq!(import.width(), 90.0);
-            assert_eq!(import.right(), email.right());
-            assert_eq!(vm.y_range(), import.y_range());
             assert_eq!(vm.height(), remote_pc.height());
             assert!(
                 visible_text_rects(&frame, "Matches the active session to this account.")
@@ -8292,18 +8297,18 @@ mod tests {
             )));
             assert_eq!(shortcut.x_range(), remote_pc.x_range());
 
-            let vm_help = "Enter and your shortcut open the selected desktop. Import reads its address from Windows App to match the session to this account.";
+            let vm_help = "Enter and your shortcut open the selected desktop. AutoLogin reads its Remote PC address from Windows App when you choose it.";
             assert!(visible_text_rects(&frame, vm_help).is_empty());
             for (saved_accounts, dismiss, guidance) in [
                 (
                     vec![],
                     escape(),
-                    "With one account, importing the address is optional.",
+                    "With one account, the address is optional.",
                 ),
                 (
                     vec![Account::new("other@example.test")],
                     click(heading),
-                    "With multiple accounts, import the address for each desktop you want to reconnect when locked.",
+                    "With multiple accounts, Reconnect uses this address to identify the locked desktop.",
                 ),
             ] {
                 app.config.accounts = saved_accounts;
@@ -8412,7 +8417,7 @@ mod tests {
         render(&mut app, vec![]); // Measure the validation message before the viewport resizes.
         let (frame, _, size) = render(&mut app, vec![]);
         let message = if cfg!(target_os = "macos") {
-            "Import a valid Remote PC address or clear the device selection."
+            "Read a valid Remote PC address from Windows App or clear the device selection."
         } else {
             "Email is required"
         };
@@ -8460,6 +8465,7 @@ mod tests {
                     id: "workspace:test".into(),
                     name: "Test desktop".into(),
                     owner: "Work".into(),
+                    remote_pc: None,
                     ambiguous: false,
                 }],
                 ..Default::default()
@@ -8509,6 +8515,7 @@ mod tests {
                 assert_recorder(&render(&mut draft, vec![]), &chord_label);
             }
             assert!(draft.remote_pc.is_empty());
+            assert!(visible_text_rects(&frame, "Read from open VM…").is_empty());
             let picker = visible_text_rects(&frame, "Choose device…")[0];
             render(&mut draft, click(picker.center()));
             let menu = render(&mut draft, vec![]);
@@ -8517,6 +8524,10 @@ mod tests {
             let linked = render(&mut draft, vec![]);
             assert!(draft.remote_pc.is_empty());
             assert_recorder(&linked, &chord_label);
+            assert_eq!(visible_text_rects(&linked, "Read from open VM…").len(), 1);
+            draft.remote_pc = "desktop.example.test".into();
+            let addressed = render(&mut draft, vec![]);
+            assert!(visible_text_rects(&addressed, "Read from open VM…").is_empty());
 
             render(&mut draft, click(picker.center()));
             let menu = render(&mut draft, vec![]);
@@ -8622,7 +8633,7 @@ mod tests {
                     "vm.example",
                 )
             } else {
-                ("", "", "user@domain.com", "Not imported")
+                ("", "", "user@domain.com", "No address")
             };
             let mut draft = Account::new(email);
             draft.remote_pc = host.into();
