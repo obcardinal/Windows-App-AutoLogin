@@ -1,5 +1,5 @@
 //! Launch the saved Windows App device so its workspace and gateway settings apply.
-use super::desktops::{EnterOutcome, LaunchHost};
+use super::desktops::{EnterOutcome, EnterWindowCapture, LaunchHost};
 use super::{
     collect_descendants_bounded, macos_identity, role_matches, AXUIElementSetAttributeValue,
     AxElement, AX_CHILDREN, AX_DESCRIPTION, AX_ENABLED, AX_FRONTMOST, AX_PRESS, AX_ROLE,
@@ -35,19 +35,23 @@ struct DeviceList {
     devices: Vec<(String, AxElement)>,
 }
 
-pub(super) fn open_saved_device(device: &SavedDevice, shared_title: bool) -> Result<EnterOutcome> {
+pub(super) fn open_saved_device(
+    device: &SavedDevice,
+    shared_title: bool,
+    capture: Option<&EnterWindowCapture>,
+) -> Result<EnterOutcome> {
     if device.id.starts_with("workspace:") && !device.owner.trim().is_empty() {
         let app = trusted_app()?;
         let (list, profile) = prepare_profile_devices(&app, &device.owner, || Ok(()))?;
         catalog::verify_card_identity(device)?;
-        return list.open_for_enter(&device.name, shared_title, || {
+        return list.open_for_enter(&device.name, shared_title, capture, || {
             list.ensure_profile(&profile)?;
             catalog::verify_card_identity(device)
         });
     }
     catalog::verify_card_identity(device)?;
     let list = devices_in_app(trusted_app()?)?;
-    list.open_for_enter(&device.name, shared_title, || {
+    list.open_for_enter(&device.name, shared_title, capture, || {
         catalog::verify_card_identity(device)
     })
 }
@@ -71,6 +75,7 @@ pub(super) fn reconnect_window_device(
     account_email: &str,
     host: Option<&LaunchHost>,
     unshared_title: impl FnOnce(&str) -> bool,
+    capture: Option<&EnterWindowCapture>,
 ) -> Result<EnterOutcome> {
     let app = trusted_app()?;
     ensure!(
@@ -85,9 +90,14 @@ pub(super) fn reconnect_window_device(
     // On repeated Enter Windows App may already have a newly named session.
     let shared_title = !unshared_title(selected);
     if selected != name && !shared_title && super::device_windows::focus_open_session(selected)? {
+        if let Some(capture) = capture {
+            capture.focused(&app, selected);
+        }
         return Ok(EnterOutcome::Focused);
     }
-    list.open_for_enter(selected, shared_title, || list.ensure_profile(&profile))
+    list.open_for_enter(selected, shared_title, capture, || {
+        list.ensure_profile(&profile)
+    })
 }
 
 pub(super) struct VerifiedWindowDevice {
@@ -389,6 +399,7 @@ impl DeviceList {
         &self,
         name: &str,
         shared_title: bool,
+        capture: Option<&EnterWindowCapture>,
         verify: impl Fn() -> Result<()>,
     ) -> Result<EnterOutcome> {
         if shared_title {
@@ -410,11 +421,18 @@ impl DeviceList {
                         focus_session_in_app(&self.app, name, &|| false, || {})?.is_some(),
                         "The selected desktop disconnected before it could be focused."
                     );
+                    if let Some(capture) = capture {
+                        capture.focused(&self.app, name);
+                    }
                     return Ok(EnterOutcome::Focused);
                 }
             }
         }
+        let pending = capture.and_then(|capture| capture.before_connect(&self.app, name));
         self.connect(name, verify)?;
+        if let Some(pending) = pending {
+            pending.start();
+        }
         Ok(EnterOutcome::ConnectRequested)
     }
 

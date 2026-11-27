@@ -4,9 +4,12 @@ use super::device_launch::{
     open_saved_device, reconnect_window_device, saved_devices, SavedDevice,
 };
 use super::device_windows::{focus_open_session, open_session_titles};
+use super::{device_windows, locked_session, AxElement, AX_ROLE, AX_TITLE, AX_WINDOWS};
 use crate::models::{canonical_remote_pc, Account};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const WINDOW_ONLY: &str = "open-window";
 
@@ -175,7 +178,16 @@ impl DesktopLaunch {
     pub(crate) fn open_and_check_preparation(&self) -> Result<bool> {
         let _launch_lock = crate::single_instance::acquire_desktop_launch_lock()?;
         let account = &self.account;
-        let focus = |title: &str| self.focus_if_unshared(title, focus_open_session);
+        let capture = EnterWindowCapture::for_account(account);
+        let focus = |title: &str| {
+            let focused = self.focus_if_unshared(title, focus_open_session)?;
+            if focused {
+                if let (Some(capture), Ok(Some(app))) = (&capture, device_windows::running_app()) {
+                    capture.focused(&app, title);
+                }
+            }
+            Ok(focused)
+        };
         let outcome = open_with(
             account,
             saved_devices,
@@ -184,6 +196,7 @@ impl DesktopLaunch {
                 open_saved_device(
                     device,
                     shared_in_catalog || !self.unshared_title(&device.name),
+                    capture.as_ref(),
                 )
             },
             |title| {
@@ -192,13 +205,21 @@ impl DesktopLaunch {
                         if let Some(device) =
                             saved_window_device(&devices, title, &account.username)?
                         {
-                            return open_saved_device(device, !has_unique_title(&devices, device));
+                            return open_saved_device(
+                                device,
+                                !has_unique_title(&devices, device),
+                                capture.as_ref(),
+                            );
                         }
                     }
                 }
-                reconnect_window_device(title, &account.username, self.host.as_ref(), |candidate| {
-                    self.unshared_title(candidate)
-                })
+                reconnect_window_device(
+                    title,
+                    &account.username,
+                    self.host.as_ref(),
+                    |candidate| self.unshared_title(candidate),
+                    capture.as_ref(),
+                )
             },
         )?;
         Ok(outcome.should_prepare_iphone(account))
@@ -221,6 +242,196 @@ impl DesktopLaunch {
             Ok(false)
         }
     }
+}
+
+// Stop obsolete observations in this process. The supervisor also checks a
+// shared capture token so Enter in the UI cancels a pending shortcut launch.
+static ENTER_WINDOW_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(super) struct EnterWindowCapture {
+    token: uuid::Uuid,
+    account_id: uuid::Uuid,
+    generation: u64,
+}
+
+pub(super) struct PendingEnterWindow {
+    capture: EnterWindowCapture,
+    pid: i32,
+    title: String,
+    previous: Vec<u32>,
+    notifications: Option<crate::background::window_hints::WindowObservation>,
+}
+
+impl EnterWindowCapture {
+    fn for_account(account: &Account) -> Option<Self> {
+        let generation = ENTER_WINDOW_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        let token = uuid::Uuid::new_v4();
+        // Also cancel a previous capture when this account's option is off.
+        // Failure disables only this optional capture, never the desktop launch.
+        if let Err(error) = crate::single_instance::request_begin_vm_window_capture(token) {
+            tracing::debug!(%error, "Could not begin retaining the Enter window association");
+            return None;
+        }
+        account.vm_mouse_movement_enabled().then_some(())?;
+        Some(Self {
+            token,
+            account_id: uuid::Uuid::parse_str(&account.id).ok()?,
+            generation,
+        })
+    }
+
+    pub(super) fn focused(&self, app: &AxElement, title: &str) {
+        let Some(window) = device_windows::focused_session(app, title) else {
+            return;
+        };
+        let Some(id) = locked_session::window_id(&window) else {
+            return;
+        };
+        let Some(pid) = app.process_id() else {
+            return;
+        };
+        if !session_window_ids(app, title, &[]).is_ok_and(|ids| ids == [id]) {
+            return;
+        }
+        let capture = *self;
+        // IPC waits for the supervisor's acknowledgement on its own thread.
+        let _ = std::thread::Builder::new()
+            .name("remember-enter-window".into())
+            .spawn(move || capture.remember(pid, id));
+    }
+
+    pub(super) fn before_connect(
+        &self,
+        app: &AxElement,
+        title: &str,
+    ) -> Option<PendingEnterWindow> {
+        let pid = app.process_id()?;
+        // Retain creation notifications before issuing Connect. The snapshot
+        // below still has to prove which matching windows already existed.
+        let notifications = crate::background::window_hints::observe_connection_windows(
+            pid,
+            std::thread::current(),
+        );
+        Some(PendingEnterWindow {
+            capture: *self,
+            pid,
+            title: title.to_owned(),
+            previous: session_window_ids(app, title, &[]).ok()?,
+            notifications,
+        })
+    }
+
+    fn current(&self) -> bool {
+        self.generation == ENTER_WINDOW_GENERATION.load(Ordering::Relaxed)
+    }
+
+    fn remember(&self, pid: i32, id: u32) {
+        if self.current() {
+            if let Err(error) = crate::single_instance::request_remember_vm_window(
+                self.token,
+                self.account_id,
+                pid,
+                id,
+            ) {
+                tracing::debug!(%error, "Could not retain the Enter window association");
+            }
+        }
+    }
+}
+
+impl PendingEnterWindow {
+    pub(super) fn start(self) {
+        let _ = std::thread::Builder::new()
+            .name("observe-enter-window".into())
+            .spawn(move || {
+                let Some(app) = AxElement::application(self.pid) else {
+                    return;
+                };
+                let deadline = Instant::now() + Duration::from_secs(180);
+                let mut notified_windows: Vec<AxElement> = Vec::new();
+                while self.capture.current() && Instant::now() < deadline {
+                    // An AX notification retains the native window while it
+                    // moves to another Space and disappears from AXWindows.
+                    notified_windows.retain(|window| {
+                        window.process_id() == Some(self.pid)
+                            && window.string_attr(AX_ROLE).as_deref() == Some("AXWindow")
+                    });
+                    if let Some(observer) = &self.notifications {
+                        for element in std::iter::from_fn(|| observer.take_window()) {
+                            let Some(window) = AxElement::from_cf(&element).filter(|window| {
+                                window.process_id() == Some(self.pid)
+                                    && window.string_attr(AX_ROLE).as_deref() == Some("AXWindow")
+                            }) else {
+                                continue;
+                            };
+                            if !notified_windows
+                                .iter()
+                                .any(|known| known.same_element(&window))
+                            {
+                                if notified_windows.len() == 32 {
+                                    notified_windows.remove(0);
+                                }
+                                notified_windows.push(window);
+                            }
+                        }
+                    }
+                    // Session menu items and AXWindows can arrive on different
+                    // notifications while authentication or Spaces are changing.
+                    let current = session_window_ids(&app, &self.title, &notified_windows)
+                        .unwrap_or_default();
+                    if let Some(id) = newly_connected_window(&self.previous, &current) {
+                        // Check the original process before publishing its window number.
+                        if device_windows::running_app().is_ok_and(|current| {
+                            current.is_some_and(|app| app.process_id() == Some(self.pid))
+                        }) {
+                            self.capture.remember(self.pid, id);
+                        }
+                        return;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(500));
+                }
+            });
+    }
+}
+
+fn newly_connected_window(previous: &[u32], current: &[u32]) -> Option<u32> {
+    let [id] = current else {
+        return None;
+    };
+    (!previous.contains(id)).then_some(*id)
+}
+
+fn session_window_ids(app: &AxElement, title: &str, notified: &[AxElement]) -> Result<Vec<u32>> {
+    let entries = device_windows::session_entries(app)?;
+    if device_windows::exact_session(&entries, title)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut windows = app.array_attr_checked(AX_WINDOWS).unwrap_or_default();
+    windows.extend(notified.iter().cloned());
+    if let Some(focused) = app.element_attr("AXFocusedWindow") {
+        if !windows.iter().any(|window| window.same_element(&focused)) {
+            windows.push(focused);
+        }
+    }
+    let mut ids = Vec::new();
+    for window in windows {
+        if window.process_id() == app.process_id()
+            && window.string_attr(AX_ROLE).as_deref() == Some("AXWindow")
+            && window.string_attr(AX_TITLE).as_deref() == Some(title)
+        {
+            let id = locked_session::window_id(&window)
+                .context("The desktop window number is unavailable.")?;
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ensure!(
+        ids.len() == 1,
+        "The connected desktop window is not uniquely observable."
+    );
+    Ok(ids)
 }
 
 pub(crate) fn remote_pc_session_title(id: &str, name: &str, owner: &str) -> Result<Option<String>> {
@@ -332,6 +543,16 @@ fn selected_saved_device<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_capture_accepts_only_one_new_native_window() {
+        assert_eq!(newly_connected_window(&[], &[7]), Some(7));
+        assert_eq!(newly_connected_window(&[4], &[7]), Some(7));
+        assert_eq!(newly_connected_window(&[7], &[7]), None);
+        assert_eq!(newly_connected_window(&[], &[]), None);
+        assert_eq!(newly_connected_window(&[4], &[4, 7]), None);
+        assert_eq!(newly_connected_window(&[], &[7, 8]), None);
+    }
 
     fn saved() -> SavedDevice {
         SavedDevice::for_test("workspace:example", "Desktop", "owner@example.test")
