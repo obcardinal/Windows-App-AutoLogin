@@ -117,19 +117,12 @@ static bool emptyRelationship(AXUIElementRef element, CFStringRef key) {
     return error == kAXErrorSuccess && [objects isKindOfClass:NSArray.class] && [objects count] == 0;
 }
 
-static bool readGuestViewport(pid_t pid, CGWindowID expected, GuestViewport *result) {
-    // The Rust binding resolves the same exact window ID when admitting the session.
+static bool readWindowGuestViewport(pid_t pid, CGWindowID expected, AXUIElementRef window, GuestViewport *result) {
     typedef AXError (*GetWindowID)(AXUIElementRef, CGWindowID *);
     static GetWindowID getWindowID;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ getWindowID = (GetWindowID)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow"); });
-    if (!getWindowID || !isFrontmost(pid)) return false;
-    id app = CFBridgingRelease(AXUIElementCreateApplication(pid));
-    if (!app) return false;
-    AXUIElementSetMessagingTimeout((__bridge AXUIElementRef)app, 0.25);
-    id focused = axValue((__bridge AXUIElementRef)app, kAXFocusedWindowAttribute);
-    if (!focused || CFGetTypeID((__bridge CFTypeRef)focused) != AXUIElementGetTypeID()) return false;
-    AXUIElementRef window = (__bridge AXUIElementRef)focused;
+    if (!getWindowID || !window) return false;
     CGWindowID wid = 0;
     pid_t owner = 0;
     if (AXUIElementGetPid(window, &owner) != kAXErrorSuccess || owner != pid ||
@@ -183,6 +176,27 @@ static bool readGuestViewport(pid_t pid, CGWindowID expected, GuestViewport *res
         return false;
     result->viewport = viewport;
     return true;
+}
+
+// Passive geometry lookup for a previously identified desktop, including a
+// background Space. This never changes focus or captures the screen.
+bool waal_background_guest_viewport(AXUIElementRef window, pid_t pid, CGWindowID expected, CGRect *viewport) {
+    @autoreleasepool {
+        GuestViewport layout;
+        if (!viewport || !readWindowGuestViewport(pid, expected, window, &layout)) return false;
+        *viewport = layout.viewport;
+        return true;
+    }
+}
+
+static bool readGuestViewport(pid_t pid, CGWindowID expected, GuestViewport *result) {
+    if (!isFrontmost(pid)) return false;
+    id app = CFBridgingRelease(AXUIElementCreateApplication(pid));
+    if (!app) return false;
+    AXUIElementSetMessagingTimeout((__bridge AXUIElementRef)app, 0.25);
+    id focused = axValue((__bridge AXUIElementRef)app, kAXFocusedWindowAttribute);
+    if (!focused || CFGetTypeID((__bridge CFTypeRef)focused) != AXUIElementGetTypeID()) return false;
+    return readWindowGuestViewport(pid, expected, (__bridge AXUIElementRef)focused, result);
 }
 
 // Keep at most one ScreenCaptureKit operation outstanding, including callbacks

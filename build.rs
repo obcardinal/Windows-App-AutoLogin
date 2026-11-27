@@ -48,12 +48,15 @@ fn main() {
         println!("cargo:rerun-if-changed=src/macos_guest_viewport.h");
         println!("cargo:rerun-if-changed=src/macos_guest_viewport.m");
         println!("cargo:rerun-if-changed=src/macos_model_cache_watch.m");
+        println!("cargo:rerun-if-changed=src/macos_vm_mouse.h");
+        println!("cargo:rerun-if-changed=src/macos_vm_mouse.m");
         let mut native = cc::Build::new();
         native
             .file(bridge)
             .file("src/macos_masked_field.m")
             .file("src/macos_guest_viewport.m")
             .file("src/macos_model_cache_watch.m")
+            .file("src/macos_vm_mouse.m")
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .compile("waal_lock_screen_capture");
