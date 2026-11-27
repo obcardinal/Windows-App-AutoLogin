@@ -73,6 +73,8 @@ const ACCOUNT_2FA_HELP: &str = "AutoLogin enters the Microsoft Authenticator num
 #[cfg(target_os = "macos")]
 const RECONNECT_HELP: &str = "While this VM is in focus, AutoLogin checks for the Windows password screen, even if you step away. When it detects the screen, it closes and reopens the VM window.";
 #[cfg(target_os = "macos")]
+const VM_MOUSE_HELP: &str = "Requires a selected VM device. While Monitor is running, moves the pointer in that VM every 4 minutes without switching windows. AutoLogin identifies the device of each open VM before allowing movement and remembers it until the window closes.";
+#[cfg(target_os = "macos")]
 const SCREEN_RECORDING_PERMISSION_CACHE: &str = "locked_vm_screen_recording_permission";
 const ACTION_ICON_SIZE: f32 = 16.0;
 const PASSWORD_ICON_SIZE: f32 = 18.0;
@@ -2882,7 +2884,7 @@ pub(crate) fn show_account_editor(ctx: &egui::Context, app: &mut AutoLoginApp) {
         "Add Account"
     };
     let initial_height = if cfg!(target_os = "macos") {
-        462.0
+        500.0
     } else {
         173.0
     };
@@ -3033,6 +3035,16 @@ fn account_editor_contents(
             crate::macos_lock_screen::request_screen_recording_on_opt_in,
             crate::macos_lock_screen::open_screen_recording_settings,
         );
+        if account.has_vm_device() {
+            account_editor_switch(
+                ui,
+                &mut account.move_mouse_in_vm,
+                true,
+                "Move mouse in VM",
+                "Move the pointer in the selected VM every 4 minutes.",
+                |ui| account_info_button(ui, "Move mouse in VM", VM_MOUSE_HELP, None),
+            );
+        }
 
         ui.add(egui::Separator::default().spacing(1.0));
         account_editor_fields(ui, "account_shortcut_field", |ui, width| {
@@ -3948,6 +3960,7 @@ fn save_edited_account_transaction(
                 && existing.vm_device_id == account.vm_device_id
                 && existing.desktop_shortcut == account.desktop_shortcut
                 && existing.reconnect_locked_vm == account.reconnect_locked_vm
+                && existing.move_mouse_in_vm == account.move_mouse_in_vm
                 && existing.username.trim() == account.username
                 && existing.has_saved_password
         });
@@ -7565,6 +7578,7 @@ mod tests {
         stale_editor_snapshot.vm_profile = "Work profile".to_string();
         stale_editor_snapshot.enabled = true;
         stale_editor_snapshot.iphone_authenticator_enabled = true;
+        stale_editor_snapshot.move_mouse_in_vm = true;
 
         let rebased = rebase_editor_enabled_state(&stale_editor_snapshot, Some(&authoritative));
 
@@ -7577,6 +7591,7 @@ mod tests {
             assert_eq!(rebased.vm_target, "Finance desktop");
             assert_eq!(rebased.vm_profile, "Work profile");
             assert!(rebased.iphone_authenticator_enabled);
+            assert!(rebased.move_mouse_in_vm);
         }
     }
 
@@ -8164,6 +8179,7 @@ mod tests {
             "Read from open VM…",
             "2FA",
             "Use iPhone",
+            "Move mouse in VM",
         ] {
             assert_eq!(
                 !visible_text_rects(&frame, name).is_empty(),
@@ -8237,11 +8253,13 @@ mod tests {
             };
             let vm_info = info_for("About VM device");
             let reconnect_info = info_for("About Reconnect when locked");
+            let mouse_info = info_for("About Move mouse in VM");
             let iphone_info = info_for("About Use iPhone");
             assert_eq!(vm_info.size(), egui::vec2(24.0, ACCOUNT_EDITOR_CONTROL_HEIGHT));
             for (caption, info) in [
                 ("VM device", vm_info),
                 ("Reconnect when locked", reconnect_info),
+                ("Move mouse in VM", mouse_info),
                 ("Use iPhone", iphone_info),
             ] {
                 assert_eq!(info.size(), vm_info.size());
@@ -8323,6 +8341,14 @@ mod tests {
                 assert!(visible_text_rects(&closed, vm_help).is_empty());
                 assert!(visible_text_rects(&closed, guidance).is_empty());
             }
+
+            assert!(visible_text_rects(&frame, super::VM_MOUSE_HELP).is_empty());
+            assert!(!render(&mut app, click(mouse_info.center())).1);
+            let (opened, _, _) = render(&mut app, vec![]);
+            assert_eq!(visible_text_rects(&opened, super::VM_MOUSE_HELP).len(), 1);
+            assert!(!render(&mut app, escape()).1);
+            let (closed, _, _) = render(&mut app, vec![]);
+            assert!(visible_text_rects(&closed, super::VM_MOUSE_HELP).is_empty());
 
             let switch_node = |output: &egui::FullOutput| {
                 let tree = output.platform_output.accesskit_update.as_ref().unwrap();
@@ -8441,7 +8467,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn account_editor_allows_shortcuts_before_vm_setup_and_preserves_them_when_unlinked() {
+    fn account_editor_keeps_shortcut_available_but_requires_vm_for_mouse_movement() {
         for is_existing in [false, true] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -8504,8 +8530,35 @@ mod tests {
                         if a.y == b.y && b.x - a.x > 300.0 && connection.bottom() < a.y && a.y < caption.top()
                 )));
             };
+            let assert_mouse_switch = |frame: &egui::FullOutput, disabled: bool| {
+                let mouse_switch = frame
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .map(|(_, node)| node)
+                    .find(|node| {
+                        node.role() == egui::accesskit::Role::CheckBox
+                            && node.label() == Some("Move mouse in VM")
+                    })
+                    .expect("mouse switch is visible");
+                assert_eq!(mouse_switch.is_disabled(), disabled);
+                let bounds = mouse_switch.bounds().unwrap();
+                egui::pos2(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                )
+            };
             render(&mut draft, vec![]);
             let frame = render(&mut draft, vec![]);
+            assert!(visible_text_rects(&frame, "Move mouse in VM").is_empty());
+            assert!(frame.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                .all(|(_, node)| node.label() != Some("Move mouse in VM")
+                    && node.label() != Some("About Move mouse in VM")));
+            assert!(!draft.move_mouse_in_vm, "a VM must be selected first");
+            assert!(!draft.vm_mouse_movement_enabled());
             if is_existing {
                 assert_recorder(&frame, &chord_label);
                 assert_eq!(draft.desktop_shortcut, Some(shortcut));
@@ -8525,6 +8578,16 @@ mod tests {
             assert!(draft.remote_pc.is_empty());
             assert_recorder(&linked, &chord_label);
             assert_eq!(visible_text_rects(&linked, "Read from open VM…").len(), 1);
+            let mouse_switch = assert_mouse_switch(&linked, false);
+            let mouse_label = visible_text_rects(&linked, "Move mouse in VM")[0];
+            render(&mut draft, click(mouse_label.center()));
+            assert!(
+                !draft.move_mouse_in_vm,
+                "the label must not toggle the switch"
+            );
+            render(&mut draft, click(mouse_switch));
+            assert!(draft.move_mouse_in_vm);
+            assert!(draft.vm_mouse_movement_enabled());
             draft.remote_pc = "desktop.example.test".into();
             let addressed = render(&mut draft, vec![]);
             assert!(visible_text_rects(&addressed, "Read from open VM…").is_empty());
@@ -8533,9 +8596,13 @@ mod tests {
             let menu = render(&mut draft, vec![]);
             let clear = visible_text_rects(&menu, "Clear selection")[0];
             render(&mut draft, click(clear.center()));
-            assert_recorder(&render(&mut draft, vec![]), &chord_label);
+            let unlinked = render(&mut draft, vec![]);
+            assert_recorder(&unlinked, &chord_label);
+            assert!(visible_text_rects(&unlinked, "Move mouse in VM").is_empty());
             assert_eq!(draft.desktop_shortcut, Some(shortcut));
             assert!(draft.vm_target.is_empty());
+            assert!(draft.move_mouse_in_vm);
+            assert!(!draft.vm_mouse_movement_enabled());
             if is_existing {
                 super::save_edited_account(&mut app, &ctx, &draft, true).unwrap();
                 let Some(AccountTransactionIntent::Save { account, .. }) =
@@ -8544,6 +8611,8 @@ mod tests {
                     panic!("saving an unlinked account must queue its shortcut");
                 };
                 assert_eq!(account.desktop_shortcut, Some(shortcut));
+                assert!(account.move_mouse_in_vm);
+                assert!(!account.vm_mouse_movement_enabled());
                 assert!(account.vm_target.is_empty());
                 assert!(account.remote_pc.is_empty());
             }
