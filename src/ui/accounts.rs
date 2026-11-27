@@ -3029,7 +3029,6 @@ fn account_editor_contents(
         show_locked_vm_reconnect(
             ui,
             account,
-            account_count,
             crate::macos_lock_screen::supported(),
             crate::macos_lock_screen::screen_recording_allowed,
             crate::macos_lock_screen::request_screen_recording_on_opt_in,
@@ -3217,7 +3216,6 @@ fn account_editor_help(ui: &mut egui::Ui, message: &str) {
 fn show_locked_vm_reconnect(
     ui: &mut egui::Ui,
     account: &mut Account,
-    account_count: usize,
     supported: bool,
     permission_allowed: impl FnOnce() -> bool,
     request_permission: impl FnOnce() -> bool,
@@ -3244,12 +3242,6 @@ fn show_locked_vm_reconnect(
             return;
         }
         if account.reconnect_locked_vm {
-            if account_count > 1 && account.remote_pc.trim().is_empty() {
-                account_editor_help(
-                    ui,
-                    "Reconnect uses the Remote PC address to identify this desktop across accounts.",
-                );
-            }
             // While the editor is open, notice changes in System Settings without
             // consulting the macOS permission service on every animation frame.
             let permission_id = egui::Id::new(SCREEN_RECORDING_PERMISSION_CACHE);
@@ -5158,7 +5150,6 @@ mod tests {
         let requests = std::cell::Cell::new(0);
         let checks = std::cell::Cell::new(0);
         let supported = std::cell::Cell::new(true);
-        let account_count = std::cell::Cell::new(1);
         let label = "Reconnect when locked";
         let settings_hint = "Allow Screen Recording for Windows App AutoLogin.";
         let opens = std::cell::Cell::new(0);
@@ -5176,7 +5167,6 @@ mod tests {
                 super::show_locked_vm_reconnect(
                     ui,
                     account,
-                    account_count.get(),
                     supported.get(),
                     || {
                         checks.set(checks.get() + 1);
@@ -5300,8 +5290,7 @@ mod tests {
         assert_eq!(requests.get(), 2);
         let host_hint = "Reconnect uses the Remote PC address to identify this desktop across accounts.";
         assert!(visible_text_rects(&granted, host_hint).is_empty());
-        account_count.set(2);
-        assert!(!visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
+        assert!(visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
         account.remote_pc = "myvm.example.test".into();
         assert!(visible_text_rects(&render(&mut account, vec![]), host_hint).is_empty());
         let key_press = |key| egui::Event::Key {
