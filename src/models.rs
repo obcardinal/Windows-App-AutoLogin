@@ -92,6 +92,9 @@ pub struct Account {
     /// Reconnect this linked VM on macOS when its focused window shows the Windows password screen.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub reconnect_locked_vm: bool,
+    /// Send a background mouse movement to this account's open VM every four minutes on macOS.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub move_mouse_in_vm: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_saved_password: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -111,10 +114,31 @@ impl Account {
             vm_device_id: String::new(),
             desktop_shortcut: None,
             reconnect_locked_vm: true,
+            move_mouse_in_vm: false,
             has_saved_password: false,
             enabled: true,
             iphone_authenticator_enabled: false,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn has_vm_device(&self) -> bool {
+        let catalog_binding = self
+            .vm_device_id
+            .strip_prefix("workspace:")
+            .or_else(|| self.vm_device_id.strip_prefix("bookmark:"))
+            .is_some_and(|id| !id.trim().is_empty());
+        let window_binding = self.vm_device_id == "open-window"
+            || (self.vm_device_id.is_empty() && !self.vm_profile.trim().is_empty());
+        !self.vm_target.trim().is_empty() && (catalog_binding || window_binding)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn vm_mouse_movement_enabled(&self) -> bool {
+        self.enabled
+            && self.move_mouse_in_vm
+            && !self.username.trim().is_empty()
+            && self.has_vm_device()
     }
 
     #[cfg(target_os = "macos")]
@@ -350,6 +374,7 @@ mod tests {
         assert_eq!(config.accounts[0].username, "user@example.com");
         assert!(config.accounts[0].remote_pc.is_empty());
         assert!(config.accounts[0].reconnect_locked_vm);
+        assert!(!config.accounts[0].move_mouse_in_vm);
         assert!(!config.accounts[0].iphone_authenticator_enabled);
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -358,6 +383,65 @@ mod tests {
         assert!(!serialized.contains("iphone_authenticator_enabled"));
         assert!(!serialized.contains("remote_pc"));
         assert!(!serialized.contains("reconnect_locked_vm"));
+        assert!(!serialized.contains("move_mouse_in_vm"));
+    }
+
+    #[test]
+    fn vm_mouse_movement_defaults_off_and_remembers_opt_in() {
+        let mut account = super::Account::new("user@example.test");
+        assert!(!account.move_mouse_in_vm);
+        assert!(serde_json::to_value(&account)
+            .unwrap()
+            .get("move_mouse_in_vm")
+            .is_none());
+        account.move_mouse_in_vm = true;
+        let wire = serde_json::to_value(&account).unwrap();
+        assert_eq!(wire["move_mouse_in_vm"], true);
+        assert_eq!(
+            serde_json::from_value::<super::Account>(wire).unwrap(),
+            account
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vm_mouse_movement_requires_an_enabled_account_and_selected_vm_device() {
+        let mut account = super::Account::new("user@example.test");
+        account.move_mouse_in_vm = true;
+        account.remote_pc = "desktop.example.test".into();
+        for (device, title, profile, eligible) in [
+            ("", "", "", false),
+            ("", "", "Work", false),
+            ("", "Desktop", "", false),
+            ("workspace:one", "", "Work", false),
+            ("open-window", "Desktop", "", true),
+            ("workspace:one", "Desktop", "Work", true),
+            ("bookmark:one", "Desktop", "", true),
+            ("", "Desktop", "Work", true),
+            (" ", "Desktop", " ", false),
+            ("unknown", "Desktop", "Work", false),
+            ("workspace:", "Desktop", "Work", false),
+            ("bookmark:", "Desktop", "Work", false),
+            ("workspace: ", "Desktop", "Work", false),
+            ("bookmark:one", " ", "Work", false),
+        ] {
+            account.vm_device_id = device.into();
+            account.vm_target = title.into();
+            account.vm_profile = profile.into();
+            assert_eq!(account.has_vm_device(), eligible);
+            assert_eq!(account.vm_mouse_movement_enabled(), eligible);
+        }
+        account.vm_device_id = "workspace:one".into();
+        account.vm_target = "Desktop".into();
+        assert!(account.vm_mouse_movement_enabled());
+        account.enabled = false;
+        assert!(!account.vm_mouse_movement_enabled());
+        account.enabled = true;
+        account.move_mouse_in_vm = false;
+        assert!(!account.vm_mouse_movement_enabled());
+        account.move_mouse_in_vm = true;
+        account.username = " ".into();
+        assert!(!account.vm_mouse_movement_enabled());
     }
 
     #[test]

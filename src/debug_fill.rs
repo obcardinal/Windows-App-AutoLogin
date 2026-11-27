@@ -2108,6 +2108,7 @@ mod windows_tests {
             vm_device_id: String::new(),
             desktop_shortcut: None,
             reconnect_locked_vm: false,
+            move_mouse_in_vm: false,
             iphone_authenticator_enabled: false,
         }
     }
@@ -2162,6 +2163,7 @@ mod macos_context_tests {
             vm_device_id: String::new(),
             desktop_shortcut: None,
             reconnect_locked_vm: false,
+            move_mouse_in_vm: false,
             iphone_authenticator_enabled: false,
         }
     }

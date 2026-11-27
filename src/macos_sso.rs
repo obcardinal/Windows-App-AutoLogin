@@ -127,6 +127,7 @@ impl Challenge {
             vm_device_id: String::new(),
             desktop_shortcut: None,
             reconnect_locked_vm: false,
+            move_mouse_in_vm: false,
             iphone_authenticator_enabled: true,
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?
@@ -162,6 +163,7 @@ impl Challenge {
             vm_device_id: String::new(),
             desktop_shortcut: None,
             reconnect_locked_vm: false,
+            move_mouse_in_vm: false,
             iphone_authenticator_enabled: true,
         };
         let current = challenge_in_window(&process, &window, &[account], guard)?;

@@ -411,6 +411,8 @@ struct StoredAccountWire {
     #[serde(default = "crate::models::default_true")]
     reconnect_locked_vm: bool,
     #[serde(default)]
+    move_mouse_in_vm: bool,
+    #[serde(default)]
     has_saved_password: bool,
     #[serde(default = "crate::models::default_true")]
     enabled: bool,
@@ -471,6 +473,7 @@ impl From<StoredAppConfigWire> for AppConfig {
                     vm_device_id: account.vm_device_id,
                     desktop_shortcut: account.desktop_shortcut,
                     reconnect_locked_vm: account.reconnect_locked_vm,
+                    move_mouse_in_vm: account.move_mouse_in_vm,
                     has_saved_password: account.has_saved_password,
                     enabled: account.enabled,
                     iphone_authenticator_enabled: account.iphone_authenticator_enabled,
@@ -6148,8 +6151,11 @@ mod tests {
 
         for reconnect in [true, false] {
             config.accounts[0].reconnect_locked_vm = reconnect;
-            save_config_to_file(&config, &path).unwrap();
-            assert_eq!(load_config_from_path(&path).unwrap(), config);
+            for move_mouse in [false, true] {
+                config.accounts[0].move_mouse_in_vm = move_mouse;
+                save_config_to_file(&config, &path).unwrap();
+                assert_eq!(load_config_from_path(&path).unwrap(), config);
+            }
         }
         let _ = std::fs::remove_dir_all(root);
     }
