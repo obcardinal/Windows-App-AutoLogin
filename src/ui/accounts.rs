@@ -3512,6 +3512,9 @@ fn show_device_picker(
             );
         });
     }
+    if device_selected {
+        remote_pc_import::selection_changed(ui.ctx(), account);
+    }
     response.on_hover_text(if device_needs_setup(account) {
         "Choose the desktop to open for this account.".to_owned()
     } else {
@@ -8165,7 +8168,6 @@ mod tests {
             "Record Shortcut",
             "VM device",
             "Selected desktop",
-            "Read from open VM…",
             "2FA",
             "Use iPhone",
             "Move mouse in VM",
@@ -8324,7 +8326,7 @@ mod tests {
                 assert_eq!(visible_text_rects(&opened, vm_help).len(), 1);
                 assert_eq!(visible_text_rects(&opened, guidance).len(), 1);
                 assert!(!egui::Popup::is_id_open(&ctx, picker_id.with("menu")));
-                assert_eq!(ctx.data(|d| d.count::<super::RemotePcLookup>()), 0);
+                assert_eq!(ctx.data(|d| d.count::<super::RemotePcLookup>()), 1);
                 assert!(!render(&mut app, dismiss).1);
                 let (closed, _, _) = render(&mut app, vec![]);
                 assert!(visible_text_rects(&closed, vm_help).is_empty());
@@ -8566,7 +8568,8 @@ mod tests {
             let linked = render(&mut draft, vec![]);
             assert!(draft.remote_pc.is_empty());
             assert_recorder(&linked, &chord_label);
-            assert_eq!(visible_text_rects(&linked, "Read from open VM…").len(), 1);
+            assert!(visible_text_rects(&linked, "Read from open VM…").is_empty());
+            assert_eq!(ctx.data(|d| d.count::<super::RemotePcLookup>()), 1);
             let mouse_switch = assert_mouse_switch(&linked, false);
             let mouse_label = visible_text_rects(&linked, "Move mouse in VM")[0];
             render(&mut draft, click(mouse_label.center()));
