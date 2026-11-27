@@ -77,6 +77,8 @@ impl WorkerInvalidator {
         WorkerPauseLatch {
             pause_state: Arc::new(AtomicU64::new(0)),
             generation: self.generation.clone(),
+            #[cfg(target_os = "macos")]
+            vm_discovery_gate: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -88,9 +90,72 @@ pub(crate) struct WorkerPauseLatch {
     // prevents an older release from reopening a newer safety pause.
     pause_state: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    #[cfg(target_os = "macos")]
+    vm_discovery_gate: Arc<Mutex<Option<std::sync::Weak<VmDiscoveryGate>>>>,
+}
+
+#[cfg(target_os = "macos")]
+struct VmDiscoveryGate {
+    automation_slot: Arc<Semaphore>,
+    activity_tracker: WorkerActivityTracker,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct VmDiscoveryGuard {
+    // Release the automation slot before acknowledging the last active job.
+    _automation: tokio::sync::OwnedSemaphorePermit,
+    _activity: WorkerActivityGuard,
+    pause: WorkerPauseLatch,
+    generation: u64,
+    gate: std::sync::Weak<VmDiscoveryGate>,
+}
+
+#[cfg(target_os = "macos")]
+impl VmDiscoveryGuard {
+    pub(crate) fn is_current(&self) -> bool {
+        self.gate.upgrade().is_some()
+            && self
+                .pause
+                .ensure_attempt_current(self.generation, "VM discovery cancelled")
+                .is_ok()
+    }
 }
 
 impl WorkerPauseLatch {
+    #[cfg(target_os = "macos")]
+    fn install_vm_discovery_gate(
+        &self,
+        automation_slot: Arc<Semaphore>,
+        activity_tracker: WorkerActivityTracker,
+    ) -> Option<Arc<VmDiscoveryGate>> {
+        let gate = Arc::new(VmDiscoveryGate {
+            automation_slot,
+            activity_tracker,
+        });
+        *self.vm_discovery_gate.lock().ok()? = Some(Arc::downgrade(&gate));
+        Some(gate)
+    }
+
+    /// Reserve the same automation and quiescence gates as reconnect and 2FA.
+    /// The caller retains this guard through cleanup of its native dialog.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn try_begin_vm_discovery(&self) -> Option<VmDiscoveryGuard> {
+        let generation = self.stable_unpaused_generation()?;
+        let gate = self.vm_discovery_gate.try_lock().ok()?.as_ref()?.clone();
+        let context = gate.upgrade()?;
+        let automation = context.automation_slot.clone().try_acquire_owned().ok()?;
+        let activity = context.activity_tracker.begin_attempt()?;
+        self.ensure_attempt_current(generation, "VM discovery cancelled")
+            .ok()?;
+        Some(VmDiscoveryGuard {
+            _automation: automation,
+            _activity: activity,
+            pause: self.clone(),
+            generation,
+            gate,
+        })
+    }
+
     pub(crate) fn pause(&self) {
         self.pause_with_epoch();
     }
@@ -1736,6 +1801,9 @@ pub(crate) fn spawn(
         let automation_slot = Arc::new(Semaphore::new(1));
         let activity_tracker = WorkerActivityTracker::default();
         #[cfg(target_os = "macos")]
+        let _vm_discovery_gate = pause_latch
+            .install_vm_discovery_gate(automation_slot.clone(), activity_tracker.clone());
+        #[cfg(target_os = "macos")]
         let iphone_attempts = Arc::new(Mutex::new(IphoneAttemptMemory::default()));
         #[cfg(target_os = "macos")]
         let mut iphone_probe_cadence = IphoneProbeCadence::default();
@@ -2460,6 +2528,58 @@ mod tests {
             generation: generation.clone(),
         }
         .pause_latch()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vm_discovery_requires_a_live_worker_and_exclusive_automation_slot() {
+        let invalidator = WorkerInvalidator::new();
+        let pause = invalidator.pause_latch();
+        assert!(pause.try_begin_vm_discovery().is_none());
+        let slot = Arc::new(Semaphore::new(1));
+        let gate = pause
+            .install_vm_discovery_gate(slot.clone(), WorkerActivityTracker::default())
+            .unwrap();
+        let busy = slot.clone().try_acquire_owned().unwrap();
+        assert!(pause.try_begin_vm_discovery().is_none());
+        drop(busy);
+        let guard = pause.try_begin_vm_discovery().unwrap();
+        assert!(guard.is_current());
+        assert!(slot.clone().try_acquire_owned().is_err());
+        invalidator.invalidate();
+        assert!(!guard.is_current());
+        drop(guard);
+        assert_eq!(slot.available_permits(), 1);
+        let guard = pause.try_begin_vm_discovery().unwrap();
+        drop(gate);
+        assert!(!guard.is_current());
+        drop(guard);
+        assert!(pause.try_begin_vm_discovery().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vm_discovery_participates_in_pause_and_quiescence() {
+        let pause = WorkerInvalidator::new().pause_latch();
+        let tracker = WorkerActivityTracker::default();
+        let slot = Arc::new(Semaphore::new(1));
+        let _gate = pause
+            .install_vm_discovery_gate(slot.clone(), tracker.clone())
+            .unwrap();
+        let guard = pause.try_begin_vm_discovery().unwrap();
+        let epoch = pause.pause_with_epoch();
+        assert!(!guard.is_current());
+        assert!(pause.try_begin_vm_discovery().is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tracker.acknowledge_when_quiescent(19, tx);
+        assert!(rx.try_recv().is_err());
+        drop(guard);
+        assert_eq!(rx.try_recv().unwrap().request_id, 19);
+        assert_eq!(slot.available_permits(), 1);
+        assert!(pause.resume_if_epoch(epoch));
+        assert!(pause.try_begin_vm_discovery().is_none());
+        assert!(tracker.reopen_after_fresh_release());
+        assert!(pause.try_begin_vm_discovery().is_some());
     }
 
     fn macos_transient_fill_report(
