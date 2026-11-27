@@ -24,7 +24,7 @@ These checks run on your computer. The Microsoft client handles authentication. 
 
 | Platform | Download | Install |
 | --- | --- | --- |
-| macOS 11+, Apple Silicon | [macOS v1.0.4](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.4) | Extract the ZIP and move `Windows App AutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
+| macOS 11+, Apple Silicon | [macOS v1.0.5](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v1.0.5) | Extract the ZIP and move `Windows App AutoLogin.app` to `/Applications`. Install Microsoft's client at `/Applications/Windows App.app`. |
 | Windows 10/11, x64 | [Windows v0.4.0](https://github.com/obcardinal/Windows-App-AutoLogin/releases/tag/v0.4.0) | Extract the ZIP and run `WindowsAppAutoLogin.exe`. Keep `WindowsAppAutoLoginUI.exe` in the same folder. Both executables are unsigned. |
 
 1. Open AutoLogin. On macOS, grant it **Accessibility** under **System Settings → Privacy & Security** so it can read and fill the sign-in prompt.
@@ -47,11 +47,17 @@ When a new remote desktop connects, AutoLogin closes the Windows App device list
 
 ### Reconnect to a locked desktop
 
-Choose a desktop under **Connection → VM device**. AutoLogin fills in **Remote PC** when Windows App has a saved address. If the field is empty, connect to that desktop in Windows App and choose **Read from open VM…** in AutoLogin. Reconnect uses this address to distinguish between accounts. With one account, the address is optional.
+Choose a desktop under **Connection → VM device**. AutoLogin fills in **Remote PC** from the saved device or reads it from the open VM automatically. It also checks when you open an account that has a selected VM but no address. If the desktop is disconnected, connect it in Windows App and select it again. Reconnect uses this address to distinguish between accounts. With one account, the address is optional.
 
 **Reconnect when locked** is on by default for linked desktops on macOS 14+. While the VM window is in focus, AutoLogin uses **Screen Recording** to check for the English Windows password screen, even if you step away. It processes the image in memory on your Mac and discards it. If it recognizes the password screen, it reconnects. Password entry takes place in Windows App's verified credential prompt.
 
 While at least one active linked account uses this option, AutoLogin restores missing recognition models in the background, even when no desktop is open.
+
+### Move the mouse in a linked VM
+
+After choosing **VM device**, you can enable **Move mouse in VM** for that account. While Monitor is running, AutoLogin sends a small pointer movement to the identified VM window every four minutes without bringing it to the foreground or moving your Mac’s pointer. The option is off by default.
+
+AutoLogin remembers the window’s device while it stays open. If the window cannot be matched to the selected VM unambiguously, it sends no movement.
 
 ### Confirm a sign-in on your iPhone
 
