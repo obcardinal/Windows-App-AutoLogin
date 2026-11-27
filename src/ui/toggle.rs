@@ -64,7 +64,7 @@ pub(super) fn labeled_switch(
             |ui| {
                 ui.add(
                     egui::Label::new(egui::RichText::new(label).color(theme::TEXT))
-                        .selectable(false),
+                        .selectable(true),
                 );
                 after_label(ui);
             },
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_label_keeps_its_text_color_and_cursor_on_hover() {
+    fn switch_label_keeps_its_text_color_and_uses_text_cursor_on_hover() {
         for enabled in [true, false] {
             let ctx = egui::Context::default();
             theme::apply(&ctx);
@@ -169,7 +169,15 @@ mod tests {
             assert_eq!(cursor, egui::CursorIcon::Default);
             assert_eq!(
                 render(vec![egui::Event::PointerMoved(rect.center())]),
-                (rect, idle, cursor)
+                (
+                    rect,
+                    idle,
+                    if enabled {
+                        egui::CursorIcon::Text
+                    } else {
+                        cursor
+                    }
+                )
             );
             assert!(!checked);
         }
