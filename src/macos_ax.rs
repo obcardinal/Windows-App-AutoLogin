@@ -27,6 +27,8 @@ pub(crate) mod locked_session;
 pub(crate) mod remote_pc_info;
 #[path = "macos_sso.rs"]
 pub(crate) mod sso;
+#[path = "macos_vm_activity.rs"]
+pub(crate) mod vm_activity;
 
 const MAX_ELEMENT_COUNT: usize = 900;
 const AX_SEARCH_DEPTH: usize = 12;
