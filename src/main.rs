@@ -1028,6 +1028,10 @@ struct LightweightSupervisor {
     #[cfg(target_os = "macos")]
     connection_center: macos_ax::connection_watch::ConnectionWatch,
     #[cfg(target_os = "macos")]
+    vm_mouse: macos_ax::vm_activity::MouseWatch,
+    #[cfg(target_os = "macos")]
+    current_vm_capture: Option<uuid::Uuid>,
+    #[cfg(target_os = "macos")]
     desktop_shortcuts: Option<desktop_shortcuts::AccountShortcuts>,
     #[cfg(target_os = "macos")]
     shortcut_launch: Option<std::thread::JoinHandle<anyhow::Result<bool>>>,
@@ -1105,6 +1109,10 @@ impl LightweightSupervisor {
             #[cfg(target_os = "macos")]
             connection_center: Default::default(),
             #[cfg(target_os = "macos")]
+            vm_mouse: Default::default(),
+            #[cfg(target_os = "macos")]
+            current_vm_capture: None,
+            #[cfg(target_os = "macos")]
             desktop_shortcuts: None,
             #[cfg(target_os = "macos")]
             shortcut_launch: None,
@@ -1160,6 +1168,8 @@ impl LightweightSupervisor {
         self.storage_recovery_ready = storage_recovery_ready;
         if !storage_recovery_ready {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
         }
         self
     }
@@ -1172,6 +1182,8 @@ impl LightweightSupervisor {
         if storage_recovery_sticky_blocked {
             self.storage_recovery_ready = false;
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
         }
         self
     }
@@ -1402,6 +1414,8 @@ impl LightweightSupervisor {
                 }
             }
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             self.worker_invalidator.invalidate();
             self.desired_monitor_running = false;
             self.resume_monitor_after_settings = false;
@@ -1434,6 +1448,8 @@ impl LightweightSupervisor {
         self.exit_shutdown_finalized = true;
         self.settings_child_exit_deadline = None;
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         self.worker_invalidator.invalidate();
         self.worker_status = models::WorkerStatus::Idle;
         self.settings_mutation_active = false;
@@ -1697,6 +1713,37 @@ impl LightweightSupervisor {
                 self.poll_iphone_preparation(iphone_preparation::Trigger::DesktopConnect);
                 true
             }
+            #[cfg(target_os = "macos")]
+            single_instance::LocalIpcCommand::BeginVmWindowCapture { token } => {
+                if self.exit_requested || self.settings_mutation_active {
+                    return false;
+                }
+                self.current_vm_capture = Some(token);
+                macos_ax::vm_activity::begin_enter();
+                true
+            }
+            #[cfg(target_os = "macos")]
+            single_instance::LocalIpcCommand::RememberVmWindow {
+                token,
+                account_id,
+                pid,
+                window_id,
+            } => {
+                if self.current_vm_capture != Some(token)
+                    || self.exit_requested
+                    || self.settings_mutation_active
+                {
+                    return false;
+                }
+                let enabled = self.config.accounts.iter().any(|account| {
+                    uuid::Uuid::parse_str(&account.id).ok() == Some(account_id)
+                        && account.vm_mouse_movement_enabled()
+                });
+                if enabled {
+                    macos_ax::vm_activity::remember_enter(account_id, pid, window_id);
+                }
+                enabled
+            }
             single_instance::LocalIpcCommand::SettingsBootstrap => false,
             single_instance::LocalIpcCommand::SettingsMutationBegin => {
                 self.begin_settings_mutation()
@@ -1834,6 +1881,11 @@ impl LightweightSupervisor {
     }
 
     fn begin_settings_mutation(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.current_vm_capture = None;
+            macos_ax::vm_activity::begin_enter();
+        }
         if !self.settings_child_bootstrapped
             || self.storage_recovery_sticky_blocked
             || !self.storage_recovery_ready
@@ -1853,6 +1905,8 @@ impl LightweightSupervisor {
         self.settings_mutation_active = true;
         self.resume_monitor_after_settings = self.desired_monitor_running;
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         self.worker_invalidator.invalidate();
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
             tracing::warn!(%error, "Could not queue settings mutation worker stop; pause remains active");
@@ -1927,6 +1981,8 @@ impl LightweightSupervisor {
         }
         if self.storage_recovery_sticky_blocked {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             return false;
         }
         let should_resume = self.desired_monitor_running
@@ -2236,6 +2292,8 @@ impl LightweightSupervisor {
     fn queue_worker_start_fail_closed(&mut self) {
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Start) {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!(%error, "Monitor start command could not be queued; pause latch remains active");
         }
     }
@@ -2244,6 +2302,8 @@ impl LightweightSupervisor {
         self.desired_monitor_running = false;
         self.resume_monitor_after_settings = false;
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
             tracing::warn!(%error, "Monitor stop command could not be queued; pause latch remains active");
         }
@@ -2255,6 +2315,8 @@ impl LightweightSupervisor {
     fn pause_monitor_preserving_intent(&mut self) {
         self.resume_monitor_after_settings = false;
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
             tracing::warn!(%error, "Monitor pause command could not be queued; pause latch remains active");
         }
@@ -2279,6 +2341,8 @@ impl LightweightSupervisor {
             }
         }
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         self.worker_invalidator.invalidate();
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
             tracing::error!(%error, "Password storage recovery block could not queue worker stop; pause latch remains active");
@@ -2289,9 +2353,13 @@ impl LightweightSupervisor {
     fn queue_fresh_config_and_start(&mut self) -> bool {
         if !self.desired_monitor_running || self.storage_recovery_sticky_blocked {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             return false;
         }
         let pause_epoch = self.worker_pause_latch.pause_with_epoch();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         let command = self.worker_pause_latch.apply_config_command(
             pause_epoch,
             self.config.settings.clone(),
@@ -2301,6 +2369,8 @@ impl LightweightSupervisor {
         );
         if let Err(error) = self.worker_tx.try_send(command) {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!(
                 %error,
                 "Monitor start could not be queued safely; pause latch remains active"
@@ -2438,15 +2508,21 @@ impl LightweightSupervisor {
         // in progress before creating any child authorization or lease.
         self.resume_monitor_after_settings = false;
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         self.worker_invalidator.invalidate();
         if let Err(error) = self.worker_tx.try_send(background::WorkerCommand::Stop) {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!(%error, "Could not queue settings worker stop; settings launch remains unauthorized");
             return false;
         }
 
         let Some(request_id) = self.next_settings_launch_request_id.checked_add(1) else {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!("Settings quiescence request identifier space is exhausted");
             return false;
         };
@@ -2457,11 +2533,15 @@ impl LightweightSupervisor {
             acknowledgement,
         }) {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!(%error, "Could not queue worker quiescence request; settings launch remains unauthorized");
             return false;
         }
         let Some(deadline) = Instant::now().checked_add(SETTINGS_QUIESCENCE_TIMEOUT) else {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!("Could not establish settings quiescence deadline");
             return false;
         };
@@ -2709,6 +2789,8 @@ impl LightweightSupervisor {
                 self.pending_settings_launch = None;
                 self.resume_monitor_after_settings = false;
                 self.worker_pause_latch.pause();
+                #[cfg(target_os = "macos")]
+                self.vm_mouse.pause();
                 tracing::warn!(%error, "Settings launch remains unauthorized");
                 return;
             }
@@ -2725,6 +2807,8 @@ impl LightweightSupervisor {
         {
             self.resume_monitor_after_settings = false;
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             tracing::warn!(
                 request_id = pending.request_id,
                 "Settings launch state changed after quiescence; launch remains unauthorized"
@@ -2796,6 +2880,8 @@ impl LightweightSupervisor {
                 if let Err(revocation_error) = self.revoke_settings_session_authorization() {
                     self.storage_recovery_ready = false;
                     self.worker_pause_latch.pause();
+                    #[cfg(target_os = "macos")]
+                    self.vm_mouse.pause();
                     anyhow::bail!(
                         "could not acquire settings session lease: {error}; fresh authorization could not be revoked: {revocation_error}"
                     );
@@ -2908,6 +2994,8 @@ impl LightweightSupervisor {
             tracing::error!(%error, "Ambiguous settings exit recovery block could not be persisted; supervisor-local pause remains active");
         }
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         self.worker_invalidator.invalidate();
     }
 
@@ -3004,6 +3092,8 @@ impl LightweightSupervisor {
         }) else {
             self.storage_recovery_ready = false;
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             return false;
         };
         if self.storage_recovery_sticky_blocked {
@@ -3015,6 +3105,8 @@ impl LightweightSupervisor {
                 tracing::error!(%error, "Could not rotate settings session authorization");
             }
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             return false;
         }
         let startup = load_config(&mut recovery_lease);
@@ -3025,6 +3117,8 @@ impl LightweightSupervisor {
             tracing::error!(%error, "Could not rotate settings session authorization");
             self.storage_recovery_ready = false;
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             return false;
         }
         self.apply_reloaded_config(startup, start_monitor)
@@ -3053,6 +3147,8 @@ impl LightweightSupervisor {
             tracing::error!(%error, "{message}");
             self.storage_recovery_ready = false;
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
         }
     }
 
@@ -3129,6 +3225,8 @@ impl LightweightSupervisor {
         start_monitor: bool,
     ) -> Option<(models::AppConfig, background::WorkerCommand)> {
         let pause_epoch = self.worker_pause_latch.pause_with_epoch();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         self.worker_invalidator.invalidate();
         if !startup.storage_recovery_ready {
             self.block_storage_recovery_until_restart();
@@ -3139,6 +3237,8 @@ impl LightweightSupervisor {
         }
         if self.storage_recovery_sticky_blocked {
             self.worker_pause_latch.pause();
+            #[cfg(target_os = "macos")]
+            self.vm_mouse.pause();
             return None;
         }
         let next_config = startup.config;
@@ -3157,6 +3257,8 @@ impl LightweightSupervisor {
         self.storage_recovery_ready = false;
         self.resume_monitor_after_settings = false;
         self.worker_pause_latch.pause();
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.pause();
         if self.worker_status == models::WorkerStatus::Running {
             let _ = self.worker_tx.try_send(background::WorkerCommand::Stop);
         }
@@ -3335,6 +3437,15 @@ impl ApplicationHandler<SupervisorEvent> for LightweightSupervisor {
                 && self.accessibility_trusted
                 && self.config.settings.close_connection_center_after_connect,
         );
+        #[cfg(target_os = "macos")]
+        self.vm_mouse.update(
+            &self.config.accounts,
+            !self.exit_requested
+                && self.accessibility_trusted
+                && self.worker_status == models::WorkerStatus::Running
+                && !self.settings_mutation_active,
+            &self.worker_pause_latch,
+        );
         if self.exit_requested {
             if self.poll_exit_request(Instant::now()) && self.finish_exit(event_loop) {
                 return;
@@ -3383,6 +3494,12 @@ fn local_ipc_command_authorized(
         #[cfg(target_os = "macos")]
         single_instance::LocalIpcCommand::PrepareIphoneWifi => {
             settings_child_bootstrapped && Some(peer_pid) == settings_child_pid
+        }
+        #[cfg(target_os = "macos")]
+        single_instance::LocalIpcCommand::BeginVmWindowCapture { .. }
+        | single_instance::LocalIpcCommand::RememberVmWindow { .. } => {
+            peer_pid == std::process::id()
+                || (settings_child_bootstrapped && Some(peer_pid) == settings_child_pid)
         }
         single_instance::LocalIpcCommand::SettingsBootstrap => Some(peer_pid) == settings_child_pid,
         single_instance::LocalIpcCommand::SettingsMutationBegin
@@ -4905,6 +5022,85 @@ mod tests {
             Some(42),
             true,
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enter_window_hints_require_the_latest_capture_and_enabled_account() {
+        use super::single_instance::LocalIpcCommand::{BeginVmWindowCapture, RememberVmWindow};
+        let (worker_tx, _worker_rx) = tokio_channel(8);
+        let (_worker_event_tx, worker_event_rx) = tokio_channel(8);
+        let (tray_tx, tray_rx) = std_channel();
+        let mut account = crate::models::Account::new("user@example.test");
+        account.move_mouse_in_vm = true;
+        account.vm_device_id = "workspace:test".into();
+        account.vm_target = "Test VM".into();
+        let account_id = uuid::Uuid::parse_str(&account.id).unwrap();
+        let mut supervisor = LightweightSupervisor::new(
+            worker_tx,
+            worker_event_rx,
+            tray_tx,
+            tray_rx,
+            WorkerInvalidator::new(),
+            AppConfig {
+                accounts: vec![account],
+                ..AppConfig::default()
+            },
+            None,
+        );
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let remember = |token| RememberVmWindow {
+            token,
+            account_id,
+            pid: 123,
+            window_id: 456,
+        };
+        assert!(!supervisor.handle_authorized_local_ipc_command(remember(first)));
+        assert!(
+            supervisor.handle_authorized_local_ipc_command(BeginVmWindowCapture { token: first })
+        );
+        assert!(
+            supervisor.handle_authorized_local_ipc_command(BeginVmWindowCapture { token: second })
+        );
+        assert!(!supervisor.handle_authorized_local_ipc_command(remember(first)));
+        assert!(supervisor.handle_authorized_local_ipc_command(remember(second)));
+        supervisor.config.accounts[0].move_mouse_in_vm = false;
+        assert!(!supervisor.handle_authorized_local_ipc_command(remember(second)));
+        supervisor.config.accounts[0].move_mouse_in_vm = true;
+        supervisor.config.accounts[0].vm_target.clear();
+        assert!(!supervisor.handle_authorized_local_ipc_command(remember(second)));
+        supervisor.config.accounts[0].vm_target = "Test VM".into();
+        supervisor.settings_mutation_active = true;
+        assert!(!supervisor.handle_authorized_local_ipc_command(remember(second)));
+        crate::macos_ax::vm_activity::begin_enter();
+
+        for command in [BeginVmWindowCapture { token: first }, remember(first)] {
+            assert!(super::local_ipc_command_authorized(
+                command,
+                std::process::id(),
+                None,
+                false
+            ));
+            assert!(super::local_ipc_command_authorized(
+                command,
+                42,
+                Some(42),
+                true
+            ));
+            assert!(!super::local_ipc_command_authorized(
+                command,
+                42,
+                Some(42),
+                false
+            ));
+            assert!(!super::local_ipc_command_authorized(
+                command,
+                7,
+                Some(42),
+                true
+            ));
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]

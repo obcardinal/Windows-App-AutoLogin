@@ -95,6 +95,10 @@ const IPC_COMMAND_ACTIVATE: &str = "activate";
 const IPC_COMMAND_CHECK_FOR_UPDATES: &str = "updates:check";
 #[cfg(target_os = "macos")]
 const IPC_COMMAND_PREPARE_IPHONE_WIFI: &str = "iphone:prepare-wifi";
+#[cfg(target_os = "macos")]
+const IPC_COMMAND_REMEMBER_VM_WINDOW: &str = "vm:r:";
+#[cfg(target_os = "macos")]
+const IPC_COMMAND_BEGIN_VM_CAPTURE: &str = "vm:begin:";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const IPC_COMMAND_SETTINGS_BOOTSTRAP: &str = "settings:bootstrap";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -179,6 +183,17 @@ pub(crate) enum LocalIpcCommand {
     CheckForUpdates,
     #[cfg(target_os = "macos")]
     PrepareIphoneWifi,
+    #[cfg(target_os = "macos")]
+    BeginVmWindowCapture {
+        token: uuid::Uuid,
+    },
+    #[cfg(target_os = "macos")]
+    RememberVmWindow {
+        token: uuid::Uuid,
+        account_id: uuid::Uuid,
+        pid: i32,
+        window_id: u32,
+    },
     SettingsBootstrap,
     SettingsMutationBegin,
     SettingsMutationCancel,
@@ -825,6 +840,26 @@ pub(crate) fn request_check_for_updates() -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 pub(crate) fn request_iphone_wifi_preparation() -> anyhow::Result<()> {
     send_local_ipc_command(IPC_COMMAND_PREPARE_IPHONE_WIFI)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_begin_vm_window_capture(token: uuid::Uuid) -> anyhow::Result<()> {
+    send_local_ipc_command(&format!("{IPC_COMMAND_BEGIN_VM_CAPTURE}{}", token.simple()))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_remember_vm_window(
+    token: uuid::Uuid,
+    account_id: uuid::Uuid,
+    pid: i32,
+    window_id: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(pid > 0 && window_id != 0, "Invalid VM window identity.");
+    send_local_ipc_command(&format!(
+        "{IPC_COMMAND_REMEMBER_VM_WINDOW}{}:{}:{pid}:{window_id}",
+        token.simple(),
+        account_id.simple(),
+    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1819,6 +1854,30 @@ fn parse_local_ipc_command(message: &str) -> Option<LocalIpcCommand> {
     #[cfg(target_os = "macos")]
     if message == IPC_COMMAND_PREPARE_IPHONE_WIFI {
         return Some(LocalIpcCommand::PrepareIphoneWifi);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(token) = message.strip_prefix(IPC_COMMAND_BEGIN_VM_CAPTURE) {
+        return uuid::Uuid::parse_str(token)
+            .ok()
+            .map(|token| LocalIpcCommand::BeginVmWindowCapture { token });
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(fields) = message.strip_prefix(IPC_COMMAND_REMEMBER_VM_WINDOW) {
+        let mut fields = fields.split(':');
+        let token = uuid::Uuid::parse_str(fields.next()?).ok()?;
+        let account_id = uuid::Uuid::parse_str(fields.next()?).ok()?;
+        let pid: i32 = fields.next()?.parse().ok()?;
+        let window_id: u32 = fields.next()?.parse().ok()?;
+        return (pid > 0 && window_id != 0 && fields.next().is_none()).then_some(
+            LocalIpcCommand::RememberVmWindow {
+                token,
+                account_id,
+                pid,
+                window_id,
+            },
+        );
     }
 
     if message == IPC_COMMAND_SETTINGS_BOOTSTRAP {
@@ -4279,6 +4338,57 @@ mod tests {
         for suffix in [":device", " directory", "\nactivate", "\0"] {
             assert_eq!(
                 parse_local_ipc_challenge_response(&format!("{request}{suffix}"), challenge),
+                None
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remembered_vm_window_ipc_requires_a_challenge_and_exact_window_identity() {
+        let challenge = "0123456789abcdef0123456789abcdef";
+        let account_id = uuid::Uuid::new_v4();
+        let token = uuid::Uuid::new_v4();
+        let prefix = format!(
+            "{challenge}:{IPC_COMMAND_REMEMBER_VM_WINDOW}{}:",
+            token.simple()
+        );
+        let request = format!("{prefix}{}:234:456", account_id.simple());
+        assert_eq!(
+            parse_local_ipc_challenge_response(&request, challenge),
+            Some(LocalIpcCommand::RememberVmWindow {
+                token,
+                account_id,
+                pid: 234,
+                window_id: 456,
+            })
+        );
+        let maximum = format!("{prefix}{}:{}:{}", account_id.simple(), i32::MAX, u32::MAX);
+        assert!(maximum.len() <= MACOS_LOCAL_IPC_MAX_BYTES);
+        assert_eq!(parse_local_ipc_challenge_response(&request, "wrong"), None);
+        let begin = format!(
+            "{challenge}:{IPC_COMMAND_BEGIN_VM_CAPTURE}{}",
+            token.simple()
+        );
+        assert_eq!(
+            parse_local_ipc_challenge_response(&begin, challenge),
+            Some(LocalIpcCommand::BeginVmWindowCapture { token })
+        );
+        assert_eq!(
+            parse_local_ipc_challenge_response(&format!("{begin}:extra"), challenge),
+            None
+        );
+        for fields in [
+            format!("{account_id}:0:456"),
+            format!("{account_id}:-234:456"),
+            format!("{account_id}:234:0"),
+            format!("{account_id}:234:456:extra"),
+            format!("{account_id}:234:456\nactivate"),
+            format!("{account_id}:234:456\0"),
+            "invalid:234:456".into(),
+        ] {
+            assert_eq!(
+                parse_local_ipc_challenge_response(&format!("{prefix}{fields}"), challenge,),
                 None
             );
         }
